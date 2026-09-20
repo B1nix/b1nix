@@ -9279,8 +9279,21 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         }
         if (!swap_active())
           return (u64)-EINVAL;
-        scheduler_swapin_all_tasks();
-        int dr = swap_detach();
+        /* Page everything back in and detach -- and if a slot is still held,
+         * try again rather than reporting EBUSY straight away. The slots that
+         * are left after one pass belong to a task that is dying: it is off
+         * the list the walk above covers, and its address space is freed a
+         * moment later. Linux's swapoff does the same thing by looping until
+         * the area is free; a caller that gets EBUSY for a task that is
+         * already dead has no way to act on it. */
+        int dr = -2;
+        for (int attempt = 0; attempt < 200; attempt++) {
+          scheduler_swapin_all_tasks();
+          dr = swap_detach();
+          if (dr != -2)
+            break;
+          scheduler_sleep_ticks(10);
+        }
         if (dr == -2)
           return (u64)-EBUSY;
         return dr == 0 ? 0 : (u64)-EINVAL;

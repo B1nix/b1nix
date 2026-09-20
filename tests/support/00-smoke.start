@@ -238,6 +238,10 @@ run_test /bin/m125_smoke posix
 # inside one, and loads every CPU on the machine for a few seconds -- so it runs
 # in the sequential group, where nothing else is measuring anything.
 run_test /bin/m127_smoke posix
+# M127: compressed swap. It takes the lane's swap disk off, puts swap on a zram
+# device, fills a cgroup past its memory.max and puts the disk back -- so it
+# runs in the sequential group, where nothing else is swapping at the time.
+run_test /bin/m127_swap_smoke posix
 # M123: the same namespaces through Alpine's unshare, nsenter and bubblewrap.
 if [ "$SMOKE_POSIX" = "1" ] && [ -x /etc/m123-tools-smoke.sh ]; then
     /bin/sh /etc/m123-tools-smoke.sh

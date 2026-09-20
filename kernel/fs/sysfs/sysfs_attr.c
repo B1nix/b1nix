@@ -304,7 +304,11 @@ static int reg_attr(struct sysfs_dir *dir, const char *name, u16 mode,
                     sysfs_attr_release release) {
   u64 flags;
 
-  if (!dir || !name || !*name || (!show && !read_at))
+  /* A file has to do SOMETHING: read one way or the other, or take a write.
+   * A write-only attribute is a real shape -- /sys/block/zram0/reset and
+   * uevent are two -- and refusing it here silently left the file out of the
+   * tree, which userspace sees as a kernel that does not have the feature. */
+  if (!dir || !name || !*name || (!show && !read_at && !store))
     return -EINVAL;
   spin_lock_irqsave(&sysfs_reg_lock, &flags);
   for (struct sysfs_attr *e = dir->attrs; e; e = e->next) {

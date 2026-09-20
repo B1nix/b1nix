@@ -737,13 +737,20 @@ static int r_vmstat(usize pid, struct sbuf *s) {
 }
 
 /* /proc/swaps — the Linux swap-area table. b1nix attaches at most one swap
- * device, at boot (kernel/mm/swap.c), so the table has one row or none. */
+ * device, so the table has one row or none.
+ *
+ * The row names the device that is actually in use. It used to say
+ * "/dev/swap0" whatever the device was -- a name no machine has -- and the
+ * first thing that tried to act on the table found that out: swapoff(8) reads
+ * this file to learn what to turn off, and asking the kernel to turn off
+ * /dev/swap0 is ENODEV. */
 static int r_swaps(usize pid, struct sbuf *s) {
   (void)pid;
   sb_puts(s, "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n");
   u64 total = 0, used = 0;
-  if (swap_active() && swap_stats(&total, &used) == 0)
-    sb_addf(s, "/dev/swap0                              partition\t%lu\t%lu\t-2\n",
+  const char *name = swap_device_name();
+  if (name && swap_stats(&total, &used) == 0)
+    sb_addf(s, "/dev/%-34s partition\t%lu\t%lu\t-2\n", name,
             (unsigned long)(total * 4), (unsigned long)(used * 4)); /* KiB */
   return 0;
 }

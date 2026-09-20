@@ -565,6 +565,7 @@ KERNEL_SOURCES := \
 	kernel/lib/kprof.c \
 	kernel/lib/kprintf.c \
 	kernel/lib/ktime.c \
+	kernel/lib/lz4.c \
 	kernel/lib/wallclock.c \
 	kernel/lib/termios_abi.c \
 	kernel/lib/stdio.c \
@@ -622,6 +623,7 @@ KERNEL_SOURCES := \
 	kernel/fs/tarfs.c \
 	kernel/dev/blk.c \
 	kernel/dev/loop.c \
+	kernel/dev/zram.c \
 	kernel/dev/uevent.c \
 	kernel/dev/console_redirect.c \
 	kernel/dev/md.c \

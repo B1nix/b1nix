@@ -3251,32 +3251,40 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
  * (now-unused) address field. The page is non-present, so the address bits are
  * free to carry the slot; the #PF handler reads it back to drive swap_in with no
  * reverse-map table. */
-void paging_mark_swapped(u64 pml4_phys, u64 vaddr, u64 slot) {
+/* Returns 1 when the mapping really became a swapped marker, 0 when there was
+ * nothing present at that address to replace -- the page was unmapped while
+ * the write to swap was in flight, or it is part of a huge mapping this does
+ * not split. The caller has a slot in hand by then, and it has to know: a slot
+ * that nothing points at is a leaked slot, a leaked cgroup charge, and a page
+ * of data with no way back. */
+int paging_mark_swapped(u64 pml4_phys, u64 vaddr, u64 slot) {
   u64 *pml4 = (u64 *)(usize)(pml4_phys ? (pml4_phys + DIRECT_MAP_BASE) : (u64)(usize)kernel_pml4_virt);
   u64 pml4e = pml4[pml4_index(vaddr)];
-  if (!(pml4e & VMM_PRESENT)) return;
+  if (!(pml4e & VMM_PRESENT)) return 0;
 
   u64 *pdpt = table_from_entry(pml4e);
   u64 pdpte = pdpt[pdpt_index(vaddr)];
-  if (!(pdpte & VMM_PRESENT)) return;
-  if (pdpte & HUGE_PAGE_FLAG) return;
+  if (!(pdpte & VMM_PRESENT)) return 0;
+  if (pdpte & HUGE_PAGE_FLAG) return 0;
 
   u64 *pd = table_from_entry(pdpte);
   u64 pde = pd[pd_index(vaddr)];
-  if (!(pde & VMM_PRESENT)) return;
-  if (pde & HUGE_PAGE_FLAG) return;
+  if (!(pde & VMM_PRESENT)) return 0;
+  if (pde & HUGE_PAGE_FLAG) return 0;
 
   u64 *pt = table_from_entry(pde);
   u64 pte = pt[pt_index(vaddr)];
 
-  if (pte & VMM_PRESENT) {
-    u64 flags = pte & ~PAGE_ENTRY_ADDRESS_MASK;
-    flags &= ~VMM_PRESENT;
-    flags |= VMM_SWAPPED;
-    pt[pt_index(vaddr)] = ((slot << 12) & PAGE_ENTRY_ADDRESS_MASK) | flags;
-    addrspace_note_replaced(pte);
-    invalidate_page(vaddr);
-  }
+  if (!(pte & VMM_PRESENT))
+    return 0;
+
+  u64 flags = pte & ~PAGE_ENTRY_ADDRESS_MASK;
+  flags &= ~VMM_PRESENT;
+  flags |= VMM_SWAPPED;
+  pt[pt_index(vaddr)] = ((slot << 12) & PAGE_ENTRY_ADDRESS_MASK) | flags;
+  addrspace_note_replaced(pte);
+  invalidate_page(vaddr);
+  return 1;
 }
 
 /* Swap slots are now freed incrementally as their pages are unmapped

@@ -1554,25 +1554,28 @@ int paging_pte_is_wc(u64 pte) {
 /* Replace a present leaf with a non-present VMM_SWAPPED marker carrying the
  * swap slot in its address field — the shape swap_in_fault above decodes. The
  * frame itself is freed by the eviction path that called us, not here. */
-void paging_mark_swapped(u64 pml4_phys, u64 vaddr, u64 slot) {
+/* Returns 1 when the marker was installed, 0 when nothing was mapped there any
+ * more -- see the x86_64 copy for why the caller must be told. */
+int paging_mark_swapped(u64 pml4_phys, u64 vaddr, u64 slot) {
   u64 *l0 = pml4_phys ? phys_to_virt(pml4_phys) : kernel_l0_virt;
   usize i0 = l0_index(vaddr);
-  if ((l0[i0] & 0x3ULL) != D_TABLE) return;
+  if ((l0[i0] & 0x3ULL) != D_TABLE) return 0;
   u64 *l1 = table_from_entry(l0[i0]);
   usize i1 = l1_index(vaddr);
-  if ((l1[i1] & 0x3ULL) != D_TABLE) return;
+  if ((l1[i1] & 0x3ULL) != D_TABLE) return 0;
   u64 *l2 = table_from_entry(l1[i1]);
   usize i2 = l2_index(vaddr);
-  if ((l2[i2] & 0x3ULL) != D_TABLE) return;
+  if ((l2[i2] & 0x3ULL) != D_TABLE) return 0;
   u64 *l3 = table_from_entry(l2[i2]);
   usize i3 = l3_index(vaddr);
   u64 entry = l3[i3];
-  if ((entry & 0x3ULL) != D_PAGE) return;
+  if ((entry & 0x3ULL) != D_PAGE) return 0;
   /* bit0 (valid) clear, so hardware ignores every other bit: this is purely a
    * software record. Keep SW_USER so the fault path can restore the mapping's
    * privilege level. */
   l3[i3] = ((slot << 12) & ADDR_MASK) | VMM_SWAPPED | (entry & SW_USER);
   tlb_flush_page(vaddr);
+  return 1;
 }
 
 /* Bring every swapped-out page of an address space back into memory. fork(2)

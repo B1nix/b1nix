@@ -114,4 +114,34 @@ u64 cgroup_io_delay_ns(u32 devno, u64 bytes, int write);
  * not set oom_score_adj to -1000. Returns 0 when there is nothing to kill. */
 usize cgroup_oom_victim(void *within);
 
+/* ── swap accounting ────────────────────────────────────────────────────────
+ *
+ * memory.swap.current is the pages of this cgroup's memory that are out in
+ * swap, and it can only be that if a page carries its owner with it: the task
+ * that faulted it may be asleep, moved, or dead by the time the page comes
+ * back. So the eviction path asks for the owner's id here, the swap layer
+ * stores the id beside the slot (kernel/mm/swap.c), and the charge is released
+ * when the slot is freed -- by whoever frees it, in whatever context.
+ *
+ * The id is small and stable: a cgroup gets one when it is created and keeps
+ * it until both the cgroup is gone and its last swapped page has come back.
+ * A cgroup removed while it still has pages out hands its id to its parent,
+ * which is where Linux's charges go too (the "reparent" in mem_cgroup_css_
+ * offline), so the count can never be attributed to a cgroup that no longer
+ * exists and can never simply vanish. */
+
+/* The id of a task's cgroup. 0 for the root, for a task with no membership,
+ * and on a machine with no cgroup2: everywhere the charge has nowhere more
+ * specific to go. */
+u16 cgroup_id_of_task(usize pid);
+
+/* Charge `pages` to the cgroup `id` names and to every ancestor. Returns 0, or
+ * -1 when an ancestor is at its memory.swap.max -- in which case nothing was
+ * charged and the caller must not swap the page out. */
+int cgroup_swap_charge(u16 id, u64 pages);
+
+/* Release a charge taken above. Called from the swap layer when a slot is
+ * freed: a major fault, an address space being torn down, or swapoff. */
+void cgroup_swap_uncharge(u16 id, u64 pages);
+
 #endif /* B1NIX_CGROUP_H */

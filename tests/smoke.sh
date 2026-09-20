@@ -3126,6 +3126,17 @@ check_output "$LOG" "M127-SMOKE: ok psi-format" "/proc/pressure/{cpu,memory,io} 
 check_output "$LOG" "M127-SMOKE: ok psi-cpu" "contending for the CPU moves /proc/pressure/cpu's some total"
 check_output "$LOG" "M127-SMOKE: ok psi-io" "reading a block device moves /proc/pressure/io's some total"
 check_output "$LOG" "M127-SMOKE: done" "M127 resource-control suite completes"
+# ── M127: compressed swap and cgroup-targeted reclaim (m127_swap_smoke) ──
+check_output "$LOG" "M127-SWAP: ok zram-disksize" "writing a size to /sys/block/zram0/disksize creates a block device of that many sectors, and initstate says it is up"
+check_output "$LOG" "M127-SWAP: ok zram-roundtrip" "a compressible pattern written to /dev/zram0 reads back byte for byte, and mm_stat reports it cost less than it is"
+check_output "$LOG" "M127-SWAP: ok zram-incompress" "an incompressible page also reads back identical, and is counted as a huge page rather than truncated"
+check_output "$LOG" "M127-SWAP: ok zram-zero-pages" "a page of zeroes reads back as zeroes, costs no memory at all, and is counted in same_pages"
+check_output "$LOG" "M127-SWAP: ok swapon-zram" "mkswap's signature plus swapon(2) puts swap on the compressed device, whole, and /proc/swaps names the real device"
+check_output "$LOG" "M127-SWAP: ok cgroup-reclaim" "a cgroup that exceeds memory.max with cold pages is reclaimed into swap instead of killed: the process is alive afterwards and memory.stat's pgsteal counts the pages taken"
+check_output "$LOG" "M127-SWAP: ok cgroup-swap-cur" "those pages are charged to that cgroup's memory.swap.current, and every byte of the charge is released when the process dies"
+check_output "$LOG" "M127-SWAP: ok swap-max" "memory.swap.max stops the reclaim: memory.swap.events counts the refusals and the runaway is killed as before"
+check_output "$LOG" "M127-SWAP: ok swapoff-zram" "swapoff pages everything back, leaves no cgroup charge behind and releases the device"
+check_output "$LOG" "M127-SWAP: done" "M127 compressed-swap suite completes"
 # ── M123: namespaces complete enough for containers (m123_smoke) ──
 check_output "$LOG" "M123-SMOKE: ok userns-unpriv" "an unprivileged task creates a user namespace, reads the overflow uid until it maps itself, then is root with every capability there"
 check_output "$LOG" "M123-SMOKE: ok userns-map-rules" "uid_map is written once; an unprivileged task maps only its own id, and gid_map only after setgroups is denied"

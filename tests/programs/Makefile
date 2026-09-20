@@ -368,6 +368,8 @@ BINARIES += $(BUILD)/bin/m124_smoke
 BINARIES += $(BUILD)/bin/m125_smoke
 # M127: cgroup v2 resource control, the OOM killer and PSI.
 BINARIES += $(BUILD)/bin/m127_smoke
+# M127: compressed swap (zram), cgroup-targeted reclaim, memory.swap.current.
+BINARIES += $(BUILD)/bin/m127_swap_smoke
 # reboot(RESTART2, "bootloader"): the iommu lane ends through it.
 BINARIES += $(BUILD)/bin/reboot2_smoke
 BINARIES += $(BUILD)/bin/m42_w5pre_smoke

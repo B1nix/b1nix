@@ -416,6 +416,14 @@ void vmm_set_swap_device(struct block_device *dev);
 // the slot. No (pml4,vaddr) reverse-map table.
 int swap_init(void);
 int swap_active(void);
+/* The name of the swap device, or 0 when swap is off. */
+const char *swap_device_name(void);
+/* Is `dev` the device swap is using right now? */
+int swap_is_device(struct block_device *dev);
+/* zram: a block device whose blocks live compressed in RAM. Publishes
+ * /sys/block/zram0 at boot; the device itself appears when userspace sizes
+ * it. */
+void zram_init(void);
 /* Slot accounting (one slot == one page): 0 on success, -1 if swap is off. */
 int swap_stats(u64 *out_total_slots, u64 *out_used_slots);
 /* swapoff(2) backing: 0 on success, -1 if no device, -2 if slots are still in
@@ -427,6 +435,9 @@ int swap_out(u64 physical_frame);
 int swap_in(u32 slot, u64 *out_physical_frame);
 void swap_free_slot_index(u32 slot);
 void swap_free_all_slots(u64 pml4_phys);
+/* Charge a freshly written slot to a cgroup id (0 = nobody). The charge is
+ * released when the slot is freed, wherever that happens. */
+void swap_set_owner(u32 slot, u16 cg_id);
 
 /* mlock(2) backing: a locked range is skipped by the CLOCK eviction scan, so
  * its pages are never swapped out while the owning task lives. Returns -1 when
@@ -436,6 +447,26 @@ struct task;
 int eviction_lock_range(struct task *task, u64 start, u64 end);
 void eviction_unlock_range(struct task *task, u64 start, u64 end);
 void eviction_unlock_all(struct task *task);
+
+/* Reclaim by writing out the pages of ONE task.
+ *
+ * The machine-wide path frees whatever the CLOCK hand lands on, which is the
+ * right answer for the machine and the wrong one for a cgroup over its
+ * memory.max: freeing another cgroup's memory to keep this one inside its
+ * limit is not what the limit means. A cgroup reclaims by calling this for
+ * each of its member tasks. Returns how many pages were written out and freed,
+ * and adds to `scanned` the candidates it considered -- the two numbers are
+ * memory.stat's pgsteal and pgscan. */
+usize eviction_reclaim_task(struct task *t, usize want_pages, usize *scanned);
+
+/* Keep one page out of reclaim's reach while a fault installs it.
+ *
+ * A fault that installs a page can, through the memory controller, start a
+ * reclaim that would take that same page straight back out -- and the faulting
+ * instruction would then fault on it again, forever. The fault brackets its
+ * charge with these. */
+void eviction_protect_begin(struct task *task, u64 vaddr);
+void eviction_protect_end(void);
 
 #endif
 

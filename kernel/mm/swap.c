@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/blk.h>
+#include <b1nix/cgroup.h>
 #include <b1nix/console.h>
+#include <b1nix/lz4.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
@@ -50,6 +52,20 @@ static u8 *swap_bitmap = 0;        /* 1 bit per slot: 1 = used */
 static usize swap_slot_count = 0;  /* usable slots, set by vmm_set_swap_device */
 static usize swap_used = 0;        /* allocated slots (for diagnostics) */
 static usize swap_next_slot = 0;   /* round-robin allocation cursor */
+static int swap_full_said = 0;     /* the "device is full" line, said once */
+
+/* Who each slot is charged to (kernel/fs/cgroup/cgroup.c hands out the ids;
+ * 0 means "nobody", which is the root cgroup and every machine that never
+ * mounts cgroup2).
+ *
+ * A swapped page has to stay charged to the cgroup that owned it, because
+ * memory.swap.current is read long after the task that faulted it has gone to
+ * sleep, and the page comes back in whatever context happens to touch it. The
+ * PTE carries the slot index and nothing else, so the attribution lives here,
+ * beside the slot -- two bytes per slot, the same place and the same price
+ * Linux pays for its swap_cgroup array. */
+static u16 *swap_owner = 0;        /* one id per disk slot */
+static u16 *zswap_owner = 0;       /* one id per pool entry */
 
 static int swap_bit_get(usize i) {
     return (swap_bitmap[i >> 3] >> (i & 7)) & 1;
@@ -67,8 +83,6 @@ static void swap_bit_clear(usize i) { swap_bitmap[i >> 3] &= (u8)~(1u << (i & 7)
 #define ZSWAP_SLOT_COMPRESSED (1u << 30)
 #define ZSWAP_MAX_ENTRIES 65536
 #define ZSWAP_MIN_ENTRIES 64
-#define ZSWAP_HASH_LOG 15           /* 32 K entries -> 64 KiB hash table */
-#define LZ4_COMPRESS_BOUND(n) ((n) + ((n) / 255) + 16)
 
 struct zswap_entry {
     u8 *data;   /* kmalloc'd compressed blob */
@@ -82,6 +96,58 @@ static usize zswap_pool_used_n = 0;
 static spinlock_t zswap_pool_lock = 0;
 static u16 *zswap_hash = 0;         /* compressor scratch (serialized by the lock) */
 
+/* Blobs whose entry is gone but whose memory has not been handed back yet.
+ *
+ * Freeing one is a kfree, and a slot is freed from places that hold locks the
+ * heap lock must not be taken under. The address-space teardown is the one
+ * that matters: it walks the page tables with the paging lock held and frees
+ * every swapped page's slot as it goes, so a kfree there is
+ *     paging lock -> heap lock
+ * while a kernel heap that grows takes
+ *     heap lock -> paging lock (to map the new pages)
+ * and the two together are a deadlock that takes down the machine the first
+ * time a process with a lot of compressed pages exits.
+ *
+ * So a freed blob goes on this list instead, threaded through its own first
+ * eight bytes, and the list is drained from places that hold nothing. Nothing
+ * here allocates, so pushing is always safe. */
+static u8 *zswap_free_pending;
+static spinlock_t zswap_pending_lock = 0;
+
+/* Every stored blob is at least this big, so the list can live inside one. */
+#define ZSWAP_MIN_BLOB (sizeof(void *))
+
+static void zswap_pending_push(u8 *blob) {
+    if (!blob)
+        return;
+
+    u64 flags;
+
+    spin_lock_irqsave(&zswap_pending_lock, &flags);
+    *(u8 **)(void *)blob = zswap_free_pending;
+    zswap_free_pending = blob;
+    spin_unlock_irqrestore(&zswap_pending_lock, flags);
+}
+
+/* Hand back everything that was freed while a lock was held. Called from the
+ * paths that hold nothing: storing a page, and reading one back. */
+static void zswap_drain_pending(void) {
+    u64 flags;
+    u8 *chain;
+
+    spin_lock_irqsave(&zswap_pending_lock, &flags);
+    chain = zswap_free_pending;
+    zswap_free_pending = 0;
+    spin_unlock_irqrestore(&zswap_pending_lock, flags);
+
+    while (chain) {
+        u8 *next = *(u8 **)(void *)chain;
+
+        kfree(chain);
+        chain = next;
+    }
+}
+
 static int zswap_pool_used_bit(usize i) {
     return (zswap_pool_used[i >> 3] >> (i & 7)) & 1;
 }
@@ -92,127 +158,6 @@ static void zswap_pool_used_clear(usize i) {
     zswap_pool_used[i >> 3] &= (u8)~(1u << (i & 7));
 }
 
-/* LZ4 block-format hash of the next 4 bytes. Unaligned-safe. */
-static u32 lz4_hash4(const u8 *p) {
-    u32 v;
-    memcpy(&v, p, 4);
-    v *= 0x9E3779B1u;
-    return (v >> (32 - ZSWAP_HASH_LOG)) & ((1u << ZSWAP_HASH_LOG) - 1);
-}
-
-/* LZ4 block-format compressor (greedy, single pass). Returns the compressed
- * size (>0), or 0 when the input cannot be represented within dstCapacity
- * (treated as incompressible by the caller). Pure integer code — no SSE, no
- * floating point — safe for the kernel's -mno-sse build. Uses the shared
- * zswap_hash scratch table; the caller must serialize access (zswap_pool_lock). */
-static int lz4_compress_block(const u8 *src, u8 *dst, int srcSize, int dstCapacity) {
-    const int HT = 1 << ZSWAP_HASH_LOG;
-    u16 *ht = zswap_hash;
-    for (int i = 0; i < HT; i++) ht[i] = 0xFFFF;
-
-    int ip = 0;      /* current position in src */
-    int anchor = 0;  /* start of pending literals */
-    int op = 0;      /* write position in dst */
-
-    while (ip < srcSize - 4) {
-        u32 h = lz4_hash4(src + ip);
-        u16 cand = ht[h];
-        ht[h] = (u16)ip;
-        if (cand != 0xFFFF && ip - cand > 0 && ip - cand < 0x10000) {
-            u32 a, b;
-            memcpy(&a, src + cand, 4);
-            memcpy(&b, src + ip, 4);
-            if (a == b) {
-                int len = 4;
-                while (ip + len < srcSize && src[cand + len] == src[ip + len])
-                    len++;
-                int litLen = ip - anchor;
-                int mlen = len - 4;
-                if (op + 1 + litLen / 255 + litLen + 2 + mlen / 255 > dstCapacity)
-                    return 0;
-                int tok = op++;
-                dst[tok] = (u8)((litLen >= 15 ? 15 : litLen) << 4);
-                if (litLen >= 15) {
-                    int e = litLen - 15;
-                    while (e >= 255) { dst[op++] = 255; e -= 255; }
-                    dst[op++] = (u8)e;
-                }
-                memcpy(dst + op, src + anchor, (usize)litLen);
-                op += litLen;
-                dst[tok] |= (u8)(mlen >= 15 ? 15 : mlen);
-                int off = ip - cand;
-                dst[op++] = (u8)off;
-                dst[op++] = (u8)(off >> 8);
-                if (mlen >= 15) {
-                    int e = mlen - 15;
-                    while (e >= 255) { dst[op++] = 255; e -= 255; }
-                    dst[op++] = (u8)e;
-                }
-                ip += len;
-                anchor = ip;
-                continue;
-            }
-        }
-        ip++;
-    }
-
-    /* Trailing literals — the last LZ4 sequence carries no match. */
-    int litLen = srcSize - anchor;
-    if (op + 1 + litLen / 255 + litLen > dstCapacity) return 0;
-    dst[op++] = (u8)((litLen >= 15 ? 15 : litLen) << 4);
-    if (litLen >= 15) {
-        int e = litLen - 15;
-        while (e >= 255) { dst[op++] = 255; e -= 255; }
-        dst[op++] = (u8)e;
-    }
-    memcpy(dst + op, src + anchor, (usize)litLen);
-    op += litLen;
-    return op;
-}
-
-/* LZ4 block-format decompressor. Decodes exactly dstSize bytes (raw-block
- * convention: the final sequence is literals only). Returns 0 on success, -1
- * on corrupt input (bounds-checked against srcSize). */
-static int lz4_decompress_block(const u8 *src, int srcSize, u8 *dst, int dstSize) {
-    int ip = 0;
-    int op = 0;
-    for (;;) {
-        if (ip >= srcSize) return -1;
-        u8 token = src[ip++];
-        int litLen = token >> 4;
-        if (litLen == 15) {
-            for (;;) {
-                if (ip >= srcSize) return -1;
-                u8 b = src[ip++];
-                litLen += b;
-                if (b != 255) break;
-            }
-        }
-        if (op + litLen > dstSize || ip + litLen > srcSize) return -1;
-        memcpy(dst + op, src + ip, (usize)litLen);
-        ip += litLen;
-        op += litLen;
-        if (op == dstSize) return 0;   /* block end: trailing literals */
-        if (ip + 2 > srcSize) return -1;
-        int off = src[ip] | (src[ip + 1] << 8);
-        ip += 2;
-        if (off == 0 || off > op) return -1;
-        int mlen = (token & 0xF) + 4;
-        if ((token & 0xF) == 15) {
-            for (;;) {
-                if (ip >= srcSize) return -1;
-                u8 b = src[ip++];
-                mlen += b;
-                if (b != 255) break;
-            }
-        }
-        if (op + mlen > dstSize) return -1;
-        for (int i = 0; i < mlen; i++)   /* overlapping matches allowed */
-            dst[op + i] = dst[op + i - off];
-        op += mlen;
-    }
-}
-
 static void zswap_init(void) {
     usize budget = pmm_total_usable_memory() / ZSWAP_POOL_RAM_DIVISOR;
     if (budget < PAGE_SIZE) return;
@@ -221,14 +166,17 @@ static void zswap_init(void) {
     if (zswap_pool_count < ZSWAP_MIN_ENTRIES) zswap_pool_count = ZSWAP_MIN_ENTRIES;
     zswap_pool = kzalloc(zswap_pool_count * sizeof(struct zswap_entry));
     zswap_pool_used = kzalloc((zswap_pool_count + 7) / 8);
-    zswap_hash = kmalloc((1u << ZSWAP_HASH_LOG) * sizeof(u16));
-    if (!zswap_pool || !zswap_pool_used || !zswap_hash) {
+    zswap_hash = kmalloc(LZ4_HASH_ENTRIES * sizeof(u16));
+    zswap_owner = kzalloc(zswap_pool_count * sizeof(u16));
+    if (!zswap_pool || !zswap_pool_used || !zswap_hash || !zswap_owner) {
         kfree(zswap_pool);
         kfree(zswap_pool_used);
         kfree(zswap_hash);
+        kfree(zswap_owner);
         zswap_pool = 0;
         zswap_pool_used = 0;
         zswap_hash = 0;
+        zswap_owner = 0;
         zswap_pool_count = 0;
         return;
     }
@@ -242,6 +190,18 @@ static void zswap_init(void) {
 /* Compress `page` into a pool entry. Returns the encoded slot (with
  * ZSWAP_SLOT_COMPRESSED) on success, or -1 to fall back to the disk path. */
 static int zswap_pool_store(const u8 *page) {
+    /* Allocated BEFORE the lock, and the failed cases free it after letting
+     * go. A kmalloc under this lock is a kmalloc with interrupts off inside
+     * the reclaim path: the heap may have to grow, growing it maps frames, and
+     * everything else on the machine waits on the heap lock meanwhile -- which
+     * is reported, eventually, as a spinlock lockup somewhere unrelated. */
+    zswap_drain_pending();
+
+    u8 *blob = kmalloc(LZ4_COMPRESS_BOUND(PAGE_SIZE));
+
+    if (!blob)
+        return -1;
+
     u64 flags;
     spin_lock_irqsave(&zswap_pool_lock, &flags);
     usize idx = zswap_pool_count;
@@ -250,18 +210,17 @@ static int zswap_pool_store(const u8 *page) {
     }
     if (idx == zswap_pool_count) {
         spin_unlock_irqrestore(&zswap_pool_lock, flags);
+        kfree(blob);
         return -1;   /* pool full */
     }
-    u8 *blob = kmalloc(LZ4_COMPRESS_BOUND(PAGE_SIZE));
-    if (!blob) {
-        spin_unlock_irqrestore(&zswap_pool_lock, flags);
-        return -1;
-    }
-    int csize = lz4_compress_block(page, blob, PAGE_SIZE, LZ4_COMPRESS_BOUND(PAGE_SIZE));
+    int csize = lz4_compress(page, PAGE_SIZE, blob, LZ4_COMPRESS_BOUND(PAGE_SIZE),
+                             zswap_hash);
+    if (csize > 0 && (usize)csize < ZSWAP_MIN_BLOB)
+        csize = (int)ZSWAP_MIN_BLOB;  /* room for the pending-free link */
     if (csize <= 0 || (usize)csize > PAGE_SIZE / 2) {
         /* Incompressible or worse than 2:1 — disk is the better home. */
-        kfree(blob);
         spin_unlock_irqrestore(&zswap_pool_lock, flags);
+        kfree(blob);
         return -1;
     }
     zswap_pool[idx].data = blob;
@@ -283,16 +242,19 @@ static int zswap_pool_load(u32 slot, u8 *page) {
         return -1;
     }
     struct zswap_entry *e = &zswap_pool[idx];
-    if (lz4_decompress_block(e->data, e->size, page, PAGE_SIZE) != 0) {
+    if (lz4_decompress(e->data, e->size, page, PAGE_SIZE) != 0) {
         spin_unlock_irqrestore(&zswap_pool_lock, flags);
         return -1;
     }
-    kfree(e->data);
+    u8 *old = e->data;
+
     e->data = 0;
     e->size = 0;
     zswap_pool_used_clear(idx);
     zswap_pool_used_n--;
     spin_unlock_irqrestore(&zswap_pool_lock, flags);
+    zswap_pending_push(old);
+    zswap_drain_pending();  /* a swap-in holds nothing: a good place to pay */
     return 0;
 }
 
@@ -301,15 +263,20 @@ static void zswap_pool_free(u32 slot) {
     u32 idx = slot & ~ZSWAP_SLOT_COMPRESSED;
     if (idx >= zswap_pool_count) return;
     u64 flags;
+    u8 *old = 0;
+
     spin_lock_irqsave(&zswap_pool_lock, &flags);
     if (zswap_pool_used_bit(idx)) {
-        kfree(zswap_pool[idx].data);
+        old = zswap_pool[idx].data;
         zswap_pool[idx].data = 0;
         zswap_pool[idx].size = 0;
         zswap_pool_used_clear(idx);
         zswap_pool_used_n--;
     }
     spin_unlock_irqrestore(&zswap_pool_lock, flags);
+    /* NOT kfree: this runs from the address-space teardown, which holds the
+     * paging lock. See zswap_free_pending. */
+    zswap_pending_push(old);
 }
 
 /* The second disk of a storage class is the swap disk by convention: the first
@@ -392,10 +359,30 @@ static int swap_device_is_free(struct block_device *dev)
     return 1;
 }
 
+/* Does this device carry a mkswap(8) signature? Then userspace has already
+ * said what the whole of it is for, and reserving a corner of it would be
+ * second-guessing a decision that has been written to the device. */
+static int swap_has_signature(struct block_device *dev)
+{
+    u8 buf[512];
+
+    if (!dev || dev->block_count < SECTORS_PER_PAGE)
+        return 0;
+    return blk_read_cached(dev, SECTORS_PER_PAGE - 1, 1, buf) >= 0 &&
+           memcmp(buf + 512 - 10, "SWAPSPACE2", 10) == 0;
+}
+
 static int swap_is_dedicated_disk(struct block_device *dev)
 {
     if (!dev)
         return 0;
+    /* A device that says it is swap IS swap, whatever bus it is on. This is
+     * the only way `mkswap /dev/zram0 && swapon /dev/zram0` can mean what it
+     * says: zram is not on one of the two buses named below, and taking the
+     * last quarter of it would hand back three quarters of a device that
+     * exists for nothing else. */
+    if (swap_has_signature(dev))
+        return 1;
     return dev == blk_nth_on_bus(BLK_BUS_ATA, SWAP_DISK_INDEX) ||
            dev == blk_nth_on_bus(BLK_BUS_NVME, SWAP_DISK_INDEX);
 }
@@ -405,8 +392,12 @@ void vmm_set_swap_device(struct block_device *dev)
     swap_dev = dev;
     if (dev) {
         if (swap_is_dedicated_disk(dev)) {
-            swap_start_lba = 0;
-            swap_sector_count = dev->block_count;
+            /* Skip the first page on a device that carries a header: that page
+             * IS the header, and slot 0 would write over the signature that
+             * told us to use the whole device -- so the next swapon of the
+             * same device would take a quarter of it instead. */
+            swap_start_lba = swap_has_signature(dev) ? SECTORS_PER_PAGE : 0;
+            swap_sector_count = dev->block_count - swap_start_lba;
         } else {
             // Reserve last 1/4 of the device for swap
             swap_start_lba = (dev->block_count * 3) / 4;
@@ -431,8 +422,13 @@ void vmm_set_swap_device(struct block_device *dev)
         swap_used = 0;
         swap_next_slot = 0;
         swap_bitmap = kzalloc((swap_slot_count + 7) / 8);
-        if (!swap_bitmap) {
+        swap_owner = kzalloc(swap_slot_count * sizeof(u16));
+        if (!swap_bitmap || !swap_owner) {
             console_write("swap: bitmap alloc failed, disabling swap\n");
+            kfree(swap_bitmap);
+            kfree(swap_owner);
+            swap_bitmap = 0;
+            swap_owner = 0;
             swap_slot_count = 0;
         }
         console_write("swap: device=");
@@ -547,6 +543,47 @@ static u32 swap_alloc_slot(void)
     return (u32)-1; // No free slots
 }
 
+/* ── who a swapped page is charged to ───────────────────────────────────────
+ * Set right after the page is written out, by the only caller that knows whose
+ * page it was (kernel/mm/eviction.c walks the ring and holds the task), and
+ * read back exactly once, when the slot is freed. Freeing is the single place
+ * the charge can be released from, and every path that stops using a slot goes
+ * through it: swap_in on a major fault, the address-space teardown walk, and
+ * swapoff. */
+void swap_set_owner(u32 slot_index, u16 cg_id)
+{
+    if (slot_index & ZSWAP_SLOT_COMPRESSED) {
+        u32 idx = slot_index & ~ZSWAP_SLOT_COMPRESSED;
+        if (zswap_owner && idx < zswap_pool_count)
+            zswap_owner[idx] = cg_id;
+        return;
+    }
+    if (swap_owner && slot_index < swap_slot_count)
+        swap_owner[slot_index] = cg_id;
+}
+
+/* Read the owner and clear it in one step: a slot that is being freed must not
+ * be able to release the same charge twice, however many times a caller asks
+ * for it to be freed. */
+static u16 swap_owner_take(u32 slot_index)
+{
+    u16 id = 0;
+
+    if (slot_index & ZSWAP_SLOT_COMPRESSED) {
+        u32 idx = slot_index & ~ZSWAP_SLOT_COMPRESSED;
+        if (zswap_owner && idx < zswap_pool_count) {
+            id = zswap_owner[idx];
+            zswap_owner[idx] = 0;
+        }
+        return id;
+    }
+    if (swap_owner && slot_index < swap_slot_count) {
+        id = swap_owner[slot_index];
+        swap_owner[slot_index] = 0;
+    }
+    return id;
+}
+
 /* Public: free a slot by index. Called by the address-space teardown walk
  * (paging_free_swap_slots) for every VMM_SWAPPED PTE, and internally by
  * swap_in. Handles both disk slots and ZSWAP pool entries. Idempotent on an
@@ -554,19 +591,46 @@ static u32 swap_alloc_slot(void)
 void swap_free_slot_index(u32 slot_index)
 {
     if (slot_index & ZSWAP_SLOT_COMPRESSED) {
+        u32 idx = slot_index & ~ZSWAP_SLOT_COMPRESSED;
+        /* Only a live entry carries a charge; freeing a free slot is a no-op
+         * here as it is below. */
+        int live = zswap_pool && idx < zswap_pool_count &&
+                   zswap_pool_used_bit(idx);
+        u16 owner = live ? swap_owner_take(slot_index) : 0;
+
         zswap_pool_free(slot_index);
+        if (owner)
+            cgroup_swap_uncharge(owner, 1);
         return;
     }
     if (slot_index < swap_slot_count && swap_bit_get(slot_index)) {
+        u16 owner = swap_owner_take(slot_index);
+
         swap_bit_clear(slot_index);
         if (swap_used)
             swap_used--;
+        if (owner)
+            cgroup_swap_uncharge(owner, 1);
     }
 }
 
 int swap_active(void)
 {
     return swap_dev && swap_dev->write_blocks;
+}
+
+/* The name of the device swap is using, for /proc/swaps. 0 when swap is off. */
+const char *swap_device_name(void)
+{
+    return swap_active() && swap_dev ? swap_dev->name : 0;
+}
+
+/* Is this the device swap is currently using? Asked by a driver that is about
+ * to take its backing store away (zram's reset), because the swap layer holds
+ * the pointer and has pages out on it. */
+int swap_is_device(struct block_device *dev)
+{
+    return dev && swap_dev == dev;
 }
 
 /* swapoff(2): detach the swap device. The caller must have paged every
@@ -578,11 +642,24 @@ int swap_detach(void)
 {
     if (!swap_dev)
         return -1;
-    if (swap_used != 0 || zswap_pool_used_n != 0)
+    if (swap_used != 0 || zswap_pool_used_n != 0) {
+        /* Say what is holding it. A bare EBUSY from swapoff(8) is unactionable
+         * -- the caller cannot see whether one page is left or a hundred
+         * thousand, nor whether the number is going down. */
+        console_write("swap: cannot detach, ");
+        console_write_dec(swap_used);
+        console_write(" disk slots and ");
+        console_write_dec(zswap_pool_used_n);
+        console_write(" compressed pages still in use\n");
         return -2; /* pages still live in swap -> caller reports EBUSY */
+    }
     if (swap_bitmap) {
         kfree(swap_bitmap);
         swap_bitmap = 0;
+    }
+    if (swap_owner) {
+        kfree(swap_owner);
+        swap_owner = 0;
     }
     swap_dev = 0;
     swap_start_lba = 0;
@@ -630,9 +707,18 @@ int swap_out(u64 physical_frame)
 
     u32 slot = swap_alloc_slot();
     if (slot == (u32)-1) {
-        console_write("swap_out: no free swap slots\n");
+        /* Said once per full-to-not-full episode. A full swap device is the
+         * state a machine under memory pressure stays in, and every eviction
+         * attempt lands here -- thousands of identical lines that push the
+         * evidence of what actually happened off the top of the log, and cost
+         * more time on the serial port than the reclaim itself. */
+        if (!swap_full_said) {
+            swap_full_said = 1;
+            console_write("swap: device is full\n");
+        }
         return -1;
     }
+    swap_full_said = 0;
 
     u64 slot_sector = (u64)slot * SECTORS_PER_PAGE;
     if (slot_sector > swap_sector_count || SECTORS_PER_PAGE > swap_sector_count - slot_sector) {
@@ -669,6 +755,15 @@ int swap_in(u32 slot, u64 *out_physical_frame)
         extern u64 vmm_direct_map_base(void);
         u64 direct_base = vmm_direct_map_base();
         if (zswap_pool_load(slot, (u8 *)(usize)(frame + direct_base)) == 0) {
+            /* The entry is gone, so its charge must go with it. The disk path
+             * below gets this from swap_free_slot_index; this path frees the
+             * entry inside zswap_pool_load and would otherwise leave the
+             * cgroup billed for a page that is back in memory -- and leave a
+             * stale owner on a pool slot that the next eviction reuses. */
+            u16 owner = swap_owner_take(slot);
+
+            if (owner)
+                cgroup_swap_uncharge(owner, 1);
             *out_physical_frame = frame;
             return 0;
         }
@@ -704,6 +799,7 @@ int swap_in(u32 slot, u64 *out_physical_frame)
  * swap_free_slot_index for each VMM_SWAPPED PTE it finds. */
 void swap_free_all_slots(u64 pml4_phys)
 {
+
     extern void paging_free_swap_slots(u64 pml4_phys);
     paging_free_swap_slots(pml4_phys);
 }

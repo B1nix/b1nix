@@ -159,6 +159,17 @@ struct cgroup {
   u64 mem_peak;
   u64 mem_pgfault;      /* memory.stat: pages charged here */
   u64 mem_pgmajfault;   /* memory.stat: pages faulted back in from swap */
+  u64 mem_pgscan;       /* memory.stat: pages the reclaim hand looked at */
+  u64 mem_pgsteal;      /* memory.stat: pages it actually wrote out */
+  /* memory.swap.current, in pages. mem_swap_cur counts this cgroup AND its
+   * descendants, which is what the file reports; mem_swap_own counts only the
+   * pages charged with this cgroup's own id, which is what has to move to the
+   * parent if the cgroup is removed while its pages are still out. */
+  u64 mem_swap_cur;
+  u64 mem_swap_own;
+  u64 mem_swap_ev_max;  /* memory.swap.events: max */
+  u64 mem_swap_ev_fail; /* memory.swap.events: fail */
+  u16 id;               /* index into cg_ids, 0 = the root / untracked */
   u64 mem_ev_low, mem_ev_high, mem_ev_max, mem_ev_oom, mem_ev_oom_kill;
   int mem_oom_group;
   /* When this cgroup was last taken over its memory.max or memory.high. Both
@@ -167,6 +178,10 @@ struct cgroup {
    * often either may run. */
   u64 mem_oom_at_ns;
   u64 mem_high_at_ns;
+  /* When reclaim last found nothing to take. A cgroup whose pages are all hot,
+   * or whose swap is full, would otherwise sweep the whole eviction ring on
+   * every fault -- a page-table walk per page of RAM, inside a page fault. */
+  u64 mem_reclaim_dry_at_ns;
 
   /* ── cpu ── */
   u32 cpu_weight;             /* 1..10000 */
@@ -219,6 +234,77 @@ struct cg_member {
 };
 
 static struct cg_member cg_members[CG_SLOTS];
+
+/* ── cgroup ids ──────────────────────────────────────────────────────────────
+ *
+ * A swapped page is charged to an id rather than to a pointer, because the
+ * page outlives everything else: the slot it sits in remembers two bytes and
+ * nothing more, and the cgroup may be removed before the page comes back.
+ *
+ * An entry stays allocated while any swapped page still names it. When the
+ * cgroup it belongs to is removed with pages still out, the entry is pointed
+ * at the parent -- the charge moves up rather than disappearing, which is what
+ * Linux does at css_offline -- and it is freed once the last of those pages
+ * has been read back. `refs` is exactly that count.
+ *
+ * 1024 ids: systemd creates a cgroup per unit and a handful per session, and
+ * an id is held only for as long as a cgroup exists or has pages in swap. A
+ * machine that runs out gets id 0 for the next cgroup, whose swapped pages are
+ * then simply not attributed -- the count stays honest by being absent rather
+ * than wrong, and the console says so once. */
+#define CG_IDS 1024u
+
+struct cg_id_slot {
+  struct cgroup *cg; /* 0 = free */
+  u64 refs;          /* swapped pages still charged to this id */
+  int orphaned;      /* the cgroup is gone; the entry is only a redirect */
+};
+
+static struct cg_id_slot cg_ids[CG_IDS];
+static int cg_ids_exhausted_said;
+
+/* Caller holds cg_lock. */
+static u16 cg_id_alloc(struct cgroup *cg) {
+  for (u16 i = 1; i < (u16)CG_IDS; i++) {
+    if (!cg_ids[i].cg) {
+      cg_ids[i].cg = cg;
+      cg_ids[i].refs = 0;
+      cg_ids[i].orphaned = 0;
+      return i;
+    }
+  }
+  return 0;
+}
+
+/* Caller holds cg_lock. The cgroup is going away: hand its id, and the pages
+ * still charged to it, to its parent. */
+static void cg_id_reparent(struct cgroup *cg) {
+  if (!cg->id || cg->id >= CG_IDS)
+    return;
+  struct cg_id_slot *sl = &cg_ids[cg->id];
+
+  if (sl->cg != cg)
+    return;
+  if (sl->refs == 0) { /* nothing out there names it */
+    sl->cg = 0;
+    sl->orphaned = 0;
+    return;
+  }
+  if (cg->parent) {
+    cg->parent->mem_swap_own += cg->mem_swap_own;
+    sl->cg = cg->parent;
+    sl->orphaned = 1;
+  } else {
+    sl->cg = 0;
+    sl->orphaned = 0;
+  }
+  cg->mem_swap_own = 0;
+  /* An entry already redirected AT this cgroup has to follow it up, or the
+   * next uncharge would walk a freed struct. */
+  for (u16 i = 1; i < (u16)CG_IDS; i++)
+    if (cg_ids[i].cg == cg && i != cg->id)
+      cg_ids[i].cg = cg->parent;
+}
 
 static inline u32 cg_hash(usize pid) {
   u64 h = (u64)pid * 0x9E3779B97F4A7C15ull;
@@ -333,6 +419,8 @@ void cgroup_ns_root_put(void *root) {
   u64 flags;
   spin_lock_irqsave(&cg_lock, &flags);
   int free_it = --cg->ns_refs == 0 && cg->removed;
+  if (free_it)
+    cg_id_reparent(cg);
   spin_unlock_irqrestore(&cg_lock, flags);
   if (free_it)
     kfree(cg);
@@ -544,19 +632,223 @@ usize cgroup_oom_victim(void *within) {
  * altogether and a spinlock lockup was reported somewhere unrelated. */
 #define CG_MEM_ACTION_COOLDOWN_NS (100ull * 1000000ull)
 
-/* Over memory.max: measure exactly, and kill inside the cgroup if it really is
- * over. Called in task context with no cgroup lock held. Returns the pid
- * killed, or 0 when the exact measurement disagreed with the estimate.
- *
- * No reclaim. The machine-wide allocator reclaims before it declares OOM, and
- * that is right for the machine -- but page eviction here has no notion of
- * whose pages it is writing out, and freeing another cgroup's memory to keep
- * this one inside its limit is not what memory.max means. Linux reclaims
- * INSIDE the cgroup first; until that exists, and with it a real
- * memory.swap.current, the limit is enforced by the kill alone. */
-static usize cg_mem_over_limit(struct cgroup *cg, u64 max_pages) {
-  if (cg_mem_refresh(cg) <= max_pages)
+/* Pages one reclaim attempt may take, and how many attempts one crossing of
+ * memory.max may make. See cg_reclaim and cg_mem_over_limit. */
+#define CG_RECLAIM_BATCH 32u
+/* Batches the kill path may reclaim before it decides that killing is the only
+ * answer left. It runs at most once per cooldown, has already paid for an
+ * exact measurement, and is the last thing between a cgroup and a dead
+ * process -- so it tries considerably harder than a fault does. */
+#define CG_RECLAIM_ROUNDS 16u
+/* How many batches one crossing of memory.max may reclaim before giving up and
+ * letting the kill path decide. 32 x 8 = 256 pages, a megabyte, per fault. */
+#define CG_RELIEVE_ROUNDS 8
+
+/* ── swap accounting and cgroup-targeted reclaim ─────────────────────────── */
+
+u16 cgroup_id_of_task(usize pid) {
+  if (!cg_root || !pid)
     return 0;
+  u64 flags;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  struct cgroup *cg = cg_of(pid);
+  u16 id = cg ? cg->id : 0;
+  spin_unlock_irqrestore(&cg_lock, flags);
+  return id;
+}
+
+int cgroup_swap_charge(u16 id, u64 pages) {
+  if (!id || id >= CG_IDS || !pages)
+    return 0;
+  u64 flags;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  struct cgroup *cg = cg_ids[id].cg;
+  if (!cg) {
+    spin_unlock_irqrestore(&cg_lock, flags);
+    return 0; /* the id outlived everything it named */
+  }
+  /* memory.swap.max is a limit on the subtree, so every ancestor gets a veto
+   * and the whole charge is refused if any of them says no. Refusing is the
+   * point: Linux stops swapping for that cgroup and lets the memory pressure
+   * fall back on memory.max, which ends in reclaim or a kill. */
+  for (struct cgroup *a = cg; a; a = a->parent) {
+    if (a->mem_swap_max != CG_LIM_MAX &&
+        a->mem_swap_cur + pages > a->mem_swap_max) {
+      a->mem_swap_ev_max++;
+      a->mem_swap_ev_fail++;
+      spin_unlock_irqrestore(&cg_lock, flags);
+      return -1;
+    }
+  }
+  for (struct cgroup *a = cg; a; a = a->parent)
+    a->mem_swap_cur += pages;
+  cg->mem_swap_own += pages;
+  cg_ids[id].refs += pages;
+  spin_unlock_irqrestore(&cg_lock, flags);
+  return 0;
+}
+
+void cgroup_swap_uncharge(u16 id, u64 pages) {
+  if (!id || id >= CG_IDS || !pages)
+    return;
+  u64 flags;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  struct cgroup *cg = cg_ids[id].cg;
+  if (cg) {
+    for (struct cgroup *a = cg; a; a = a->parent)
+      a->mem_swap_cur = a->mem_swap_cur > pages ? a->mem_swap_cur - pages : 0;
+    cg->mem_swap_own = cg->mem_swap_own > pages ? cg->mem_swap_own - pages : 0;
+  }
+  if (cg_ids[id].refs > pages)
+    cg_ids[id].refs -= pages;
+  else {
+    cg_ids[id].refs = 0;
+    /* The last page charged to a cgroup that is already gone: the id has
+     * nothing left to redirect and can be handed out again. */
+    if (cg_ids[id].orphaned) {
+      cg_ids[id].cg = 0;
+      cg_ids[id].orphaned = 0;
+    }
+  }
+  spin_unlock_irqrestore(&cg_lock, flags);
+}
+
+/* Reclaim inside a cgroup: write its own pages out to swap until it is back
+ * under `target_pages`, and never touch anybody else's.
+ *
+ * This is what makes memory.max a limit rather than a death sentence. A
+ * cgroup over its limit with anonymous memory that is not being touched now
+ * loses that memory to swap and carries on, which is what the process that set
+ * the limit asked for; only a cgroup that cannot give anything back reaches
+ * the kill below. With no swap device attached there is nowhere to put the
+ * pages, the scan frees nothing, and the behaviour is exactly what it was. */
+static usize cg_reclaim(struct cgroup *cg, u64 over_pages) {
+  if (!swap_active() || !over_pages)
+    return 0;
+
+  u64 now = ktime_monotonic_ns();
+  u64 flags;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  u64 dry = cg->mem_reclaim_dry_at_ns;
+  spin_unlock_irqrestore(&cg_lock, flags);
+  /* Nothing to take a moment ago means nothing to take now: the pages this
+   * cgroup owns are all in use, or swap is full. Either way the answer does
+   * not change between two faults, and looking for it again costs a sweep of
+   * the ring -- which is what made a cgroup with a full swap device stop the
+   * machine rather than merely stop itself. */
+  if (dry && now - dry < CG_MEM_ACTION_COOLDOWN_NS)
+    return 0;
+
+  /* How much one crossing of the limit may reclaim. Linux reclaims in
+   * clusters (SWAP_CLUSTER_MAX, 32 pages) for the same reason: the allocation
+   * that crossed the limit needs a little room now, not the whole excess, and
+   * the next allocation will come back here in a moment anyway. Asking for the
+   * whole excess made a single fault write megabytes out. */
+  if (over_pages > CG_RECLAIM_BATCH)
+    over_pages = CG_RECLAIM_BATCH;
+
+  /* The members, taken once: reclaim walks each task's own pages, so the list
+   * is the whole of what this cgroup may take from. A task that exits while we
+   * work is handled by the ring, which forgets its pages on the way out. */
+  struct task *tasks[CG_MEM_TASKS];
+  int n;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  n = cg_collect_tasks(cg, tasks, CG_MEM_TASKS);
+  spin_unlock_irqrestore(&cg_lock, flags);
+
+  usize scanned = 0;
+  usize freed = 0;
+
+  for (int i = 0; i < n && freed < (usize)over_pages; i++)
+    freed += eviction_reclaim_task(tasks[i], (usize)over_pages - freed,
+                                   &scanned);
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  for (struct cgroup *a = cg; a; a = a->parent) {
+    a->mem_pgscan += scanned;
+    a->mem_pgsteal += freed;
+    /* The pages are gone from this cgroup's resident set, so the running
+     * estimate has to lose them too -- otherwise the next fault reads an
+     * estimate that still counts them, decides the cgroup is over, and
+     * reclaims again on evidence that reclaim itself has already answered. */
+    a->mem_delta = a->mem_delta > freed ? a->mem_delta - freed : 0;
+  }
+  cg->mem_reclaim_dry_at_ns = freed ? 0 : now;
+  spin_unlock_irqrestore(&cg_lock, flags);
+  return freed;
+}
+
+
+/* Reclaim until the cgroup's own estimate says it is back inside its limit, or
+ * until reclaim stops making progress.
+ *
+ * This is the shape of Linux's try_charge loop, and the reason for it is that
+ * one batch per fault is not a limit: a task that allocates faster than 32
+ * pages per fault stays over the limit however long it runs, and the kill
+ * comes for a cgroup that had cold pages it could have given back. Each round
+ * is small so the fault does not disappear for a long time, and the estimate
+ * -- which cg_reclaim keeps honest by subtracting what it freed -- is what
+ * decides when to stop, because measuring exactly costs a walk of every
+ * member's page tables and this runs inside a page fault.
+ */
+static void cg_mem_relieve(struct cgroup *cg, u64 max_pages) {
+  for (int round = 0; round < CG_RELIEVE_ROUNDS; round++) {
+    u64 flags;
+
+    spin_lock_irqsave(&cg_lock, &flags);
+    u64 est = cg->mem_exact + cg->mem_delta;
+    spin_unlock_irqrestore(&cg_lock, flags);
+
+    if (est <= max_pages)
+      return;
+    if (cg_reclaim(cg, CG_RECLAIM_BATCH) == 0)
+      return; /* nothing left to take: the kill path decides from here */
+  }
+}
+
+/* Over memory.max: measure exactly, reclaim inside the cgroup, and kill inside
+ * it only if that was not enough. Called in task context with no cgroup lock
+ * held. Returns the pid killed, or 0 when nothing had to die -- because the
+ * exact measurement disagreed with the estimate, or because reclaim brought
+ * the cgroup back under its limit.
+ *
+ * Reclaim first, as Linux does. What it may take is restricted to this
+ * cgroup's own pages: freeing another cgroup's memory to keep this one inside
+ * its limit is not what memory.max means, and the charge for every page it
+ * writes out lands on this cgroup's memory.swap.current. */
+static usize cg_mem_over_limit(struct cgroup *cg, u64 max_pages) {
+  u64 now = cg_mem_refresh(cg);
+
+  if (now <= max_pages)
+    return 0;
+
+  /* Reclaim in rounds until the cgroup is back inside its limit or there is
+   * nothing left to take. Each round is a bounded slice of the eviction ring;
+   * between rounds the excess is tracked by subtracting what was freed rather
+   * than by measuring again, because measuring walks the page tables of every
+   * member and doing that per round would cost more than the reclaim. */
+  usize total = 0;
+
+  for (usize round = 0; round < CG_RECLAIM_ROUNDS && now > max_pages; round++) {
+    usize freed = cg_reclaim(cg, now - max_pages > CG_RECLAIM_BATCH
+                                     ? CG_RECLAIM_BATCH
+                                     : (usize)(now - max_pages));
+
+    if (!freed)
+      break;
+    total += freed;
+    now = now > freed ? now - freed : 0;
+  }
+  if (total) {
+    now = cg_mem_refresh(cg);
+    if (now <= max_pages)
+      return 0; /* it gave the memory back instead of dying */
+  }
 
   usize victim = cgroup_oom_victim(cg);
   u64 flags;
@@ -591,14 +883,14 @@ void cgroup_mem_note_majfault(void) {
   spin_unlock_irqrestore(&cg_lock, flags);
 }
 
-/* memory.high: a throttle rather than a kill.
+/* memory.high: reclaim, and throttle the allocator while it happens.
  *
- * Linux puts an allocating task to sleep in proportion to how far past
- * memory.high its cgroup is, and reclaims inside the cgroup; with no
- * cgroup-targeted reclaim here, the sleep is what is left, and it is real --
- * a cgroup past its soft limit allocates more slowly than one inside it. One
- * tick per crossing, and crossings are rate-limited, so this can slow a cgroup
- * down and never stop it. */
+ * Linux reclaims inside the cgroup and puts the allocating task to sleep in
+ * proportion to how far past memory.high it is. Both halves are here: the
+ * reclaim takes this cgroup's own cold pages out to swap, and the sleep is
+ * what is left when there is nothing to take -- a cgroup past its soft limit
+ * allocates more slowly than one inside it, and is never stopped. One tick per
+ * crossing, and crossings are rate-limited. */
 static void cg_mem_check_high(struct cgroup *cg) {
   u64 flags;
   u64 high;
@@ -608,11 +900,16 @@ static void cg_mem_check_high(struct cgroup *cg) {
   spin_unlock_irqrestore(&cg_lock, flags);
   if (high == CG_LIM_MAX)
     return;
-  if (cg_mem_refresh(cg) <= high)
+
+  u64 now = cg_mem_refresh(cg);
+
+  if (now <= high)
     return;
   spin_lock_irqsave(&cg_lock, &flags);
   cg->mem_ev_high++;
   spin_unlock_irqrestore(&cg_lock, flags);
+  if (cg_reclaim(cg, now - high) > 0 && cg_mem_refresh(cg) <= high)
+    return; /* back inside the soft limit: no reason to hold the task up */
   scheduler_sleep_ticks(1);
 }
 
@@ -624,7 +921,11 @@ static volatile int cg_mem_limited;
 void cgroup_mem_fault_charge(u64 fault_addr) {
   if (fault_addr >= USER_SPACE_LIMIT)
     return; /* a kernel page: nothing charges kernel memory to a cgroup here */
+  /* The charge can reclaim, and reclaim must not take the page this fault has
+   * just installed -- the instruction that faulted is about to touch it. */
+  eviction_protect_begin(current_task, fault_addr);
   cgroup_mem_charge_pages(1);
+  eviction_protect_end();
 }
 
 void cgroup_mem_charge_pages(u64 npages) {
@@ -675,6 +976,18 @@ void cgroup_mem_charge_pages(u64 npages) {
   }
   if (!over)
     return;
+
+  /* Reclaim first, and on every fault that crosses the limit -- not once per
+   * cooldown. The cooldown below exists because measuring a cgroup exactly and
+   * killing inside it are expensive and must not happen per fault; reclaim is
+   * neither. One small batch per crossing is what keeps a cgroup that has cold
+   * pages inside its limit instead of killing it, and it is self-limiting: a
+   * cgroup that is not over does not come here at all.
+   *
+   * It also throttles, which is the other half of what Linux does here: the
+   * task that went over the limit pays for the reclaim in its own fault. */
+  cg_mem_relieve(over, over_max);
+
   {
     int act;
 
@@ -1161,6 +1474,7 @@ enum cg_file {
   CGF_MEM_STAT,
   CGF_MEM_SWAP_CURRENT,
   CGF_MEM_SWAP_MAX,
+  CGF_MEM_SWAP_EVENTS,
   CGF_MEM_OOM_GROUP,
   CGF_CPU_STAT,
   CGF_CPU_WEIGHT,
@@ -1415,12 +1729,39 @@ static usize cg_render(struct cgroup *cg, enum cg_file kind, char *buf,
     }
     break;
   }
-  case CGF_MEM_SWAP_CURRENT:
-    /* Nothing charges swap to a cgroup yet: a page written out by the shared
-     * eviction ring is not attributed back to whoever owned it. Reporting a
-     * figure would be inventing one. */
-    len = cg_append(buf, cap, len, "0\n");
+  case CGF_MEM_SWAP_CURRENT: {
+    /* The subtree's pages that are out in swap. At the root the question is
+     * the machine's, and the swap layer already counts it exactly -- reporting
+     * the sum of the children there would miss every page belonging to a task
+     * in no cgroup at all. */
+    u64 pages;
+
+    if (cg->is_root) {
+      u64 total = 0, used = 0;
+      pages = swap_stats(&total, &used) == 0 ? used : 0;
+    } else {
+      spin_lock_irqsave(&cg_lock, &flags);
+      pages = cg->mem_swap_cur;
+      spin_unlock_irqrestore(&cg_lock, flags);
+    }
+    len = cg_append_u64(buf, cap, len, pages * PAGE_SIZE);
+    len = cg_append(buf, cap, len, "\n");
     break;
+  }
+  case CGF_MEM_SWAP_EVENTS: {
+    spin_lock_irqsave(&cg_lock, &flags);
+    u64 mx = cg->mem_swap_ev_max, fl = cg->mem_swap_ev_fail;
+    spin_unlock_irqrestore(&cg_lock, flags);
+    /* Linux prints high, max and fail. There is no memory.swap.high here, so
+     * printing a "high" counter that nothing can ever increment would be
+     * describing a limit this kernel does not have. */
+    len = cg_append(buf, cap, len, "max ");
+    len = cg_append_u64(buf, cap, len, mx);
+    len = cg_append(buf, cap, len, "\nfail ");
+    len = cg_append_u64(buf, cap, len, fl);
+    len = cg_append(buf, cap, len, "\n");
+    break;
+  }
   case CGF_MEM_OOM_GROUP: {
     spin_lock_irqsave(&cg_lock, &flags);
     int g = cg->mem_oom_group;
@@ -1455,11 +1796,21 @@ static usize cg_render(struct cgroup *cg, enum cg_file kind, char *buf,
      * so the honest set is a short one. */
     spin_lock_irqsave(&cg_lock, &flags);
     u64 pf = cg->mem_pgfault, mf = cg->mem_pgmajfault;
+    u64 sc = cg->mem_pgscan, st = cg->mem_pgsteal, sw = cg->mem_swap_cur;
     spin_unlock_irqrestore(&cg_lock, flags);
-    len = cg_append(buf, cap, len, "pgfault ");
+    len = cg_append(buf, cap, len, "swapcached 0\nswap ");
+    len = cg_append_u64(buf, cap, len, sw * PAGE_SIZE);
+    len = cg_append(buf, cap, len, "\npgfault ");
     len = cg_append_u64(buf, cap, len, pf);
     len = cg_append(buf, cap, len, "\npgmajfault ");
     len = cg_append_u64(buf, cap, len, mf);
+    /* What the cgroup's own reclaim did, and only that: these count the pages
+     * the scan above looked at and the ones it wrote out, not the machine-wide
+     * eviction that runs on everyone's behalf. */
+    len = cg_append(buf, cap, len, "\npgscan ");
+    len = cg_append_u64(buf, cap, len, sc);
+    len = cg_append(buf, cap, len, "\npgsteal ");
+    len = cg_append_u64(buf, cap, len, st);
     len = cg_append(buf, cap, len, "\n");
     break;
   }
@@ -2103,6 +2454,7 @@ static void cg_sync_controller_files(struct cgroup *cg) {
     cg_mkfile(cg, "memory.stat", CGF_MEM_STAT, 0);
     cg_mkfile(cg, "memory.swap.current", CGF_MEM_SWAP_CURRENT, 0);
     cg_mkfile(cg, "memory.swap.max", CGF_MEM_SWAP_MAX, 1);
+    cg_mkfile(cg, "memory.swap.events", CGF_MEM_SWAP_EVENTS, 0);
     cg_mkfile(cg, "memory.oom.group", CGF_MEM_OOM_GROUP, 1);
   } else {
     cg_rmfile(cg, "memory.current");
@@ -2116,6 +2468,7 @@ static void cg_sync_controller_files(struct cgroup *cg) {
     cg_rmfile(cg, "memory.stat");
     cg_rmfile(cg, "memory.swap.current");
     cg_rmfile(cg, "memory.swap.max");
+    cg_rmfile(cg, "memory.swap.events");
     cg_rmfile(cg, "memory.oom.group");
   }
   if (avail & CG_CTRL_CPU) {
@@ -2211,7 +2564,14 @@ static struct cgroup *cg_new(struct cgroup *parent, struct vfs_node *dir) {
   spin_lock_irqsave(&cg_lock, &flags);
   cg->next = cg_all;
   cg_all = cg;
+  cg->id = parent ? cg_id_alloc(cg) : 0; /* the root is id 0 by definition */
+  int none_left = parent && !cg->id && !cg_ids_exhausted_said;
+  if (none_left)
+    cg_ids_exhausted_said = 1;
   spin_unlock_irqrestore(&cg_lock, flags);
+  if (none_left)
+    console_write("cgroup: out of swap-accounting ids — new cgroups will not "
+                  "report memory.swap.current\n");
   return cg;
 }
 
@@ -2319,6 +2679,8 @@ static int cg_rmdir_cb(struct vfs_node *dir, const char *name) {
   cg->dir = 0;
   cg->removed = 1;
   int keep = cg->ns_refs > 0;
+  if (!keep)
+    cg_id_reparent(cg);
   spin_unlock_irqrestore(&cg_lock, flags);
   if (!keep)
     kfree(cg);

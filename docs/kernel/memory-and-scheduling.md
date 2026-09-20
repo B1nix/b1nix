@@ -143,3 +143,57 @@ and never reproduced otherwise: a spinlock lockup on the TLB-shootdown lock
 and a `BCACHE-TEST` writer stuck on a virtio-blk completion. A guest with
 384 MiB still degrades under fsverify at scale 200 instead of finishing; that
 belongs to memory accounting (M127).
+
+
+## Compressed swap, and reclaim that belongs to a cgroup
+
+Three things arrived together, because none of them is much use alone: a place
+to put pages that is not a disk, a reclaim that knows whose pages it is taking,
+and an account of where they went.
+
+**zram** (`kernel/dev/zram.c`) is a block device whose blocks live in RAM,
+LZ4-compressed. `swapon /dev/zram0` is the whole of how a machine with no disk
+gets swap. It is configured the way Linux's is, because that is what userspace
+drives: a size is written to `/sys/block/zram0/disksize`, the device appears
+with that many sectors, `mm_stat` reports the eight numbers `zramctl` parses,
+and `reset` releases it. A page of zeroes is stored as nothing at all, which is
+most of a fresh swap area; an incompressible page is stored raw, because the
+compressed form of one is larger than the page.
+
+**zswap** (`kernel/mm/swap.c`) is the other shape of the same idea and it
+predates zram here: a bounded RAM pool in FRONT of a real device, which a page
+falls through when it does not compress or the pool is full. A machine can run
+either or both.
+
+Both use the kernel's own LZ4 (`kernel/lib/lz4.c`), and both obey one rule that
+is easy to state and was expensive to learn: **nothing allocates while the
+compressor's lock is held.** The kernel heap's lock is taken first, growing the
+heap maps pages, mapping pages can reclaim, and reclaim writes a page to swap —
+so a `kmalloc` under a swap lock closes a cycle with a `kmalloc` that is already
+inside the heap lock. The same reasoning covers freeing: the address-space
+teardown walks the page tables with the paging lock held and frees every
+swapped page's slot as it goes, so a compressed blob freed there goes onto a
+pending list (threaded through its own first eight bytes) and is handed back
+from a context that holds nothing.
+
+**Reclaim inside a cgroup** is what makes `memory.max` a limit rather than a
+death sentence. A cgroup over its limit now has its own cold pages written out
+before the OOM killer is asked for a victim, and only its own: the eviction
+ring is indexed by task (`kernel/mm/eviction.c`), so the scan costs what the
+cgroup has rather than what the machine has. Two details are load-bearing:
+
+* The page the faulting instruction is about to touch is protected for the
+  duration of the charge. Without that, the fault installs a page, the charge
+  reclaims it (its accessed bit is clear — nothing has touched it yet), the
+  instruction faults again, and the machine makes no progress while saying
+  nothing.
+* Eviction does not re-enter itself on a CPU. Writing a page out allocates, an
+  allocation can reclaim, and that wheel has no bottom.
+
+**The account.** A swapped page carries the id of the cgroup that owned it, two
+bytes beside its slot, the same way Linux's `swap_cgroup` array does — the task
+that faulted it may be asleep, moved or dead before the page comes back.
+`memory.swap.current` is that count; `memory.swap.max` is checked before a page
+is written out, and a refusal is counted in `memory.swap.events`. A cgroup
+removed while its pages are still out hands its id to its parent, so a charge
+can neither vanish nor be attributed to something that no longer exists.

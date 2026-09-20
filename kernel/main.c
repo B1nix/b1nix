@@ -1071,6 +1071,7 @@ void kernel_main(usize arg0, usize arg1)
 	ramdisk_init();
 	BOOTMARK(29);	/* ramdisk_init */
 	loop_init();            /* loop block devices + /dev/loop-control */
+	zram_init();            /* compressed RAM block device, sized from /sys */
 	BOOTMARK(30);	/* loop_init */
 	vt_init();              /* M107 virtual terminals + console font/keymap */
 	BOOTMARK(31);	/* magenta: device init survived, VTs up */
