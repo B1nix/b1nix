@@ -13,6 +13,14 @@ struct b1nix_sigframe {
   /* The interrupted thread's protection-key rights (x86 PKRU), put back by
    * sigreturn; the handler itself runs with the initial rights. */
   u64 pkru;
+  /* The interrupted thread's FPU/vector state, saved on the user stack just
+   * above this frame (a 64-byte aligned XSAVE image of fpu_size bytes, or the
+   * 512-byte FXSAVE image where XSAVE is not enabled) and loaded back by
+   * sigreturn. Without it a handler's own use of the vector registers -- the
+   * ABI treats them as caller-saved -- leaks into the interrupted code, which
+   * is how a toolkit computing layout in AVX ended up with sizes of 1e-8. */
+  u64 fpu_addr;
+  u64 fpu_size;
 } __attribute__((packed));
 
 /* M74: native siginfo_t handed to an SA_SIGINFO handler. Layout MUST match the

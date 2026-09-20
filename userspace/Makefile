@@ -373,6 +373,8 @@ BINARIES += $(BUILD)/bin/invite_stress
 BINARIES += $(BUILD)/bin/pipe_eof
 BINARIES += $(BUILD)/bin/fd_visibility
 BINARIES += $(BUILD)/bin/clock_sanity
+# Vector register state across yields, sleeps and signal handlers.
+BINARIES += $(BUILD)/bin/fpu_ctx_smoke
 BINARIES += $(BUILD)/bin/vdso_smoke
 BINARIES += $(BUILD)/bin/yield_fairness
 BINARIES += $(BUILD)/bin/ext_stress

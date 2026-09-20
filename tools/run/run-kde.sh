@@ -77,7 +77,7 @@ qemu-system-x86_64 $ACCEL \
 	-m "${KDE_MEM_MB:-4096}" -smp "${KDE_SMP:-4}" \
 	$BOOT_MEDIA \
 	-device virtio-gpu-pci,id=vgpu \
-	-netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+	-netdev "user,id=net0${KDE_HOSTFWD:+,hostfwd=tcp:127.0.0.1:$KDE_HOSTFWD-:22}" -device virtio-net-pci,netdev=net0 \
 	-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
 	-device virtio-tablet-pci,id=vtablet \
 	-display none -no-reboot \

@@ -966,6 +966,13 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 	has_flag b1nix.kde-memprof && memsnap "scanout-ready"
 	echo "KDE: SCANOUT-READY t=$(up)"
 	kprof scanout
+	# b1nix.kde-sshd: a way into the running session from the host (with a
+	# hostfwd on the guest's :22), for looking at what the desktop's own
+	# processes see. Nothing in the runlevels starts it here.
+	if has_flag b1nix.kde-sshd; then
+		/bin/sh /etc/init.d/sshd start > /tmp/kde-sshd.log 2>&1 &
+		echo "KDE: sshd starting (b1nix.kde-sshd)"
+	fi
 	# How long the desktop stays up. Ninety seconds is enough for the host to
 	# take its picture, and far too short for someone sitting in front of the
 	# panel with a mouse: the session used to close under them mid-test.

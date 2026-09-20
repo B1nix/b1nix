@@ -2733,6 +2733,10 @@ check_output "$LOG" "UNIX-SMOKE: ok listen-no-hup" "a LISTENING unix socket repo
 # in every harness reported a timeout after N/10 seconds.
 check_output "$LOG" "CLOCK: ok alarm-keeps-time" "alarm(2) fires one second after it was asked for, measured against CLOCK_MONOTONIC rather than counted in ticks"
 check_output "$LOG" "CLOCK: ok itimer-keeps-time" "setitimer(ITIMER_REAL) keeps the time it was given"
+check_output "$LOG" "FPU-CTX: ok ymm-across-yield" "the wide vector registers survive a context switch (XSAVE mask and area)"
+check_output "$LOG" "FPU-CTX: ok ymm-across-sleep" "the wide vector registers survive a sleep on another CPU"
+check_output "$LOG" "FPU-CTX: ok ymm-across-signal" "a signal handler's use of the vector registers does not leak into the interrupted code (the sigframe holds the FPU state)"
+check_output "$LOG" "FPU-CTX: ok xmm-across-yield" "the SSE registers survive a context switch"
 # The vDSO: clock readings a process takes without entering the kernel
 # (kernel/user/vdso.c, kernel/vdso/). Each marker is printed by
 # userspace/bin/smoke/vdso_smoke.c only after the property was checked.

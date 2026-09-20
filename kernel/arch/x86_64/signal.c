@@ -55,6 +55,14 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
     uc_addr = (si_addr - sizeof(struct linux_ucontext)) & ~0xFULL;
     top = uc_addr;
   }
+  /* The interrupted FPU state, above the frame: an XSAVE image needs 64-byte
+   * alignment, and the registers are still the interrupted code's here (the
+   * kernel never touches them). Saved into the task's own area first, which
+   * doubles as the copy the scheduler keeps, then copied out. */
+  void *xarea = task_fpu_alloc(t) ? task_xsave_area(t) : 0;
+  u64 fpu_size = xarea ? (u64)arch_xsave_area_size() : 512;
+  u64 fpu_addr = (top - fpu_size) & ~0x3FULL;
+  top = fpu_addr;
   u64 frame_base = (top - sizeof(struct b1nix_sigframe)) & ~0xFULL;
   u64 restorer_slot = frame_base - sizeof(u64);
 
@@ -80,6 +88,24 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
     sf.old_blocked_signals = t->blocked_signals;
   }
   sf.saved_frame = *frame;
+  sf.fpu_addr = fpu_addr;
+  sf.fpu_size = fpu_size;
+  {
+    const void *fpu_src;
+
+    if (xarea) {
+      arch_xsave(xarea, arch_xsave_mask());
+      fpu_src = xarea;
+    } else {
+      arch_fpu_save(t->fpu_state);
+      fpu_src = t->fpu_state;
+    }
+    if (syscall_copyout((void *)(usize)fpu_addr, fpu_src, (usize)fpu_size) < 0) {
+      console_write("signal: failed to save the FPU state on the user stack\n");
+      scheduler_exit_current(-SIGSEGV);
+      return;
+    }
+  }
 
   if (syscall_copyout((void *)(usize)frame_base, &sf, sizeof(sf)) < 0 ||
       syscall_copyout((void *)(usize)restorer_slot, &restorer,
@@ -418,6 +444,36 @@ u64 sys_sigreturn(struct interrupt_frame *frame) {
   t->blocked_signals = sf.old_blocked_signals;
   if (arch_pkeys_enabled())
     arch_pkru_user_set((u32)sf.pkru);
+
+  /* The FPU state the handler interrupted, from the user stack. The image is
+   * user memory by now, so it is sanitised the way the hardware demands
+   * before xrstor/fxrstor see it: reserved MXCSR bits clear, XSTATE_BV within
+   * the enabled mask, XCOMP_BV and the header's reserved words zero. A frame
+   * without one (fpu_size 0) is left alone. */
+  if (sf.fpu_size && sf.fpu_addr < 0x0000800000000000ULL) {
+    void *xarea = task_xsave_area(t);
+    usize want = xarea ? arch_xsave_area_size() : 512;
+
+    if (sf.fpu_size != want)
+      return (u64)-EINVAL;
+    u8 *dst = xarea ? (u8 *)xarea : (u8 *)t->fpu_state;
+    if (syscall_copyin(dst, (void *)(usize)sf.fpu_addr, want) < 0)
+      return (u64)-EFAULT;
+    u32 mxcsr;
+    memcpy(&mxcsr, dst + 24, sizeof(mxcsr));
+    mxcsr &= 0xFFFFu;
+    memcpy(dst + 24, &mxcsr, sizeof(mxcsr));
+    if (xarea) {
+      u64 bv;
+      memcpy(&bv, dst + 512, sizeof(bv));
+      bv &= arch_xsave_mask();
+      memcpy(dst + 512, &bv, sizeof(bv));
+      memset(dst + 520, 0, 64 - 8);
+      arch_xrstor(xarea, arch_xsave_mask());
+    } else {
+      arch_fpu_restore(t->fpu_state);
+    }
+  }
   memcpy(frame, &sf.saved_frame, sizeof(*frame));
   t->saved_user_rsp = frame->rsp;
 

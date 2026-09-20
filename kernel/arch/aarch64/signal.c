@@ -67,6 +67,15 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
     uc_addr = (top - sizeof(struct linux_ucontext_aarch64)) & ~0xFULL;
     top = uc_addr;
   }
+  /* The interrupted code's FP/SIMD register file goes on the stack too and
+   * sigreturn loads it back: the handler is free to use V0-V31 (caller-saved
+   * in the ABI) and nothing else puts them back. The kernel is built with
+   * general registers only, so the live file is still the user's here; the
+   * save also makes the ucontext snapshot below current. */
+  u64 fpu_size = sizeof(t->fpu_state);
+  u64 fpu_addr = (top - fpu_size) & ~0xFULL;
+  top = fpu_addr;
+  arch_fpu_save(t->fpu_state);
   u64 frame_base = (top - sizeof(struct b1nix_sigframe)) & ~0xFULL;
 
   u64 restorer = (sa->sa_restorer) ? (u64)(usize)sa->sa_restorer
@@ -87,8 +96,12 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
     sf.old_blocked_signals = t->blocked_signals;
   }
   sf.saved_frame = *frame;
+  sf.fpu_addr = fpu_addr;
+  sf.fpu_size = fpu_size;
 
-  if (syscall_copyout((void *)(usize)frame_base, &sf, sizeof(sf)) < 0) {
+  if (syscall_copyout((void *)(usize)frame_base, &sf, sizeof(sf)) < 0 ||
+      syscall_copyout((void *)(usize)fpu_addr, t->fpu_state,
+                      (usize)fpu_size) < 0) {
     console_write("signal: failed to build user frame\n");
     scheduler_exit_current(-SIGSEGV);
     return;
@@ -319,6 +332,19 @@ u64 sys_sigreturn(struct interrupt_frame *frame) {
   /* Keep only the user-writable PSTATE bits (NZCV + DIT/SSBS-class flags);
    * force DAIF clear so the task cannot return with interrupts masked. */
   sf.saved_frame.spsr &= 0xF0000000ULL;
+
+  /* The FP/SIMD file the handler interrupted, saved above the frame by
+   * arch_build_signal_frame. A frame without one (fpu_size 0) is left alone;
+   * one of another size is not ours. */
+  if (sf.fpu_size) {
+    if (sf.fpu_size != sizeof(t->fpu_state) ||
+        sf.fpu_addr >= USER_ADDR_LIMIT - sf.fpu_size)
+      return (u64)-EINVAL;
+    if (syscall_copyin(t->fpu_state, (void *)(usize)sf.fpu_addr,
+                       sizeof(t->fpu_state)) < 0)
+      return (u64)-EFAULT;
+    arch_fpu_restore(t->fpu_state);
+  }
 
   t->blocked_signals = sf.old_blocked_signals;
   memcpy(frame, &sf.saved_frame, sizeof(*frame));
