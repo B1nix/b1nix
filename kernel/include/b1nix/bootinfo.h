@@ -168,6 +168,13 @@ u64 fdt_ufshc_base(void);
 u64 fdt_qcom_gcc_base(void);
 u64 fdt_dwc3_base(void);
 u64 fdt_qcom_hsphy_base(void);
+/* The SPMI PMIC arbiter's register blocks and the APPS execution environment,
+ * the IMEM restart_reason word, and the PMIC's PON block (slave id and
+ * peripheral base). Each returns 0 when the tree does not describe it. */
+int fdt_qcom_spmi_arb(u64 *core, u64 *chnls, u64 *obsrvr, u64 *cnfg, u32 *ee);
+u64 fdt_qcom_restart_reason_addr(void);
+u64 fdt_qcom_pshold_addr(void);
+int fdt_qcom_pon(u32 *sid, u32 *base);
 #endif
 
 /* Print what the device tree claimed about the ramdisk and whether it was

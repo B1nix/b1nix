@@ -553,7 +553,7 @@ KERNEL_BASE ?= 0x40080000
 ARCH_LDFLAGS += --defsym=KERNEL_LOAD_BASE=$(KERNEL_BASE)
 LINKER_SCRIPT := kernel/arch/aarch64/linker.ld
 ASM_SOURCES := kernel/arch/aarch64/boot.S kernel/arch/aarch64/context_switch.S kernel/arch/aarch64/isr.S kernel/arch/aarch64/fpu.S
-ARCH_SOURCES := kernel/arch/aarch64/arch.c kernel/arch/aarch64/platform.c kernel/arch/aarch64/bootinfo.c kernel/arch/aarch64/smp.c kernel/arch/aarch64/gicv3.c kernel/arch/aarch64/gicv3_its.c kernel/arch/aarch64/console.c kernel/arch/aarch64/fb_panel.c kernel/arch/aarch64/io.c kernel/arch/aarch64/interrupts.c kernel/arch/aarch64/paging.c kernel/arch/aarch64/serial.c kernel/arch/aarch64/signal.c kernel/arch/aarch64/coredump.c kernel/arch/aarch64/gdbstub.c kernel/arch/aarch64/memtype.c
+ARCH_SOURCES := kernel/arch/aarch64/arch.c kernel/arch/aarch64/platform.c kernel/arch/aarch64/bootinfo.c kernel/arch/aarch64/smp.c kernel/arch/aarch64/gicv3.c kernel/arch/aarch64/gicv3_its.c kernel/arch/aarch64/console.c kernel/arch/aarch64/fb_panel.c kernel/arch/aarch64/io.c kernel/arch/aarch64/interrupts.c kernel/arch/aarch64/paging.c kernel/arch/aarch64/serial.c kernel/arch/aarch64/signal.c kernel/arch/aarch64/coredump.c kernel/arch/aarch64/gdbstub.c kernel/arch/aarch64/memtype.c kernel/arch/aarch64/qcom_restart.c
 else
 $(error Unsupported ARCH=$(ARCH). Active builds support ARCH=x86_64 and ARCH=aarch64)
 endif

@@ -3352,7 +3352,8 @@ check_output "$INIT_LOG" "M108-SMOKE: ok init-shell" "the BusyBox-init boot reac
 check_output "$INIT_LOG" "M108-SMOKE: ok init-reaps-orphan" "BusyBox init reaps an orphaned grandchild re-parented to PID 1"
 check_output "$INIT_LOG" "M108-SMOKE: ok init-respawns-getty" "killing the inittab getty makes PID 1 respawn it as a new process"
 # ── M100b: VT-d DMA remapping ──
-check_iommu "$IOMMU_LOG" "reboot: restarting" "SYS_REBOOT restart reaches the kernel's reset path"
+check_iommu "$IOMMU_LOG" "reboot: restarting (bootloader)" "reboot(RESTART2, \"bootloader\") reaches the kernel's reset path with its reason (a phone's \`reboot bootloader\`)"
+check_iommu "$AMDVI_LOG" "reboot: restarting" "SYS_REBOOT restart reaches the kernel's reset path"
 check_iommu "$AMDVI_LOG" "SMOKE-WATCHDOG: qemu-exited-after-done" "the restart really resets the machine: QEMU (-no-reboot) exits on its own"
 check_iommu "$IOMMU_LOG" "iommu: VT-d at" "M100b: the DMAR table is parsed and the remapping unit is brought up"
 check_iommu "$IOMMU_LOG" "M100B-SMOKE: ok vtd-enable" "M100b: the unit reports translation enabled and pointing at our root table"

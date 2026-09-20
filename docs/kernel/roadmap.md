@@ -246,3 +246,4 @@ Detail in [xperia5-ufs-usb.md](xperia5-ufs-usb.md).
 - [x] UFS on the phone: `/` from `system_a`, boots to login (DMA confined to the hypervisor-allowed window at 0xf0000000).
 - [x] DWC3 USB gadget (CDC-ECM `usb0`, 172.16.42.1): enumerates on macOS; ping (4-30 ms), `ssh root@172.16.42.1` and netconsole work.
 - [x] The page allocator's window on SM8150 is clipped to ABL's `/memory` banks: it covered a 52 MiB hypervisor hole (0xbcc00000-0xc0000000) that froze the CPU on first touch.
+- [ ] `partial` `reboot bootloader`: `LINUX_REBOOT_CMD_RESTART2` reaches the kernel (was EINVAL; iommu smoke lane restarts through it), the SPMI PMIC arbiter driver writes the PON restart reason and IMEM word and configures a warm reset — but ABL still boots normally and every reset lands cold. Open: which value/reset path this ABL honours; slot A's GPT tries are not reset by b1nix (`gpt` in `b1nix.ufs-rw` opens the tables for that).

@@ -125,6 +125,8 @@
 #define LINUX_REBOOT_CMD_RESTART   0x01234567u
 #define LINUX_REBOOT_CMD_HALT      0xcdef0123u
 #define LINUX_REBOOT_CMD_POWER_OFF 0x4321fedcu
+/* Restart with a reason string for the firmware ("bootloader", "recovery"). */
+#define LINUX_REBOOT_CMD_RESTART2  0xa1b2c3d4u
 /* Ctrl-Alt-Del handling. On Linux these only flip a flag — the machine keeps
  * running — and PID 1 calls DISABLE_CAD at startup (runit, openrc-init,
  * sysvinit all do). b1nix has no CAD path at all, so both are accepted no-ops;

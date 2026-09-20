@@ -436,6 +436,34 @@ void arch_psci_reset(void)
 	aarch64_platform_watchdog_bite();
 }
 
+void aarch64_platform_report_reset_reason(void)
+{
+	extern void aarch64_qcom_report_reset_reason(void);
+
+	if (platform_type() == PLATFORM_SM8150)
+		aarch64_qcom_report_reset_reason();
+}
+
+void arch_stop_other_cpus(void)
+{
+	extern void gicv3_send_halt_others(void);
+	extern int get_online_cpu_count(void);
+
+	if (get_online_cpu_count() <= 1)
+		return;
+	gicv3_send_halt_others();
+	/* Time for each of them to take the interrupt and park. */
+	arch_udelay(20000);
+}
+
+void arch_reboot_set_reason(const char *cmd)
+{
+	extern void aarch64_qcom_set_restart_reason(const char *cmd);
+
+	if (platform_type() == PLATFORM_SM8150)
+		aarch64_qcom_set_restart_reason(cmd);
+}
+
 void arch_halt(void)
 {
 	console_write("aarch64: arch_halt\n");

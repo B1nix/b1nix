@@ -129,3 +129,46 @@ The interface name (`en7` above; `en8` on the Mac this was brought up on) is wha
   - The console is copied into the ramoops console zone (`0xffc80000`, Android reads it as `/sys/fs/pstore/console-ramoops-0` after a warm reset).
   - The same zone is mirrored every 2 s to `system_a` at MiB 1024, readable from Android with `dd ... skip=1024 count=1`.
   - Panics paint a full-screen stop screen.
+
+## Rebooting into fastboot from b1nix (2026-09-20, open)
+
+`reboot bootloader` is `reboot(LINUX_REBOOT_CMD_RESTART2, "bootloader")`. It
+used to be EINVAL in the Linux shim; now it reaches `SYS_REBOOT` with the
+string, and on SM8150 `kernel/arch/aarch64/qcom_restart.c` does what Android's
+msm-poweroff does before the reset: the other CPUs are parked (SGI 2), the IMEM
+`restart_reason` word gets `0x77665500`, the PMIC's PON `SOFT_RB_SPARE` gets
+the reason through the SPMI PMIC arbiter (v5: `core`/`chnls`/`obsrvr`/`cnfg`
+from the `qcom,spmi-pmic-arb` node, APPS EE from `qcom,ee`; the PON node comes
+from ABL's dtbo overlay, slave 0 peripheral 0x800, its channel is APID 0xf9
+owned by EE 0), PS_HOLD is set to a warm reset, the log is flushed to the flash
+mirror, and PS_HOLD is dropped (SCM `SVC_PWR` calls first, then the register at
+`qcom,pshold`, then PSCI). Every step prints a `reboot:` line; the previous
+boot's `/proc/last_kmsg` holds them.
+
+At boot the kernel prints what survived: `pon: imem restart_reason 0x...` and
+one `pon: sid N reason1= warm_reset_reason1= ps_hold_rst_ctl= ps_hold_rst_ctl2=
+soft_rb_spare=` line per PMIC whose PON answers (sid 0, 2, 4 on this phone).
+
+What the phone showed: the writes take (read back), the SoC resets at once
+when PS_HOLD is dropped, and ABL then boots slot A as usual. Every reset is
+cold (`warm_reset_reason1=0`, `reason1=0x03`), and `soft_rb_spare` reads
+`0x82` at each boot, so ABL rewrites it. Values tried: `0x04` (reason 2 << 1,
+the pm8998 encoding) over PSCI and over PS_HOLD, `0x0a` once. Still to try:
+raw `0x02` and `0x08`, and reading the SCM calls' return codes out of the
+mirror. The PONs on slaves 2 and 4 belong to EE 1 and cannot be written from
+here (a write through another EE's channel does not fail: the CPU never comes
+back from it — the driver now refuses it).
+
+Two things to know before iterating:
+
+- **Slot A's tries run out.** ABL decrements the A/B tries in `boot_a`'s GPT
+  entry (attribute byte 6, bits 3-5) on every boot and b1nix never marks the
+  boot successful, so after seven boots ABL switches to slot B (Android) and
+  the USB gadget is gone. `fastboot --set-active=a` resets it. With `gpt` in
+  `b1nix.ufs-rw` the kernel lets the primary and backup tables be written, so
+  the same can be done from b1nix (byte 6 = 0x7f: priority 3, active, 7 tries,
+  successful; both CRCs must follow).
+- **No fastboot needed between kernels.** `boot_a` is in `b1nix.ufs-rw`: copy
+  the boot image over ssh (`cat > /tmp/boot.img`; the phone has no
+  sftp-server) and `dd` it onto the `boot_a` device, then `reboot -f`.
+

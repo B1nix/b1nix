@@ -14,6 +14,12 @@
 
 void arch_init(void);
 void arch_halt(void) __attribute__((noreturn));
+/* reboot(RESTART2, cmd): tell the firmware where the next boot goes ("bootloader",
+ * "recovery") before the reset. A no-op where the platform has no such thing. */
+void arch_reboot_set_reason(const char *cmd);
+/* Park every other CPU before a reset is prepared, so that nothing else is
+ * mid-way through the flash or the PMIC when the machine goes. */
+void arch_stop_other_cpus(void);
 #if defined(__aarch64__)
 /* PSCI SYSTEM_OFF / SYSTEM_RESET (kernel/arch/aarch64/arch.c). */
 void arch_psci_poweroff(void);

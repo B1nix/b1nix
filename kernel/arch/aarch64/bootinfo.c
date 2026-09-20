@@ -34,6 +34,15 @@ static u64 g_ufshc_base;   /* Qualcomm UFS host controller */
 static u64 g_qcom_gcc_base; /* Qualcomm global clock controller */
 static u64 g_dwc3_base;    /* Synopsys DWC3 USB controller (first one) */
 static u64 g_qcom_hsphy_base; /* its Synopsys femto high-speed PHY */
+/* Qualcomm SPMI PMIC arbiter (core, chnls, obsrvr, cnfg blocks and the APPS
+ * execution environment), the IMEM restart_reason word and the PMIC's PON
+ * block, all for reboot-to-bootloader (qcom_restart.c). */
+static u64 g_qcom_spmi_core, g_qcom_spmi_chnls, g_qcom_spmi_obsrvr, g_qcom_spmi_cnfg;
+static u32 g_qcom_spmi_ee;
+static u64 g_qcom_restart_reason;
+static u32 g_qcom_pon_sid, g_qcom_pon_base;
+static int g_qcom_pon_from_fdt;
+static u64 g_qcom_pshold;  /* the PS_HOLD register: writing 0 resets the SoC */
 /* The rest of a Raspberry Pi's SoC. Every one of these is zero on a board
  * whose tree does not describe it, which is how each driver decides whether
  * it has anything to drive. */
@@ -257,6 +266,28 @@ u64 fdt_ufshc_base(void) { return g_ufshc_base; }
 u64 fdt_qcom_gcc_base(void) { return g_qcom_gcc_base; }
 u64 fdt_dwc3_base(void) { return g_dwc3_base; }
 u64 fdt_qcom_hsphy_base(void) { return g_qcom_hsphy_base; }
+int fdt_qcom_spmi_arb(u64 *core, u64 *chnls, u64 *obsrvr, u64 *cnfg, u32 *ee)
+{
+	if (!g_qcom_spmi_core || !g_qcom_spmi_chnls || !g_qcom_spmi_obsrvr ||
+	    !g_qcom_spmi_cnfg)
+		return 0;
+	*core = g_qcom_spmi_core;
+	*chnls = g_qcom_spmi_chnls;
+	*obsrvr = g_qcom_spmi_obsrvr;
+	*cnfg = g_qcom_spmi_cnfg;
+	*ee = g_qcom_spmi_ee;
+	return 1;
+}
+u64 fdt_qcom_restart_reason_addr(void) { return g_qcom_restart_reason; }
+u64 fdt_qcom_pshold_addr(void) { return g_qcom_pshold; }
+int fdt_qcom_pon(u32 *sid, u32 *base)
+{
+	if (!g_qcom_pon_from_fdt)
+		return 0;
+	*sid = g_qcom_pon_sid;
+	*base = g_qcom_pon_base;
+	return 1;
+}
 u64 fdt_mbox_base(void) { return g_mbox_base; }
 u64 fdt_gpio_base(void) { return g_gpio_base; }
 u64 fdt_pm_base(void) { return g_pm_base; }
@@ -333,6 +364,7 @@ struct fdt_node {
 	 * garbage — it is a read that does not come back. */
 	const char *status;
 	const char *method;        /* /psci: "smc" or "hvc" */
+	u32 qcom_ee;               /* spmi-pmic-arb: the APPS execution environment */
 	const char *enable_method;
 	const u32 *release_addr;
 	u32 release_addr_len;
@@ -654,6 +686,53 @@ static void fdt_finish_node(struct fdt_node *node, int depth)
 				continue;
 			if (fdt_reg_entry(node, depth, 0, &base, 0) && base)
 				*bcm[i].slot = base;
+		}
+	}
+
+	/* The SPMI PMIC arbiter's five register blocks are `reg` entries 0..4 in
+	 * the order core, chnls, obsrvr, intr, cnfg (reg-names is not parsed:
+	 * every Qualcomm tree lists them in this order). */
+	if (!g_qcom_spmi_core &&
+	    fdt_compatible_is(node->compatible, node->compatible_len,
+	                      "qcom,spmi-pmic-arb")) {
+		u64 core = 0, chnls = 0, obsrvr = 0, cnfg = 0;
+
+		if (fdt_reg_entry(node, depth, 0, &core, 0) &&
+		    fdt_reg_entry(node, depth, 1, &chnls, 0) &&
+		    fdt_reg_entry(node, depth, 2, &obsrvr, 0) &&
+		    fdt_reg_entry(node, depth, 4, &cnfg, 0)) {
+			g_qcom_spmi_core = core;
+			g_qcom_spmi_chnls = chnls;
+			g_qcom_spmi_obsrvr = obsrvr;
+			g_qcom_spmi_cnfg = cnfg;
+			g_qcom_spmi_ee = node->qcom_ee;
+		}
+	}
+	/* The restart_reason word is a child of the IMEM node, whose `ranges`
+	 * places it in the SoC. */
+	if (!g_qcom_restart_reason &&
+	    fdt_compatible_is(node->compatible, node->compatible_len,
+	                      "qcom,msm-imem-restart_reason"))
+		fdt_reg_entry(node, depth, 0, &g_qcom_restart_reason, 0);
+	if (!g_qcom_pshold &&
+	    fdt_compatible_is(node->compatible, node->compatible_len, "qcom,pshold"))
+		fdt_reg_entry(node, depth, 0, &g_qcom_pshold, 0);
+	/* The PMIC's PON block. Its `reg` starts with the 16-bit peripheral
+	 * address on the PMIC: upstream trees write <0x800> under one address
+	 * cell, Android's write <0x800 0x100> under two address cells and no
+	 * size cell, so only the first cell is the address either way. The PMIC
+	 * node's own `reg` starts with the SPMI slave id. This node comes from
+	 * the bootloader's overlays (dtbo) on a phone, not from the SoC tree. */
+	if (!g_qcom_pon_from_fdt && depth >= 2 && node->reg && node->reg_len >= 4 &&
+	    (fdt_compatible_is(node->compatible, node->compatible_len, "qcom,pm8998-pon") ||
+	     fdt_compatible_is(node->compatible, node->compatible_len, "qcom,pm8150-pon") ||
+	     fdt_compatible_is(node->compatible, node->compatible_len, "qcom,qpnp-power-on"))) {
+		const struct fdt_node *pmic = &g_nodes[depth - 1];
+
+		if (pmic->reg && pmic->reg_len >= 4) {
+			g_qcom_pon_sid = fdt32_to_cpu(pmic->reg[0]);
+			g_qcom_pon_base = fdt32_to_cpu(node->reg[0]);
+			g_qcom_pon_from_fdt = 1;
 		}
 	}
 
@@ -1124,6 +1203,8 @@ void bootinfo_fdt_scan(u64 dtb_address)
 					node->status = val;
 				} else if (strcmp(prop_name, "method") == 0) {
 					node->method = val;
+				} else if (strcmp(prop_name, "qcom,ee") == 0 && len == 4) {
+					node->qcom_ee = fdt32_to_cpu(p[0]);
 } else if (strcmp(prop_name, "device_type") == 0) {
 					node->device_type = val;
 				} else if (strcmp(prop_name, "enable-method") == 0) {

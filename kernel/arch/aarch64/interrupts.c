@@ -578,6 +578,13 @@ static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 		gic_eoi(iar);
 		return;
 	}
+	/* The reboot path parks every other CPU here, for good. */
+	if (irq == GICV3_SGI_HALT && gicv3_present()) {
+		gic_eoi(iar);
+		__asm__ volatile("msr daifset, #2" ::: "memory");
+		for (;;)
+			__asm__ volatile("wfi");
+	}
 
 	if (irq == TIMER_IRQ) {
 		timer_rearm();

@@ -171,6 +171,10 @@ struct ufs_host {
 	volatile u32 irq_hits;  /* completions the interrupt reported */
 };
 
+/* Logical blocks a GPT takes at either end of a LUN: the protective MBR or
+ * nothing, the header, and the entries (128 of 128 bytes fit in 4 of 4 KiB). */
+#define UFS_GPT_BLOCKS 6
+
 struct ufs_rw_window {
 	u64 start;              /* 512-byte sectors on the LUN */
 	u64 count;
@@ -657,6 +661,22 @@ static void lu_open_writable_partitions(struct ufs_lu *lu)
 		console_write(") writable: ");
 		console_write(named ? "b1nix.ufs-rw" : "label b1nix-root");
 		console_write("\n");
+	}
+	/* `gpt` in the list opens the partition tables themselves: the header
+	 * and entries at the front of the LUN and their backup at its end.
+	 * That is where an A/B bootloader keeps the slot's tries and success
+	 * bits, which only a write there can reset. */
+	if (in_list(allow, "gpt") && lu->rw_count + 2 <= sizeof(lu->rw) / sizeof(lu->rw[0]) &&
+	    lu->lb_count > 2 * UFS_GPT_BLOCKS) {
+		lu->rw[lu->rw_count].start = (u64)lu->ratio;
+		lu->rw[lu->rw_count].count = (u64)(UFS_GPT_BLOCKS - 1) * lu->ratio;
+		lu->rw_count++;
+		lu->rw[lu->rw_count].start = (lu->lb_count - UFS_GPT_BLOCKS) * lu->ratio;
+		lu->rw[lu->rw_count].count = (u64)UFS_GPT_BLOCKS * lu->ratio;
+		lu->rw_count++;
+		console_write("ufs: ");
+		console_write(lu->blk.name);
+		console_write(" GPT writable: b1nix.ufs-rw\n");
 	}
 	console_write("ufs: ");
 	console_write(lu->blk.name);
@@ -1182,6 +1202,33 @@ void ufs_log_panic_flush(void)
 
 	if (!lu || __atomic_load_n(&lu->host->io_busy, __ATOMIC_ACQUIRE))
 		return;
+	memcpy(buf, zone, size);
+	g_log_part->write_blocks(g_log_part, g_log_sector, size / 512, buf);
+}
+
+/* The same copy from the reboot path, after the other CPUs were parked: one
+ * of them may have been mid-command and holds the I/O lock for ever, so this
+ * waits for the doorbell to clear (the command itself finishes in hardware)
+ * and takes the lock over. */
+void ufs_log_reboot_flush(void)
+{
+	u32 size = 0;
+	extern const u8 *console_ramoops_zone(u32 *size);
+	const u8 *zone = console_ramoops_zone(&size);
+	static u8 buf[0x40000];
+
+	if (!g_log_part || !zone || !size || size > sizeof(buf))
+		return;
+	struct block_device *disk = blk_partition_parent(g_log_part);
+	struct ufs_lu *lu = disk ? (struct ufs_lu *)disk->priv : 0;
+
+	if (!lu)
+		return;
+	for (u32 t = 0; t < 5000 && (rd(lu->host, REG_UTRLDBR) & 1u); t++)
+		arch_udelay(100);
+	if (rd(lu->host, REG_UTRLDBR) & 1u)
+		return;
+	__sync_lock_release(&lu->host->io_busy);
 	memcpy(buf, zone, size);
 	g_log_part->write_blocks(g_log_part, g_log_sector, size / 512, buf);
 }

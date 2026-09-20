@@ -358,6 +358,8 @@ BINARIES += $(BUILD)/bin/m63_smoke
 BINARIES += $(BUILD)/bin/m123_smoke
 # M124: memfd_secret, protection keys and quotas.
 BINARIES += $(BUILD)/bin/m124_smoke
+# reboot(RESTART2, "bootloader"): the iommu lane ends through it.
+BINARIES += $(BUILD)/bin/reboot2_smoke
 BINARIES += $(BUILD)/bin/m42_w5pre_smoke
 BINARIES += $(BUILD)/bin/m46_smoke
 BINARIES += $(BUILD)/bin/m73_smoke

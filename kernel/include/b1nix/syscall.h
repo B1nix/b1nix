@@ -321,6 +321,9 @@ enum {
 #define B1NIX_REBOOT_RESTART  0
 #define B1NIX_REBOOT_POWEROFF 1
 #define B1NIX_REBOOT_HALT     2
+/* Restart with a reason for the firmware; arg1 is the string (reboot(2)'s
+ * LINUX_REBOOT_CMD_RESTART2 argument, e.g. "bootloader"). */
+#define B1NIX_REBOOT_RESTART2 3
 
 #include <b1nix/arch.h>
 u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5, struct interrupt_frame *frame);

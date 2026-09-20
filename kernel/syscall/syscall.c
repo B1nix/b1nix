@@ -9600,6 +9600,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         case LINUX_REBOOT_CMD_POWER_OFF: arg0 = B1NIX_REBOOT_POWEROFF; break;
         case LINUX_REBOOT_CMD_HALT:      arg0 = B1NIX_REBOOT_HALT;     break;
         case LINUX_REBOOT_CMD_RESTART:   arg0 = B1NIX_REBOOT_RESTART;  break;
+        case LINUX_REBOOT_CMD_RESTART2:
+          arg0 = B1NIX_REBOOT_RESTART2;
+          arg1 = arg3;   /* the reason string */
+          break;
         /* CAD_OFF/CAD_ON only toggle the ctrl-alt-del action on Linux; b1nix
          * has none, so report success rather than failing PID 1's first call. */
         case LINUX_REBOOT_CMD_CAD_OFF:
@@ -10898,8 +10902,27 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       console_write("reboot: system halted\n");
       arch_halt();
     } else {
-      console_write("reboot: restarting\n");
+      /* RESTART2 carries a reason for the firmware. It is read before the
+       * console line so a bad pointer is EFAULT, not a restart. */
+      char reason[64];
+      int with_reason = (int)arg0 == B1NIX_REBOOT_RESTART2;
+
+      if (with_reason) {
+        int rc = syscall_copyinstr(reason, sizeof(reason), (const char *)(usize)arg1);
+        if (rc < 0)
+          return (u64)rc;
+      }
+      console_write("reboot: restarting");
+      if (with_reason) {
+        console_write(" (");
+        console_write(reason);
+        console_write(")");
+      }
+      console_write("\n");
       interrupts_disable();
+      arch_stop_other_cpus();
+      if (with_reason)
+        arch_reboot_set_reason(reason);
 #if defined(__aarch64__)
       arch_psci_reset();
 #endif

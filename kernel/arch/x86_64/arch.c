@@ -996,6 +996,9 @@ void x86_ap_arch_init(int cpu) {
   x86_record_cpu_state(cpu);
 }
 
+void arch_reboot_set_reason(const char *cmd) { (void)cmd; }
+void arch_stop_other_cpus(void) {}
+
 void arch_halt(void) {
   /* QEMU isa-debug-exit: exit with status (val << 1) | 1. */
   __asm__ volatile("outb %0, %1" : : "a"((u8)0), "Nd"((u16)0xf4));

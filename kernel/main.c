@@ -726,7 +726,9 @@ void kernel_main(usize arg0, usize arg1)
 	{
 		/* After the log mirror is up, so a watchdog reset leaves a log. */
 		extern void aarch64_platform_watchdog_arm(void);
+		extern void aarch64_platform_report_reset_reason(void);
 		aarch64_platform_watchdog_arm();
+		aarch64_platform_report_reset_reason();
 	}
 #endif
 	ufs_selftest();

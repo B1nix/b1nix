@@ -62,7 +62,17 @@ elif grep -q 'b1nix.smoke=iommu' /proc/cmdline 2>/dev/null; then
     # syscall, which is the one test of the reset path: the harness passes it
     # only when QEMU (-no-reboot) then exits on its own.
     # A fifth of a second for this script to exit first, not a whole one.
-    ( /bin/usleep 200000; /bin/reboot -f ) &
+    # The VT-d instance restarts through RESTART2 with a reason, the call
+    # `reboot bootloader` makes on a phone; the AMD-Vi one through the plain
+    # restart, so both commands stay covered.
+    # Both boot the same ISO, so the lane is told apart by the unit the
+    # kernel found, not by the command line.
+    if ! dmesg 2>/dev/null | grep -q 'amdvi: unit at' &&
+       [ -x /bin/reboot2_smoke ]; then
+        ( /bin/usleep 200000; /bin/reboot2_smoke bootloader; /bin/reboot -f ) &
+    else
+        ( /bin/usleep 200000; /bin/reboot -f ) &
+    fi
     exit 0
 else
     SMOKE_SYS=1

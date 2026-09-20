@@ -290,6 +290,9 @@ struct b1nix_tls_info {
 #define B1NIX_REBOOT_RESTART  0
 #define B1NIX_REBOOT_POWEROFF 1
 #define B1NIX_REBOOT_HALT     2
+/* Restart with a reason for the firmware; arg1 is the string (reboot(2)'s
+ * LINUX_REBOOT_CMD_RESTART2 argument, e.g. "bootloader"). */
+#define B1NIX_REBOOT_RESTART2 3
 
 /* Raw syscall for the x86_64 B1NIX syscall ABI. */
 static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, long a4, long a5) {

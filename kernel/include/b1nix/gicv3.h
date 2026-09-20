@@ -14,6 +14,9 @@ void gicv3_enable_irq(u32 irq);
  * gicv3_cpu_init; the handler only acknowledges it, since leaving WFI is the
  * whole point. */
 #define GICV3_SGI_RESCHED 1u
+/* Park this CPU for good: sent by the reboot path so that nothing else
+ * touches the flash or the PMIC while the reset is prepared. */
+#define GICV3_SGI_HALT    2u
 void gicv3_send_resched_others(void);
 u32  gicv3_ack(void);
 void gicv3_eoi(u32 iar);
