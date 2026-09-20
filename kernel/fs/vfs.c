@@ -221,37 +221,6 @@ static usize mount_hwm;
  * Reported as the high-water mark rather than the table size: /proc/mounts and
  * mountinfo allocate a buffer of this many entries on EVERY read, and at ~850
  * bytes an entry that was most of a megabyte per read of a file systemd polls. */
-/* A number that changes whenever the mount table does.
- *
- * Derived from the table rather than bumped by each mutator: mounts are added,
- * moved, remounted, re-propagated and released from a dozen places with many
- * return paths each, and a counter that one of them forgets is a watcher that
- * never wakes -- a bug that would show up as a mount unit failing on a machine
- * where the filesystem is plainly mounted. Reading a few tens of slots costs
- * nothing next to a poll that blocks for seconds. */
-u64 vfs_mount_generation(void) {
-  u64 g = 1469598103934665603ULL; /* FNV-1a offset basis */
-
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
-  for (usize i = 0; i < mount_hwm; i++) {
-    if (!mounts[i].used)
-      continue;
-    g ^= (u64)i + 1;
-    g *= 1099511628211ULL;
-    g ^= mounts[i].seq;
-    g *= 1099511628211ULL;
-    g ^= mounts[i].flags ^ ((u64)mounts[i].propagation << 32);
-    g *= 1099511628211ULL;
-    for (const char *c = mounts[i].target; *c; c++) {
-      g ^= (u64)(u8)*c;
-      g *= 1099511628211ULL;
-    }
-  }
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
-  return g;
-}
-
 usize vfs_mount_capacity(void) { return mount_hwm ? mount_hwm : 1; }
 
 /* Allocate the mount table. Called from vfs_init() before any mount happens. */
@@ -7042,6 +7011,7 @@ int vfs_set_propagation(const char *target, u64 flags) {
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
   mount_record_target(target, node, canon, sizeof(canon));
+  vfs_node_put(node);
 
   int recursive = (flags & MS_REC) ? 1 : 0;
   int touched = 0;
@@ -7051,25 +7021,8 @@ int vfs_set_propagation(const char *target, u64 flags) {
   for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i))
       continue;
-    /* By node first, by path second.
-     *
-     * A mount is a place, and one place can have several names: systemd binds
-     * a directory into the root it is preparing for a unit, so the same node
-     * is both /run/systemd/incoming and
-     * /run/systemd/mount-rootfs/run/systemd/incoming. The entry was recorded
-     * under one spelling and the propagation change arrives under the other,
-     * and a table keyed on the string finds nothing -- which is EINVAL, which
-     * systemd reports as "Failed at step NAMESPACE" for systemd-udevd,
-     * systemd-logind and every unit with a private mount namespace.
-     *
-     * The entry knows the node it is mounted on and the node it mounted, so
-     * the comparison that cannot be fooled by a second name is available
-     * without a lookup. The string comparison stays for the recursive case
-     * and for entries whose nodes have gone. */
-    int same_place = (mounts[i].mount_point == node) ||
-                     (mounts[i].root_node && mounts[i].root_node == node);
     if (recursive ? !path_is_under(mounts[i].target, canon)
-                  : (!same_place && strcmp(mounts[i].target, canon) != 0))
+                  : strcmp(mounts[i].target, canon) != 0)
       continue;
     mounts[i].propagation = type;
     if (type == MS_SHARED) {
@@ -7081,7 +7034,6 @@ int vfs_set_propagation(const char *target, u64 flags) {
     touched = 1;
   }
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
-  vfs_node_put(node);
 
   /* Linux allows a propagation change on any mountpoint; a path that is not
    * one is EINVAL. */
@@ -7096,6 +7048,7 @@ int vfs_remount(const char *target, u64 flags) {
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
   mount_record_target(target, node, canon, sizeof(canon));
+  vfs_node_put(node);
 
   int found = 0;
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
@@ -7107,14 +7060,7 @@ int vfs_remount(const char *target, u64 flags) {
    * made, then remounts its own). */
   int top = -1;
   for (usize i = 0; i < mount_hwm; i++) {
-    /* By node as well as by path, for the reason vfs_set_propagation gives:
-     * a bind gives one place a second name, and the remount that turns a bind
-     * read-only arrives under whichever name the caller holds -- for systemd
-     * that is /proc/self/fd/N, resolved against the root it is building. */
-    int same_place = (mounts[i].mount_point == node) ||
-                     (mounts[i].root_node && mounts[i].root_node == node);
-    if (!mount_visible(i) ||
-        (!same_place && strcmp(mounts[i].target, canon) != 0))
+    if (!mount_visible(i) || strcmp(mounts[i].target, canon) != 0)
       continue;
     if (top < 0 || mounts[i].seq > mounts[top].seq)
       top = (int)i;
@@ -7133,7 +7079,6 @@ int vfs_remount(const char *target, u64 flags) {
   }
   struct vfs_node *mroot = found ? mounts[top].root_node : 0;
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
-  vfs_node_put(node);
   /* The filesystem's half, outside the table lock: it may sleep. A bind
    * remount (MS_BIND) changes one mount's flags, not the superblock. */
   if (mroot && mroot->inode && mroot->inode->remount_cb && !(flags & MS_BIND)) {

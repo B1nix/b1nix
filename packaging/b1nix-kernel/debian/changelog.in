@@ -1,5 +1,0 @@
-b1nix-kernel (@DEB_VERSION@) @SUITE@; urgency=medium
-
-  * b1nix kernel @RELEASE@, built from @GIT_DESCRIBE@.
-
- -- b1nix maintainers <maintainers@b1nix.invalid>  @DATE@

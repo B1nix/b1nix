@@ -300,10 +300,6 @@ struct b1nix_statfs {
 };
 
 #define B1NIX_POLLIN 0x001
-/* POLLPRI: out-of-band readiness. Linux uses it for the change notification on
- * /proc/self/mountinfo and on a sysfs attribute, which is how a watcher hears
- * that mounts moved. */
-#define B1NIX_POLLPRI 0x002
 #define B1NIX_POLLOUT 0x004
 #define B1NIX_POLLERR 0x008
 #define B1NIX_POLLHUP 0x010

@@ -26,10 +26,7 @@
 #include <b1nix/serial_tty.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/syscall.h>
-#include <b1nix/sysfs_attr.h>
-#include <b1nix/uevent.h>
 #include <b1nix/virtio_console.h>
-#include <stdio.h>
 #include <string.h>
 
 /* The UART lines, then hvc0: a virtio console served by the same line
@@ -767,75 +764,6 @@ void serial_tty_register_nodes(void) {
   }
 }
 
-static u64 stty_rdev(const struct serial_tty *t);
-
-/* ── /sys/class/tty/ttySN, so udev and systemd can see the port ──────────
- *
- * A device node alone is not a device: systemd builds `dev-ttyS0.device` from
- * what udev reports, udev reports what it finds in /sys, and nothing here
- * published the UARTs. A unit ordered after that device -- which is every
- * serial getty -- then waited its ninety seconds and failed, on a machine
- * where /dev/ttyS0 worked perfectly.
- *
- * The VTs next door already do this (vt_sysfs_publish); this is the same three
- * files for the serial side, including a writable `uevent` so that a coldplug
- * replay (`udevadm trigger`) re-announces the port to a manager that started
- * after the kernel did. */
-static isize stty_sysfs_dev_show(void *ctx, char *buf, usize cap) {
-  u64 rdev = (u64)(usize)ctx;
-
-  return (isize)snprintf(buf, cap, "%u:%u\n", (unsigned)(rdev >> 8),
-                         (unsigned)(rdev & 0xff));
-}
-
-static isize stty_sysfs_uevent_show(void *ctx, char *buf, usize cap) {
-  const struct serial_tty *t = ctx;
-  u64 rdev = stty_rdev(t);
-
-  return (isize)snprintf(buf, cap, "MAJOR=%u\nMINOR=%u\nDEVNAME=%s\n",
-                         (unsigned)(rdev >> 8), (unsigned)(rdev & 0xff),
-                         t->name);
-}
-
-static isize stty_sysfs_uevent_store(void *ctx, const char *buf, usize len) {
-  const struct serial_tty *t = ctx;
-  u64 rdev = stty_rdev(t);
-  char devpath[40];
-
-  snprintf(devpath, sizeof(devpath), "/class/tty/%s", t->name);
-  /* A tty carries no DEVTYPE on Linux either. */
-  return uevent_store_write(buf, len, devpath, "tty", 0, t->name,
-                            (int)(rdev >> 8), (int)(rdev & 0xff));
-}
-
-static void stty_sysfs_publish(struct serial_tty *t) {
-  struct sysfs_dir *cls = sysfs_reg_dir(sysfs_reg_dir(0, "class"), "tty");
-  struct sysfs_dir *d;
-
-  if (!cls)
-    return;
-  d = sysfs_reg_dir(cls, t->name);
-  if (!d)
-    return;
-  (void)sysfs_reg_attr(d, "dev", 0444, stty_sysfs_dev_show, 0,
-                       (void *)(usize)stty_rdev(t), 0);
-  (void)sysfs_reg_attr(d, "uevent", 0644, stty_sysfs_uevent_show,
-                       stty_sysfs_uevent_store, t, 0);
-}
-
-/* The device number a port really has, with Linux's numbering: the UARTs are
- * major 4 starting at minor 64 (ttyS0 = 4:64), and virtio-console is 229:0.
- *
- * A node created without one is invisible to everything that finds devices by
- * number: /sys/dev/char skips it, udev has nothing to key on, and systemd
- * never creates dev-ttyS0.device -- so a serial getty waits ninety seconds for
- * a device that exists in /dev the whole time, then fails. */
-static u64 stty_rdev(const struct serial_tty *t) {
-  if (t->hvc)
-    return ((u64)229 << 8);
-  return ((u64)4 << 8) | (u64)(64 + (t - sttys));
-}
-
 static void stty_register_node(struct serial_tty *t) {
   char path[16];
   strcpy(path, "/dev/");
@@ -845,10 +773,8 @@ static void stty_register_node(struct serial_tty *t) {
     node->inode->mode = 0620;
     node->inode->uid = 0;
     node->inode->gid = 5; /* group tty */
-    node->inode->rdev = stty_rdev(t);
     vfs_node_put(node);
   }
-  stty_sysfs_publish(t);
 }
 
 /* virtio-console is up: hvc0 exists from now on. */

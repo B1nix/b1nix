@@ -23,84 +23,40 @@ lane. Kernel milestones that a phase depends on are named where they block.
 
 ## Phase A: packaging skeleton
 
-- [x] `initial` `packaging/` in the tree: two source packages. `b1nix-kernel`
-  produces the release-named kernel, its `-dbg` and `-headers` companions and
-  the metapackage; `b1nix-meta` produces `b1nix-base-files`, `b1nix-desktop`
-  and `b1nix-tools`. `b1nix-artwork`, `b1nix-installer-config` and `b1cc` are
-  not packaged yet: the first two have no assets before phase D.
-- [x] `initial` `tools/packages/debian-chroot.sh` builds a trixie chroot as an
-  ordinary user — the registry layer the Debian lane already uses, entered
-  through a user namespace, with no sudo and no container runtime.
-- [x] `initial` `tools/packages/build-deb.sh` renders the packaging templates
-  and builds them in that chroot under `lintian --fail-on error`; package
-  versions are derived, never typed. `tools/packages/publish-repo.sh` writes a
-  static apt tree with `apt-ftparchive`, signs it when `SIGN_KEY` is set, and
-  refuses a version that sorts below what is already published.
-- [x] `initial` The apt pin that keeps Debian's `linux-image-*` out, and
-  `/usr/lib/os-release` taken over from Debian's `base-files` by diversion
-  rather than by overwriting it. `SECURITY.md` and `CONTRIBUTING.md` are
-  written; the address in them is filled in when the domain exists.
-- [x] `initial` Package contents follow [packaging.md](packaging.md), which is
+- [ ] `planned` `packaging/` in the tree: `debian/` directories for
+  `b1nix-kernel`, `b1nix-kernel-headers`, `b1nix-base-files`, `b1nix-desktop`,
+  `b1nix-artwork`, `b1nix-installer-config`, `b1nix-tools`, `b1cc`.
+- [ ] `planned` `tools/packages/build-deb.sh` (sbuild in a pinned trixie
+  chroot) and `tools/packages/publish-repo.sh` (aptly, signed static tree);
+  package versions derived from `git describe`, never typed.
+- [ ] `planned` The signing key and its rotation note, the apt pinning that
+  keeps Debian's `linux-image-*` out, `/etc/os-release`. `SECURITY.md` and
+  `CONTRIBUTING.md` are written; the address in them is filled in when the
+  domain exists.
+- [ ] `planned` Package contents follow [packaging.md](packaging.md), which is
   the contract this phase implements.
-- [x] `initial` Lane `PKG-SMOKE` (`tests/packages-smoke.sh`): builds,
-  publishes, installs into a clean chroot, and asserts that the kernel is on
-  `/boot`, stripped but still carrying `.kallsyms`, that `os-release` says
-  b1nix, that Debian's kernel is pinned to -1, that `b1nix-report` produces its
-  documented header, and that the bootloader generator writes a state file and
-  a `limine.conf` offering both kernels with an uncounted rescue entry.
-  16 checks, all passing.
-- [x] `done` Proof: a clean trixie chroot adds the repository and installs
-  `b1nix-kernel`, `b1nix-base-files` and `b1nix-tools` from it.
-- [ ] `planned` A signing key and its rotation note; `b1cc` packaged; the
-  kernel package built for `arm64` as well as `amd64`.
+- [ ] `planned` Proof: a Debian trixie container adds the repo, `apt install
+  b1nix-kernel` succeeds, `dpkg -L` shows the kernel in `/boot`, and pinning
+  refuses Debian's kernel.
 
 No kernel work. This phase exists so that everything after it has somewhere to
 ship to.
 
 ## Phase B: bootable installed system
 
-- [x] `initial` `tools/images/mk-b1nix-image.sh`: a trixie root with the
-  overlay installed, an ESP written with mtools, a root filesystem from
-  `mke2fs -d` and a GPT around them — all as an ordinary user. The image boots
-  and reaches Debian's systemd; `PROFILE=broken` adds a kernel that cannot
-  bring userspace up, for the fallback test.
-- [x] `initial` Limine integration: the config template, the `b1nix-kernel`
-  postinst that writes it, the ESP layout, two-kernel retention and the
-  fallback entry.
-- [ ] `partial` **The image boots through Limine's BIOS path, not UEFI.** The
-  kernel asks for a fixed load address at 1 MiB and the firmware is already
-  there, so Limine refuses; the tree's own ISOs fail the same way under OVMF.
-  The disk carries a BIOS boot partition and an ESP, so the layout is ready for
-  the day the kernel becomes relocatable. See
-  [../kernel/abi-gaps.md](../kernel/abi-gaps.md).
-- [ ] `partial` `/boot` is not mounted in the running system: the ESP is in
-  `/etc/fstab` by label and the mount does not happen, so the boot-counting
-  state is invisible to userspace and no boot is ever marked good.
-- [x] `done` systemd's mount namespacing works: `vfs_set_propagation` and
-  `vfs_remount` match a mount by its node as well as by its path, which is what
-  a bind into a prepared root needs. `systemd-udevd`, `systemd-logind`,
-  `systemd-journald`, `dbus-broker` and `systemd-sysctl` all start now — the
-  failed-unit list went from twelve to four.
-- [ ] `partial` Four units still fail, each with its own cause, all listed in
-  [../kernel/abi-gaps.md](../kernel/abi-gaps.md): `tmp.mount` and
-  `run-lock.mount` (the mount succeeds but is reported under the wrong path),
-  `e2scrub_reap` (`sched_setscheduler`) and `systemd-sysusers`.
-- [x] `initial` The repository reaches the guest over 9p — mounted by tag with
-  no options, which is all this kernel's 9p takes. `apt-get update` against it
-  still fails on a `symlink()` and on apt's `store:` method.
+- [ ] `planned` `tools/images/mk-b1nix-image.sh`: debootstrap trixie, install
+  the overlay, produce a disk image that boots the b1nix kernel to a systemd
+  multi-user target; initramfs from Debian's `initramfs-tools`.
+- [ ] `planned` Limine integration: the config template, the `b1nix-kernel`
+  postinst that writes it, the ESP layout (kernel and initramfs on FAT at
+  `/boot`), two-kernel retention and the fallback entry.
 - [ ] `planned` Boot counting as designed in
   [boot-counting.md](boot-counting.md): the initramfs hook decrements, a unit
   marks the boot good, the postinst seeds and regenerates `limine.conf`.
-- [x] `initial` Lane `DISTRO-SMOKE` (`tests/distro-smoke.sh`), to the contract
-  in [lanes.md](lanes.md). It boots the image, reads the in-guest checks, grades
-  the failed units against `tools/configs/known-degraded.txt`, and boots the
-  broken-kernel image up to four times to see the fallback happen.
-- [ ] `partial` The lane is not green, and says so: the kernel boots, userspace
-  reaches the in-guest checks, and then `tmp.mount`, `run-lock.mount`,
-  `systemd-logind`, `systemd-udevd` and the rest of the list above still fail,
-  `apt` cannot reach the repository shared over 9p, and no boot is marked good
-  because `/boot` is unmounted. Every one of those is a real gap, not a lane
-  defect.
+- [ ] `planned` Lane `DISTRO-SMOKE`, to the contract in [lanes.md](lanes.md):
+  the image boots, `systemctl is-system-running` matches the known-degraded
+  list, `apt update` works, and a deliberately broken kernel falls back after
+  three tries.
 
 ## Phase C: cgroup v2
 

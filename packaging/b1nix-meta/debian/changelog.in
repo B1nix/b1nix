@@ -1,6 +1,0 @@
-b1nix-meta (@DEB_VERSION@) @SUITE@; urgency=medium
-
-  * b1nix @DISTRO_RELEASE@ (@CODENAME_UI@) base files, desktop metapackage and
-    tools, built from @GIT_DESCRIBE@.
-
- -- b1nix maintainers <maintainers@b1nix.invalid>  @DATE@

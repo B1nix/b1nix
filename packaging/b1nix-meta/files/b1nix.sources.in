@@ -1,5 +1,0 @@
-Types: deb
-URIs: @REPO_URL@
-Suites: @REPO_SUITE@
-Components: main
-Signed-By: /etc/apt/keyrings/b1nix-archive.asc

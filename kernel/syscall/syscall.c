@@ -8979,26 +8979,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return 0;
       }
 
-      /* sched_*: b1nix has one runnable class, the stride scheduler, so the
-       * policies it can offer are the fair-share three — SCHED_OTHER,
-       * SCHED_BATCH and SCHED_IDLE, which differ in how small a share they
-       * ask for. SCHED_FIFO and SCHED_RR stay refused: a caller that believes
-       * it has a real-time thread makes different decisions. Nice lives in
-       * get/setpriority. */
-      if (number == LX_sched_setscheduler) { /* (pid, policy, param) */
-        struct task *t = arg0 ? scheduler_task_by_pid((usize)arg0) : current_task;
-
-        if (!t)
-          return (u64)-ESRCH;
-        return (u64)(isize)sched_set_policy(t, (int)arg1);
-      }
-      if (number == LX_sched_getscheduler) {
-        struct task *t = arg0 ? scheduler_task_by_pid((usize)arg0) : current_task;
-
-        if (!t)
-          return (u64)-ESRCH;
-        return (u64)(isize)sched_get_policy(t);
-      }
+      /* sched_*: b1nix runs one policy — SCHED_OTHER, stride scheduling with
+       * nice weighting — so the policy calls report it truthfully and refuse to
+       * switch to a policy that does not exist. Nice lives in get/setpriority. */
+      if (number == LX_sched_setscheduler) /* sched_setscheduler(pid, policy, param) */
+        return (int)arg1 == 0 ? 0 : (u64)-EINVAL;
+      if (number == LX_sched_getscheduler) /* sched_getscheduler → SCHED_OTHER */
+        return 0;
       if (number == LX_sched_setparam || number == LX_sched_getparam) {
         /* sched_setparam / sched_getparam: struct sched_param {int priority;},
          * always 0 under SCHED_OTHER. */
@@ -9013,18 +9000,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           return (u64)-EFAULT;
         return prio == 0 ? 0 : (u64)-EINVAL;
       }
-      if (number == LX_sched_get_priority_max ||
-          number == LX_sched_get_priority_min) {
-        /* [0, 0] for the fair-share policies, as on Linux. chrt asks for the
-         * range before it sets a policy and refuses to call at all when the
-         * answer is an error, so a policy this kernel accepts must have a
-         * range it can report. */
-        int pol = (int)arg0;
-
-        return (pol == SCHED_OTHER || pol == SCHED_BATCH || pol == SCHED_IDLE)
-                   ? 0
-                   : (u64)-EINVAL;
-      }
+      if (number == LX_sched_get_priority_max || number == LX_sched_get_priority_min) /* sched_get_priority_max/min */
+        return (int)arg0 == 0 ? 0 : (u64)-EINVAL;
       if (number == LX_sched_rr_get_interval) { /* sched_rr_get_interval(pid, timespec) */
         if (!arg1)
           return (u64)-EFAULT;
@@ -11456,24 +11433,18 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     ret = 0;
     break;
 
-  case SYS_SCHED_GETSCHEDULER: {
-    /* The policy the task actually carries. A crash reporter asks this per
-     * thread while walking a process and logs a failure for each one when it
-     * is missing. */
-    struct task *t = arg0 ? scheduler_task_by_pid((usize)arg0) : current_task;
-
-    ret = t ? (u64)(isize)sched_get_policy(t) : (u64)-ESRCH;
+  case SYS_SCHED_GETSCHEDULER:
+    /* One policy for every task here, so the honest answer is SCHED_OTHER (0)
+     * rather than ENOSYS. A crash reporter asks this per thread while walking
+     * a process and logs a failure for each one when it is missing. */
+    ret = 0;
     break;
-  }
-  case SYS_SCHED_SETSCHEDULER: {
-    /* The fair-share policies are accepted and honoured; SCHED_FIFO and
-     * SCHED_RR are refused, because a silent "yes" would promise real-time
-     * scheduling this kernel does not provide. */
-    struct task *t = arg0 ? scheduler_task_by_pid((usize)arg0) : current_task;
-
-    ret = t ? (u64)(isize)sched_set_policy(t, (int)arg1) : (u64)-ESRCH;
+  case SYS_SCHED_SETSCHEDULER:
+    /* Accept a request for the policy we already run, refuse the rest — a
+     * silent "yes" to SCHED_FIFO would promise real-time scheduling that this
+     * kernel does not provide. */
+    ret = ((int)arg1 == 0) ? 0 : (u64)-EINVAL;
     break;
-  }
   case SYS_SCHED_GETPARAM: {
     /* sched_param is one int, and under SCHED_OTHER it is always zero. */
     int prio = 0;
@@ -11487,12 +11458,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     break;
   case SYS_SCHED_GET_PRIORITY_MAX:
   case SYS_SCHED_GET_PRIORITY_MIN:
-    /* [0, 0] for every fair-share policy, which is what Linux answers too;
-     * the real-time policies this kernel refuses have no range to report. */
-    ret = ((int)arg0 == SCHED_OTHER || (int)arg0 == SCHED_BATCH ||
-           (int)arg0 == SCHED_IDLE)
-              ? 0
-              : (u64)-EINVAL;
+    /* SCHED_OTHER's range is [0, 0] on Linux too. */
+    ret = ((int)arg0 == 0) ? 0 : (u64)-EINVAL;
     break;
 
   case SYS_SET_ROBUST_LIST:

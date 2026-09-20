@@ -960,18 +960,6 @@ void vma_delete_range(struct task *t, u64 start, u64 end);
  * from how often spinning processes happened to run. */
 int sched_stride_for_nice(int nice);
 
-/* sched_setscheduler(2) policies. Only the fair-share three exist here; the
- * real-time ones are refused rather than faked. */
-#define SCHED_OTHER 0
-#define SCHED_BATCH 3
-#define SCHED_IDLE  5
-
-/* The stride a task gets once its policy is taken into account. */
-int sched_stride_for_policy(int policy, int nice);
-/* Set/read a task's policy. Setting anything but OTHER/BATCH/IDLE is EINVAL. */
-int sched_set_policy(struct task *t, int policy);
-int sched_get_policy(struct task *t);
-
 /* Known-answer checks for that contract and for the min-pass selection rule it
  * feeds. Emits M46-SCHED markers; test mode only. */
 void sched_nice_selftest(void);
