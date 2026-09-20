@@ -31,7 +31,7 @@ hosted job, and the first one to move locally.
 
 1. Builds the kernel for both architectures from the tag, with ccache warm
    where the cache survives.
-2. Builds every overlay package with `tools/packages/build-deb.sh`, runs
+2. Builds every overlay package with `tools/deb/build-deb.sh`, runs
    `lintian`, fails on errors.
 3. Builds the netinstall image for both architectures.
 4. Writes the build manifest: every Debian package version that went in, the

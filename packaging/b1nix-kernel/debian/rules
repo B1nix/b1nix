@@ -1,0 +1,87 @@
+#!/usr/bin/make -f
+# The kernel is not compiled here: it is built by the tree's own Makefile and
+# handed to this package as artifacts/kernel.elf. What this rules file does is
+# split it into the stripped kernel that boots and the debug information that
+# does not, and place the boot-counting pieces.
+#
+# RELEASE is written by tools/deb/build-deb.sh when it renders this source
+# package, so that every path agrees on one release string.
+
+RELEASE := $(shell cat debian/b1nix-release)
+PKG     := b1nix-kernel-$(RELEASE)
+DBG     := b1nix-kernel-$(RELEASE)-dbg
+HDR     := b1nix-kernel-headers-$(RELEASE)
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	mkdir -p out
+	# The debug link ties the two halves together: the stripped kernel names
+	# the file that carries its symbols, so gdb finds them without being told.
+	objcopy --only-keep-debug artifacts/kernel.elf out/b1nix-$(RELEASE).debug
+	# --strip-all, not --strip-debug: the panic path symbolises addresses
+	# from the kernel's own .kallsyms blob (M35), not from the ELF symbol
+	# table, so the symtab is dead weight on an ESP that the bootloader
+	# reads on every boot.
+	objcopy --strip-all artifacts/kernel.elf out/b1nix-$(RELEASE)
+	# The blob the symbolisation actually uses must survive the strip; if it
+	# ever does not, a panic on a user's machine prints bare addresses.
+	objdump -h out/b1nix-$(RELEASE) | grep -q '\.kallsyms' || \
+		{ echo "kallsyms section lost in strip -- refusing to ship a kernel that cannot symbolise" >&2; exit 1; }
+	cd out && objcopy --add-gnu-debuglink=b1nix-$(RELEASE).debug b1nix-$(RELEASE)
+
+override_dh_auto_install:
+	# ── the kernel ──────────────────────────────────────────────────────
+	install -D -m 0644 out/b1nix-$(RELEASE) \
+		debian/$(PKG)/boot/b1nix-$(RELEASE)
+	[ ! -f artifacts/System.map ] || install -D -m 0644 artifacts/System.map \
+		debian/$(PKG)/boot/System.map-$(RELEASE)
+	# /usr/lib, not /lib: trixie is merged-/usr and a package that writes to
+	# the aliased path is an error, not a style question.
+	install -d debian/$(PKG)/usr/lib/modules/$(RELEASE)
+	# The boot-counting mechanism: the initramfs hook that spends a try, and
+	# the unit that marks a boot good. docs/distro/boot-counting.md says why
+	# the decrement cannot live in userspace.
+	install -D -m 0755 files/initramfs-boot-count \
+		debian/$(PKG)/usr/share/initramfs-tools/scripts/init-premount/b1nix-boot-count
+	install -D -m 0755 files/b1nix-boot-good \
+		debian/$(PKG)/usr/sbin/b1nix-boot-good
+	install -D -m 0644 files/b1nix-boot-good.service \
+		debian/$(PKG)/usr/lib/systemd/system/b1nix-boot-good.service
+	install -D -m 0755 files/b1nix-update-bootloader \
+		debian/$(PKG)/usr/sbin/b1nix-update-bootloader
+	install -D -m 0644 files/limine-entry.conf.in \
+		debian/$(PKG)/usr/share/b1nix/limine-entry.conf.in
+	# ── the debug information ───────────────────────────────────────────
+	install -D -m 0644 out/b1nix-$(RELEASE).debug \
+		debian/$(DBG)/usr/lib/debug/boot/b1nix-$(RELEASE).debug
+	# ── the headers ─────────────────────────────────────────────────────
+	install -d debian/$(HDR)/usr/src/b1nix-headers-$(RELEASE)
+	cp -a artifacts/include/. debian/$(HDR)/usr/src/b1nix-headers-$(RELEASE)/
+	install -D -m 0644 files/headers-README.Debian \
+		debian/$(HDR)/usr/share/doc/$(HDR)/README.Debian
+
+# The kernel is already stripped above, deliberately and once. Letting
+# dh_strip near it would either strip the debug package or fail on a
+# freestanding ELF it does not recognise.
+override_dh_strip:
+
+override_dh_strip_nondeterminism:
+
+# dwz compresses DWARF by sharing it between objects, which is worth doing for
+# a distribution full of C++ libraries and worth nothing for one freestanding
+# kernel. It also does not understand the DWARF 5 our clang emits
+# (.debug_str_offsets), so letting it run turns a working build into a failure
+# for no gain.
+override_dh_dwz:
+
+# /boot/b1nix-<release> is not a shared library and has no dependencies to
+# compute; dpkg-shlibdeps on a freestanding kernel is noise at best.
+override_dh_shlibdeps:
+
+override_dh_installsystemd:
+	dh_installsystemd -p$(PKG) --name=b1nix-boot-good --no-start b1nix-boot-good.service
+
+override_dh_auto_clean:
+	rm -rf out

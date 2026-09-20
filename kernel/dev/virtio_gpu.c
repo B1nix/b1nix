@@ -1149,7 +1149,7 @@ static void virtio_gpu_virgl_selftest(void)
  * context is created at device init. The kernel is the transport; userspace
  * owns the virgl protocol — the same split Mesa's winsys expects. */
 
-/* Kernel copies of the userspace ABI (userspace/include/b1nix/virgl.h). */
+/* Kernel copies of the userspace ABI (third_party/b1cc-sysroot/b1nix/virgl.h). */
 #define B1NIX_VIRGL_GET_CAPS 0x7601
 #define B1NIX_VIRGL_GET_CAPS_DATA 0x7602
 #define B1NIX_VIRGL_RES_CREATE 0x7603

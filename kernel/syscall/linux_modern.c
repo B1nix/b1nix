@@ -417,9 +417,14 @@ static isize lm_sched_setattr(u64 pid, u64 uattr, u64 flags) {
   struct task *t = lm_task_for_pid(pid);
   if (!t)
     return -ESRCH;
-  if (!(a.sched_flags & SCHED_FLAG_KEEP_POLICY) &&
-      a.sched_policy != SCHED_OTHER)
-    return -EINVAL; /* the one class this scheduler has */
+  if (!(a.sched_flags & SCHED_FLAG_KEEP_POLICY)) {
+    /* The fair-share policies this scheduler can honour; the real-time ones
+     * are refused rather than accepted and ignored. */
+    int prc = sched_set_policy(t, (int)a.sched_policy);
+
+    if (prc < 0)
+      return prc;
+  }
   if (a.sched_priority != 0)
     return -EINVAL;
   if (a.sched_nice < -20 || a.sched_nice > 19)
@@ -449,7 +454,7 @@ static isize lm_sched_getattr(u64 pid, u64 uattr, u64 usize_, u64 flags) {
     return -ESRCH;
   memset(&a, 0, sizeof(a));
   a.size = usize_ < sizeof(a) ? (u32)usize_ : sizeof(a);
-  a.sched_policy = SCHED_OTHER;
+  a.sched_policy = (u32)sched_get_policy(t);
   a.sched_nice = scheduler_get_priority(t->id);
   a.sched_util_max = 1024; /* SCHED_CAPACITY_SCALE: no clamp */
   if (syscall_copyout((void *)(usize)uattr, &a, a.size))

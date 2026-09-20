@@ -2,6 +2,7 @@
 #include <b1nix/kprintf.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
+#include <b1nix/psi.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/klog.h>
 #include <b1nix/panic.h>
@@ -2059,9 +2060,14 @@ u64 pmm_alloc_frames(usize count) {
     }
     /* Top-level reclaim: full eviction (writes dirty pages back). Run it inside
      * the reclaim context so a nested alloc takes the clean-only path above. */
+    /* PSI: from here to the end of the reclaim is time this task spends not
+     * getting the memory it asked for -- which is the definition of memory
+     * pressure. */
+    psi_stall_begin(PSI_MEM);
     pmm_enter_reclaim();
     usize pc_evicted = page_cache_evict(reclaim_target);
     pmm_leave_reclaim();
+    psi_stall_end(PSI_MEM);
     if (pc_evicted > 0) {
       continue;
     }
@@ -2080,9 +2086,11 @@ u64 pmm_alloc_frames(usize count) {
     extern int swap_active(void);
     if (swap_active() && interrupts_enabled() && !pmm_in_reclaim()) {
       extern u64 swap_evict_page(void);
+      psi_stall_begin(PSI_MEM);
       pmm_enter_reclaim();
       u64 evicted_frame = swap_evict_page();
       pmm_leave_reclaim();
+      psi_stall_end(PSI_MEM);
       if (evicted_frame != 0) {
         if (bootinfo_has_flag("b1nix.debug.heap")) {
           console_write("[M26DIAG] swap_evict frame=0x");

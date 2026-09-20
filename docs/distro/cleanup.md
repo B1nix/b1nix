@@ -32,17 +32,17 @@ subject per removed thing or per closely related group.
 | What | Size | Who still references it | Verdict |
 |---|---|---|---|
 | `archive/kernel/native-abi`, `archive/tests/native-abi` | 660 KiB | `docs/kernel/roadmap.md` (M121 prose) only | **Delete.** The native ABI is gone and will not come back; M121's entry can say so without a copy of the code. |
-| `userspace/src/mojo_core.c` + `include/mojo*.h` | 20 KiB | `userspace/Makefile`, only to build `m57_smoke` | **Delete with its test** if `m57_smoke` is Chromium-IPC scaffolding whose subject is now covered by the Debian lane; keep only if that smoke proves a syscall path nothing else reaches. Decide by reading the test, not the name. |
-| `userspace/compat/crypt.c`, `utmp.c` | 16 KiB | nothing found outside the directory | **Delete** — musl and the distribution provide both. Verify no link error appears in the PAM and login paths. |
-| `userspace/libcxx_compat.c` | — | `userspace/Makefile` (`BESPOKE_LIBCXX_EXTRA`) | **Audit.** libc++ comes from Alpine since M89/M121; if the bespoke libc++ is gone, this object and its variable go with it. |
-| `userspace/hello_native.c` | — | `userspace/Makefile`, copied into the rootfs | **Delete** unless a lane asserts on it; a hello-world in `/home` is not a test. |
-| `tools/blobs/*.bin`, `*.S`, `hello_b1nix.rs` | 14 files | `Makefile`, `tests/smoke.sh`, `tools/configs/static-allowlist.txt` | **Keep, but rebuild from source.** These prove a foreign Linux binary runs unmodified — exactly the property the distribution rests on. Committed `.bin` files are the problem, not the tests: build them in the lane and stop tracking the binaries. |
+| `tests/programs/src/mojo_core.c` + `include/mojo*.h` | 20 KiB | `tests/programs/Makefile`, only to build `m57_smoke` | **Delete with its test** if `m57_smoke` is Chromium-IPC scaffolding whose subject is now covered by the Debian lane; keep only if that smoke proves a syscall path nothing else reaches. Decide by reading the test, not the name. |
+| `tests/programs/compat/crypt.c`, `utmp.c` | 16 KiB | nothing found outside the directory | **Delete** — musl and the distribution provide both. Verify no link error appears in the PAM and login paths. |
+| `tests/programs/libcxx_compat.c` | — | `tests/programs/Makefile` (`BESPOKE_LIBCXX_EXTRA`) | **Audit.** libc++ comes from Alpine since M89/M121; if the bespoke libc++ is gone, this object and its variable go with it. |
+| `tests/programs/hello_native.c` | — | `tests/programs/Makefile`, copied into the rootfs | **Delete** unless a lane asserts on it; a hello-world in `/home` is not a test. |
+| `tests/support/linux-abi/*.bin`, `*.S`, `hello_b1nix.rs` | 14 files | `Makefile`, `tests/smoke.sh`, `tools/toolchain/static-allowlist.txt` | **Keep, but rebuild from source.** These prove a foreign Linux binary runs unmodified — exactly the property the distribution rests on. Committed `.bin` files are the problem, not the tests: build them in the lane and stop tracking the binaries. |
 | `tests/liveusb.sh` | — | nothing; not wired into `smoke.sh` or the Makefile | **Delete at phase D**, when the live ISO lane replaces it. Until then it is the only recipe for a bootable stick; read it for anything worth carrying over first. |
-| `userspace/include/` | 179 files | `Makefile` dependency lists, `tools/toolchain/build-toolchain.sh` (copies a subset over musl's headers) | **Shrink, do not delete.** Go header by header: anything musl already provides is removed from the copy list and then from the tree. The subset that stays is whatever declares b1nix-only interfaces (`include/b1nix/`). |
-| `userspace/bin/smoke/` | 58 tests | `userspace/Makefile`, `tests/smoke.sh` | **Shrink by the rule below.** |
-| `userspace/rootfs-overlay/` | 40 files | `Makefile`, `userspace/Makefile` | **Audit against the Debian image.** The overlay configures the Alpine smoke image; anything it sets that the distribution sets differently is a source of "works in smoke, broken in the product". |
-| `tools/configs/openrc/`, `applet-manifest.conf` | 5 files | `Makefile`, `tools/images/00-smoke.start`, the Alpine fetch scripts | **Keep.** The Alpine lane stays as the fast CI path; this is its configuration. |
-| `tools/selfhost/` | 2 files | `Makefile` | **Keep.** The self-host build is a kernel test on release tags. |
+| `third_party/b1cc-sysroot/` | 179 files | `Makefile` dependency lists, `tools/toolchain/build-toolchain.sh` (copies a subset over musl's headers) | **Shrink, do not delete.** Go header by header: anything musl already provides is removed from the copy list and then from the tree. The subset that stays is whatever declares b1nix-only interfaces (`include/b1nix/`). |
+| `tests/programs/bin/smoke/` | 58 tests | `tests/programs/Makefile`, `tests/smoke.sh` | **Shrink by the rule below.** |
+| `tools/image/overlay/` | 40 files | `Makefile`, `tests/programs/Makefile` | **Audit against the Debian image.** The overlay configures the Alpine smoke image; anything it sets that the distribution sets differently is a source of "works in smoke, broken in the product". |
+| `tools/image/openrc/`, `applet-manifest.conf` | 5 files | `Makefile`, `tests/support/00-smoke.start`, the Alpine fetch scripts | **Keep.** The Alpine lane stays as the fast CI path; this is its configuration. |
+| `tests/selfhost/` | 2 files | `Makefile` | **Keep.** The self-host build is a kernel test on release tags. |
 
 ## Shrinking the smoke binaries
 

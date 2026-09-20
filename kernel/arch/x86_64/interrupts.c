@@ -2,6 +2,7 @@
 #include <b1nix/virtio_console.h>
 #include <b1nix/arch_x86_64.h>
 #include <b1nix/arch.h>
+#include <b1nix/cgroup.h>
 #include <b1nix/console.h>
 #include <b1nix/user.h>
 #include <b1nix/bootinfo.h>
@@ -991,6 +992,16 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
 
     if (pf_t0)
       pf_prof_account(pf_prof_now() - pf_t0);
+
+    /* Resource control (M127): a fault that installed a USER page is the
+     * moment that task's cgroup grew -- whichever ring the access came from,
+     * because the kernel filling a user buffer grows the process just as much
+     * as the process writing to it does. A cgroup whose memory.max this
+     * crosses is measured exactly and, if it is over, killed inside; the
+     * victim, which may be this task, dies of SIGKILL on its way back to
+     * ring 3 rather than of this fault. */
+    if (handled && current_task)
+      cgroup_mem_fault_charge(fault_addr);
 
     if (restore_irqs)
       __asm__ volatile("cli");

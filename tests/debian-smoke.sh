@@ -3,7 +3,7 @@
 # filesystem attached as a virtio-blk disk and let the distro's own binaries
 # exercise the Linux-ABI layer.
 #
-#   sh tools/images/mk-debian-image.sh     # once, builds build/$ARCH/debian.ext4
+#   sh tools/image/mk-debian-image.sh     # once, builds build/$ARCH/debian.ext4
 #   sh tests/debian-smoke.sh [x86_64]
 #
 # Skips cleanly (exit 0) when the image has not been built, so it can be wired
@@ -62,7 +62,7 @@ mkdir -p "$PROJECT_DIR/smoke_run"
 echo "=== B1NIX Debian (glibc) Boot Test ($ARCH) ==="
 
 if [ ! -f "$IMG" ]; then
-	printf "  ${YELLOW}skipped${NC}: %s not built — run tools/images/mk-debian-image.sh first\n" "$IMG"
+	printf "  ${YELLOW}skipped${NC}: %s not built — run tools/image/mk-debian-image.sh first\n" "$IMG"
 	exit 0
 fi
 
@@ -109,11 +109,11 @@ cp "$IMG" "$RUN_IMG"
 # be months old; debugfs writes the working-tree version into the scratch copy
 # without root and without rebuilding the image, so the test always runs the
 # harness that sits beside it in the repository.
-STAGE="$PROJECT_DIR/tools/images/debian-stage.sh"
+STAGE="$PROJECT_DIR/tools/image/debian-stage.sh"
 if [ -f "$STAGE" ] && command -v debugfs >/dev/null 2>&1; then
 	if debugfs -w -R "rm /b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1 &&
 		debugfs -w -R "write $STAGE b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1; then
-		echo "  (harness injected from tools/images/debian-stage.sh)"
+		echo "  (harness injected from tools/image/debian-stage.sh)"
 	else
 		printf "  ${YELLOW}note${NC}: could not inject the harness; using the one in the image\n"
 	fi

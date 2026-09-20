@@ -3,8 +3,8 @@
 
 #include <b1nix/types.h>
 
-/* The otter, generated from tools/build/kernel/art/otter-pitchfork.jpg by
- * tools/build/kernel/gen_panic_otter.py (kernel/dev/panic_otter.c). */
+/* The otter, generated from tools/toolchain/kernel/art/otter-pitchfork.jpg by
+ * tools/toolchain/kernel/gen_panic_otter.py (kernel/dev/panic_otter.c). */
 #define PANIC_OTTER_COLOURS 5
 extern const u32 panic_otter_palette[PANIC_OTTER_COLOURS]; /* 0x00RRGGBB; [0] = background */
 extern const u16 panic_otter_width;

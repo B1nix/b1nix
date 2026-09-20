@@ -1,0 +1,17 @@
+#!/bin/sh
+# Give /usr/lib/os-release back to Debian's base-files. Removing b1nix-base-files
+# must leave a system that still identifies itself, not one with no os-release
+# at all.
+set -e
+
+case "$1" in
+remove | purge | disappear)
+	dpkg-divert --package b1nix-base-files --remove --rename \
+		--divert /usr/lib/os-release.debian /usr/lib/os-release
+	;;
+upgrade | failed-upgrade | abort-install | abort-upgrade) ;;
+esac
+
+#DEBHELPER#
+
+exit 0

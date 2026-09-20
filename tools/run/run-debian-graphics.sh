@@ -24,7 +24,7 @@ ISO=$DIR/build/x86_64/${GFX_ISO:-b1nix-graphics.iso}
 RUN_SECONDS=${RUN_SECONDS:-420}
 
 [ -f "$IMG" ] || {
-	echo "[run-debian-graphics] no $IMG — run PROFILE=graphics sh tools/images/mk-debian-image.sh" >&2
+	echo "[run-debian-graphics] no $IMG — run PROFILE=graphics sh tools/image/mk-debian-image.sh" >&2
 	exit 1
 }
 [ -f "$ISO" ] || {

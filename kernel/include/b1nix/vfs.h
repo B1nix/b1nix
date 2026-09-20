@@ -15,6 +15,11 @@
 #define MS_NODEV 4
 #define MS_NOEXEC 8
 #define MS_REMOUNT 32
+/* The atime policy bits, with Linux's values. They belong to the VFS rather
+ * than to any filesystem, so every mount path has to take them: refusing one
+ * of them fails the mount, and Debian's tmpfs units pass them by name. */
+#define MS_NOATIME 1024
+#define MS_NODIRATIME 2048
 #define MS_BIND 4096
 /* Move an existing mount to another mountpoint, without unmounting it. */
 #define MS_MOVE 8192
@@ -736,6 +741,15 @@ int vfs_remount(const char *target, u64 flags);
  * vfs_mounts() should ask for this rather than assume MAX_MOUNTS, and must
  * heap-allocate it. */
 usize vfs_mount_capacity(void);
+
+/* A counter that moves whenever the mount table changes.
+ *
+ * Linux reports a mount change by making /proc/self/mountinfo poll-ready with
+ * POLLPRI|POLLERR, and that notification is not a convenience: systemd starts
+ * a mount unit, runs mount(8), and then waits to be told the mount appeared.
+ * Without the wake-up it decides the mount never happened and fails the unit
+ * with "Result: protocol" -- while the filesystem is, in fact, mounted. */
+u64 vfs_mount_generation(void);
 /* Inode references: the inode is freed at the last put when unlinked. */
 struct vfs_inode *vfs_inode_get(struct vfs_inode *inode);
 void vfs_inode_put(struct vfs_inode *inode);

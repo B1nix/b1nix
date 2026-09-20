@@ -75,7 +75,7 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 
 /* b1nix-private auxv type carrying the shared-library constructor descriptor
  * table (see user_build_initial_stack / crt0). Far above the standard auxv
- * range (0..51) so it can never collide. Must match userspace/include/sys/auxv.h. */
+ * range (0..51) so it can never collide. Must match third_party/b1cc-sysroot/sys/auxv.h. */
 #define AT_B1NIX_DSO_INIT 0x1000
 
 /* Userspace ld.so support: fixed load base for a real ELF interpreter (musl's
@@ -838,7 +838,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * and compute the actual VA: segment_p_vaddr + (e_phoff - segment_p_offset). */
   /* Default assumes a 0-based PIE (first LOAD maps file offset 0 at vaddr 0),
    * but that is NOT universally true: b1nix's own PIE binaries are linked at a
-   * fixed non-zero base (0x2000000, see userspace/linker.ld), so e_phoff (a file
+   * fixed non-zero base (0x2000000, see tests/programs/linker.ld), so e_phoff (a file
    * offset) does not equal the phdrs' virtual-address offset. Resolve the real
    * VA by locating the PT_LOAD that contains e_phoff and mapping through it —
    * for BOTH ET_EXEC and ET_DYN. For a genuine 0-based PIE the first LOAD has

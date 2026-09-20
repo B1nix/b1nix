@@ -24,44 +24,113 @@
  *
  * Controllers
  * -----------
- * One: `pids`, and it is enforced — a fork that would exceed a pids.max
- * anywhere between the new task's cgroup and the root fails with EAGAIN, which
- * is what Linux's pids controller returns. `memory`, `cpu` and `io` are NOT
- * advertised, because advertising a controller means accepting writes to
- * memory.max or cpu.weight, and accepting a limit that nothing enforces is a
- * lie told to the process that set it. cgroup.controllers therefore lists what
- * this kernel can actually do, and systemd logs the rest as unavailable — the
- * same thing it does on a Linux kernel built without those controllers.
+ * Four, and every one of them is enforced. A controller is advertised only
+ * when it is, because advertising one means accepting a write to memory.max or
+ * cpu.weight, and accepting a limit that nothing enforces is a lie told to the
+ * process that set it.
+ *
+ * pids    A fork that would exceed a pids.max anywhere between the new task's
+ *         cgroup and the root fails with EAGAIN, which is what Linux's pids
+ *         controller returns.
+ *
+ * memory  memory.current is the resident memory of the member address spaces:
+ *         every page a member process has mapped and present, anonymous and
+ *         file-backed alike, counted once per address space so threads do not
+ *         multiply it. It is measured, not modelled -- the same page-table walk
+ *         /proc/<pid>/status reports VmRSS with. memory.max is enforced from
+ *         the page-fault path: each fault charged to a limited cgroup advances
+ *         a running estimate, and the moment the estimate crosses the limit the
+ *         cgroup is measured exactly. Only that exact figure is allowed to
+ *         decide anything, so the kernel never kills on a drifting counter.
+ *         Over the limit means: reclaim, measure again, and if it is still over
+ *         kill the worst task INSIDE the cgroup -- by oom_score_adj and
+ *         resident size, exactly as the machine-wide killer chooses. Every one
+ *         of those steps shows up in memory.events.
+ *
+ * cpu     cpu.weight rides the stride scheduler that already implements nice
+ *         (M117). A cgroup's effective weight is the product of the weights
+ *         down to it, and each of its tasks is given a stride of
+ *         base * tasks_in_cgroup * 100 / effective_weight -- so the group's
+ *         share of the machine is its weight, however many tasks it splits it
+ *         between, which is what systemd's CPUWeight= means. cpu.max is a
+ *         quota per period: the tick charges each task's CPU time to its
+ *         cgroups, and a cgroup that has spent its quota has its tasks passed
+ *         over by the scheduler until the period rolls over. A task inside a
+ *         system call is never passed over -- it may be holding a lock the rest
+ *         of the machine needs.
+ *
+ * io      io.stat counts the bytes and the device commands that really went to
+ *         a device on a member's behalf, charged where the block layer
+ *         serialises them. io.max is a ceiling on those two rates, enforced by
+ *         making the next command wait.
+ *
+ * What is NOT here: per-cgroup pressure files (memory.pressure and friends).
+ * PSI is measured machine-wide in kernel/mm/psi.c and published under
+ * /proc/pressure; a per-cgroup file would have to be a copy of the global one,
+ * which is worse than the honest absence a kernel without CONFIG_PSI_PER_CGROUP
+ * presents.
  */
 
 #include <b1nix/cgroup.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/inotify.h>
+#include <b1nix/ktime.h>
 #include <b1nix/mm.h>
 #include <b1nix/namespace.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/user.h>
 #include <b1nix/vfs.h>
 #include <stdio.h>
 #include <string.h>
 
 /* ── controllers ─────────────────────────────────────────────────────────── */
 
-#define CG_CTRL_PIDS 0x1u
+#define CG_CTRL_CPU 0x1u
+#define CG_CTRL_IO 0x2u
+#define CG_CTRL_MEMORY 0x4u
+#define CG_CTRL_PIDS 0x8u
+#define CG_CTRL_ALL (CG_CTRL_CPU | CG_CTRL_IO | CG_CTRL_MEMORY | CG_CTRL_PIDS)
 
+/* Listed in the order Linux lists them, because a few readers compare the
+ * string rather than parsing it. */
 static const struct {
   const char *name;
   u32 bit;
 } cg_controllers[] = {
+    {"cpu", CG_CTRL_CPU},
+    {"io", CG_CTRL_IO},
+    {"memory", CG_CTRL_MEMORY},
     {"pids", CG_CTRL_PIDS},
 };
 
 #define CG_PIDS_MAX_UNSET 0xFFFFFFFFu
+/* "max" for the 64-bit limits (memory.max, cpu quota, io.max). */
+#define CG_LIM_MAX (~0ull)
 
-const char *cgroup_available_controllers(void) { return "pids"; }
+/* cpu.weight: the cgroup v2 range, and its default. */
+#define CG_CPU_WEIGHT_MIN 1u
+#define CG_CPU_WEIGHT_MAX 10000u
+#define CG_CPU_WEIGHT_DEF 100u
+#define CG_CPU_PERIOD_DEF_US 100000ull
+
+const char *cgroup_available_controllers(void) { return "cpu io memory pids"; }
 
 /* ── the tree ────────────────────────────────────────────────────────────── */
+
+/* How many block devices one cgroup keeps io statistics and limits for. A unit
+ * touches one or two; a slot is never reclaimed, so past the fourth a cgroup
+ * stops accounting new devices rather than losing the ones it has. */
+#define CG_IO_DEVS 4
+
+struct cg_io_dev {
+  u32 devno; /* blk_devno(): (major << 8) | minor. 0 == free slot. */
+  u64 rbytes, wbytes, rios, wios; /* io.stat, since the slot was taken */
+  u64 rbps, wbps, riops, wiops;   /* io.max, CG_LIM_MAX == "max" */
+  /* The one-second window io.max is expressed against. */
+  u64 win_start_ns, win_rbytes, win_wbytes, win_rios, win_wios;
+};
 
 struct cgroup {
   struct cgroup *parent;
@@ -73,6 +142,51 @@ struct cgroup {
   u64 pids_denied;      /* pids.events: max */
   u32 max_depth;        /* cgroup.max.depth, CG_PIDS_MAX_UNSET = "max" */
   u32 max_descendants;  /* cgroup.max.descendants */
+
+  /* ── memory ──
+   * Limits are in pages; CG_LIM_MAX is "max". mem_exact is the last exact
+   * measurement and mem_delta the faults charged since, so mem_exact+mem_delta
+   * is the running estimate that decides WHEN to measure again -- never what
+   * to do about it. */
+  u64 mem_max;
+  u64 mem_high;
+  u64 mem_low;
+  u64 mem_min;
+  u64 mem_swap_max;
+  u64 mem_exact;
+  u64 mem_delta;
+  u64 mem_peak;
+  u64 mem_pgfault;      /* memory.stat: pages charged here */
+  u64 mem_pgmajfault;   /* memory.stat: pages faulted back in from swap */
+  u64 mem_ev_low, mem_ev_high, mem_ev_max, mem_ev_oom, mem_ev_oom_kill;
+  int mem_oom_group;
+  /* When this cgroup was last taken over its memory.max or memory.high. Both
+   * paths cost an exact measurement, and a cgroup that stays over its limit
+   * crosses it again on the very next fault -- so there is a floor on how
+   * often either may run. */
+  u64 mem_oom_at_ns;
+  u64 mem_high_at_ns;
+
+  /* ── cpu ── */
+  u32 cpu_weight;             /* 1..10000 */
+  u64 cpu_quota_us;           /* cpu.max, CG_LIM_MAX = "max" */
+  u64 cpu_period_us;
+  u64 cpu_period_start_ns;
+  u64 cpu_period_used_ns;
+  u64 cpu_usage_ns, cpu_user_ns, cpu_sys_ns; /* cpu.stat, since creation */
+  u64 cpu_nr_periods, cpu_nr_throttled, cpu_throttled_ns;
+  int cpu_throttled;
+  /* Members in this cgroup alone, refreshed once per sweep. Counting it per
+   * task inside the publish loop made the sweep quadratic in the task table. */
+  u32 cpu_nr_tasks;
+
+  /* ── io ──
+   * Per device, because that is how cgroup v2 expresses both sides of it:
+   * io.stat prints one line per device and io.max is written as
+   * "MAJ:MIN rbps=... wiops=...". A slot is taken the first time a cgroup
+   * touches a device or names one in io.max. */
+  u32 io_weight;
+  struct cg_io_dev io_dev[CG_IO_DEVS];
   int populated;        /* last value published in cgroup.events */
   int scratch;          /* cg_events_refresh's single-pass accumulator */
   int is_root;
@@ -84,6 +198,7 @@ struct cgroup {
 
 static struct cgroup *cg_root;
 static struct cgroup *cg_all; /* singly linked list of every live cgroup */
+static void cg_sync_children_controller_files(struct cgroup *cg);
 /* Live mounts of the hierarchy: one superblock, however many places. */
 static int cg_mounts;
 static spinlock_t cg_lock = SPINLOCK_INIT;
@@ -260,6 +375,725 @@ static u32 cg_depth(const struct cgroup *cg) {
   return d;
 }
 
+/* The kernel's own task ceiling (TASK_CHUNK_SIZE * TASK_MAX_CHUNKS), which is
+ * what scheduler_task_index() is bounded by. The two side tables below are
+ * indexed by it rather than by pid, because the tick reads them once per task
+ * per tick and a hash probe there would be the most expensive thing in it. */
+#define CG_TASK_SLOTS 4096
+/* Total CPU nanoseconds each task had burned when the tick last looked, and
+ * how much of that was user time. The difference is what gets charged. */
+static u64 cg_task_cpu_seen[CG_TASK_SLOTS];
+static u64 cg_task_cpu_user_seen[CG_TASK_SLOTS];
+
+/* ── memory: measurement, charging, and the kill ─────────────────────────── */
+
+/* How many member tasks one measurement or one kill decision may look at.
+ * Every slice systemd makes is far below this; a cgroup with more members than
+ * this is measured from the first CG_MEM_TASKS of them, which can only
+ * under-count and so can only under-enforce. */
+#define CG_MEM_TASKS 512
+/* Distinct address spaces remembered while de-duplicating threads. */
+#define CG_MEM_SPACES 256
+
+/* Snapshot the live tasks in `cg` and everything below it. Caller holds
+ * cg_lock; the array is read after the lock is dropped, which is safe because
+ * a task slot is never freed, only recycled (and a recycled slot fails the
+ * liveness re-check below). Returns how many were stored. */
+static int cg_collect_tasks(struct cgroup *cg, struct task **out, int cap) {
+  int n = 0;
+  usize slots = scheduler_task_slots();
+
+  for (usize i = 0; i < slots && n < cap; i++) {
+    struct task *t = scheduler_task_slot(i);
+
+    if (!cg_task_live(t))
+      continue;
+    struct cgroup *tc = cg_of(t->id);
+    if (tc != cg && !cg_is_ancestor(cg, tc))
+      continue;
+    out[n++] = t;
+  }
+  return n;
+}
+
+/* The resident memory of a set of tasks, in pages, counting each address space
+ * once so a threaded process is not multiplied by its thread count.
+ *
+ * Called WITHOUT cg_lock: the walk it performs is the one /proc/<pid>/status
+ * does for VmRSS, which takes tens of thousands of table reads for a large
+ * process and must not run with interrupts off. */
+static u64 cg_mem_measure_tasks(struct task **tasks, int n) {
+  u64 seen[CG_MEM_SPACES];
+  int nseen = 0;
+  u64 pages = 0;
+
+  for (int i = 0; i < n; i++) {
+    struct task *t = tasks[i];
+
+    if (!cg_task_live(t) || !t->pml4_phys)
+      continue;
+    int dup = 0;
+    for (int k = 0; k < nseen; k++)
+      if (seen[k] == t->pml4_phys) {
+        dup = 1;
+        break;
+      }
+    if (dup)
+      continue;
+    if (nseen < CG_MEM_SPACES)
+      seen[nseen++] = t->pml4_phys;
+    pages += task_rss_current_pages(t);
+  }
+  return pages;
+}
+
+/* Measure `cg` exactly and publish the result, clearing the running estimate's
+ * delta. Returns the measurement in pages. Must be called in task context. */
+static u64 cg_mem_refresh(struct cgroup *cg) {
+  struct task *tasks[CG_MEM_TASKS];
+  u64 flags;
+  int n;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  n = cg_collect_tasks(cg, tasks, CG_MEM_TASKS);
+  spin_unlock_irqrestore(&cg_lock, flags);
+
+  u64 pages = cg_mem_measure_tasks(tasks, n);
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  cg->mem_exact = pages;
+  cg->mem_delta = 0;
+  if (pages > cg->mem_peak)
+    cg->mem_peak = pages;
+  spin_unlock_irqrestore(&cg_lock, flags);
+  return pages;
+}
+
+/* Linux's badness, in the shape that matters here: resident pages, shifted by
+ * oom_score_adj as a thousandth of the machine. -1000 means never. */
+static u64 cg_oom_badness(struct task *t, int *immune) {
+  int adj = scheduler_oom_score_adj(t->id);
+
+  *immune = 0;
+  if (adj <= -1000 || t->id == 1) {
+    *immune = 1;
+    return 0;
+  }
+  u64 rss = task_rss_current_pages(t);
+  u64 total = pmm_total_usable_memory() / PAGE_SIZE;
+  i64 bias = total ? ((i64)adj * (i64)total) / 1000 : 0;
+  i64 points = (i64)rss + bias;
+
+  return points > 0 ? (u64)points : 1;
+}
+
+/* The task the OOM killer should choose. `within` is a struct cgroup (0 for the
+ * whole machine). Exported through cgroup.h so the machine-wide killer in the
+ * page allocator picks by the same rule. */
+usize cgroup_oom_victim(void *within) {
+  struct cgroup *cg = within;
+  struct task *tasks[CG_MEM_TASKS];
+  int n = 0;
+  u64 flags;
+
+  if (cg) {
+    spin_lock_irqsave(&cg_lock, &flags);
+    n = cg_collect_tasks(cg, tasks, CG_MEM_TASKS);
+    spin_unlock_irqrestore(&cg_lock, flags);
+  } else {
+    usize slots = scheduler_task_slots();
+
+    for (usize i = 0; i < slots && n < CG_MEM_TASKS; i++) {
+      struct task *t = scheduler_task_slot(i);
+
+      if (cg_task_live(t) && t->pml4_phys)
+        tasks[n++] = t;
+    }
+  }
+
+  struct task *best = 0;
+  u64 best_points = 0;
+
+  for (int i = 0; i < n; i++) {
+    struct task *t = tasks[i];
+    int immune = 0;
+
+    if (!cg_task_live(t) || !t->pml4_phys)
+      continue;
+    /* A task already condemned is not a candidate: choosing it again would
+     * make the killer think it had made progress when it had not. */
+    if (t->pending_signals & (1ULL << (SIGKILL - 1)))
+      continue;
+    u64 points = cg_oom_badness(t, &immune);
+    if (immune)
+      continue;
+    if (!best || points > best_points) {
+      best = t;
+      best_points = points;
+    }
+  }
+  return best ? best->id : 0;
+}
+
+/* How long a cgroup is left alone after it has been taken over memory.max or
+ * memory.high. A cgroup that is over stays over until the process that took it
+ * there dies, and the fault after the kill crosses the limit again: without a
+ * floor, every one of those faults ran a fresh measurement, which is a
+ * page-table walk of every member -- the machine stopped making progress
+ * altogether and a spinlock lockup was reported somewhere unrelated. */
+#define CG_MEM_ACTION_COOLDOWN_NS (100ull * 1000000ull)
+
+/* Over memory.max: measure exactly, and kill inside the cgroup if it really is
+ * over. Called in task context with no cgroup lock held. Returns the pid
+ * killed, or 0 when the exact measurement disagreed with the estimate.
+ *
+ * No reclaim. The machine-wide allocator reclaims before it declares OOM, and
+ * that is right for the machine -- but page eviction here has no notion of
+ * whose pages it is writing out, and freeing another cgroup's memory to keep
+ * this one inside its limit is not what memory.max means. Linux reclaims
+ * INSIDE the cgroup first; until that exists, and with it a real
+ * memory.swap.current, the limit is enforced by the kill alone. */
+static usize cg_mem_over_limit(struct cgroup *cg, u64 max_pages) {
+  if (cg_mem_refresh(cg) <= max_pages)
+    return 0;
+
+  usize victim = cgroup_oom_victim(cg);
+  u64 flags;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  cg->mem_ev_max++;
+  cg->mem_ev_oom++;
+  if (victim)
+    cg->mem_ev_oom_kill++;
+  struct vfs_node *ev = cg->events_node;
+  spin_unlock_irqrestore(&cg_lock, flags);
+
+  if (victim) {
+    console_write("[OOM-KILL] cgroup over memory.max — killing pid ");
+    console_write_dec(victim);
+    console_write("\n");
+    scheduler_kill(victim, SIGKILL);
+  }
+  if (ev)
+    vfs_inotify_notify(ev, IN_MODIFY, 0);
+  return victim;
+}
+
+void cgroup_mem_note_majfault(void) {
+  if (!cg_root || !current_task)
+    return;
+  u64 flags;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  for (struct cgroup *a = cg_of(current_task->id); a; a = a->parent)
+    a->mem_pgmajfault++;
+  spin_unlock_irqrestore(&cg_lock, flags);
+}
+
+/* memory.high: a throttle rather than a kill.
+ *
+ * Linux puts an allocating task to sleep in proportion to how far past
+ * memory.high its cgroup is, and reclaims inside the cgroup; with no
+ * cgroup-targeted reclaim here, the sleep is what is left, and it is real --
+ * a cgroup past its soft limit allocates more slowly than one inside it. One
+ * tick per crossing, and crossings are rate-limited, so this can slow a cgroup
+ * down and never stop it. */
+static void cg_mem_check_high(struct cgroup *cg) {
+  u64 flags;
+  u64 high;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  high = cg->mem_high;
+  spin_unlock_irqrestore(&cg_lock, flags);
+  if (high == CG_LIM_MAX)
+    return;
+  if (cg_mem_refresh(cg) <= high)
+    return;
+  spin_lock_irqsave(&cg_lock, &flags);
+  cg->mem_ev_high++;
+  spin_unlock_irqrestore(&cg_lock, flags);
+  scheduler_sleep_ticks(1);
+}
+
+/* How many cgroups want memory accounting -- a limit, or the controller
+ * enabled. Zero is the normal case and makes the fault hook a load and a
+ * branch; the machine that never mounts cgroup2 never pays anything. */
+static volatile int cg_mem_limited;
+
+void cgroup_mem_fault_charge(u64 fault_addr) {
+  if (fault_addr >= USER_SPACE_LIMIT)
+    return; /* a kernel page: nothing charges kernel memory to a cgroup here */
+  cgroup_mem_charge_pages(1);
+}
+
+void cgroup_mem_charge_pages(u64 npages) {
+  if (!cg_root || !npages ||
+      !__atomic_load_n(&cg_mem_limited, __ATOMIC_RELAXED))
+    return;
+  struct task *cur = current_task;
+  if (!cur || !cur->pml4_phys)
+    return;
+
+  struct cgroup *over = 0, *high = 0;
+  u64 over_max = 0;
+  u64 flags;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  struct cgroup *cg = cg_of(cur->id);
+  for (struct cgroup *a = cg; a; a = a->parent) {
+    a->mem_pgfault += npages;
+    a->mem_delta += npages;
+    u64 est = a->mem_exact + a->mem_delta;
+
+    if (est > a->mem_peak)
+      a->mem_peak = est;
+    if (!high && a->mem_high != CG_LIM_MAX && est > a->mem_high)
+      high = a;
+    if (a->mem_max == CG_LIM_MAX)
+      continue;
+    if (!over && est > a->mem_max) {
+      over = a;
+      over_max = a->mem_max;
+    }
+  }
+  spin_unlock_irqrestore(&cg_lock, flags);
+
+  u64 now = (high || over) ? ktime_monotonic_ns() : 0;
+
+  if (high && high != over) {
+    int act;
+
+    spin_lock_irqsave(&cg_lock, &flags);
+    act = high->mem_high_at_ns == 0 ||
+          now - high->mem_high_at_ns >= CG_MEM_ACTION_COOLDOWN_NS;
+    if (act)
+      high->mem_high_at_ns = now;
+    spin_unlock_irqrestore(&cg_lock, flags);
+    if (act)
+      cg_mem_check_high(high);
+  }
+  if (!over)
+    return;
+  {
+    int act;
+
+    spin_lock_irqsave(&cg_lock, &flags);
+    act = over->mem_oom_at_ns == 0 ||
+          now - over->mem_oom_at_ns >= CG_MEM_ACTION_COOLDOWN_NS;
+    if (act)
+      over->mem_oom_at_ns = now;
+    spin_unlock_irqrestore(&cg_lock, flags);
+    if (!act)
+      return;
+  }
+  /* The fault itself is never failed, not even when the task that just faulted
+   * is the one chosen to die. Failing it turned a clean SIGKILL into an
+   * unhandled SIGSEGV reported against a page the kernel had in fact just
+   * installed: the process died either way, but of the wrong signal and with a
+   * fault report that named nothing real. The victim carries a pending SIGKILL
+   * and dies on its next return to ring 3. */
+  (void)cg_mem_over_limit(over, over_max);
+}
+
+/* ── cpu: weights on the stride scheduler, and the quota ─────────────────── */
+
+/* cpu.weight.nice <-> cpu.weight, the same table Linux maps them through: the
+ * scheduler weight of each nice value, rescaled so that nice 0 is 100. */
+static const u32 cg_prio_to_weight[40] = {
+    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916,
+    9548,  7620,  6100,  4904,  3906,  3121,  2501,  1991,  1586,  1277,
+    1024,  820,   655,   526,   423,   335,   272,   215,   172,   137,
+    110,   87,    70,    56,    45,    36,    29,    23,    18,    15,
+};
+
+static u32 cg_nice_to_weight(int nice) {
+  if (nice < -20)
+    nice = -20;
+  if (nice > 19)
+    nice = 19;
+  u64 w = ((u64)cg_prio_to_weight[nice + 20] * CG_CPU_WEIGHT_DEF + 512) / 1024;
+
+  if (w < CG_CPU_WEIGHT_MIN)
+    w = CG_CPU_WEIGHT_MIN;
+  if (w > CG_CPU_WEIGHT_MAX)
+    w = CG_CPU_WEIGHT_MAX;
+  return (u32)w;
+}
+
+/* The nice value whose weight is nearest to `w` — what Linux reports back. */
+static int cg_weight_to_nice(u32 w) {
+  int best = 0;
+  u64 best_err = ~0ull;
+
+  for (int n = -20; n <= 19; n++) {
+    u32 cand = cg_nice_to_weight(n);
+    u64 err = cand > w ? cand - w : w - cand;
+
+    if (err < best_err) {
+      best_err = err;
+      best = n;
+    }
+  }
+  return best;
+}
+
+/* The weight a cgroup really carries: the product of the weights from the root
+ * down to it, in units where 100 is "unweighted". Caller holds cg_lock. */
+static u64 cg_cpu_effective_weight(struct cgroup *cg) {
+  u64 w = CG_CPU_WEIGHT_DEF;
+
+  for (struct cgroup *c = cg; c && !c->is_root; c = c->parent) {
+    if (!c->parent || !(c->parent->subtree_control & CG_CTRL_CPU))
+      continue;
+    w = (w * c->cpu_weight) / CG_CPU_WEIGHT_DEF;
+    if (w < 1)
+      w = 1;
+  }
+  return w ? w : 1;
+}
+
+/* How often the stride weights are recomputed. A weight change takes effect
+ * within this, which is well below the window any CPUWeight test measures. */
+#define CG_SWEEP_MS 100
+
+/* Set when any cgroup has the cpu controller enabled, and separately when one
+ * has a cpu.max. Without a quota nothing can change between sweeps, so the
+ * tick does nothing at all ninety-nine times in a hundred; a machine that
+ * never touches the controller pays one load. */
+static volatile int cg_cpu_active;
+static volatile int cg_cpu_quota;
+
+/* Take the scheduler's cgroup weighting off every task. Called when the
+ * hierarchy goes away: cgroup_tick is what publishes those values and it stops
+ * running with the hierarchy, so a throttled task would stay throttled for
+ * ever. Caller holds no cgroup lock. */
+static void cg_sched_clear_all(void) {
+  usize slots = scheduler_task_slots();
+
+  for (usize i = 0; i < slots; i++) {
+    struct task *t = scheduler_task_slot(i);
+
+    if (!t || t->state == TASK_UNUSED)
+      continue;
+    sched_set_cgroup_stride_pct(t, 0);
+    sched_set_cgroup_throttled(t, 0);
+  }
+}
+
+void cgroup_tick(void) {
+  if (!cg_root)
+    return;
+
+  u64 now = ktime_monotonic_ns();
+  u64 flags;
+  static u64 last_sweep_ns;
+  int sweep;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  sweep = (last_sweep_ns == 0 ||
+           now - last_sweep_ns >= (u64)CG_SWEEP_MS * 1000000ull);
+  if (sweep)
+    last_sweep_ns = now;
+
+  /* Between sweeps there is only one thing that can change: a cgroup spending
+   * its cpu.max. Without a quota anywhere, the tick has nothing to do. */
+  if (!sweep && !__atomic_load_n(&cg_cpu_quota, __ATOMIC_RELAXED)) {
+    spin_unlock_irqrestore(&cg_lock, flags);
+    return;
+  }
+
+  /* 1. Roll the cpu.max periods over. */
+  for (struct cgroup *c = cg_all; c; c = c->next) {
+    if (c->cpu_quota_us == CG_LIM_MAX)
+      continue;
+    u64 period_ns = c->cpu_period_us * 1000ull;
+    if (!period_ns)
+      period_ns = CG_CPU_PERIOD_DEF_US * 1000ull;
+    if (c->cpu_period_start_ns == 0) {
+      c->cpu_period_start_ns = now;
+      c->cpu_nr_periods++; /* the first one counts, or nr_throttled outruns it */
+      continue;
+    }
+    if (now - c->cpu_period_start_ns < period_ns)
+      continue;
+    c->cpu_period_start_ns = now;
+    c->cpu_period_used_ns = 0;
+    c->cpu_nr_periods++;
+    c->cpu_throttled = 0;
+  }
+
+  /* 2. Charge the CPU time every task burned since the last tick to its
+   *    cgroups. One pass over the task table, the same shape as the alarm
+   *    sweep the tick already does. */
+  if (__atomic_load_n(&cg_cpu_active, __ATOMIC_RELAXED)) {
+    usize slots = scheduler_task_slots();
+
+    for (usize i = 0; i < slots; i++) {
+      struct task *t = scheduler_task_slot(i);
+      usize idx;
+
+      if (!t || t->state == TASK_UNUSED)
+        continue;
+      idx = scheduler_task_index(t);
+      if (idx >= CG_TASK_SLOTS)
+        continue;
+      u64 u = task_utime_ns(t), sy = task_stime_ns(t);
+      u64 total = u + sy;
+      u64 prev = cg_task_cpu_seen[idx];
+      u64 prev_u = cg_task_cpu_user_seen[idx];
+
+      cg_task_cpu_seen[idx] = total;
+      cg_task_cpu_user_seen[idx] = u;
+      if (total <= prev)
+        continue; /* a recycled slot, or no time since the last tick */
+      if (prev == 0) {
+        /* First sight of this slot. Whatever it has burned so far is not time
+         * its cgroup spent since the last tick -- charging it would hand a
+         * fresh cgroup the whole history of every task moved into it. */
+        continue;
+      }
+      u64 dt = total - prev;
+      u64 du = u > prev_u ? u - prev_u : 0;
+
+      if (du > dt)
+        du = dt;
+
+      for (struct cgroup *a = cg_of(t->id); a; a = a->parent) {
+        a->cpu_usage_ns += dt;
+        a->cpu_user_ns += du;
+        a->cpu_sys_ns += dt - du;
+        if (a->cpu_quota_us == CG_LIM_MAX)
+          continue;
+        a->cpu_period_used_ns += dt;
+        if (!a->cpu_throttled &&
+            a->cpu_period_used_ns >= a->cpu_quota_us * 1000ull) {
+          a->cpu_throttled = 1;
+          a->cpu_nr_throttled++;
+        }
+        if (a->cpu_throttled)
+          a->cpu_throttled_ns += dt;
+      }
+    }
+  }
+
+  /* 3. Publish, for every task, the stride scale and the throttle flag the
+   *    scheduler reads. Only on the sweep: these change when a control file is
+   *    written or a cgroup's membership changes, not tick by tick. Throttling
+   *    is republished every tick, because a quota can be spent mid-period. */
+  usize slots = scheduler_task_slots();
+  if (sweep) {
+    /* Members per cgroup, once, rather than once per task: the weight each
+     * task is given divides its cgroup's weight by how many share it, and
+     * asking for that count inside the loop made the sweep quadratic in the
+     * task table.
+     *
+     * RUNNABLE members, not live ones. A cgroup's weight is divided among the
+     * tasks competing for the CPU right now, which is what CFS group
+     * scheduling divides it among; counting every thread instead would have a
+     * compositor with fifty mostly-idle threads give its one busy thread a
+     * fiftieth of a share, and the desktop lanes would have paid for the
+     * controller being enabled at all. */
+    for (struct cgroup *c = cg_all; c; c = c->next)
+      c->cpu_nr_tasks = 0;
+    for (usize i = 0; i < slots; i++) {
+      struct task *t = scheduler_task_slot(i);
+
+      if (cg_task_live(t) &&
+          (t->state == TASK_READY || t->state == TASK_RUNNING))
+        cg_of(t->id)->cpu_nr_tasks++;
+    }
+  }
+  for (usize i = 0; i < slots; i++) {
+    struct task *t = scheduler_task_slot(i);
+
+    if (!cg_task_live(t))
+      continue;
+    struct cgroup *cg = cg_of(t->id);
+    int throttled = 0;
+
+    for (struct cgroup *a = cg; a; a = a->parent)
+      if (a->cpu_throttled) {
+        throttled = 1;
+        break;
+      }
+    sched_set_cgroup_throttled(t, throttled);
+
+    if (!sweep)
+      continue;
+    u32 pct = 0; /* 0 == "no cgroup weighting", the scheduler's default */
+    if (!cg->is_root && cg->parent &&
+        (cg->parent->subtree_control & CG_CTRL_CPU)) {
+      u64 w = cg_cpu_effective_weight(cg);
+      u64 nr = cg->cpu_nr_tasks;
+
+      if (nr < 1)
+        nr = 1;
+      u64 p = (10000ull * nr) / w;
+      if (p < 1)
+        p = 1;
+      if (p > 1000000ull)
+        p = 1000000ull;
+      pct = (u32)p;
+    }
+    sched_set_cgroup_stride_pct(t, pct);
+  }
+  spin_unlock_irqrestore(&cg_lock, flags);
+}
+
+/* ── io: accounting and the rate ceilings ────────────────────────────────── */
+
+/* One second of history is what io.max is expressed against. */
+#define CG_IO_WINDOW_NS 1000000000ull
+
+static volatile int cg_io_limited;
+
+/* The slot a cgroup keeps for one device, taken on first use. Caller holds
+ * cg_lock. NULL when every slot is spoken for by another device. */
+static struct cg_io_dev *cg_io_slot(struct cgroup *cg, u32 devno, int create) {
+  for (int i = 0; i < CG_IO_DEVS; i++)
+    if (cg->io_dev[i].devno == devno)
+      return &cg->io_dev[i];
+  if (!create)
+    return 0;
+  for (int i = 0; i < CG_IO_DEVS; i++)
+    if (cg->io_dev[i].devno == 0) {
+      struct cg_io_dev *d = &cg->io_dev[i];
+
+      d->devno = devno;
+      d->rbps = d->wbps = d->riops = d->wiops = CG_LIM_MAX;
+      return d;
+    }
+  return 0;
+}
+
+/* Drop the window once a second has passed. Caller holds cg_lock. */
+static void cg_io_window_roll(struct cg_io_dev *d, u64 now) {
+  if (d->win_start_ns && now - d->win_start_ns < CG_IO_WINDOW_NS)
+    return;
+  d->win_start_ns = now;
+  d->win_rbytes = 0;
+  d->win_wbytes = 0;
+  d->win_rios = 0;
+  d->win_wios = 0;
+}
+
+void cgroup_io_account(u32 devno, u64 bytes, int write) {
+  if (!cg_root || !current_task || !devno)
+    return;
+  u64 now = ktime_monotonic_ns();
+  u64 flags;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  for (struct cgroup *a = cg_of(current_task->id); a; a = a->parent) {
+    struct cg_io_dev *d = cg_io_slot(a, devno, 1);
+
+    if (!d)
+      continue;
+    cg_io_window_roll(d, now);
+    if (write) {
+      d->wbytes += bytes;
+      d->wios++;
+      d->win_wbytes += bytes;
+      d->win_wios++;
+    } else {
+      d->rbytes += bytes;
+      d->rios++;
+      d->win_rbytes += bytes;
+      d->win_rios++;
+    }
+  }
+  spin_unlock_irqrestore(&cg_lock, flags);
+}
+
+/* How long this request has to wait to keep its cgroup inside io.max.
+ *
+ * A rate limit of R per second over a window that has already carried U means
+ * the window may not end before (U + this request)/R seconds after it began;
+ * the wait is the remainder of that. The longest wait any one request can be
+ * given is the window itself, so a limit can slow a stream down but never
+ * wedge it. */
+static u64 cg_io_wait_for(u64 used, u64 limit, u64 want, u64 elapsed_ns) {
+  if (limit == CG_LIM_MAX || limit == 0)
+    return 0;
+  u64 need_ns = ((used + want) * CG_IO_WINDOW_NS) / limit;
+
+  if (need_ns <= elapsed_ns)
+    return 0;
+  u64 wait = need_ns - elapsed_ns;
+
+  return wait > CG_IO_WINDOW_NS ? CG_IO_WINDOW_NS : wait;
+}
+
+u64 cgroup_io_delay_ns(u32 devno, u64 bytes, int write) {
+  if (!cg_root || !devno || !current_task ||
+      !__atomic_load_n(&cg_io_limited, __ATOMIC_RELAXED))
+    return 0;
+  u64 now = ktime_monotonic_ns();
+  u64 worst = 0;
+  u64 flags;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  for (struct cgroup *a = cg_of(current_task->id); a; a = a->parent) {
+    struct cg_io_dev *d = cg_io_slot(a, devno, 0);
+
+    if (!d)
+      continue;
+    cg_io_window_roll(d, now);
+    u64 elapsed = now - d->win_start_ns;
+    u64 w;
+
+    if (write) {
+      w = cg_io_wait_for(d->win_wbytes, d->wbps, bytes, elapsed);
+      if (w > worst)
+        worst = w;
+      w = cg_io_wait_for(d->win_wios, d->wiops, 1, elapsed);
+    } else {
+      w = cg_io_wait_for(d->win_rbytes, d->rbps, bytes, elapsed);
+      if (w > worst)
+        worst = w;
+      w = cg_io_wait_for(d->win_rios, d->riops, 1, elapsed);
+    }
+    if (w > worst)
+      worst = w;
+  }
+  spin_unlock_irqrestore(&cg_lock, flags);
+  return worst;
+}
+
+/* Recount the "is anything limited at all?" flags after a control-file write.
+ * Caller holds cg_lock. */
+static void cg_limits_recount(void) {
+  int mem = 0, io = 0, cpu = 0, quota = 0;
+
+  for (struct cgroup *c = cg_all; c; c = c->next) {
+    /* A limit is not the only reason to charge. memory.current is measured on
+     * demand, but memory.stat's pgfault is a count, and a counter kept only
+     * while a limit happens to be set reads zero for every cgroup that asked
+     * for accounting alone -- which is most of what systemd asks for. Enabling
+     * the controller is the ask. */
+    if (c->mem_max != CG_LIM_MAX || c->mem_high != CG_LIM_MAX ||
+        (c->subtree_control & CG_CTRL_MEMORY))
+      mem++;
+    for (int i = 0; i < CG_IO_DEVS; i++) {
+      struct cg_io_dev *d = &c->io_dev[i];
+
+      if (d->devno && (d->rbps != CG_LIM_MAX || d->wbps != CG_LIM_MAX ||
+                       d->riops != CG_LIM_MAX || d->wiops != CG_LIM_MAX))
+        io++;
+    }
+    if (c->subtree_control & CG_CTRL_CPU)
+      cpu++;
+    if (c->cpu_quota_us != CG_LIM_MAX) {
+      cpu++;
+      quota++;
+    }
+  }
+  __atomic_store_n(&cg_mem_limited, mem, __ATOMIC_RELAXED);
+  __atomic_store_n(&cg_io_limited, io, __ATOMIC_RELAXED);
+  __atomic_store_n(&cg_cpu_active, cpu, __ATOMIC_RELAXED);
+  __atomic_store_n(&cg_cpu_quota, quota, __ATOMIC_RELAXED);
+}
+
 /* ── cgroup.events: the edge systemd waits on ────────────────────────────── */
 
 /* systemd watches cgroup.events with inotify to learn that a unit's last
@@ -315,6 +1149,25 @@ enum cg_file {
   CGF_PIDS_MAX,
   CGF_PIDS_EVENTS,
   CGF_PIDS_PEAK,
+  CGF_MEM_CURRENT,
+  CGF_MEM_PEAK,
+  CGF_MEM_MIN,
+  CGF_MEM_LOW,
+  CGF_MEM_HIGH,
+  CGF_MEM_MAX,
+  CGF_MEM_EVENTS,
+  CGF_MEM_EVENTS_LOCAL,
+  CGF_MEM_STAT,
+  CGF_MEM_SWAP_CURRENT,
+  CGF_MEM_SWAP_MAX,
+  CGF_MEM_OOM_GROUP,
+  CGF_CPU_STAT,
+  CGF_CPU_WEIGHT,
+  CGF_CPU_WEIGHT_NICE,
+  CGF_CPU_MAX,
+  CGF_IO_STAT,
+  CGF_IO_MAX,
+  CGF_IO_WEIGHT,
 };
 
 struct cg_filenode {
@@ -430,7 +1283,7 @@ static usize cg_render(struct cgroup *cg, enum cg_file kind, char *buf,
     /* A cgroup's available controllers are the ones its parent enabled for its
      * children; the root's are everything the kernel implements. */
     spin_lock_irqsave(&cg_lock, &flags);
-    u32 avail = cg->is_root ? CG_CTRL_PIDS
+    u32 avail = cg->is_root ? CG_CTRL_ALL
                             : (cg->parent ? cg->parent->subtree_control : 0);
     spin_unlock_irqrestore(&cg_lock, flags);
     int first = 1;
@@ -524,6 +1377,202 @@ static usize cg_render(struct cgroup *cg, enum cg_file kind, char *buf,
     len = cg_append(buf, cap, len, "\n");
     break;
   }
+  /* ── memory ── */
+  case CGF_MEM_CURRENT:
+  case CGF_MEM_PEAK: {
+    /* Measured on the spot. The running estimate the fault path keeps is a
+     * trigger, never an answer: a reader asking what a cgroup uses gets the
+     * same page-table walk /proc/<pid>/status answers VmRSS with. */
+    u64 pages = cg_mem_refresh(cg);
+
+    if (kind == CGF_MEM_PEAK) {
+      spin_lock_irqsave(&cg_lock, &flags);
+      pages = cg->mem_peak;
+      spin_unlock_irqrestore(&cg_lock, flags);
+    }
+    len = cg_append_u64(buf, cap, len, pages * PAGE_SIZE);
+    len = cg_append(buf, cap, len, "\n");
+    break;
+  }
+  case CGF_MEM_MIN:
+  case CGF_MEM_LOW:
+  case CGF_MEM_HIGH:
+  case CGF_MEM_MAX:
+  case CGF_MEM_SWAP_MAX: {
+    spin_lock_irqsave(&cg_lock, &flags);
+    u64 v = kind == CGF_MEM_MIN    ? cg->mem_min
+            : kind == CGF_MEM_LOW  ? cg->mem_low
+            : kind == CGF_MEM_HIGH ? cg->mem_high
+            : kind == CGF_MEM_MAX  ? cg->mem_max
+                                   : cg->mem_swap_max;
+    spin_unlock_irqrestore(&cg_lock, flags);
+    if (v == CG_LIM_MAX)
+      len = cg_append(buf, cap, len, "max\n");
+    else {
+      len = cg_append_u64(buf, cap, len, v * PAGE_SIZE);
+      len = cg_append(buf, cap, len, "\n");
+    }
+    break;
+  }
+  case CGF_MEM_SWAP_CURRENT:
+    /* Nothing charges swap to a cgroup yet: a page written out by the shared
+     * eviction ring is not attributed back to whoever owned it. Reporting a
+     * figure would be inventing one. */
+    len = cg_append(buf, cap, len, "0\n");
+    break;
+  case CGF_MEM_OOM_GROUP: {
+    spin_lock_irqsave(&cg_lock, &flags);
+    int g = cg->mem_oom_group;
+    spin_unlock_irqrestore(&cg_lock, flags);
+    len = cg_append_u64(buf, cap, len, (u64)g);
+    len = cg_append(buf, cap, len, "\n");
+    break;
+  }
+  case CGF_MEM_EVENTS:
+  case CGF_MEM_EVENTS_LOCAL: {
+    spin_lock_irqsave(&cg_lock, &flags);
+    u64 lo = cg->mem_ev_low, hi = cg->mem_ev_high, mx = cg->mem_ev_max;
+    u64 oom = cg->mem_ev_oom, ok = cg->mem_ev_oom_kill;
+    spin_unlock_irqrestore(&cg_lock, flags);
+    len = cg_append(buf, cap, len, "low ");
+    len = cg_append_u64(buf, cap, len, lo);
+    len = cg_append(buf, cap, len, "\nhigh ");
+    len = cg_append_u64(buf, cap, len, hi);
+    len = cg_append(buf, cap, len, "\nmax ");
+    len = cg_append_u64(buf, cap, len, mx);
+    len = cg_append(buf, cap, len, "\noom ");
+    len = cg_append_u64(buf, cap, len, oom);
+    len = cg_append(buf, cap, len, "\noom_kill ");
+    len = cg_append_u64(buf, cap, len, ok);
+    len = cg_append(buf, cap, len, "\n");
+    break;
+  }
+  case CGF_MEM_STAT: {
+    /* Only what is really counted. Linux lists thirty-odd keys here, most of
+     * them breakdowns this kernel does not keep; printing them as zero would
+     * say "no file pages" about a cgroup full of them. A reader parses keys,
+     * so the honest set is a short one. */
+    spin_lock_irqsave(&cg_lock, &flags);
+    u64 pf = cg->mem_pgfault, mf = cg->mem_pgmajfault;
+    spin_unlock_irqrestore(&cg_lock, flags);
+    len = cg_append(buf, cap, len, "pgfault ");
+    len = cg_append_u64(buf, cap, len, pf);
+    len = cg_append(buf, cap, len, "\npgmajfault ");
+    len = cg_append_u64(buf, cap, len, mf);
+    len = cg_append(buf, cap, len, "\n");
+    break;
+  }
+  /* ── cpu ── */
+  case CGF_CPU_STAT: {
+    spin_lock_irqsave(&cg_lock, &flags);
+    u64 us = cg->cpu_usage_ns / 1000, uu = cg->cpu_user_ns / 1000;
+    u64 sy = cg->cpu_sys_ns / 1000, np = cg->cpu_nr_periods;
+    u64 nt = cg->cpu_nr_throttled, tu = cg->cpu_throttled_ns / 1000;
+    spin_unlock_irqrestore(&cg_lock, flags);
+    len = cg_append(buf, cap, len, "usage_usec ");
+    len = cg_append_u64(buf, cap, len, us);
+    len = cg_append(buf, cap, len, "\nuser_usec ");
+    len = cg_append_u64(buf, cap, len, uu);
+    len = cg_append(buf, cap, len, "\nsystem_usec ");
+    len = cg_append_u64(buf, cap, len, sy);
+    len = cg_append(buf, cap, len, "\nnr_periods ");
+    len = cg_append_u64(buf, cap, len, np);
+    len = cg_append(buf, cap, len, "\nnr_throttled ");
+    len = cg_append_u64(buf, cap, len, nt);
+    len = cg_append(buf, cap, len, "\nthrottled_usec ");
+    len = cg_append_u64(buf, cap, len, tu);
+    len = cg_append(buf, cap, len, "\n");
+    break;
+  }
+  case CGF_CPU_WEIGHT: {
+    spin_lock_irqsave(&cg_lock, &flags);
+    u32 w = cg->cpu_weight;
+    spin_unlock_irqrestore(&cg_lock, flags);
+    len = cg_append_u64(buf, cap, len, (u64)w);
+    len = cg_append(buf, cap, len, "\n");
+    break;
+  }
+  case CGF_CPU_WEIGHT_NICE: {
+    spin_lock_irqsave(&cg_lock, &flags);
+    u32 w = cg->cpu_weight;
+    spin_unlock_irqrestore(&cg_lock, flags);
+    int nice = cg_weight_to_nice(w);
+    if (nice < 0) {
+      len = cg_append(buf, cap, len, "-");
+      nice = -nice;
+    }
+    len = cg_append_u64(buf, cap, len, (u64)nice);
+    len = cg_append(buf, cap, len, "\n");
+    break;
+  }
+  case CGF_CPU_MAX: {
+    spin_lock_irqsave(&cg_lock, &flags);
+    u64 q = cg->cpu_quota_us, per = cg->cpu_period_us;
+    spin_unlock_irqrestore(&cg_lock, flags);
+    if (q == CG_LIM_MAX)
+      len = cg_append(buf, cap, len, "max");
+    else
+      len = cg_append_u64(buf, cap, len, q);
+    len = cg_append(buf, cap, len, " ");
+    len = cg_append_u64(buf, cap, len, per);
+    len = cg_append(buf, cap, len, "\n");
+    break;
+  }
+  /* ── io ── */
+  case CGF_IO_WEIGHT: {
+    spin_lock_irqsave(&cg_lock, &flags);
+    u32 w = cg->io_weight;
+    spin_unlock_irqrestore(&cg_lock, flags);
+    len = cg_append(buf, cap, len, "default ");
+    len = cg_append_u64(buf, cap, len, (u64)w);
+    len = cg_append(buf, cap, len, "\n");
+    break;
+  }
+  case CGF_IO_STAT:
+  case CGF_IO_MAX: {
+    struct cg_io_dev snap[CG_IO_DEVS];
+
+    spin_lock_irqsave(&cg_lock, &flags);
+    memcpy(snap, cg->io_dev, sizeof(snap));
+    spin_unlock_irqrestore(&cg_lock, flags);
+    for (int i = 0; i < CG_IO_DEVS; i++) {
+      struct cg_io_dev *d = &snap[i];
+
+      if (!d->devno)
+        continue;
+      if (kind == CGF_IO_MAX && d->rbps == CG_LIM_MAX &&
+          d->wbps == CG_LIM_MAX && d->riops == CG_LIM_MAX &&
+          d->wiops == CG_LIM_MAX)
+        continue;
+      len = cg_append_u64(buf, cap, len, (u64)(d->devno >> 8));
+      len = cg_append(buf, cap, len, ":");
+      len = cg_append_u64(buf, cap, len, (u64)(d->devno & 0xff));
+      if (kind == CGF_IO_STAT) {
+        len = cg_append(buf, cap, len, " rbytes=");
+        len = cg_append_u64(buf, cap, len, d->rbytes);
+        len = cg_append(buf, cap, len, " wbytes=");
+        len = cg_append_u64(buf, cap, len, d->wbytes);
+        len = cg_append(buf, cap, len, " rios=");
+        len = cg_append_u64(buf, cap, len, d->rios);
+        len = cg_append(buf, cap, len, " wios=");
+        len = cg_append_u64(buf, cap, len, d->wios);
+      } else {
+        static const char *const keys[4] = {" rbps=", " wbps=", " riops=",
+                                            " wiops="};
+        u64 vals[4] = {d->rbps, d->wbps, d->riops, d->wiops};
+
+        for (int k = 0; k < 4; k++) {
+          len = cg_append(buf, cap, len, keys[k]);
+          if (vals[k] == CG_LIM_MAX)
+            len = cg_append(buf, cap, len, "max");
+          else
+            len = cg_append_u64(buf, cap, len, vals[k]);
+        }
+      }
+      len = cg_append(buf, cap, len, "\n");
+    }
+    break;
+  }
   default:
     break;
   }
@@ -565,6 +1614,26 @@ static u64 cg_parse_u64(const char *s, usize len, int *ok) {
   }
   *ok = digits > 0;
   return v;
+}
+
+/* A cgroup v2 limit file: a decimal number, or the literal "max". Returns 0 and
+ * fills *out, or -EINVAL. */
+static int cg_parse_limit(const char *s, usize len, u64 *out) {
+  usize i = 0;
+
+  while (i < len && (s[i] == ' ' || s[i] == '\t'))
+    i++;
+  if (len - i >= 3 && strncmp(s + i, "max", 3) == 0) {
+    *out = CG_LIM_MAX;
+    return 0;
+  }
+  int ok = 0;
+  u64 v = cg_parse_u64(s + i, len - i, &ok);
+
+  if (!ok)
+    return -EINVAL;
+  *out = v;
+  return 0;
 }
 
 /* Move every thread of `pid`'s thread group into `cg`. */
@@ -659,7 +1728,7 @@ static isize cg_write_cb(struct vfs_node *node, u64 offset, const char *buffer,
         return -ENOENT;
       /* Only a controller this cgroup itself has available may be delegated. */
       spin_lock_irqsave(&cg_lock, &lock_flags);
-      u32 avail = cg->is_root ? CG_CTRL_PIDS
+      u32 avail = cg->is_root ? CG_CTRL_ALL
                               : (cg->parent ? cg->parent->subtree_control : 0);
       spin_unlock_irqrestore(&cg_lock, lock_flags);
       if (!(avail & bit))
@@ -671,7 +1740,13 @@ static isize cg_write_cb(struct vfs_node *node, u64 offset, const char *buffer,
     }
     spin_lock_irqsave(&cg_lock, &lock_flags);
     cg->subtree_control = (cg->subtree_control | add) & ~del;
+    cg_limits_recount();
     spin_unlock_irqrestore(&cg_lock, lock_flags);
+    /* The children's interface files exist exactly while their parent
+     * delegates the controller, so enabling one has to create them in every
+     * child that already exists -- systemd writes cgroup.subtree_control after
+     * it has made the slice's children, not before. */
+    cg_sync_children_controller_files(cg);
     return (isize)size;
   }
   case CGF_PIDS_MAX:
@@ -697,6 +1772,231 @@ static isize cg_write_cb(struct vfs_node *node, u64 offset, const char *buffer,
       cg->max_depth = v;
     else
       cg->max_descendants = v;
+    spin_unlock_irqrestore(&cg_lock, lock_flags);
+    return (isize)size;
+  }
+  /* ── memory: the byte limits ── */
+  case CGF_MEM_MIN:
+  case CGF_MEM_LOW:
+  case CGF_MEM_HIGH:
+  case CGF_MEM_MAX:
+  case CGF_MEM_SWAP_MAX: {
+    u64 v;
+    int r = cg_parse_limit(buffer, size, &v);
+
+    if (r < 0)
+      return r;
+    /* Written in bytes, kept in pages: a limit that is not a whole number of
+     * pages rounds down, so the cgroup can never exceed what was asked for. */
+    if (v != CG_LIM_MAX)
+      v /= PAGE_SIZE;
+    spin_lock_irqsave(&cg_lock, &lock_flags);
+    if (fn->kind == CGF_MEM_MIN)
+      cg->mem_min = v;
+    else if (fn->kind == CGF_MEM_LOW)
+      cg->mem_low = v;
+    else if (fn->kind == CGF_MEM_HIGH)
+      cg->mem_high = v;
+    else if (fn->kind == CGF_MEM_MAX)
+      cg->mem_max = v;
+    else
+      cg->mem_swap_max = v;
+    /* A fresh limit must be judged against a fresh measurement, not against
+     * whatever estimate the old one left behind. */
+    cg->mem_delta = 0;
+    cg->mem_exact = 0;
+    cg_limits_recount();
+    spin_unlock_irqrestore(&cg_lock, lock_flags);
+    /* Setting a limit below what the cgroup already uses is the one moment a
+     * limit can be exceeded without a single new page being faulted. Linux
+     * reclaims and, failing that, kills, right here. */
+    if (fn->kind == CGF_MEM_MAX && v != CG_LIM_MAX &&
+        cg_mem_refresh(cg) > v)
+      cg_mem_over_limit(cg, v);
+    return (isize)size;
+  }
+  case CGF_MEM_OOM_GROUP: {
+    int ok = 0;
+    u64 v = cg_parse_u64(buffer, size, &ok);
+
+    if (!ok || v > 1)
+      return -EINVAL;
+    spin_lock_irqsave(&cg_lock, &lock_flags);
+    cg->mem_oom_group = (int)v;
+    spin_unlock_irqrestore(&cg_lock, lock_flags);
+    return (isize)size;
+  }
+  /* ── cpu ── */
+  case CGF_CPU_WEIGHT: {
+    int ok = 0;
+    u64 v = cg_parse_u64(buffer, size, &ok);
+
+    if (!ok || v < CG_CPU_WEIGHT_MIN || v > CG_CPU_WEIGHT_MAX)
+      return -ERANGE;
+    spin_lock_irqsave(&cg_lock, &lock_flags);
+    cg->cpu_weight = (u32)v;
+    spin_unlock_irqrestore(&cg_lock, lock_flags);
+    return (isize)size;
+  }
+  case CGF_CPU_WEIGHT_NICE: {
+    int nice = 0;
+    usize i = 0;
+    int neg = 0, digits = 0;
+
+    while (i < size && (buffer[i] == ' ' || buffer[i] == '\t'))
+      i++;
+    if (i < size && (buffer[i] == '-' || buffer[i] == '+'))
+      neg = buffer[i++] == '-';
+    while (i < size && buffer[i] >= '0' && buffer[i] <= '9') {
+      nice = nice * 10 + (buffer[i++] - '0');
+      digits++;
+      if (nice > 1000)
+        break;
+    }
+    if (!digits)
+      return -EINVAL;
+    if (neg)
+      nice = -nice;
+    if (nice < -20 || nice > 19)
+      return -ERANGE;
+    spin_lock_irqsave(&cg_lock, &lock_flags);
+    cg->cpu_weight = cg_nice_to_weight(nice);
+    spin_unlock_irqrestore(&cg_lock, lock_flags);
+    return (isize)size;
+  }
+  case CGF_CPU_MAX: {
+    /* "QUOTA [PERIOD]", QUOTA either a number of microseconds or "max". */
+    usize i = 0;
+    u64 quota, period = CG_CPU_PERIOD_DEF_US;
+
+    while (i < size && (buffer[i] == ' ' || buffer[i] == '\t'))
+      i++;
+    if (size - i >= 3 && strncmp(buffer + i, "max", 3) == 0) {
+      quota = CG_LIM_MAX;
+      i += 3;
+    } else {
+      int ok = 0;
+      quota = cg_parse_u64(buffer + i, size - i, &ok);
+      if (!ok)
+        return -EINVAL;
+      while (i < size && buffer[i] >= '0' && buffer[i] <= '9')
+        i++;
+    }
+    while (i < size && (buffer[i] == ' ' || buffer[i] == '\t'))
+      i++;
+    if (i < size && buffer[i] >= '0' && buffer[i] <= '9') {
+      int ok = 0;
+      u64 p = cg_parse_u64(buffer + i, size - i, &ok);
+      if (!ok || p == 0)
+        return -EINVAL;
+      period = p;
+    }
+    spin_lock_irqsave(&cg_lock, &lock_flags);
+    cg->cpu_quota_us = quota;
+    cg->cpu_period_us = period;
+    cg->cpu_period_used_ns = 0;
+    cg->cpu_period_start_ns = 0;
+    cg->cpu_throttled = 0;
+    cg_limits_recount();
+    spin_unlock_irqrestore(&cg_lock, lock_flags);
+    return (isize)size;
+  }
+  /* ── io ── */
+  case CGF_IO_WEIGHT: {
+    usize i = 0;
+    int ok = 0;
+
+    /* "default 100" or "100", as Linux accepts both. */
+    while (i < size && (buffer[i] == ' ' || buffer[i] == '\t'))
+      i++;
+    if (size - i >= 7 && strncmp(buffer + i, "default", 7) == 0)
+      i += 7;
+    u64 v = cg_parse_u64(buffer + i, size - i, &ok);
+    if (!ok || v < 1 || v > 10000)
+      return -ERANGE;
+    spin_lock_irqsave(&cg_lock, &lock_flags);
+    cg->io_weight = (u32)v;
+    spin_unlock_irqrestore(&cg_lock, lock_flags);
+    return (isize)size;
+  }
+  case CGF_IO_MAX: {
+    /* "MAJ:MIN rbps=... wbps=... riops=... wiops=...", any subset, each value
+     * a number or "max". */
+    usize i = 0;
+    int ok = 0;
+
+    while (i < size && (buffer[i] == ' ' || buffer[i] == '\t'))
+      i++;
+    u64 major = cg_parse_u64(buffer + i, size - i, &ok);
+    if (!ok)
+      return -EINVAL;
+    while (i < size && buffer[i] >= '0' && buffer[i] <= '9')
+      i++;
+    if (i >= size || buffer[i] != ':')
+      return -EINVAL;
+    i++;
+    u64 minor = cg_parse_u64(buffer + i, size - i, &ok);
+    if (!ok)
+      return -EINVAL;
+    while (i < size && buffer[i] >= '0' && buffer[i] <= '9')
+      i++;
+    u32 devno = (u32)((major << 8) | (minor & 0xff));
+    if (!devno)
+      return -EINVAL;
+
+    u64 vals[4] = {CG_LIM_MAX, CG_LIM_MAX, CG_LIM_MAX, CG_LIM_MAX};
+    int seen[4] = {0, 0, 0, 0};
+    static const char *const keys[4] = {"rbps", "wbps", "riops", "wiops"};
+
+    while (i < size) {
+      while (i < size && (buffer[i] == ' ' || buffer[i] == '\t' ||
+                          buffer[i] == '\n'))
+        i++;
+      if (i >= size)
+        break;
+      usize start = i;
+      while (i < size && buffer[i] != '=' && buffer[i] != ' ' &&
+             buffer[i] != '\n')
+        i++;
+      if (i >= size || buffer[i] != '=')
+        return -EINVAL;
+      usize klen = i - start;
+      i++;
+      int which = -1;
+      for (int k = 0; k < 4; k++)
+        if (strlen(keys[k]) == klen && strncmp(buffer + start, keys[k], klen) == 0)
+          which = k;
+      if (which < 0)
+        return -EINVAL;
+      if (size - i >= 3 && strncmp(buffer + i, "max", 3) == 0) {
+        vals[which] = CG_LIM_MAX;
+        i += 3;
+      } else {
+        int vok = 0;
+        vals[which] = cg_parse_u64(buffer + i, size - i, &vok);
+        if (!vok)
+          return -EINVAL;
+        while (i < size && buffer[i] >= '0' && buffer[i] <= '9')
+          i++;
+      }
+      seen[which] = 1;
+    }
+
+    spin_lock_irqsave(&cg_lock, &lock_flags);
+    struct cg_io_dev *d = cg_io_slot(cg, devno, 1);
+    if (!d) {
+      spin_unlock_irqrestore(&cg_lock, lock_flags);
+      return -ENOSPC;
+    }
+    if (seen[0])
+      d->rbps = vals[0];
+    if (seen[1])
+      d->wbps = vals[1];
+    if (seen[2])
+      d->riops = vals[2];
+    if (seen[3])
+      d->wiops = vals[3];
+    cg_limits_recount();
     spin_unlock_irqrestore(&cg_lock, lock_flags);
     return (isize)size;
   }
@@ -790,6 +2090,53 @@ static void cg_sync_controller_files(struct cgroup *cg) {
     cg_rmfile(cg, "pids.max");
     cg_rmfile(cg, "pids.events");
   }
+  if (avail & CG_CTRL_MEMORY) {
+    cg_mkfile(cg, "memory.current", CGF_MEM_CURRENT, 0);
+    cg_mkfile(cg, "memory.peak", CGF_MEM_PEAK, 0);
+    cg_mkfile(cg, "memory.min", CGF_MEM_MIN, 1);
+    cg_mkfile(cg, "memory.low", CGF_MEM_LOW, 1);
+    cg_mkfile(cg, "memory.high", CGF_MEM_HIGH, 1);
+    cg_mkfile(cg, "memory.max", CGF_MEM_MAX, 1);
+    cg_mkfile(cg, "memory.events", CGF_MEM_EVENTS, 0);
+    cg_mkfile(cg, "memory.events.local", CGF_MEM_EVENTS_LOCAL, 0);
+    cg_mkfile(cg, "memory.stat", CGF_MEM_STAT, 0);
+    cg_mkfile(cg, "memory.swap.current", CGF_MEM_SWAP_CURRENT, 0);
+    cg_mkfile(cg, "memory.swap.max", CGF_MEM_SWAP_MAX, 1);
+    cg_mkfile(cg, "memory.oom.group", CGF_MEM_OOM_GROUP, 1);
+  } else {
+    cg_rmfile(cg, "memory.current");
+    cg_rmfile(cg, "memory.peak");
+    cg_rmfile(cg, "memory.min");
+    cg_rmfile(cg, "memory.low");
+    cg_rmfile(cg, "memory.high");
+    cg_rmfile(cg, "memory.max");
+    cg_rmfile(cg, "memory.events");
+    cg_rmfile(cg, "memory.events.local");
+    cg_rmfile(cg, "memory.stat");
+    cg_rmfile(cg, "memory.swap.current");
+    cg_rmfile(cg, "memory.swap.max");
+    cg_rmfile(cg, "memory.oom.group");
+  }
+  if (avail & CG_CTRL_CPU) {
+    cg_mkfile(cg, "cpu.stat", CGF_CPU_STAT, 0);
+    cg_mkfile(cg, "cpu.weight", CGF_CPU_WEIGHT, 1);
+    cg_mkfile(cg, "cpu.weight.nice", CGF_CPU_WEIGHT_NICE, 1);
+    cg_mkfile(cg, "cpu.max", CGF_CPU_MAX, 1);
+  } else {
+    cg_rmfile(cg, "cpu.stat");
+    cg_rmfile(cg, "cpu.weight");
+    cg_rmfile(cg, "cpu.weight.nice");
+    cg_rmfile(cg, "cpu.max");
+  }
+  if (avail & CG_CTRL_IO) {
+    cg_mkfile(cg, "io.stat", CGF_IO_STAT, 0);
+    cg_mkfile(cg, "io.max", CGF_IO_MAX, 1);
+    cg_mkfile(cg, "io.weight", CGF_IO_WEIGHT, 1);
+  } else {
+    cg_rmfile(cg, "io.stat");
+    cg_rmfile(cg, "io.max");
+    cg_rmfile(cg, "io.weight");
+  }
 }
 
 static void cg_populate(struct cgroup *cg) {
@@ -811,6 +2158,24 @@ static int cg_mkdir_cb(struct vfs_node *dir, const char *name, u32 mode);
 static int cg_rmdir_cb(struct vfs_node *dir, const char *name);
 static int cg_unlink_cb(struct vfs_node *dir, const char *name);
 
+/* Rebuild the controller files of every direct child of `cg`, after its
+ * cgroup.subtree_control changed. Takes no cgroup lock: cg_mkfile and
+ * cg_rmfile work on the VFS tree, which has its own, and the child list is
+ * read under cg_lock only long enough to copy it. */
+static void cg_sync_children_controller_files(struct cgroup *cg) {
+  struct cgroup *kids[64];
+  int n = 0;
+  u64 flags;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  for (struct cgroup *c = cg_all; c && n < 64; c = c->next)
+    if (c->parent == cg && !c->removed && c->dir)
+      kids[n++] = c;
+  spin_unlock_irqrestore(&cg_lock, flags);
+  for (int i = 0; i < n; i++)
+    cg_sync_controller_files(kids[i]);
+}
+
 static void cg_dir_init(struct cgroup *cg, struct vfs_node *dir) {
   cg->dir = dir;
   dir->inode->data = cg;
@@ -831,6 +2196,13 @@ static struct cgroup *cg_new(struct cgroup *parent, struct vfs_node *dir) {
   cg->pids_max = CG_PIDS_MAX_UNSET;
   cg->max_depth = CG_PIDS_MAX_UNSET;
   cg->max_descendants = CG_PIDS_MAX_UNSET;
+  cg->mem_max = CG_LIM_MAX;
+  cg->mem_high = CG_LIM_MAX;
+  cg->mem_swap_max = CG_LIM_MAX;
+  cg->cpu_weight = CG_CPU_WEIGHT_DEF;
+  cg->cpu_quota_us = CG_LIM_MAX;
+  cg->cpu_period_us = CG_CPU_PERIOD_DEF_US;
+  cg->io_weight = CG_CPU_WEIGHT_DEF;
   cg->is_root = parent ? 0 : 1;
   cg_dir_init(cg, dir);
 
@@ -896,6 +2268,7 @@ static void cg_forget(struct cgroup *cg) {
     }
     pp = &(*pp)->next;
   }
+  cg_limits_recount(); /* its limits are gone with it */
   /* Anything still pointing here belongs to the parent now, exactly as Linux
    * refuses the rmdir until the cgroup is empty and then has nothing to move. */
   for (u32 i = 0; i < CG_SLOTS; i++)
@@ -1022,6 +2395,14 @@ static int cg_umount_cb(struct vfs_node *root_node) {
     kfree(to_free);
     to_free = next;
   }
+  {
+    u64 rf;
+
+    spin_lock_irqsave(&cg_lock, &rf);
+    cg_limits_recount();
+    spin_unlock_irqrestore(&cg_lock, rf);
+  }
+  cg_sched_clear_all();
   return 0;
 }
 

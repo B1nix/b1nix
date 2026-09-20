@@ -308,7 +308,7 @@ fi
 # the guest runs. Discovering them automatically meant every run -- including
 # the ones that only read registers and print numbers -- left the person at the
 # machine with a dead keyboard and mouse. Name them to hand them over:
-#   INPUT_EVDEVS="/dev/input/event10 /dev/input/event11" tools/drm/run-...
+#   INPUT_EVDEVS="/dev/input/event10 /dev/input/event11" tools/import/drm/run-...
 : "${INPUT_EVDEVS:=}"
 case "${EXTRA_QEMU_ARGS:-}" in
 *input-linux*) ;;

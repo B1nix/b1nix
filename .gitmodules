@@ -1,4 +1,4 @@
-[submodule "userspace/b1cc"]
-	path = userspace/b1cc
+[submodule "third_party/b1cc"]
+	path = third_party/b1cc
 	url = https://github.com/B1nix/b1cc.git
 	branch = main

@@ -1,0 +1,187 @@
+#!/bin/sh
+# Collect what a b1nix bug report needs into one plain-text file.
+#
+# Plain text and one file on purpose: the person sending it can read it first,
+# and a report nobody is willing to attach has failed at its only job. The
+# header block is stable across releases because the hardware compatibility
+# list is generated from it -- see docs/distro/b1nix-report.md.
+#
+#   b1nix-report              # writes /tmp/b1nix-report-<date>.txt
+#   b1nix-report -o FILE      # writes FILE ("-" for stdout)
+#   b1nix-report --no-ask     # skip the four questions, leave them unknown
+set -eu
+
+SCHEMA=1
+OUT=""
+ASK=1
+MAX_BYTES="${MAX_BYTES:-1048576}"
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-o) OUT="${2:?-o needs a file}"; shift 2 ;;
+	--no-ask) ASK=0; shift ;;
+	-h | --help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	*) echo "b1nix-report: unknown argument '$1'" >&2; exit 2 ;;
+	esac
+done
+[ -n "$OUT" ] || OUT="/tmp/b1nix-report-$(date -u +%Y-%m-%d-%H%M%S).txt"
+
+osr() { # read a field from /etc/os-release without sourcing it
+	sed -n "s/^$1=//p" /etc/os-release 2>/dev/null | head -1 | tr -d '"'
+}
+
+# ── the four questions the tool cannot answer by itself ─────────────────────
+# Everything else is read from the machine. These are the columns of the
+# compatibility list, and a guess in them is worse than an empty cell.
+BOOTS=unknown
+INSTALLS=unknown
+DESKTOP_WORKS=unknown
+DAILY_USABLE=unknown
+ask() { # variable prompt
+	printf '%s [yes/partial/no/unknown] ' "$2" >&2
+	read -r _a </dev/tty 2>/dev/null || _a=""
+	case "$_a" in
+	yes | partial | no) printf '%s' "$_a" ;;
+	*) printf 'unknown' ;;
+	esac
+}
+if [ "$ASK" = 1 ] && [ -t 0 ] && [ -r /dev/tty ]; then
+	echo "Four questions; press Enter to leave one unknown." >&2
+	BOOTS=$(ask BOOTS "Does this machine boot b1nix?")
+	INSTALLS=$(ask INSTALLS "Did the installer finish?")
+	DESKTOP_WORKS=$(ask DESKTOP_WORKS "Does the desktop work?")
+	DAILY_USABLE=$(ask DAILY_USABLE "Could you use this machine daily?")
+fi
+
+# ── facts ───────────────────────────────────────────────────────────────────
+kernel_release=$(uname -r 2>/dev/null || echo unknown)
+build_id=""
+for k in "/boot/b1nix-$kernel_release" /boot/b1nix-*; do
+	[ -f "$k" ] || continue
+	build_id=$(readelf -n "$k" 2>/dev/null | sed -n 's/.*Build ID: \([0-9a-f]*\).*/\1/p' | head -1)
+	[ -z "$build_id" ] || break
+done
+[ -n "$build_id" ] || build_id=unknown
+
+cpu=$(sed -n 's/^model name[ \t]*: //p' /proc/cpuinfo 2>/dev/null | head -1)
+[ -n "$cpu" ] || cpu=$(sed -n 's/^Model[ \t]*: //p' /proc/cpuinfo 2>/dev/null | head -1)
+[ -n "$cpu" ] || cpu=unknown
+cpus=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 0)
+ram=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo 2>/dev/null || echo 0)
+
+pci_ids() { # class-prefix -> "vendor:device, ..."
+	command -v lspci >/dev/null 2>&1 || { printf 'unknown'; return; }
+	lspci -n 2>/dev/null | awk -v want="$1" '$2 ~ "^" want { printf "%s%s", (n++ ? ", " : ""), $3 }'
+}
+gpu=$(pci_ids "03")
+net=$(pci_ids "02")
+[ -n "$gpu" ] || gpu=none
+[ -n "$net" ] || net=none
+
+storage=$(awk '$1 == "nodev" { next } { print $1 }' /proc/filesystems 2>/dev/null |
+	tr '\n' ' ' | sed 's/ *$//')
+root_fs=$(findmnt -no FSTYPE / 2>/dev/null || awk '$2 == "/" { print $3; exit }' /proc/mounts 2>/dev/null)
+[ -n "$root_fs" ] || root_fs=unknown
+
+if [ -d /sys/firmware/efi ]; then firmware=uefi; else firmware=bios; fi
+[ ! -f /proc/device-tree/compatible ] || firmware=abl
+
+install_kind=installed
+grep -qs 'boot=live\|b1nix.live' /proc/cmdline && install_kind=live
+[ ! -f /proc/device-tree/compatible ] || install_kind=phone
+
+desktop="${XDG_CURRENT_DESKTOP:-}"
+session="${XDG_SESSION_TYPE:-}"
+if [ -n "$desktop" ]; then
+	desktop=$(printf '%s-%s' "$desktop" "${session:-unknown}" | tr 'A-Z' 'a-z')
+else
+	desktop=none
+fi
+
+# ── write it ────────────────────────────────────────────────────────────────
+tmp=$(mktemp "${TMPDIR:-/tmp}/b1nix-report.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+
+{
+	printf 'schema: %s\n' "$SCHEMA"
+	printf 'generated: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	printf 'b1nix_release: %s\n' "$(osr VERSION_ID)"
+	printf 'b1nix_codename: %s\n' "$(osr VERSION_CODENAME)"
+	printf 'kernel: %s\n' "$kernel_release"
+	printf 'kernel_build_id: %s\n' "$build_id"
+	printf 'arch: %s\n' "$(dpkg --print-architecture 2>/dev/null || uname -m)"
+	printf 'install_kind: %s\n' "$install_kind"
+	printf 'firmware: %s\n' "$firmware"
+	printf 'cpu: %s\n' "$cpu"
+	printf 'cpus: %s\n' "$cpus"
+	printf 'ram_mib: %s\n' "$ram"
+	printf 'gpu: %s\n' "$gpu"
+	printf 'net: %s\n' "$net"
+	printf 'storage: %s\n' "$storage"
+	printf 'root_fs: %s\n' "$root_fs"
+	printf 'desktop: %s\n' "$desktop"
+	printf 'boots: %s\n' "$BOOTS"
+	printf 'installs: %s\n' "$INSTALLS"
+	printf 'desktop_works: %s\n' "$DESKTOP_WORKS"
+	printf 'daily_usable: %s\n' "$DAILY_USABLE"
+	printf '\n'
+
+	printf '== PCI ==\n'
+	command -v lspci >/dev/null 2>&1 && lspci -nn 2>/dev/null || printf '(lspci not installed)\n'
+	printf '\n== USB ==\n'
+	command -v lsusb >/dev/null 2>&1 && lsusb 2>/dev/null || printf '(lsusb not installed)\n'
+
+	printf '\n== DRIVERS ==\n'
+	# Which driver bound to which device, from sysfs rather than from a
+	# table: what actually happened on this machine is the interesting part.
+	for d in /sys/bus/pci/devices/*; do
+		[ -e "$d/driver" ] || continue
+		printf '%s -> %s\n' "${d##*/}" "$(basename "$(readlink -f "$d/driver")")"
+	done 2>/dev/null
+
+	printf '\n== DISKS ==\n'
+	# Sizes and types, never serial numbers or the labels of removable media.
+	command -v lsblk >/dev/null 2>&1 &&
+		lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null ||
+		printf '(lsblk not installed)\n'
+
+	printf '\n== FAILED UNITS ==\n'
+	command -v systemctl >/dev/null 2>&1 &&
+		systemctl --failed --no-legend --no-pager 2>/dev/null ||
+		printf '(not a systemd system)\n'
+
+	if [ -d /sys/fs/pstore ] && [ -n "$(ls -A /sys/fs/pstore 2>/dev/null)" ]; then
+		printf '\n== PREVIOUS PANIC ==\n'
+		cat /sys/fs/pstore/* 2>/dev/null || true
+	fi
+
+	printf '\n== BOOT LOG ==\n'
+	if command -v journalctl >/dev/null 2>&1; then
+		journalctl -k -b --no-pager 2>/dev/null || dmesg 2>/dev/null || true
+	else
+		dmesg 2>/dev/null || true
+	fi
+} >"$tmp" 2>/dev/null
+
+# A report too large to attach is useless; truncate the middle and say so,
+# because losing the end of the boot log would lose the panic.
+size=$(wc -c <"$tmp")
+if [ "$size" -gt "$MAX_BYTES" ]; then
+	head_lines=$((MAX_BYTES / 200))
+	tail_lines=$((MAX_BYTES / 100))
+	{
+		head -n "$head_lines" "$tmp"
+		printf '\n... truncated: the report was %s bytes, the middle was dropped ...\n\n' "$size"
+		tail -n "$tail_lines" "$tmp"
+	} >"$tmp.cut"
+	mv "$tmp.cut" "$tmp"
+fi
+
+if [ "$OUT" = "-" ]; then
+	cat "$tmp"
+else
+	cp "$tmp" "$OUT"
+	chmod 0644 "$OUT"
+	printf 'Written: %s (%s)\n' "$OUT" "$(du -h "$OUT" | cut -f1)"
+	printf 'Attach this to your issue. Read it first if you like: it is plain text.\n'
+fi

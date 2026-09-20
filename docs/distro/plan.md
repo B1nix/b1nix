@@ -200,7 +200,7 @@ page". None of it is hard; all of it is easy to forget.
 - **Kernel hardening already in the tree** stays on by default — heap canaries,
   the checks that trip `kheap_validate()`. A hardening flag disabled for
   performance gets a line in the release notes.
-- **Security contact**: [`SECURITY.md`](../../SECURITY.md) with an address and
+- **Security contact**: [`SECURITY.md`](../../.github/SECURITY.md) with an address and
   a 90-day disclosure norm. No CVE process while the audience is enthusiasts, but a
   security fix is a point release, not a "next time" item.
 - **The distribution's own attack surface** is mostly Debian's, and Debian's
@@ -422,7 +422,7 @@ later, so it is contained:
 - **The pipeline** is specified in [ci.md](ci.md), including why the lanes may
   have to stay on this machine.
 - **Built on the host** with `sbuild` in a pinned trixie chroot;
-  `tools/packages/build-deb.sh` and `tools/packages/publish-repo.sh` are the
+  `tools/deb/build-deb.sh` and `tools/deb/publish-repo.sh` are the
   only entry points, and both are runnable by hand and from CI.
 - **CI on a tag** builds packages and ISOs for both arches, runs the lanes it
   can, signs, and publishes to Pages and Releases. CI cannot hold the offline
@@ -458,7 +458,7 @@ The website is the distribution's face and can be a handful of static pages:
 ## Community
 
 - **Issue tracker** on GitHub, with the templates above.
-- **A contribution guide**: [`CONTRIBUTING.md`](../../CONTRIBUTING.md) — DCO
+- **A contribution guide**: [`CONTRIBUTING.md`](../../.github/CONTRIBUTING.md) — DCO
   sign-off, the commit-message rules already in the tree, how to run the lanes before sending a patch, what "no fake passes"
   means for a contributor.
 - **A chat or forum** only when there is someone to answer in it; a dead

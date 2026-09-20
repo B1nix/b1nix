@@ -5,7 +5,7 @@
  * expose the graphics _DSM methods to a driver.
  *
  * Upstream's drivers/gpu/drm/i915/display/intel_acpi.c is plain GPL-2.0 and is
- * therefore not imported (see tools/drm/fetch-i915.sh). Only its *header* comes
+ * therefore not imported (see tools/import/drm/fetch-i915.sh). Only its *header* comes
  * from the staged tree, which declares these under CONFIG_ACPI; this file
  * supplies the definitions.
  *

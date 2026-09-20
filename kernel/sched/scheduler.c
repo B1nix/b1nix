@@ -6,6 +6,7 @@
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/cgroup.h>
+#include <b1nix/psi.h>
 #include <b1nix/namespace.h>
 #include <b1nix/user_namespace.h>
 #include <b1nix/panic.h>
@@ -428,6 +429,36 @@ static int  g_task_execed[TASK_SLOTS];
 /* POSIX nice value (-20..19, 0 default) — see scheduler_set_priority for why
  * this is NOT task->priority. Inherited across fork. */
 static int  g_task_nice[TASK_SLOTS];
+/* Scheduling policy, as sched_setscheduler(2) names them. This kernel has one
+ * runnable class — the stride scheduler — so the only policies it can offer
+ * honestly are the three that are all fair-share and differ in how small a
+ * share they ask for:
+ *
+ *   SCHED_OTHER (0)  the default
+ *   SCHED_BATCH (3)  the same share, for work that is not interactive
+ *   SCHED_IDLE  (5)  whatever is left when nothing else wants the CPU
+ *
+ * SCHED_FIFO, SCHED_RR and SCHED_DEADLINE stay refused: accepting them would
+ * promise real-time behaviour that does not exist here, and a caller that
+ * believes it has a real-time thread makes different decisions.
+ *
+ * Debian's units ask for this in the ordinary course of a boot —
+ * e2scrub_reap.service carries CPUSchedulingPolicy=idle, and systemd fails
+ * the unit outright (status 214/SETSCHEDULER) when the call is refused. */
+static int  g_task_sched_policy[TASK_SLOTS];
+/* oom_score_adj: -1000..1000, inherited across fork and kept across exec, the
+ * way Linux keeps it. -1000 makes a task immune to the OOM killer. */
+static int  g_task_oom_score_adj[TASK_SLOTS];
+/* What the cgroup cpu controller wants of the stride scheduler.
+ *
+ * `stride_pct` scales the stride a task's nice value buys: a cgroup with twice
+ * the weight of another gives its tasks half the stride, so they come up twice
+ * as often. 0 means "no cgroup weighting", which is the state of every task on
+ * a machine that never enables the controller. `throttled` is cpu.max having
+ * been spent: the picker passes such a task over until the period rolls over.
+ * Both are published by cgroup_tick(); nothing here interprets them. */
+static u32  g_task_cg_stride_pct[TASK_SLOTS];
+static u8   g_task_cg_throttled[TASK_SLOTS];
 
 /* Stride for one nice value: how far a task's pass advances each time it gives
  * the CPU up. The scheduler then always picks the smallest pass among equal
@@ -450,6 +481,38 @@ int sched_stride_for_nice(int nice) {
   int tickets = 20 - nice;
 
   return 1000 / tickets;
+}
+
+/* The stride a task actually gets: its nice value, unless its policy says it
+ * wants less than any nice value can express.
+ *
+ * SCHED_IDLE is not "nice 19": nice 19 still competes, and idle is meant to
+ * yield to everything that is not idle. Three times the largest nice stride is
+ * the same shape of answer Linux gives (weight 3 against nice 19's 15) — a
+ * share small enough to disappear under load without ever being zero, because
+ * a task that can never run is a hang, not a policy. */
+int sched_stride_for_policy(int policy, int nice) {
+  int stride = sched_stride_for_nice(nice);
+
+  if (policy == SCHED_IDLE) {
+    int idle = sched_stride_for_nice(19) * 3;
+    return stride > idle ? stride : idle;
+  }
+  return stride;
+}
+
+/* sched_setscheduler(2): the three fair-share policies, and nothing else. */
+int sched_set_policy(struct task *t, int policy) {
+  if (policy != SCHED_OTHER && policy != SCHED_BATCH && policy != SCHED_IDLE)
+    return -EINVAL;
+  if (!t)
+    return -ESRCH;
+  g_task_sched_policy[task_index(t)] = policy;
+  return 0;
+}
+
+int sched_get_policy(struct task *t) {
+  return t ? g_task_sched_policy[task_index(t)] : SCHED_OTHER;
 }
 
 static struct rlimit g_task_rlimits[TASK_SLOTS][16];
@@ -1291,6 +1354,10 @@ static struct task *find_unused_task(int user) {
       g_task_alarm_interval_ticks[i] = 0;
       g_task_execed[i] = 0;
       g_task_nice[i] = 0;
+      g_task_sched_policy[i] = SCHED_OTHER;
+      g_task_oom_score_adj[i] = 0;
+      g_task_cg_stride_pct[i] = 0;
+      g_task_cg_throttled[i] = 0;
       linux_modern_task_reset(i);
       g_task_fdlock_owner[i] = 0;
       g_task_exiting[i] = 0;
@@ -1619,6 +1686,43 @@ static void sched_handoff_recover(struct task *t, const char *where) {
  * that shows `cur_task = boot` on cpu 1 cannot say which of them wrote it.
  * Say so once, from whichever one does. */
 
+/* The stride a task really advances by each turn: what its nice value buys,
+ * scaled by what its cgroup's cpu.weight asks for. One function so the picker
+ * and scheduler_yield cannot disagree about it. */
+static inline u64 sched_effective_stride(usize index) {
+  /* The policy picks the base -- SCHED_IDLE asks for less than any nice value
+   * can express -- and the cgroup's cpu.weight scales it. The two are
+   * independent answers to "how often should this task come up", and a task
+   * can be subject to both. */
+  u64 stride = (u64)sched_stride_for_policy(g_task_sched_policy[index],
+                                            g_task_nice[index]);
+  u32 pct = g_task_cg_stride_pct[index];
+
+  if (pct && pct != 100) {
+    stride = (stride * pct) / 100;
+    if (stride < 1)
+      stride = 1;
+    if (stride > 1000000)
+      stride = 1000000;
+  }
+  return stride;
+}
+
+/* cpu.max: has this task's cgroup spent its quota for the current period?
+ *
+ * A task inside the kernel is never passed over. Throttling is meant to slow a
+ * cgroup down, and a task holding a VFS or block-cache lock that the rest of
+ * the machine is waiting behind would instead stop the machine -- for up to a
+ * whole cpu.max period, which is a tenth of a second by default. It finishes
+ * its call and is throttled on the way back out to ring 3. */
+static inline int sched_cg_throttled(const struct task *t, usize index) {
+  if (!g_task_cg_throttled[index])
+    return 0;
+  if (t->in_kernel_syscall)
+    return 0;
+  return 1;
+}
+
 static struct task *pick_next_task(void) {
   if (current_task == 0) {
     return 0;
@@ -1676,6 +1780,20 @@ static struct task *pick_next_task(void) {
       /* sched_setaffinity: this CPU may not be allowed to run the task. Drop
        * the rq entry; the scan below (on a permitted CPU) still finds it. */
       if (pcpu && !sched_task_allowed_on_cpu(t, pcpu->cpu_id))
+        continue;
+      if (sched_cg_throttled(t, task_index(t)))
+        continue; /* cpu.max spent; the scan will not take it either */
+      /* A cgroup-weighted task is not taken from here.
+       *
+       * This path hands out the head of the queue without comparing passes --
+       * deliberately, because it is the fast route for a freshly woken task.
+       * But the pass ordering IS cpu.weight: a task taken from here gets a
+       * turn its weight had not earned, and with about half of all picks
+       * coming from this path a ten-to-one weight came out as three to one.
+       * Dropping the entry costs nothing: the scan below finds the task in the
+       * table, in pass order, exactly as it does for one pinned away from this
+       * CPU by sched_setaffinity. */
+      if (g_task_cg_stride_pct[task_index(t)])
         continue;
       /* M28 T4: spin until the outgoing CPU's arch_context_switch publishes
        * stack_released==1. Without this, we could load a saved RSP that is
@@ -1790,6 +1908,8 @@ static struct task *pick_next_task(void) {
       continue; /* APs run only userspace ELF processes */
     if (pcpu && !sched_task_allowed_on_cpu(t, pcpu->cpu_id))
       continue; /* pinned elsewhere by sched_setaffinity */
+    if (sched_cg_throttled(t, index))
+      continue; /* its cgroup has spent this period's cpu.max */
 
     int priority = t->priority;
     u64 pass = g_task_pass[index];
@@ -1824,8 +1944,61 @@ static struct task *pick_next_task(void) {
         continue;
       if (pcpu && !sched_task_allowed_on_cpu(t, pcpu->cpu_id))
         continue;
-      if (g_task_pass[index] > min_pass + SCHED_WAKE_MAX_LEAD)
-        g_task_pass[index] = min_pass + SCHED_WAKE_MAX_LEAD;
+      /* A task a cgroup is weighting gets a far wider window.
+       *
+       * A lead this clamp pulls back is normally an accident -- a woken task
+       * whose pass was inflated by drift. A task in a cgroup with a cpu.weight
+       * earns its lead: that IS the weighting. Two hundred nice-0 turns is
+       * less lead than a weight ratio of ten to one needs to express itself
+       * over a second, and clamping there put a ceiling of about three to one
+       * on cpu.weight however far apart the weights were set -- the lighter
+       * cgroup's passes ran a hundred and fifty thousand ahead of the heavier
+       * one's over three seconds and were dragged back every time, handing
+       * them turns their weight had already spent.
+       *
+       * The window is widened rather than removed, because the hang it was
+       * added for is real. A hundred times it is twenty thousand nice-0 turns,
+       * which is room for the whole 1..10000 range of cpu.weight and still an
+       * absolute bound on how long anything can wait. */
+      u64 lead = g_task_cg_stride_pct[index]
+                     ? (u64)SCHED_WAKE_MAX_LEAD * 100u
+                     : (u64)SCHED_WAKE_MAX_LEAD;
+      if (g_task_pass[index] > min_pass + lead)
+        g_task_pass[index] = min_pass + lead;
+    }
+  }
+
+  /* The task already on this CPU is still a candidate.
+   *
+   * The scan cannot see it: scheduler_yield picks BEFORE it publishes READY,
+   * so the current task is RUNNING and skipped. The CPU therefore handed over
+   * on every single tick, whatever the passes said -- which costs a context
+   * switch when there are more tasks than CPUs, and costs the whole of
+   * cpu.weight when there are not. Four spinners on two CPUs always had two
+   * READY and two RUNNING, so each tick's "choice" was between exactly the two
+   * READY ones and both got taken: a ten-to-one weight measured three to one,
+   * and with one task per cgroup it would have measured one to one.
+   *
+   * So compare. If the running task's pass, advanced by the stride this turn
+   * costs it, is still at or below the best candidate's, it keeps the CPU and
+   * scheduler_yield reports no switch. Limited to tasks a cgroup is weighting:
+   * everywhere else the round-robin handover is the behaviour every other
+   * milestone was measured against, and this is not the place to change it. */
+  if (best_task && best_task != current_task &&
+      current_task->state == TASK_RUNNING &&
+      g_task_cg_stride_pct[task_index(current_task)] &&
+      current_task->priority >= max_priority &&
+      !sched_cg_throttled(current_task, task_index(current_task))) {
+    usize ci = task_index(current_task);
+    u64 stride = sched_effective_stride(ci);
+
+    if (g_task_pass[ci] + stride <= min_pass) {
+      /* Charge the turn here. scheduler_yield only advances a pass on the path
+       * that switches, so a task kept on its CPU would otherwise never move in
+       * virtual time -- and a task whose pass never moves while every other
+       * task's grows keeps the CPU for ever. */
+      g_task_pass[ci] += stride;
+      return 0;
     }
   }
 
@@ -2846,6 +3019,15 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
   g_task_alarm_ticks[c_idx] = 0;
       g_task_alarm_interval_ticks[c_idx] = 0;
   g_task_nice[c_idx] = g_task_nice[p_idx]; /* POSIX: nice survives fork */
+  /* and so does the policy, which is what SCHED_RESET_ON_FORK exists to undo */
+  g_task_sched_policy[c_idx] = g_task_sched_policy[p_idx];
+  /* Linux inherits oom_score_adj across fork and keeps it across exec: a
+   * service systemd has marked unkillable must stay so in the shell it spawns
+   * to run itself. The cgroup weighting is republished by the next
+   * cgroup_tick(), so the child starts unweighted rather than wrong. */
+  g_task_oom_score_adj[c_idx] = g_task_oom_score_adj[p_idx];
+  g_task_cg_stride_pct[c_idx] = 0;
+  g_task_cg_throttled[c_idx] = 0;
   linux_modern_fork_inherit(p_idx, c_idx); /* memory policy */
   arch_pkru_fork(parent, child);
   g_task_tgid[c_idx] = child->id;          /* child is its own thread group leader */
@@ -3519,6 +3701,19 @@ u64 task_rss_sample(struct task *t, int force) {
     for (struct vm_area *v = t->vma_list; v; v = v->next)
       resident += paging_user_resident(t->pml4_phys, v->start, v->end);
     vma_walker_exit();
+  /* The break, which is not on the mapping list.
+   *
+   * brk(2) maps its pages itself and records no vm_area, so a walk over
+   * vma_list alone misses the whole of a glibc process's main arena -- which
+   * is most of what such a process has. A program reading /dev/zero into a
+   * growing buffer showed a resident set of a couple of megabytes while it
+   * held more than a gigabyte, so VmRSS lied, the cgroup that was supposed to
+   * cap it measured almost nothing, and the OOM killer ranked it below every
+   * small process on the machine and killed those instead. Nothing else maps
+   * this range, so there is nothing to double-count. */
+    if (t->heap_start && t->user_brk > t->heap_start)
+      resident += paging_user_resident(
+          t->pml4_phys, t->heap_start & ~(PAGE_SIZE - 1), t->user_brk);
   }
   if (resident > g_task_maxrss_pages[idx])
     g_task_maxrss_pages[idx] = resident;
@@ -3542,6 +3737,19 @@ u64 task_rss_current_pages(struct task *t) {
     for (struct vm_area *v = t->vma_list; v; v = v->next)
       resident += paging_user_resident(t->pml4_phys, v->start, v->end);
     vma_walker_exit();
+  /* The break, which is not on the mapping list.
+   *
+   * brk(2) maps its pages itself and records no vm_area, so a walk over
+   * vma_list alone misses the whole of a glibc process's main arena -- which
+   * is most of what such a process has. A program reading /dev/zero into a
+   * growing buffer showed a resident set of a couple of megabytes while it
+   * held more than a gigabyte, so VmRSS lied, the cgroup that was supposed to
+   * cap it measured almost nothing, and the OOM killer ranked it below every
+   * small process on the machine and killed those instead. Nothing else maps
+   * this range, so there is nothing to double-count. */
+    if (t->heap_start && t->user_brk > t->heap_start)
+      resident += paging_user_resident(
+          t->pml4_phys, t->heap_start & ~(PAGE_SIZE - 1), t->user_brk);
   }
   usize idx = task_index(t);
   if (resident > g_task_maxrss_pages[idx])
@@ -4783,8 +4991,12 @@ static int scheduler_yield_inner(void) {
   if (old_task->state == TASK_RUNNING) {
     /* Stride Scheduler: increment pass of yielding task by its stride */
     usize old_idx = task_index(old_task);
-    int stride = sched_stride_for_nice(g_task_nice[old_idx]);
-    g_task_pass[old_idx] += stride;
+    /* Nice, scaled by the cgroup's cpu.weight: a cgroup with more weight buys
+     * its tasks a smaller stride, so the picker's "lowest pass wins" rule
+     * comes back to them more often. The scale is divided by the cgroup's
+     * runnable task count, so the group's share of the machine is its weight
+     * however many tasks split it. */
+    g_task_pass[old_idx] += sched_effective_stride(old_idx);
 
     /* M28 T4: claim the kernel stack BEFORE publishing state=READY. Under T4
      * the save side of arch_context_switch (the movq %rsp,0(%rdi) +
@@ -6479,6 +6691,28 @@ void scheduler_on_timer_tick(void) {
   }
 
   serial_silence_watchdog();
+
+  /* Resource control (M127): roll cpu.max periods over, charge the CPU time
+   * since the last tick to the cgroups that burned it, and publish the stride
+   * weights and throttle flags this file's picker reads. A no-op until
+   * something writes a cgroup control file. */
+  cgroup_tick();
+
+  /* Pressure. CPU pressure is the one resource whose waiters cannot bracket
+   * their own wait -- a task queueing for a CPU is by definition not running --
+   * so count them here, where every runnable task is already in front of us. */
+  {
+    u32 waiting = 0;
+
+    for (usize i = 0; i < g_task_hwm; i++) {
+      struct task *t = T(i);
+
+      if (t && t->state == TASK_READY && !t->stealable)
+        waiting++;
+    }
+    psi_report_cpu_waiters(waiting);
+    psi_tick();
+  }
 
   posix_timers_tick(); /* M74: fire expired POSIX interval timers */
 
@@ -8465,6 +8699,18 @@ void scheduler_dump_tasks(void) {
       console_write_dec((u64)(u32)g_task_nice[i]);
       console_write(" pass=");
       console_write_dec(g_task_pass[i]);
+      /* What the cgroup cpu controller is asking of this task: the percentage
+       * it scales the nice stride by (0 = unweighted) and whether cpu.max has
+       * it passed over. Printed here because from ring 3 the weighting can
+       * only be inferred from how often each of several spinners ran, which
+       * cannot say which of the weight, the task count and the stride was
+       * wrong. */
+      if (g_task_cg_stride_pct[i] || g_task_cg_throttled[i]) {
+        console_write(" cgpct=");
+        console_write_dec((u64)g_task_cg_stride_pct[i]);
+        console_write(" cgthr=");
+        console_write_dec((u64)g_task_cg_throttled[i]);
+      }
       console_write(" fdheld_by=");
       console_write_dec(g_task_fdlock_holder[i]);
       console_write("@");
@@ -8688,11 +8934,26 @@ void scheduler_dump_tasks(void) {
         extern char __kernel_text_start[], __kernel_text_end[];
         u64 lo = (u64)(usize)__kernel_text_start;
         u64 hi = (u64)(usize)__kernel_text_end;
-        const u64 *stack = (const u64 *)(usize)TASK_CTX_SP(T(i));
+        u64 sp = TASK_CTX_SP(T(i));
+        const u64 *stack = (const u64 *)(usize)sp;
         unsigned printed = 0;
+        /* Never leave the page the stack pointer is in.
+         *
+         * This walk read 96 words -- 768 bytes -- off the top of the saved SP
+         * with nothing to stop it, and for a task parked near the top of its
+         * stack those bytes are the guard page: reading /proc/b1nix-tasks
+         * panicked the kernel with a page fault at `stack_top`, inside the
+         * function whose whole purpose is to report what went wrong. The page
+         * holding SP is mapped by definition, so bounding the walk there can
+         * only shorten a diagnostic, and only for a task whose SP is within
+         * 768 bytes of a page boundary. */
+        u64 page_end = (sp | (PAGE_SIZE - 1)) + 1;
+        unsigned max_words = (unsigned)((page_end - sp) / sizeof(u64));
 
+        if (max_words > 96)
+          max_words = 96;
         console_write(" callers=");
-        for (unsigned w = 0; w < 96 && printed < 5; w++) {
+        for (unsigned w = 0; w < max_words && printed < 5; w++) {
           u64 v = stack[w];
 
           if (v >= lo && v < hi) {
@@ -9148,10 +9409,106 @@ void scheduler_self_stop(int sig) {
  * task dies at its next return-to-user, then exit teardown frees its frames.
  * Never targets kernel threads (pml4_phys==0) or init (pid 1). Returns 1 if a
  * victim was signalled. */
-int scheduler_oom_kill_current(void) {
-  struct task *v = current_task;
-  if (!v || v->pml4_phys == 0 || v->id == 1)
+/* ── oom_score_adj and the machine-wide killer ────────────────────────────── */
+
+void sched_set_cgroup_stride_pct(struct task *t, u32 pct) {
+  if (!t)
+    return;
+  usize i = task_index(t);
+
+  if (i < TASK_SLOTS)
+    g_task_cg_stride_pct[i] = pct;
+}
+
+void sched_set_cgroup_throttled(struct task *t, int on) {
+  if (!t)
+    return;
+  usize i = task_index(t);
+
+  if (i < TASK_SLOTS)
+    g_task_cg_throttled[i] = on ? 1 : 0;
+}
+
+int scheduler_oom_score_adj(usize pid) {
+  struct task *t = scheduler_task_by_pid(pid);
+
+  return t ? g_task_oom_score_adj[task_index(t)] : 0;
+}
+
+int scheduler_set_oom_score_adj(usize pid, int adj) {
+  if (adj < -1000 || adj > 1000)
+    return -EINVAL;
+  struct task *t = scheduler_task_by_pid(pid);
+
+  if (!t)
+    return -ESRCH;
+  /* Linux applies it to the whole thread group: oom_score_adj is a property of
+   * the process, and /proc/<tid>/oom_score_adj of any thread sets all of them. */
+  usize tgid = task_tgid(t);
+  u64 flags = interrupts_save();
+
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *o = T(i);
+
+    if (o && o->state != TASK_UNUSED && task_tgid(o) == tgid)
+      g_task_oom_score_adj[i] = adj;
+  }
+  interrupts_restore(flags);
+  return 0;
+}
+
+/* The badness /proc/<pid>/oom_score reports: resident pages biased by
+ * oom_score_adj as a thousandth of the machine, clamped to Linux's 0..1000. */
+int scheduler_oom_score(usize pid) {
+  struct task *t = scheduler_task_by_pid(pid);
+
+  if (!t || !t->pml4_phys)
     return 0;
+  u64 total = pmm_total_usable_memory() / PAGE_SIZE;
+
+  if (!total)
+    return 0;
+  i64 points = (i64)((task_rss_current_pages(t) * 1000) / total);
+
+  points += g_task_oom_score_adj[task_index(t)];
+  if (points < 0)
+    return 0;
+  return points > 1000 ? 1000 : (int)points;
+}
+
+int scheduler_oom_kill_current(void) {
+  /* Pick by badness, not by "whoever asked for the page".
+   *
+   * The allocating task is usually the greedy one, but not always -- a small
+   * program that maps one more page while a browser holds two gigabytes used to
+   * be the one that died, and the machine was no better off for it. The victim
+   * is chosen the way Linux chooses it, by resident size shifted by
+   * oom_score_adj, which is the knob systemd sets on every unit it wants
+   * protected. cgroup.c owns the walk so that the cgroup killer and this one
+   * agree on the rule. */
+  usize pid = cgroup_oom_victim(0);
+  struct task *v = pid ? scheduler_task_by_pid(pid) : 0;
+
+  if (!v) {
+    /* Nothing eligible -- fall back to the caller, if it is eligible itself. */
+    v = current_task;
+    if (!v || v->pml4_phys == 0 || v->id == 1 ||
+        g_task_oom_score_adj[task_index(v)] <= -1000) {
+      /* Say so. A machine that dies of memory exhaustion with the killer
+       * silent is indistinguishable from one where the killer was never
+       * called, and the difference -- every candidate having asked to be
+       * spared -- is the whole answer. */
+      static u64 last_quiet_tick;
+
+      if (last_quiet_tick == 0 ||
+          scheduler_ticks - last_quiet_tick > 5ull * sched_tick_hz()) {
+        last_quiet_tick = scheduler_ticks;
+        console_write("[OOM-KILL] nothing to kill: every task is pid 1, has no "
+                      "address space, or has oom_score_adj -1000\n");
+      }
+      return 0;
+    }
+  }
   if (v->pending_signals & (1ULL << (SIGKILL - 1)))
     return 0; /* already condemned */
   console_write("[OOM-KILL] killing '");

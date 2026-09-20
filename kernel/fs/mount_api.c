@@ -188,6 +188,43 @@ static int fsctx_apply_option(struct fsctx_state *ctx, const char *key,
     return 0;
   }
 
+  /* The atime family. These belong to the VFS rather than to a filesystem, so
+   * Linux accepts them on every type, and a kernel that does not is a kernel
+   * an init system cannot mount anything on.
+   *
+   * Debian's tmp.mount and run-lock.mount both pass `strictatime`, and so does
+   * every tmpfs systemd builds while setting up a unit's mount namespace.
+   * Refusing one word here failed /tmp, /run/lock, systemd-logind,
+   * systemd-udevd and everything that depends on them, and reported itself as
+   * "Failed to set up mount namespacing: Invalid argument" -- a message that
+   * names neither the option nor the filesystem.
+   *
+   * noatime and nodiratime are recorded, because they are what /proc/self/
+   * mountinfo reports back. The three that choose WHEN an atime is written
+   * (relatime, strictatime, lazytime) are accepted and do nothing: this VFS
+   * has no atime policy to select, and failing a mount over the choice of one
+   * would be worse than ignoring it. */
+  if (strcmp(key, "noatime") == 0) {
+    ctx->flags |= MS_NOATIME;
+    return 0;
+  }
+  if (strcmp(key, "atime") == 0) {
+    ctx->flags &= ~(u64)MS_NOATIME;
+    return 0;
+  }
+  if (strcmp(key, "nodiratime") == 0) {
+    ctx->flags |= MS_NODIRATIME;
+    return 0;
+  }
+  if (strcmp(key, "diratime") == 0) {
+    ctx->flags &= ~(u64)MS_NODIRATIME;
+    return 0;
+  }
+  if (strcmp(key, "relatime") == 0 || strcmp(key, "norelatime") == 0 ||
+      strcmp(key, "strictatime") == 0 || strcmp(key, "nostrictatime") == 0 ||
+      strcmp(key, "lazytime") == 0 || strcmp(key, "nolazytime") == 0)
+    return 0;
+
   for (usize i = 0; i < sizeof(accepted_hints) / sizeof(accepted_hints[0]); i++)
     if (strcmp(key, accepted_hints[i]) == 0)
       return 0;
@@ -349,8 +386,21 @@ int vfs_fsconfig(int fd, u32 cmd, const char *key, const char *value,
     return rc;
   case FSCONFIG_SET_BINARY:
   case FSCONFIG_SET_FD:
-    mount_api_trace("fsconfig-unsupported", cmd, key, -EOPNOTSUPP);
-    return -EOPNOTSUPP;
+    /* No filesystem here takes a blob or a descriptor as a parameter value, so
+     * every key arriving this way is a key that does not exist -- and Linux
+     * answers EINVAL for a parameter a filesystem does not have, not
+     * EOPNOTSUPP.
+     *
+     * The difference is not cosmetic. systemd probes with a deliberately
+     * absent option, `adefinitelynotexistingmountoption`, to find out whether
+     * the kernel validates option names at all; EOPNOTSUPP tells it the whole
+     * mechanism is missing rather than that the one option is, and it then
+     * draws the wrong conclusion about every option after that. */
+    rc = fsctx_apply_option(ctx, key, 0);
+    if (rc == 0)
+      rc = -EINVAL; /* a known key still cannot take this kind of value */
+    mount_api_trace("fsconfig-novalue", cmd, key, rc);
+    return rc;
   default:
     mount_api_trace("fsconfig-unknown", cmd, key, -EINVAL);
     return -EINVAL;
@@ -380,6 +430,15 @@ int vfs_fsmount(int fsfd, u32 flags, u32 attr_flags) {
     return -EINVAL; /* fsconfig(CMD_CREATE) has not run */
 
   int rc = vfs_detached_set_attr(ctx->detached_id, attr_flags, 0);
+  /* Traced because this is where a sequence that got as far as CMD_CREATE
+   * dies, and the caller only sees "bad option" from mount(8) or "Invalid
+   * argument" from systemd -- neither of which names the attribute. */
+  if (bootinfo_has_flag("b1nix.trace-mount")) {
+    char line[160];
+    snprintf(line, sizeof(line), "mount-api: fsmount attrs=0x%x set-attr -> %d",
+             attr_flags, rc);
+    klog_info(line);
+  }
   if (rc < 0)
     return rc;
 
@@ -469,14 +528,50 @@ int vfs_mount_setattr_fd(int fd, const char *path, u32 flags,
              MOUNT_ATTR_NOEXEC | MOUNT_ATTR__ATIME | MOUNT_ATTR_NODIRATIME |
              MOUNT_ATTR_NOSYMFOLLOW))
     return -EINVAL;
-  if (attr->attr_set & attr->attr_clr)
-    return -EINVAL; /* setting and clearing the same bit */
+  /* Setting and clearing the same bit is a contradiction everywhere EXCEPT in
+   * the atime field, and that exception is not a courtesy: MOUNT_ATTR_RELATIME
+   * (0), _NOATIME and _STRICTATIME are an enum packed into MOUNT_ATTR__ATIME,
+   * so the only way to ask for one of them is to clear the whole field and set
+   * the value. Linux documents exactly this, and every caller does it --
+   * util-linux for `-o strictatime`, systemd for every tmpfs it builds behind
+   * a unit's mount namespace.
+   *
+   * Refusing it cost Debian's /tmp and /run/lock, systemd-logind and
+   * systemd-udevd, and reported itself as "Failed to set up mount namespacing:
+   * Invalid argument" -- a message that names neither mount_setattr nor atime.
+   */
+  if ((attr->attr_set & attr->attr_clr) & ~(u64)MOUNT_ATTR__ATIME)
+    return -EINVAL;
+  /* A caller touching the atime field clears all of it or none of it: a
+   * partial clear would leave the enum in a state that means nothing. */
+  if ((attr->attr_clr & MOUNT_ATTR__ATIME) &&
+      (attr->attr_clr & MOUNT_ATTR__ATIME) != (u64)MOUNT_ATTR__ATIME)
+    return -EINVAL;
+  /* And the value it asks for has to be one of the three, not a mixture. */
+  switch (attr->attr_set & MOUNT_ATTR__ATIME) {
+  case MOUNT_ATTR_RELATIME:
+  case MOUNT_ATTR_NOATIME:
+  case MOUNT_ATTR_STRICTATIME:
+    break;
+  default:
+    return -EINVAL;
+  }
 
   int recursive = (flags & AT_RECURSIVE) ? 1 : 0;
 
   /* A descriptor from fsmount/open_tree: the mount is not attached yet, so the
    * attributes are recorded on the detached entry and applied when it lands. */
   struct vfs_handle *h = fd >= 0 ? scheduler_fd_get(fd) : 0;
+  if (bootinfo_has_flag("b1nix.trace-mount")) {
+    char line[192];
+    struct mountfd_state *dm = (h && h->ops == &mountfd_ops) ? h->private_data : 0;
+    snprintf(line, sizeof(line),
+             "mount-api: setattr fd=%d mountfd=%d attached=%d set=0x%llx clr=0x%llx path='%s'",
+             fd, h && h->ops == &mountfd_ops, dm ? dm->attached : -1,
+             (unsigned long long)attr->attr_set,
+             (unsigned long long)attr->attr_clr, path ? path : "");
+    klog_info(line);
+  }
   if (h && h->ops == &mountfd_ops) {
     struct mountfd_state *m = h->private_data;
 
@@ -484,6 +579,12 @@ int vfs_mount_setattr_fd(int fd, const char *path, u32 flags,
       return -EINVAL;
     int rc = vfs_detached_set_attr(m->detached_id, attr->attr_set,
                                    attr->attr_clr);
+    if (bootinfo_has_flag("b1nix.trace-mount")) {
+      char line[128];
+      snprintf(line, sizeof(line), "mount-api: setattr detached id=%d -> %d",
+               m->detached_id, rc);
+      klog_info(line);
+    }
     if (rc < 0)
       return rc;
     if (attr->propagation) {

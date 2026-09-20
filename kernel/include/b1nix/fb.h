@@ -11,7 +11,7 @@ struct vfs_node;
  * pitch == width*4 regardless of the hardware pitch), draws into it, then
  * issues B1NIX_FBIOFLUSH to push a dirty rectangle to the display (virtio-gpu
  * transfer+flush when available, else a copy to the boot framebuffer).
- * Userspace mirrors these definitions in userspace/include/b1nix/fb.h —
+ * Userspace mirrors these definitions in third_party/b1cc-sysroot/b1nix/fb.h —
  * keep them matched. */
 
 struct b1nix_fb_info {

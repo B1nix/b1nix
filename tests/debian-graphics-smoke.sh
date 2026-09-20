@@ -57,7 +57,7 @@ mkdir -p "$DIR/smoke_run"
 
 if [ ! -f "$IMG" ]; then
 	echo "GFX-SMOKE: skipped — $IMG not built."
-	echo "GFX-SMOKE: build it with: PROFILE=graphics sh tools/images/mk-debian-image.sh"
+	echo "GFX-SMOKE: build it with: PROFILE=graphics sh tools/image/mk-debian-image.sh"
 	exit 0
 fi
 

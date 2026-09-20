@@ -17,7 +17,7 @@ packaging/
   b1nix-installer-config/debian/
   b1nix-tools/debian/
   b1cc/debian/
-tools/packages/
+tools/image/alpine/
   build-deb.sh                  # sbuild in a pinned trixie chroot
   publish-repo.sh               # aptly, signs, writes the static tree
 ```
@@ -158,7 +158,7 @@ started by anyone on the reference machines does not belong in Depends.
   and driver bindings into one attachable file. The format is stable enough
   that the hardware list can be generated from submissions.
 - The netconsole collector, the gdb-stub helper and the boot-timeline script,
-  as they exist in `tools/debug/` today.
+  as they exist in `tools/run/debug/` today.
 - `Architecture: all` where the scripts allow it.
 
 ## b1cc

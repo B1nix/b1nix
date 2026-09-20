@@ -4,7 +4,7 @@
 #
 # dnsmasq answers as a *proxy* DHCP server: the router keeps handing out
 # addresses and dnsmasq only adds the boot file, so nothing on the network
-# changes. The boot tree is an ISO stage directory (tools/images/mkiso.sh
+# changes. The boot tree is an ISO stage directory (tools/image/mkiso.sh
 # --stage): Limine's UEFI and BIOS PXE loaders fetch limine.conf, the kernel and
 # the root module from it over TFTP, and the kernel then runs from RAM exactly
 # as it does from the stick.
@@ -21,7 +21,7 @@ IFACE="${2:-$(ip -4 route show default | awk '{print $5; exit}')}"
 LIMINE_DATADIR="${LIMINE_DATADIR:-$(limine --print-datadir 2>/dev/null || echo /usr/share/limine)}"
 
 command -v dnsmasq >/dev/null 2>&1 || { echo "pxe-serve: dnsmasq is not installed" >&2; exit 1; }
-[ -f "$STAGE/boot/limine/limine.conf" ] || { echo "pxe-serve: $STAGE is not an ISO stage (no boot/limine/limine.conf)" >&2; exit 1; }
+[ -f "$STAGE/tools/image/limine/limine.conf" ] || { echo "pxe-serve: $STAGE is not an ISO stage (no tools/image/limine/limine.conf)" >&2; exit 1; }
 [ -f "$LIMINE_DATADIR/limine-bios-pxe.bin" ] || { echo "pxe-serve: no limine-bios-pxe.bin in $LIMINE_DATADIR" >&2; exit 1; }
 
 SUBNET=$(ip -4 addr show dev "$IFACE" | awk '/inet /{split($2,a,"/"); print a[1]; exit}')

@@ -1,5 +1,8 @@
-build/
-build
+# The build tree, and only the one at the top: an unanchored "build" also
+# ignored tools/toolchain, so a script added there silently never reached the
+# repository -- and the ones already tracked had to have been forced in.
+/build
+/build/
 .DS_Store
 logs/
 .tmp/
@@ -26,10 +29,10 @@ AGENTS.md
 *.elf
 *.hex
 *.img
-tools/blobs/
-tools/boards/rp2350/bin/
-tools/boards/rp2350/build-*/
-tools/boards/rp2350/pico-sdk/
+tests/support/linux-abi/
+tools/board/rp2350/bin/
+tools/board/rp2350/build-*/
+tools/board/rp2350/pico-sdk/
 
 
 
@@ -37,20 +40,21 @@ tools/boards/rp2350/pico-sdk/
 # Extracted vendor blobs: ~800 MB of proprietary Sony/Qualcomm binaries that
 # belong on the device, not in this history. Regenerate them from a running
 # phone with device/sony/bahamut/extract-files.sh.
-tools/boards/sony-xperia-5/android_device_tree/vendor/
-tools/boards/sony-xperia-5/android_device_tree/**/proprietary/
+tools/board/sony-xperia-5/android_device_tree/vendor/
+tools/board/sony-xperia-5/android_device_tree/**/proprietary/
 
 # AOSP/LineageOS build trees and output (hundreds of GB, all regenerable).
 /.repo/
 /out/
-tools/boards/sony-xperia-5/out/
-tools/boards/sony-xperia-5/lineage/
+tools/board/sony-xperia-5/out/
+tools/board/sony-xperia-5/lineage/
 
 # Intermediate device-tree blobs kept only while splitting a multi-SoC bundle.
 *.dtb.orig
 
-# The Xperia 5 device tree ships as tools/boards/sony-xperia-5/android_device_tree.tar.gz.
+# The Xperia 5 device tree ships as tools/board/sony-xperia-5/android_device_tree.tar.gz.
 # The unpacked copy also holds ~810 MiB of vendor blobs that are not ours to carry.
-tools/boards/sony-xperia-5/android_device_tree/
+tools/board/sony-xperia-5/android_device_tree/
 tests/.smoke-frozen.sh
 /.vscode
+*.o

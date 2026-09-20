@@ -30,7 +30,7 @@ The kernel stays monolithic; modules are how it stays modular.
 
 - **Declaration.** A module declares its name, license, aliases, dependencies
   and parameters with `MODULE_*` macros. The build fails if a module needs a
-  symbol that nothing exports (`tools/build/kernel/check-module-syms.sh`).
+  symbol that nothing exports (`tools/toolchain/kernel/check-module-syms.sh`).
 - **Loading.** The loader copies the sections, resolves symbols against the
   kernel and against live modules, applies x86_64 or AArch64 relocations,
   switches text to read-execute (W^X) and calls the init function. A module

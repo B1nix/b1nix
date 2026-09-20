@@ -1,0 +1,114 @@
+#!/bin/sh
+# Spend one boot try for the entry that is booting, and fall back to the last
+# known-good kernel when this one has none left.
+#
+# This runs in the initramfs, before the root filesystem is mounted, and that
+# placement is the whole point: a kernel that panics while probing devices
+# never reaches userspace, so a counter that only moves in userspace counts
+# nothing and the machine retries the broken kernel for ever.
+#
+# Every failure here is ignored. A machine that cannot update its boot counter
+# must still boot. See docs/distro/boot-counting.md.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "${1:-}" in
+prereqs) prereqs; exit 0 ;;
+esac
+
+. /scripts/functions 2>/dev/null || true
+
+ESP_DEV=""
+ESP_MNT=/run/b1nix-esp
+STATE_REL=b1nix/boot-state
+
+log() { printf 'b1nix-boot-count: %s\n' "$*" >/dev/kmsg 2>/dev/null || true; }
+
+# The entry that is booting, which is not necessarily the default: the user
+# may have picked one from the menu. b1nix-update-bootloader writes
+# b1nix.entry= into every entry it generates.
+entry=""
+for arg in $(cat /proc/cmdline 2>/dev/null); do
+	case "$arg" in
+	b1nix.entry=*) entry="${arg#b1nix.entry=}" ;;
+	b1nix.no-boot-count) log "counting disabled on the command line"; exit 0 ;;
+	esac
+done
+[ -n "$entry" ] || exit 0
+
+# The ESP: whatever /etc/fstab in the root would mount at /boot is not
+# available yet, so find it by its type and the file we expect on it.
+for dev in $(blkid -o device 2>/dev/null); do
+	case "$(blkid -o value -s TYPE "$dev" 2>/dev/null)" in
+	vfat) ;;
+	*) continue ;;
+	esac
+	mkdir -p "$ESP_MNT" 2>/dev/null || true
+	mount -t vfat -o rw "$dev" "$ESP_MNT" 2>/dev/null || continue
+	if [ -f "$ESP_MNT/$STATE_REL" ]; then
+		ESP_DEV="$dev"
+		break
+	fi
+	umount "$ESP_MNT" 2>/dev/null || true
+done
+[ -n "$ESP_DEV" ] || { log "no ESP with a state file -- not counting"; exit 0; }
+
+state="$ESP_MNT/$STATE_REL"
+
+good=$(awk -v r="$entry" '$1 == "entry=" r { for (i=2;i<=NF;i++) { split($i,kv,"="); if (kv[1]=="good") print kv[2] } }' "$state")
+tries=$(awk -v r="$entry" '$1 == "entry=" r { for (i=2;i<=NF;i++) { split($i,kv,"="); if (kv[1]=="tries") print kv[2] } }' "$state")
+
+if [ "$good" = "1" ]; then
+	umount "$ESP_MNT" 2>/dev/null || true
+	exit 0
+fi
+[ -n "$tries" ] || { log "no state for entry $entry -- not counting"; umount "$ESP_MNT" 2>/dev/null || true; exit 0; }
+
+left=$((tries - 1))
+[ "$left" -ge 0 ] || left=0
+log "entry $entry: $left tr{y,ies} left"
+
+tmp="$state.new"
+awk -v r="$entry" -v left="$left" '
+	$1 == "entry=" r {
+		out = $1
+		for (i = 2; i <= NF; i++) {
+			split($i, kv, "=")
+			if (kv[1] == "tries") { out = out " tries=" left } else { out = out " " $i }
+		}
+		print out
+		next
+	}
+	{ print }
+' "$state" >"$tmp" 2>/dev/null && mv "$tmp" "$state"
+
+if [ "$left" -le 0 ]; then
+	# Out of tries: hand the default to the newest entry that has booted
+	# successfully. If there is none, leave the default alone -- a machine
+	# with no known-good kernel is better off retrying than refusing.
+	fallback=$(awk '
+		/^entry=/ {
+			r = substr($1, 7)
+			for (i = 2; i <= NF; i++) {
+				split($i, kv, "=")
+				if (kv[1] == "good" && kv[2] == "1") { print r }
+			}
+		}
+	' "$state" | sort -V -r | head -1)
+	if [ -n "$fallback" ] && [ "$fallback" != "$entry" ]; then
+		log "entry $entry is out of tries -- the default becomes $fallback"
+		sed -i "s/^default=.*/default=$fallback/" "$state" 2>/dev/null || true
+		# The configuration itself is regenerated from the state on the
+		# next successful boot; ordering here would mean parsing Limine's
+		# format in an initramfs. What matters now is that the state says
+		# which kernel is good, and that the user can pick it from the menu
+		# -- the entry is already there.
+		: >"$ESP_MNT/b1nix/fallback-pending" 2>/dev/null || true
+	else
+		log "entry $entry is out of tries and there is no known-good kernel"
+	fi
+fi
+
+sync 2>/dev/null || true
+umount "$ESP_MNT" 2>/dev/null || true
+exit 0

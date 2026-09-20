@@ -1,0 +1,215 @@
+#!/bin/sh
+# Fetch the upstream DRM core and stage it for the kernel build.
+#
+# This is the import M101 is built around: the DRM core is compiled exactly as
+# upstream wrote it, and everything it stands on is b1nix's own MIT linuxkpi.
+# The rule that keeps that affordable is absolute — a patch to anything under
+# the staged tree is a bug in the shim, not a fix here. There is deliberately no
+# patch directory and no place to put one.
+#
+# The release is pinned the way tools/ports/* pin theirs: a version variable and
+# a checksum, so the same source is fetched on every machine and a silently
+# different upstream cannot creep in. Bumping LINUX_VERSION is a deliberate act
+# that also requires a new SHA256.
+#
+# Licensing: drivers/gpu/drm and include/drm are largely MIT (the X11/DRI
+# heritage), and include/uapi/drm is GPL-2.0 WITH Linux-syscall-note, whose
+# exception explicitly permits non-GPL use. Nothing under include/linux is
+# staged — those are GPL-2.0 without exception, and are exactly what the shim
+# reimplements from scratch. See LICENSE and docs/licensing.md.
+
+set -eu
+
+ROOT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+
+LINUX_VERSION="${LINUX_VERSION:-6.18.51}"
+# Pinned tarballs, checked against kernel.org's signed sha256sums.asc.
+case "$LINUX_VERSION" in
+6.6)     LINUX_SHA256="d926a06c63dd8ac7df3f86ee1ffc2ce2a3b81a2d168484e76b5b389aba8e56d0" ;;
+6.18.51) LINUX_SHA256="ba2f60f858bf4d1f929101faa356c93dc8b925b17aaa9f95eabd4627758df613" ;;
+*) echo "fetch-drm-core: no pinned SHA256 for linux-$LINUX_VERSION" >&2; exit 1 ;;
+esac
+TARBALL="linux-${LINUX_VERSION}.tar.xz"
+URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/${TARBALL}"
+
+SRC_PARENT="$ROOT_DIR/build/src/linux"
+STAGE_DIR="$ROOT_DIR/build/src/drm-core-${LINUX_VERSION}"
+
+mkdir -p "$SRC_PARENT"
+
+if [ -d "$STAGE_DIR/drivers" ] && [ -d "$STAGE_DIR/include/drm" ]; then
+	echo "$STAGE_DIR"
+	exit 0
+fi
+
+TAR_PATH="$SRC_PARENT/$TARBALL"
+if [ ! -f "$TAR_PATH" ]; then
+	echo "fetch-drm-core: downloading $TARBALL" >&2
+	curl -L "$URL" -o "$TAR_PATH.part" 1>&2
+	mv "$TAR_PATH.part" "$TAR_PATH"
+fi
+
+# Verify before extracting, not after: a truncated or substituted tarball must
+# never reach the tree, and "it built fine" is not a checksum.
+have="$(sha256sum "$TAR_PATH" | cut -d' ' -f1)"
+if [ "$have" != "$LINUX_SHA256" ]; then
+	echo "fetch-drm-core: SHA256 mismatch for $TARBALL" >&2
+	echo "  expected $LINUX_SHA256" >&2
+	echo "  got      $have" >&2
+	echo "  (delete $TAR_PATH to re-download, or update LINUX_SHA256 if the pin moved on purpose)" >&2
+	exit 1
+fi
+
+# Only what the core needs. The vendor drivers (i915, amdgpu, nouveau) are
+# M102's business and are staged by their own milestones; pulling all 477 MiB of
+# drivers/gpu/drm here would import code nothing builds yet.
+echo "fetch-drm-core: staging DRM core from linux-${LINUX_VERSION}" >&2
+rm -rf "$STAGE_DIR.tmp"
+mkdir -p "$STAGE_DIR.tmp"
+tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
+	"linux-${LINUX_VERSION}/include/drm" \
+	"linux-${LINUX_VERSION}/include/uapi/drm"
+
+# The core's own .c/.h files, without descending into the per-vendor subdirs.
+# --no-wildcards-match-slash is load-bearing: without it GNU tar lets `*` cross
+# directory separators, so "drivers/gpu/drm/*.c" quietly matches
+# drivers/gpu/drm/i915/*.c as well and stages 478 MiB of vendor drivers that
+# nothing builds.
+mkdir -p "$STAGE_DIR.tmp/drivers/gpu/drm"
+# --wildcards/--no-wildcards-match-slash are GNU tar's. bsdtar (macOS) has
+# neither, and its `*` crosses `/` with no way to say otherwise — which would
+# stage the vendor drivers this is written to avoid. There, name the members
+# explicitly instead: one pass over the archive index, filtered to exactly the
+# top-level .c/.h, and fed back through --files-from.
+if tar --version 2>/dev/null | grep -qi "GNU tar"; then
+	tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
+		--wildcards --no-wildcards-match-slash \
+		"linux-${LINUX_VERSION}/drivers/gpu/drm/*.c" \
+		"linux-${LINUX_VERSION}/drivers/gpu/drm/*.h"
+else
+	_members="$STAGE_DIR.tmp/.drm-core-members"
+	tar -tf "$TAR_PATH" |
+		grep -E "^linux-${LINUX_VERSION}/drivers/gpu/drm/[^/]+\.(c|h)$" > "$_members"
+	[ -s "$_members" ] || {
+		echo "fetch-drm-core: no top-level drm sources matched in $TAR_PATH" >&2
+		exit 1
+	}
+	tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 -T "$_members"
+	rm -f "$_members"
+fi
+
+# The display helpers (DisplayPort, DSC, HDCP, SCDC, HDMI) and TTM. Both are
+# separate modules upstream — drm_display_helper.ko and ttm.ko — and both are
+# MIT in their own right, so they are imported rather than reimplemented. i915
+# does not build without either: every DP link is trained through the first and
+# every memory region is managed by the second.
+tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
+	"linux-${LINUX_VERSION}/drivers/gpu/drm/display" \
+	"linux-${LINUX_VERSION}/drivers/gpu/drm/ttm"
+
+# Two more pieces the core needs that are MIT in their own right and therefore
+# imported rather than reimplemented: the HDMI infoframe library (linux/hdmi.h +
+# drivers/video/hdmi.c, "Permission is hereby granted, free of charge...") and
+# video/nomodeset.h (SPDX MIT). Writing our own versions of these would be
+# rewriting working MIT code for no reason — the rule is import what is
+# importable, and shim only what is not.
+tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
+	"linux-${LINUX_VERSION}/include/linux/hdmi.h" \
+	"linux-${LINUX_VERSION}/include/video/nomodeset.h" \
+	"linux-${LINUX_VERSION}/drivers/video/hdmi.c" \
+	"linux-${LINUX_VERSION}/drivers/video/nomodeset.c"
+
+# The GPU buddy allocator. 6.18 moved it out of the DRM core into
+# drivers/gpu/buddy.c with its interface in include/linux/gpu_buddy.h, leaving
+# drm_buddy.c a thin wrapper; both files are MIT, so the allocator is imported
+# with the core rather than reimplemented in the shim.
+if tar -tf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/buddy.c" >/dev/null 2>&1; then
+	tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
+		"linux-${LINUX_VERSION}/drivers/gpu/buddy.c" \
+		"linux-${LINUX_VERSION}/include/linux/gpu_buddy.h"
+	# Relative to drivers/gpu/drm, where every other entry lives.
+	echo "../buddy.c" >> "$STAGE_DIR.tmp/B1NIX-OBJECTS.extra"
+fi
+
+# The object list, taken from upstream's own Makefile rather than chosen here.
+# Not every file in drivers/gpu/drm is meant to be built — Kconfig selects them,
+# and drm_of.c for instance is device-tree-only and collides with its own
+# header's stub when built without it. `drm-y` is the set that is always built,
+# so it is the set we build, and it comes from the pinned source so it cannot
+# drift from it.
+# The assignment continues while lines end in a backslash; it does NOT end at
+# the first blank line, and stopping there swallows the drm-$(CONFIG_*) blocks
+# that follow — which is how drm_of.c, built only with CONFIG_OF, ended up in a
+# list of files that are always built.
+tar -xOf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/drm/Makefile" |
+	awk '/^drm-y[[:space:]]*:=/ { inblock = 1 }
+	     inblock { print; if ($0 !~ /\\$/) exit }' |
+	grep -oE 'drm_[a-z0-9_]+\.o' |
+	sed 's/\.o$/.c/' |
+	sort -u > "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+
+# drm_kms_helper-y as well. "The DRM core" in practice means drm.ko plus
+# drm_kms_helper.ko: the atomic modeset helpers, the probe helpers and the
+# rectangle maths live there, and every vendor driver builds on them. Splitting
+# them out is a module boundary, and b1nix links the whole thing into the kernel
+# — so the boundary buys nothing here and leaving the helpers out would only
+# mean discovering they were needed later.
+tar -xOf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/drm/Makefile" |
+	awk '/^drm_kms_helper-y[[:space:]]*:=/ { inblock = 1 }
+	     inblock { print; if ($0 !~ /\\$/) exit }' |
+	grep -oE 'drm_[a-z0-9_]+\.o' |
+	sed 's/\.o$/.c/' >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+
+# The in-kernel DRM client (6.12+ gates it on CONFIG_DRM_CLIENT, which every
+# fbdev emulation selects). b1nix's console is a DRM client, so it is built.
+tar -xOf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/drm/Makefile" |
+	sed -e :a -e '/\\$/N; s/\\\n//; ta' |
+	grep -E '^drm-\$\(CONFIG_DRM_CLIENT\)' |
+	grep -oE 'drm_[a-z0-9_]+\.o' |
+	sed 's/\.o$/.c/' >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+
+# drm_display_helper-y and ttm-y, from the same Makefiles, for the same reason.
+tar -xOf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/drm/display/Makefile" |
+	sed -e :a -e '/\\$/N; s/\\\n//; ta' |
+	grep -E '^drm_display_helper-(y|\$\(CONFIG_DRM_DISPLAY_(DP|DSC|HDCP|HDMI)_HELPER\))' |
+	grep -oE 'drm_[a-z0-9_]+\.o' |
+	sed -e 's/\.o$/.c/' -e 's|^|display/|' >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+
+tar -xOf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/drm/ttm/Makefile" |
+	sed -e :a -e '/\\$/N; s/\\\n//; ta' |
+	grep -E '^ttm-y' |
+	grep -oE 'ttm_[a-z0-9_]+\.o' |
+	sed -e 's/\.o$/.c/' -e 's|^|ttm/|' >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+
+# Files upstream builds only under a CONFIG that i915 selects: the buddy
+# allocator its memory regions are built on, the DSI host interface its panel
+# code speaks, and (6.12+, CONFIG_DRM_PANEL) the panel abstraction its DSI
+# panels register with. They are staged already — they sit in drivers/gpu/drm —
+# but they are not in drm-y, so they are named here rather than discovered at
+# link time. The kernel is built with CONFIG_DRM_PANEL to match.
+printf '%s\n' drm_buddy.c drm_mipi_dsi.c drm_panel.c >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+
+# hdmi.c is not in either list — upstream builds it alongside the video helpers —
+# but the core links against its infoframe helpers, so it is part of what has to
+# be built here.
+echo "hdmi.c" >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+[ -f "$STAGE_DIR.tmp/B1NIX-OBJECTS.extra" ] && cat "$STAGE_DIR.tmp/B1NIX-OBJECTS.extra" >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+rm -f "$STAGE_DIR.tmp/B1NIX-OBJECTS.extra"
+
+sort -u -o "$STAGE_DIR.tmp/B1NIX-OBJECTS" "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+
+# Record what this tree is, next to it, so a stray copy can still be identified.
+cat > "$STAGE_DIR.tmp/B1NIX-IMPORT" <<EOF
+source: linux-${LINUX_VERSION}
+sha256: ${LINUX_SHA256}
+url:    ${URL}
+staged: drivers/gpu/drm/*.[ch], drivers/gpu/drm/{display,ttm},
+        include/drm, include/uapi/drm,
+        include/linux/hdmi.h, include/video/nomodeset.h,
+        drivers/video/{hdmi,nomodeset}.c,
+        drivers/gpu/buddy.c, include/linux/gpu_buddy.h  (all MIT)
+rule:   imported source is never edited; fixes belong in kernel/lkpi.
+EOF
+
+mv "$STAGE_DIR.tmp" "$STAGE_DIR"
+echo "$STAGE_DIR"

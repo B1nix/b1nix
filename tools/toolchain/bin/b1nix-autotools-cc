@@ -364,14 +364,14 @@ with open(f, 'r+b') as fh:
   exit "$ld_status"
 else
   # Everything else used to fall back to a fixed-address static link (the old
-  # b1nix libc.a/crt0.o, or musl's libc.a through userspace/linker.ld). Those
-  # paths are gone: b1nix ships dynamic PIEs only, and tools/check/check-dynamic.sh
+  # b1nix libc.a/crt0.o, or musl's libc.a through tests/programs/linker.ld). Those
+  # paths are gone: b1nix ships dynamic PIEs only, and tools/toolchain/check-dynamic.sh
   # rejects a static executable in the rootfs anyway. Failing here is the point
   # — a caller that cannot link dynamically has a problem to fix, not a flag to
   # switch.
   echo "b1nix-autotools-cc: refusing to link '$output' statically." >&2
   echo "  b1nix links dynamically against /lib/libc.so; see the port scripts" >&2
-  echo "  under tools/ports/ for the flags, and tools/configs/static-allowlist.txt" >&2
+  echo "  under tools/ports/ for the flags, and tools/toolchain/static-allowlist.txt" >&2
   echo "  for the (reasoned) exceptions." >&2
   if [ ! -f "$MUSL_SCRT1" ] || [ ! -f "$MUSL_SO" ]; then
     echo "  musl's Scrt1.o/libc.so are missing — run tools/toolchain/build-musl.sh." >&2

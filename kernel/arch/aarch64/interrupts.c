@@ -1,3 +1,4 @@
+#include <b1nix/cgroup.h>
 #include <b1nix/input.h>
 #include <b1nix/virtio_console.h>
 #include <b1nix/types.h>
@@ -1010,6 +1011,12 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 		                 (from_el0 ? 4 : 0) |
 		                 ((frame->spsr & (1ULL << 7)) ? 0 : 8);
 		pf_rc = vmm_handle_page_fault(far, error_code);
+		/* Resource control (M127): see the same hook in the x86_64 handler.
+		 * A fault that grew a userspace address space is charged to its
+		 * cgroup, and a cgroup over its memory.max is measured, reclaimed and
+		 * killed inside. */
+		if (pf_rc == 0 && current_task)
+			cgroup_mem_fault_charge(far);
 		if (pf_rc == 0) {
 			if (from_el0)
 				arch_check_and_deliver_signals(frame);

@@ -24,7 +24,7 @@ struct b1nix_sigframe {
 } __attribute__((packed));
 
 /* M74: native siginfo_t handed to an SA_SIGINFO handler. Layout MUST match the
- * userspace siginfo_t (userspace/include/signal.h) exactly — the kernel copies
+ * userspace siginfo_t (third_party/b1cc-sysroot/signal.h) exactly — the kernel copies
  * this onto the user stack and the handler reads it as siginfo_t*. */
 struct b1nix_native_siginfo {
   int si_signo;  /* 0 */

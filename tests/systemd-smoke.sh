@@ -2,8 +2,8 @@
 # systemd boot test: boot b1nix with a Debian root filesystem whose PID 1 is
 # Debian's own systemd, headless, console on the serial line.
 #
-#   sh tools/images/mk-debian-image.sh   # once
-#   PROFILE=systemd sh tools/images/mk-debian-image.sh
+#   sh tools/image/mk-debian-image.sh   # once
+#   PROFILE=systemd sh tools/image/mk-debian-image.sh
 #   sh tests/systemd-smoke.sh [x86_64]
 #
 # Skips cleanly (exit 0) when the image has not been built, so it can be wired
@@ -54,7 +54,7 @@ mkdir -p "$PROJECT_DIR/smoke_run"
 echo "=== B1NIX systemd Boot Test ($ARCH) ==="
 
 if [ ! -f "$IMG" ]; then
-	printf "  ${YELLOW}skipped${NC}: %s not built — run PROFILE=systemd tools/images/mk-debian-image.sh first\n" "$IMG"
+	printf "  ${YELLOW}skipped${NC}: %s not built — run PROFILE=systemd tools/image/mk-debian-image.sh first\n" "$IMG"
 	exit 0
 fi
 
@@ -75,7 +75,14 @@ fi
 # can activate — and this image has no udev. b1nix's console is the serial line
 # regardless, and the image enables console-getty.service, which runs agetty on
 # /dev/console and needs nothing but that device.
-CMDLINE="root=LABEL=$IMG_LABEL init=/sbin/init \
+#
+# loglevel=7 is not a debugging nicety here, it is the whole output channel.
+# The harness cannot write to /dev/console -- agetty claims and vhangup()s it
+# while the harness is still running -- so every marker goes to /dev/kmsg,
+# which userspace writes at the info level. At the default console level those
+# writes are accepted and then dropped, and the run reports every single check
+# as missing while the guest is in fact healthy and printing them.
+CMDLINE="root=LABEL=$IMG_LABEL init=/sbin/init loglevel=7 \
 systemd.unit=${SYSTEMD_TARGET:-multi-user.target} ${SYSTEMD_EXTRA_CMDLINE:-}"
 
 # ── Build ──────────────────────────────────────────────────────────────────
@@ -213,6 +220,10 @@ check_output "SYSTEMD-SMOKE: ok private-tmp" "PrivateTmp really is private: the 
 check_output "SYSTEMD-SMOKE: ok protect-system" "ProtectSystem=strict refuses the write rather than letting it through"
 check_output "SYSTEMD-SMOKE: ok timer-fires" "a .timer unit fires and runs the service it names"
 check_output "SYSTEMD-SMOKE: ok restart-on-failure" "Restart=on-failure notices the exit status and starts the unit again"
+check_output "SYSTEMD-SMOKE: ok resource-controllers" "cgroup.controllers offers cpu, io, memory and pids, and the running unit's own cgroup has a memory.events and a non-zero memory.current"
+check_output "SYSTEMD-SMOKE: ok memory-max" "a transient unit with MemoryMax= has its runaway killed by SIGKILL inside the unit, and systemd is still PID 1 afterwards"
+check_output "SYSTEMD-SMOKE: ok cpu-weight" "two transient units at CPUWeight 100 and 1000 divide the CPU by weight, measured from each unit cgroup's own cpu.stat"
+check_output "SYSTEMD-SMOKE: ok pressure" "/proc/pressure/cpu moves under that load, and memory and io print the some/full lines Linux prints"
 check_output "SYSTEMD-SMOKE: ok journal-filter-unit" "journalctl -u returns one unit's entries, so the journal is indexed rather than only appended"
 check_output "SYSTEMD-SMOKE: ok unit-enable-disable" "systemctl enable/disable moves the unit between enabled and disabled"
 check_output "SYSTEMD-SMOKE: ok unit-mask-refuses" "a masked unit refuses to start even when asked directly"

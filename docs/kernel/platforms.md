@@ -30,7 +30,7 @@ AArch64 is not a milestone of its own. It is the same kernel built for another
 architecture, and any gap belongs to the milestone that owns the mechanism.
 It runs on QEMU `virt` (the smoke suite), on the Raspberry Pi 4 (QEMU
 `raspi4b`, `make run-rpi4`, `SMOKE_RASPI_LANE=1`) and on a Sony Xperia 5
-(`make bahamut`, tools in `tools/boards/sony-xperia-5/`). On `virt` the suite
+(`make bahamut`, tools in `tools/board/sony-xperia-5/`). On `virt` the suite
 runs the same lanes as on x86_64, with PCIe devices reached through ECAM; the
 `smp` lane adds GICv3 with an ITS and an SMMUv3.
 
@@ -71,7 +71,7 @@ branch is now the AArch64 branch.
 
 The Linux ABI is the only system-call interface (M40, M121). Binaries are
 dynamically linked against musl by default (M92), and the root image is
-assembled from pinned Alpine packages (`tools/packages/alpine-ports.map`, with
+assembled from pinned Alpine packages (`tools/image/alpine/alpine-ports.map`, with
 hashes in `alpine.lock`; M104). Optional groups keep large stacks out of the
 ordinary image: `B1NIX_BROWSER=1` for Chromium, `B1NIX_GPU_DRV=1` for Mesa's
 hardware drivers, `B1NIX_KDE=1` for Plasma.
@@ -82,7 +82,7 @@ On the Alpine image BusyBox init is PID 1 and starts OpenRC; `su`, `passwd` and
 (M94).
 
 The Debian lane boots bookworm unmodified from a disk image built without root
-privileges (`tools/images/mk-debian-image.sh`), with glibc as the libc (M111).
+privileges (`tools/image/mk-debian-image.sh`), with glibc as the libc (M111).
 The kernel log is levelled and timestamped the way Debian's tools expect. The
 systemd profile of the same image runs systemd 252 as PID 1 up to
 `graphical.target`, with cgroup v2, mount propagation, devtmpfs and Weston on

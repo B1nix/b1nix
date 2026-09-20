@@ -339,6 +339,10 @@ static int user_range_prepare_write(void *user_dst, usize size) {
        * leaving the entry exactly as read-only as it found it. The code the CPU
        * would have reported is the code to pass. */
       rc = vmm_handle_page_fault(v, PF_USER | PF_WRITE | PF_PRESENT);
+      if (rc == 0)
+        cgroup_mem_fault_charge(v); /* M127: the page this installed is the
+                                     * process's, wherever the fault came
+                                     * from -- see b1nix/cgroup.h */
       pte = vmm_query_leaf_pte(v);
       if ((pte & need) == need || rc < 0)
         break;
@@ -1604,13 +1608,14 @@ static isize sys_fchown(int fd, u32 uid, u32 gid) {
 }
 
 static isize sys_fcntl(int fd, int cmd, u64 arg) {
-  if (cmd == B1NIX_F_GETLK || cmd == B1NIX_F_SETLK || cmd == B1NIX_F_SETLKW) {
+  if (cmd == B1NIX_F_GETLK || cmd == B1NIX_F_SETLK || cmd == B1NIX_F_SETLKW ||
+      cmd == F_OFD_GETLK || cmd == F_OFD_SETLK || cmd == F_OFD_SETLKW) {
     struct flock kfl;
     if (copy_from_user(&kfl, (void *)(usize)arg, sizeof(struct flock)) < 0) {
       return -EFAULT;
     }
     isize res = vfs_fcntl(fd, cmd, (u64)(usize)&kfl);
-    if (res == 0 && cmd == B1NIX_F_GETLK) {
+    if (res == 0 && (cmd == B1NIX_F_GETLK || cmd == F_OFD_GETLK)) {
       if (copy_to_user((void *)(usize)arg, &kfl, sizeof(struct flock)) < 0) {
         return -EFAULT;
       }
@@ -2167,6 +2172,8 @@ static int mlock_populate(u64 start, u64 end) {
      * (anonymous zero-fill, file-backed page-in, or swap-in). */
     if (vmm_handle_page_fault(va, PF_USER) != 0)
       return -1;
+    cgroup_mem_fault_charge(va); /* M127: MAP_POPULATE and friends grow the
+                                  * process without a ring-3 fault */
     if (!paging_user_frame(current_task->pml4_phys, va))
       return -1;
   }
@@ -5454,6 +5461,7 @@ static u64 sys_brk(u64 addr) {
   if (addr > t->user_brk) {
     u64 old_brk_page_end = (t->user_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     u64 new_brk_page_end = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    u64 brk_mapped = 0;
 
     for (u64 v = old_brk_page_end; v < new_brk_page_end; v += PAGE_SIZE) {
       /* Never over a page that is already there.
@@ -5478,7 +5486,13 @@ static u64 sys_brk(u64 addr) {
       vmm_map_page(v, frame,
                    vmm_user_flags_from_prot(PROT_READ | PROT_WRITE) |
                        VMM_PRESENT);
+      brk_mapped++;
     }
+    /* M127: charged in one go. These pages never fault -- they are mapped
+     * here, eagerly -- so the cgroup memory controller would never see the
+     * main arena of a glibc process grow at all. */
+    if (brk_mapped)
+      cgroup_mem_charge_pages(brk_mapped);
   } else if (addr < t->user_brk) {
     u64 old_brk_page_end = (t->user_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     u64 new_brk_page_end = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -8979,13 +8993,26 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return 0;
       }
 
-      /* sched_*: b1nix runs one policy — SCHED_OTHER, stride scheduling with
-       * nice weighting — so the policy calls report it truthfully and refuse to
-       * switch to a policy that does not exist. Nice lives in get/setpriority. */
-      if (number == LX_sched_setscheduler) /* sched_setscheduler(pid, policy, param) */
-        return (int)arg1 == 0 ? 0 : (u64)-EINVAL;
-      if (number == LX_sched_getscheduler) /* sched_getscheduler → SCHED_OTHER */
-        return 0;
+      /* sched_*: b1nix has one runnable class, the stride scheduler, so the
+       * policies it can offer are the fair-share three — SCHED_OTHER,
+       * SCHED_BATCH and SCHED_IDLE, which differ in how small a share they
+       * ask for. SCHED_FIFO and SCHED_RR stay refused: a caller that believes
+       * it has a real-time thread makes different decisions. Nice lives in
+       * get/setpriority. */
+      if (number == LX_sched_setscheduler) { /* (pid, policy, param) */
+        struct task *t = arg0 ? scheduler_task_by_pid((usize)arg0) : current_task;
+
+        if (!t)
+          return (u64)-ESRCH;
+        return (u64)(isize)sched_set_policy(t, (int)arg1);
+      }
+      if (number == LX_sched_getscheduler) {
+        struct task *t = arg0 ? scheduler_task_by_pid((usize)arg0) : current_task;
+
+        if (!t)
+          return (u64)-ESRCH;
+        return (u64)(isize)sched_get_policy(t);
+      }
       if (number == LX_sched_setparam || number == LX_sched_getparam) {
         /* sched_setparam / sched_getparam: struct sched_param {int priority;},
          * always 0 under SCHED_OTHER. */
@@ -9000,8 +9027,18 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           return (u64)-EFAULT;
         return prio == 0 ? 0 : (u64)-EINVAL;
       }
-      if (number == LX_sched_get_priority_max || number == LX_sched_get_priority_min) /* sched_get_priority_max/min */
-        return (int)arg0 == 0 ? 0 : (u64)-EINVAL;
+      if (number == LX_sched_get_priority_max ||
+          number == LX_sched_get_priority_min) {
+        /* [0, 0] for the fair-share policies, as on Linux. chrt asks for the
+         * range before it sets a policy and refuses to call at all when the
+         * answer is an error, so a policy this kernel accepts must have a
+         * range it can report. */
+        int pol = (int)arg0;
+
+        return (pol == SCHED_OTHER || pol == SCHED_BATCH || pol == SCHED_IDLE)
+                   ? 0
+                   : (u64)-EINVAL;
+      }
       if (number == LX_sched_rr_get_interval) { /* sched_rr_get_interval(pid, timespec) */
         if (!arg1)
           return (u64)-EFAULT;
@@ -11433,18 +11470,24 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     ret = 0;
     break;
 
-  case SYS_SCHED_GETSCHEDULER:
-    /* One policy for every task here, so the honest answer is SCHED_OTHER (0)
-     * rather than ENOSYS. A crash reporter asks this per thread while walking
-     * a process and logs a failure for each one when it is missing. */
-    ret = 0;
+  case SYS_SCHED_GETSCHEDULER: {
+    /* The policy the task actually carries. A crash reporter asks this per
+     * thread while walking a process and logs a failure for each one when it
+     * is missing. */
+    struct task *t = arg0 ? scheduler_task_by_pid((usize)arg0) : current_task;
+
+    ret = t ? (u64)(isize)sched_get_policy(t) : (u64)-ESRCH;
     break;
-  case SYS_SCHED_SETSCHEDULER:
-    /* Accept a request for the policy we already run, refuse the rest — a
-     * silent "yes" to SCHED_FIFO would promise real-time scheduling that this
-     * kernel does not provide. */
-    ret = ((int)arg1 == 0) ? 0 : (u64)-EINVAL;
+  }
+  case SYS_SCHED_SETSCHEDULER: {
+    /* The fair-share policies are accepted and honoured; SCHED_FIFO and
+     * SCHED_RR are refused, because a silent "yes" would promise real-time
+     * scheduling this kernel does not provide. */
+    struct task *t = arg0 ? scheduler_task_by_pid((usize)arg0) : current_task;
+
+    ret = t ? (u64)(isize)sched_set_policy(t, (int)arg1) : (u64)-ESRCH;
     break;
+  }
   case SYS_SCHED_GETPARAM: {
     /* sched_param is one int, and under SCHED_OTHER it is always zero. */
     int prio = 0;
@@ -11458,8 +11501,12 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     break;
   case SYS_SCHED_GET_PRIORITY_MAX:
   case SYS_SCHED_GET_PRIORITY_MIN:
-    /* SCHED_OTHER's range is [0, 0] on Linux too. */
-    ret = ((int)arg0 == 0) ? 0 : (u64)-EINVAL;
+    /* [0, 0] for every fair-share policy, which is what Linux answers too;
+     * the real-time policies this kernel refuses have no range to report. */
+    ret = ((int)arg0 == SCHED_OTHER || (int)arg0 == SCHED_BATCH ||
+           (int)arg0 == SCHED_IDLE)
+              ? 0
+              : (u64)-EINVAL;
     break;
 
   case SYS_SET_ROBUST_LIST:

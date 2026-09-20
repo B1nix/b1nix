@@ -204,10 +204,13 @@ Per-call state: [processes-and-system-calls.md](processes-and-system-calls.md).
 Ahead of M125 and M126: it blocks phase C of
 [../distro/roadmap.md](../distro/roadmap.md), and no ISO ships before it.
 
-- [ ] `planned` cgroup v2 controllers: memory (limits, accounting per cgroup), cpu (weights on the stride scheduler, quotas), io, pids.
-- [ ] `planned` OOM killer that picks by cgroup and `oom_score_adj`, with an honest `memory.events`; PSI (`/proc/pressure/*`).
-- [ ] `planned` Compressed swap: zram block device and/or zswap in front of the existing swap.
-- [ ] `planned` Proof: systemd slices enforce `MemoryMax`/`CPUWeight`; a runaway process is killed inside its cgroup, not system-wide.
+Per-controller detail: [memory-and-scheduling.md](memory-and-scheduling.md).
+
+- [x] `done` cgroup v2 controllers, each advertised only because it is enforced: `memory` (`memory.current` measured from the members' page tables, `memory.max` enforced from the fault path on an exact measurement), `cpu` (`cpu.weight` as a stride on the M117 scheduler, `cpu.max` as a quota per period), `io` (per-device `io.stat` and rate ceilings at the block layer) and `pids`.
+- [x] `done` An OOM killer that ranks by resident size and `oom_score_adj` — one walk shared by the machine-wide and the per-cgroup killer — and a `memory.events` that counts only what happened.
+- [x] `done` PSI at `/proc/pressure/{cpu,memory,io}`, measured from stall regions in the block layer, reclaim and swap-in. No per-cgroup pressure files: they would be copies of the global one.
+- [ ] `planned` Compressed swap: zram block device and/or zswap in front of the existing swap. Not started; with it belong cgroup-targeted reclaim and a real `memory.swap.current`, without which `memory.max` is enforced by the kill alone.
+- [x] `done` Proved twice: `m127_smoke` on the Alpine lane (12 checks, every one an observed kill, refusal or ratio) and Debian's own systemd on the systemd lane, where a `MemoryMax=48M` unit's `tail /dev/zero` dies of `SIGKILL` inside it within a second while PID 1 carries on, two `CPUWeight=` units at 100 and 1000 divide the CPU 1:9.8 by their own `cpu.stat`, and `/proc/pressure/cpu` moves under that load.
 
 ## M128: Large memory and NUMA
 

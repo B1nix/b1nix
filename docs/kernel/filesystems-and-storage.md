@@ -26,7 +26,7 @@ filesystems do not work yet.
 btrfs, ext4 and jbd2 are compiled unmodified from Linux 6.18.51 on top of the
 linuxkpi shim in `kernel/include/linux` and `kernel/lkpi/`. There is no patch
 directory: a patch to anything under the staged tree would be a bug in the shim.
-`tools/fs/fetch-linux-fs.sh` stages the sources, pinned by version and hash, and
+`tools/import/fs/fetch-linux-fs.sh` stages the sources, pinned by version and hash, and
 `B1NIX_FS_IMPORT` chooses btrfs alone or btrfs with ext4. ext2, ext3 and ext4
 are all mounted by the imported ext4, and there are no native ext or btrfs
 drivers. The root image is btrfs on both architectures.
@@ -51,7 +51,7 @@ what upstream returns when that feature is configured out.
 What is not there yet: the raid5/raid6 profiles of btrfs (`lib/raid6` is not
 imported), sha256 and blake2b checksums, a hardware CRC fast path, ACLs,
 fs-verity and fscrypt. The host is the judge in the tests: images made by
-`tools/fs/make-lkpi-image.sh` are checked afterwards with `btrfs check` and
+`tools/import/fs/make-lkpi-image.sh` are checked afterwards with `btrfs check` and
 `e2fsck`.
 
 ## Disk quotas (M124)

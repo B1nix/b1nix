@@ -955,10 +955,39 @@ void vma_retire_poll(void);
 struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr);
 void vma_delete_range(struct task *t, u64 start, u64 end);
 
+/* ── cgroup cpu controller hooks (M127) ──────────────────────────────────────
+ *
+ * Published by cgroup_tick() and read by the picker and the stride update.
+ * `pct` scales the stride a task's nice value buys -- 0 means no cgroup
+ * weighting at all, which is every task until something writes cpu.weight.
+ * `throttled` says the task's cgroup has spent this period's cpu.max. */
+void sched_set_cgroup_stride_pct(struct task *t, u32 pct);
+void sched_set_cgroup_throttled(struct task *t, int on);
+
+/* oom_score_adj, as /proc/<pid>/oom_score_adj reads and writes it: -1000..1000,
+ * a thousandth of the machine's memory each, -1000 meaning "never kill me".
+ * Set on the whole thread group, as Linux does. scheduler_oom_score() is the
+ * derived 0..1000 badness /proc/<pid>/oom_score reports. */
+int scheduler_oom_score_adj(usize pid);
+int scheduler_set_oom_score_adj(usize pid, int adj);
+int scheduler_oom_score(usize pid);
+
 /* Stride for a nice value: how far a task's pass advances each time it yields.
  * Exposed so the nice weighting can be checked directly instead of inferred
  * from how often spinning processes happened to run. */
 int sched_stride_for_nice(int nice);
+
+/* sched_setscheduler(2) policies. Only the fair-share three exist here; the
+ * real-time ones are refused rather than faked. */
+#define SCHED_OTHER 0
+#define SCHED_BATCH 3
+#define SCHED_IDLE  5
+
+/* The stride a task gets once its policy is taken into account. */
+int sched_stride_for_policy(int policy, int nice);
+/* Set/read a task's policy. Setting anything but OTHER/BATCH/IDLE is EINVAL. */
+int sched_set_policy(struct task *t, int policy);
+int sched_get_policy(struct task *t);
 
 /* Known-answer checks for that contract and for the min-pass selection rule it
  * feeds. Emits M46-SCHED markers; test mode only. */

@@ -50,7 +50,7 @@ access (XSAVE on x86_64, FPSIMD on AArch64), the Yama `ptrace_scope` rules,
 
 These live in `kernel/syscall/linux_modern.c`, `linux_keys.c` and
 `kernel/fs/landlock.c`. Each has a probe in the Debian lane (stage 12 of
-`tools/images/debian-stage.sh`) that checks results and errno values, not just
+`tools/image/debian-stage.sh`) that checks results and errno values, not just
 that the call no longer answers ENOSYS.
 
 - **`openat2`** resolves each path component itself, honouring every

@@ -23,7 +23,7 @@ ln -sfn "$B1NIX_ROOTFS" "$SYSROOT" 2>/dev/null || true
 
 # 2. Fetch musl libc headers/libs from Alpine packages and stage into sysroot
 echo "Fetching musl libc (Alpine packages) and staging headers/libs..."
-MUSL_USR="$(B1NIX_ARCH="$B1NIX_ARCH" "$PROJECT_DIR/tools/packages/pkg-prefix.sh" musl | tail -1)"
+MUSL_USR="$(B1NIX_ARCH="$B1NIX_ARCH" "$PROJECT_DIR/tools/image/alpine/pkg-prefix.sh" musl | tail -1)"
 if [ -d "$MUSL_USR" ]; then
     mkdir -p "$SYSROOT/usr/include" "$SYSROOT/usr/lib" "$SYSROOT/include" "$SYSROOT/lib"
     cp -Rf "$MUSL_USR/include/"* "$SYSROOT/include/" 2>/dev/null || true
@@ -38,15 +38,15 @@ fi
 # ships: without it, a port that includes <linux/...> only builds if its own
 # build script bolts on a private copy of the header, which is a patch by
 # another name.
-if [ -d "$PROJECT_DIR/userspace/include" ]; then
+if [ -d "$PROJECT_DIR/third_party/b1cc-sysroot" ]; then
     for _dir in "$SYSROOT/include" "$SYSROOT/usr/include"; do
         mkdir -p "$_dir/sys"
         for _tree in linux asm asm-generic b1nix; do
-            [ -d "$PROJECT_DIR/userspace/include/$_tree" ] &&
-                cp -Rn "$PROJECT_DIR/userspace/include/$_tree" "$_dir/" 2>/dev/null || true
+            [ -d "$PROJECT_DIR/third_party/b1cc-sysroot/$_tree" ] &&
+                cp -Rn "$PROJECT_DIR/third_party/b1cc-sysroot/$_tree" "$_dir/" 2>/dev/null || true
         done
-        [ -f "$PROJECT_DIR/userspace/include/sys/cdefs.h" ] &&
-            cp -n "$PROJECT_DIR/userspace/include/sys/cdefs.h" "$_dir/sys/" 2>/dev/null || true
+        [ -f "$PROJECT_DIR/third_party/b1cc-sysroot/sys/cdefs.h" ] &&
+            cp -n "$PROJECT_DIR/third_party/b1cc-sysroot/sys/cdefs.h" "$_dir/sys/" 2>/dev/null || true
     done
 fi
 
@@ -109,6 +109,6 @@ for stubdir in "$SYSROOT/usr/lib" "$SYSROOT/lib" "$PREFIX/$B1NIX_TRIPLET/lib"; d
 done
 
 # The C++ runtime and compiler-rt come from Alpine packages at build time
-# (tools/packages/alpine-ports.map: libcxx, compiler-rt).
+# (tools/image/alpine/alpine-ports.map: libcxx, compiler-rt).
 
 echo "=== Cross-toolchain setup complete ==="

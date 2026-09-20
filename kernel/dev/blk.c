@@ -1,7 +1,10 @@
 #include <b1nix/kprof.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/lapic.h>
+#include <b1nix/arch.h>
 #include <b1nix/blk.h>
+#include <b1nix/cgroup.h>
+#include <b1nix/psi.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/acpi.h>
 #include <b1nix/console.h>
@@ -1621,19 +1624,81 @@ int blk_io_gate_selftest(void) {
 }
 
 /* The device-command wrappers every path below goes through. */
+/* ── the one place a command really reaches a device ─────────────────────────
+ *
+ * Everything the block layer does funnels through these two calls, which is
+ * what makes them the place for three things that have nothing to do with each
+ * other but all need exactly this point:
+ *
+ *   - io.stat, because a cgroup's I/O is the commands issued on its behalf,
+ *     not the read(2)s it made (most of which the cache answers);
+ *   - io.max, because a limit can only be applied before a command goes out;
+ *   - PSI's io pressure, because the time from here to the completion is
+ *     precisely the time a task spent waiting for a disk. The wait for the
+ *     device gate counts too: a request queued behind another is stalled just
+ *     the same.
+ */
+
+static u64 blk_bytes_of(struct block_device *dev, u32 count) {
+  u64 bs = dev->block_size ? dev->block_size : 512;
+
+  return (u64)count * bs;
+}
+
+/* Hold the caller back long enough to keep its cgroup inside io.max.
+ *
+ * Only a task that can sleep is delayed: a completion path or a driver worker
+ * running with interrupts masked has nobody to charge and nowhere to wait, and
+ * sleeping there would deadlock the device it is draining. */
+static void blk_cgroup_throttle(u32 devno, u64 bytes, int write) {
+  if (!devno || !current_task || !interrupts_enabled())
+    return;
+  u64 ns = cgroup_io_delay_ns(devno, bytes, write);
+
+  if (!ns)
+    return;
+  u64 hz = sched_tick_hz() ? sched_tick_hz() : 1000;
+  u64 ticks = (ns * hz) / 1000000000ull;
+
+  if (!ticks)
+    ticks = 1;
+  scheduler_sleep_ticks(ticks);
+}
+
 static int blk_dev_read(struct block_device *dev, u64 lba, u32 count,
                         void *buf) {
+  u32 devno = blk_devno(dev);
+  u64 bytes = blk_bytes_of(dev, count);
+
+  blk_cgroup_throttle(devno, bytes, 0);
+  psi_stall_begin(PSI_IO);
   blk_io_begin(dev);
   int rc = dev->read_blocks(dev, lba, count, buf);
   blk_io_end(dev);
+  psi_stall_end(PSI_IO);
+  /* Any non-negative answer is a completed command. A driver is free to
+   * return the sector count instead of zero and virtio-blk does exactly that,
+   * so a check for zero counted nothing at all on the one device every lane
+   * boots from -- io.stat stayed empty while the reads were plainly reaching
+   * the disk. */
+  if (rc >= 0)
+    cgroup_io_account(devno, bytes, 0);
   return rc;
 }
 
 static int blk_dev_write(struct block_device *dev, u64 lba, u32 count,
                          const void *buf) {
+  u32 devno = blk_devno(dev);
+  u64 bytes = blk_bytes_of(dev, count);
+
+  blk_cgroup_throttle(devno, bytes, 1);
+  psi_stall_begin(PSI_IO);
   blk_io_begin(dev);
   int rc = dev->write_blocks(dev, lba, count, buf);
   blk_io_end(dev);
+  psi_stall_end(PSI_IO);
+  if (rc >= 0)
+    cgroup_io_account(devno, bytes, 1);
   return rc;
 }
 

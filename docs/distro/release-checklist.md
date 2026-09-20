@@ -49,7 +49,7 @@ login:
 ## Artifacts
 
 - [ ] amd64 ISO and arm64 phone image built from the tag by
-      `tools/packages/build-deb.sh` and the image scripts.
+      `tools/deb/build-deb.sh` and the image scripts.
 - [ ] `SHA256SUMS` written and signed; the signature verifies with the
       published key on a machine that does not hold it.
 - [ ] The build manifest lists every Debian package version, the kernel commit

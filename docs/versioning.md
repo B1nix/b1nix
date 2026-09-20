@@ -86,13 +86,16 @@ Overlay packages take their version from the kernel version and the git
 state, so `apt` always sees a monotonic string:
 
 - On a tag: `0.124.0-1`
-- Between tags: `0.124.0+git20260920.841bf528-1`
+- Between tags: `0.124.0+git20260920.1493.841bf528-1`
 
 `0.124.0+git…` sorts above `0.124.0` and below `0.124.1`, which is what a
-snapshot should do. The `-1` is the Debian revision: it increments when the
+snapshot should do. The number between the date and the hash is the commit
+count, and it is not decoration: two snapshots from the same day are otherwise
+ordered by their hashes, which are not monotonic, so the newer build can sort
+below the older one and the repository will refuse it. The `-1` is the Debian revision: it increments when the
 packaging changes and the upstream version does not.
 
-`tools/packages/build-deb.sh` generates the `debian/changelog` entry from
+`tools/deb/build-deb.sh` generates the `debian/changelog` entry from
 `git describe --tags --long`; a hand-written version in a changelog is a bug.
 Packages that are not versioned with the kernel (`b1cc`, `b1nix-artwork`)
 carry their own upstream version and the same revision rule.

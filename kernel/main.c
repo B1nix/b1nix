@@ -330,7 +330,7 @@ static struct block_device *find_root_device(const char *root_val) {
 
 /* M26 native-Clang kernel self-host: orchestration moved to userspace
  * (/bin/selfhost-build). The kernel just mounts the toolchain ext4 and
- * spawns the userspace builder. See userspace/bin/selfhost_build.c. */
+ * spawns the userspace builder. See tests/programs/bin/selfhost_build.c. */
 
 /* Repeats the i915 port dump for as long as the machine runs. See the note at
  * its only caller. */
@@ -1828,7 +1828,7 @@ void kernel_main(usize arg0, usize arg1)
 
 	/* M94: Generic init path — honour `init=/path` from kernel cmdline.
 	 * Default PID 1 is /sbin/init, which is BusyBox's `init` applet (the
-	 * symlink is stamped by tools/packages/stage-busybox.sh) — Alpine's layout.
+	 * symlink is stamped by tools/image/alpine/stage-busybox.sh) — Alpine's layout.
 	 * BusyBox init supervises (reaps orphans, respawns getty, runs the
 	 * sysinit/shutdown phases) and /etc/inittab hands the service graph to
 	 * OpenRC, which stays the high-level init: `openrc sysinit`, `openrc boot`,

@@ -34,7 +34,7 @@ MUSL_INSTALL="$ROOT_DIR/build/$B1NIX_ARCH/pkg/musl"
 [ -d "$MUSL_INSTALL/usr" ] && MUSL_INSTALL="$MUSL_INSTALL/usr"
 
 if [ ! -d "$MUSL_INSTALL" ]; then
-  echo "b1nix-musl-cc: musl not installed yet. Run: tools/packages/pkg-prefix.sh musl" >&2
+  echo "b1nix-musl-cc: musl not installed yet. Run: tools/image/alpine/pkg-prefix.sh musl" >&2
   exit 1
 fi
 

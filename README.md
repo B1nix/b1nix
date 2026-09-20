@@ -18,7 +18,7 @@ Implementation status per milestone is tracked in
 | `ARCH=` | Status |
 | --- | --- |
 | `x86_64` (default) | Primary target: QEMU (KVM) and real hardware |
-| `aarch64` | Second target of the same kernel: QEMU `virt`, Raspberry Pi 4, Sony Xperia 5 ([tools/boards/sony-xperia-5](tools/boards/sony-xperia-5/README.md)); gaps in [docs/kernel/platforms.md](docs/kernel/platforms.md) |
+| `aarch64` | Second target of the same kernel: QEMU `virt`, Raspberry Pi 4, Sony Xperia 5 ([tools/board/sony-xperia-5](tools/board/sony-xperia-5/README.md)); gaps in [docs/kernel/platforms.md](docs/kernel/platforms.md) |
 
 ## Host Requirements
 
@@ -94,7 +94,7 @@ every assertion; `SMOKE_PCAP=1` captures network traffic.
 
 ```text
 kernel/      kernel core, arch code, drivers, VFS, networking, linuxkpi
-userspace/   headers, rootfs overlay, b1cc, native programs and smoke tests
+tests/programs/   headers, rootfs overlay, b1cc, native programs and smoke tests
 boot/        Limine configuration
 tools/       toolchain, ports, packaging, image and device scripts
 tests/       host-side QEMU test drivers
@@ -106,4 +106,4 @@ docs/        roadmap and subsystem notes
 Original b1nix code is licensed under the
 [GNU General Public License, version 2 only](LICENSE). Third-party components
 keep their own licenses; imported Linux DRM/i915 sources are taken under their
-MIT option. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+MIT option. See [docs/licensing.md](docs/licensing.md).

@@ -25,6 +25,7 @@
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/cgroup.h>
+#include <b1nix/psi.h>
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
 #include <b1nix/kmsg.h>
@@ -1344,8 +1345,35 @@ static int r_mounts(usize pid, struct sbuf *s) {
  * field 3 is the synthetic 8:<blk-index> used by /sys/block + /proc/partitions
  * for a `/dev/<blk>` source, else 0:<mount-index>. Layout:
  *   id parent maj:min root mountpoint opts - fstype source superopts */
+/* What the last reader of /proc/self/mountinfo saw.
+ *
+ * Linux wakes a poll on this file with POLLPRI|POLLERR when the mount table
+ * changes, and systemd depends on it: it starts a mount unit, runs mount(8),
+ * and waits to be told the mount appeared. Without the wake-up it decides the
+ * mount never happened and fails the unit with "Result: protocol" on a machine
+ * where the filesystem is mounted -- which is exactly what Debian's tmp.mount
+ * and run-lock.mount did here.
+ *
+ * One generation for the whole system rather than one per open file: this
+ * kernel's procfs nodes carry no per-descriptor state, and the watcher that
+ * matters is systemd's single monitor. A second watcher would see an event it
+ * has already consumed, which costs it a re-read and nothing else. */
+static u64 g_mountinfo_seen;
+
+static int mountinfo_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
+  (void)node;
+  pfd->revents = 0;
+  if (vfs_mount_generation() != __atomic_load_n(&g_mountinfo_seen,
+                                                __ATOMIC_ACQUIRE))
+    pfd->revents |= B1NIX_POLLPRI | B1NIX_POLLERR;
+  return 0;
+}
+
 static int r_mountinfo(usize pid, struct sbuf *s) {
   (void)pid;
+  /* Reading is what acknowledges the change: the next poll is quiet until the
+   * table moves again. */
+  __atomic_store_n(&g_mountinfo_seen, vfs_mount_generation(), __ATOMIC_RELEASE);
   usize cap = vfs_mount_capacity();
   struct b1nix_mount_entry *ents = kmalloc(cap * sizeof(*ents));
 
@@ -1832,52 +1860,20 @@ static int r_pid_cgroup(usize pid, struct sbuf *s) {
  * so the value is what userspace set and nothing acts on it yet. Recording it
  * in a side table keeps struct task the size it is.
  */
-#define PROC_OOM_SLOTS 128
 #define PROC_OOM_MIN (-1000)
 #define PROC_OOM_MAX 1000
 
-static struct {
-  usize pid;
-  int adj;
-  u8 used;
-} g_oom_adj[PROC_OOM_SLOTS];
-static spinlock_t g_oom_lock;
+/* The value itself lives in the scheduler's per-task side table, not here.
+ *
+ * It used to be a 128-entry pid-keyed table in this file, which was fine while
+ * nothing read it: with an OOM killer that ranks victims by it (M127) it has to
+ * be the same number the killer sees, has to survive fork the way Linux's does,
+ * and has to apply to a whole thread group -- none of which a table in procfs
+ * can do, and the 129th process to set it silently kept the default. */
+static int proc_oom_adj_get(usize pid) { return scheduler_oom_score_adj(pid); }
 
-static int proc_oom_adj_get(usize pid) {
-  u64 flags;
-  int v = 0;
-  spin_lock_irqsave(&g_oom_lock, &flags);
-  for (usize i = 0; i < PROC_OOM_SLOTS; i++) {
-    if (g_oom_adj[i].used && g_oom_adj[i].pid == pid) {
-      v = g_oom_adj[i].adj;
-      break;
-    }
-  }
-  spin_unlock_irqrestore(&g_oom_lock, flags);
-  return v;
-}
-
-static void proc_oom_adj_set(usize pid, int adj) {
-  u64 flags;
-  usize free_slot = PROC_OOM_SLOTS;
-  spin_lock_irqsave(&g_oom_lock, &flags);
-  for (usize i = 0; i < PROC_OOM_SLOTS; i++) {
-    if (g_oom_adj[i].used && g_oom_adj[i].pid == pid) {
-      g_oom_adj[i].adj = adj;
-      spin_unlock_irqrestore(&g_oom_lock, flags);
-      return;
-    }
-    if (!g_oom_adj[i].used && free_slot == PROC_OOM_SLOTS)
-      free_slot = i;
-  }
-  /* The default is 0, so a process that cannot get a slot reads back the
-   * default rather than another process's value. */
-  if (adj != 0 && free_slot < PROC_OOM_SLOTS) {
-    g_oom_adj[free_slot].pid = pid;
-    g_oom_adj[free_slot].adj = adj;
-    g_oom_adj[free_slot].used = 1;
-  }
-  spin_unlock_irqrestore(&g_oom_lock, flags);
+static int proc_oom_adj_set(usize pid, int adj) {
+  return scheduler_set_oom_score_adj(pid, adj);
 }
 
 static int r_pid_oom_score_adj(usize pid, struct sbuf *s) {
@@ -1901,17 +1897,18 @@ static int w_pid_oom_score_adj(usize pid, const char *buf, usize len) {
   v *= sign;
   if (v < PROC_OOM_MIN || v > PROC_OOM_MAX)
     return -EINVAL;
-  proc_oom_adj_set(pid, v);
+  int rc = proc_oom_adj_set(pid, v);
+
+  if (rc < 0)
+    return rc;
   return (int)len;
 }
 
-/* /proc/<pid>/oom_score — Linux derives it from the process's memory footprint
- * and the bias above. With no OOM killer there is no victim ranking to report,
- * so the bias is all this can honestly say. */
+/* /proc/<pid>/oom_score — the badness the OOM killer really ranks by: the
+ * process's resident memory as a thousandth of the machine, shifted by
+ * oom_score_adj and clamped to 0..1000, exactly as Linux reports it. */
 static int r_pid_oom_score(usize pid, struct sbuf *s) {
-  int adj = proc_oom_adj_get(pid);
-  int score = adj < 0 ? 0 : adj;
-  sb_addf(s, "%d\n", score);
+  sb_addf(s, "%d\n", scheduler_oom_score(pid));
   return 0;
 }
 
@@ -3372,7 +3369,11 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   procfs_mkchild(d, "comm", VFS_DEVICE, r_pid_comm, pid);
   procfs_mkchild(d, "stat", VFS_DEVICE, r_pid_stat, pid);
   procfs_mkchild(d, "maps", VFS_DEVICE, r_pid_maps, pid);
-  procfs_mkchild(d, "mountinfo", VFS_DEVICE, r_mountinfo, pid);
+  {
+    struct vfs_node *mi = procfs_mkchild(d, "mountinfo", VFS_DEVICE, r_mountinfo, pid);
+    if (mi)
+      mi->inode->poll_cb = mountinfo_poll;
+  }
   procfs_mkchild(d, "mounts", VFS_DEVICE, r_mounts, pid);
   procfs_mkchild(d, "environ", VFS_DEVICE, r_pid_environ, pid);
   procfs_mkchild(d, "statm", VFS_DEVICE, r_pid_statm, pid);
@@ -3867,6 +3868,31 @@ static int r_diskstats(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/pressure/{cpu,memory,io} — PSI, in the format Linux prints and
+ * systemd-oomd, `systemd-analyze`, and every monitoring agent parses. The
+ * measurement is kernel/mm/psi.c; this only renders it. */
+static int r_pressure(usize which, struct sbuf *s) {
+  char buf[256];
+  usize n = psi_render((enum psi_res)which, buf, sizeof(buf) - 1);
+
+  buf[n < sizeof(buf) ? n : sizeof(buf) - 1] = '\0';
+  sb_puts(s, buf);
+  return 0;
+}
+
+static int r_pressure_cpu(usize pid, struct sbuf *s) {
+  (void)pid;
+  return r_pressure(PSI_CPU, s);
+}
+static int r_pressure_memory(usize pid, struct sbuf *s) {
+  (void)pid;
+  return r_pressure(PSI_MEM, s);
+}
+static int r_pressure_io(usize pid, struct sbuf *s) {
+  (void)pid;
+  return r_pressure(PSI_IO, s);
+}
+
 static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
                                         void *data) {
   (void)source;
@@ -3915,6 +3941,15 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "vmstat", VFS_DEVICE, r_vmstat, 0);
   procfs_mkchild(root, "filesystems", VFS_DEVICE, r_filesystems, 0);
   procfs_mkchild(root, "cgroups", VFS_DEVICE, r_cgroups, 0);
+  {
+    struct vfs_node *pr = procfs_mkchild(root, "pressure", VFS_DIRECTORY, 0, 0);
+
+    if (pr) {
+      procfs_mkchild(pr, "cpu", VFS_DEVICE, r_pressure_cpu, 0);
+      procfs_mkchild(pr, "memory", VFS_DEVICE, r_pressure_memory, 0);
+      procfs_mkchild(pr, "io", VFS_DEVICE, r_pressure_io, 0);
+    }
+  }
   procfs_mkchild(root, "mounts", VFS_DEVICE, r_mounts, 0);
   {
     struct vfs_node *ipc = procfs_mkchild(root, "sysvipc", VFS_DIRECTORY, 0, 0);

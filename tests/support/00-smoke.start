@@ -1,0 +1,294 @@
+#!/bin/sh
+grep -q 'b1nix.test=1' /proc/cmdline 2>/dev/null || exit 0
+trap '' USR2 HUP TERM INT ALRM
+
+# NOTE: this script prints no boot marker of its own. It used to echo
+# "init: ... pid=1" and two "M94-INIT: ok ..." lines, which were forgeries — a
+# shell in the default runlevel cannot know what PID 1 is or how the kernel
+# parsed `init=`. Those lines come from the kernel itself (kernel/main.c), which
+# is the only thing that can report them truthfully.
+
+[ -x /etc/rc ] && /bin/sh /etc/rc
+
+SMOKE_SYS=0
+SMOKE_SYSNET=0
+SMOKE_BLK=0
+SMOKE_GFX=0
+SMOKE_POSIX=0
+if grep -q 'b1nix.smoke=sysnet' /proc/cmdline 2>/dev/null; then
+    # The network half of what used to be one `sys` lane.
+    #
+    # sys was 67 s while the next longest lane was 31 s, and the pool runs three
+    # at a time -- so every other lane sat waiting for this one and the whole
+    # suite was exactly as long as it. Splitting it is the only lever left that
+    # does not touch the kernel.
+    #
+    # The cut is along the network suite because that is where the time is
+    # (dropbear, TLS via curl, ping, unix_chkpwd) and because it keeps a
+    # coherent set together rather than slicing by stopwatch. The two
+    # deliberate five-second sleeps in m32_smoke -- TCP keepalive probes, which
+    # are the property under test -- move here with it.
+    SMOKE_SYSNET=1
+elif grep -q 'b1nix.smoke=sys' /proc/cmdline 2>/dev/null; then
+    SMOKE_SYS=1
+elif grep -q 'b1nix.smoke=gfx' /proc/cmdline 2>/dev/null; then
+    SMOKE_GFX=1
+elif grep -q 'b1nix.smoke=posix' /proc/cmdline 2>/dev/null; then
+    SMOKE_POSIX=1
+elif grep -q 'b1nix.smoke=blk' /proc/cmdline 2>/dev/null; then
+    SMOKE_BLK=1
+elif grep -q 'b1nix.smoke=init' /proc/cmdline 2>/dev/null; then
+    # M108: the init instance. PID 1 drives the checks itself from /etc/inittab
+    # (see /etc/init-smoke.sh). Nothing of the ordinary suite runs here — but
+    # leaving a breadcrumb proves something the test cannot otherwise see from
+    # the outside: that OpenRC's `default` runlevel really executed, with its
+    # local.d hooks, under BusyBox init. m108_smoke checks for this file; it is
+    # never written on any other instance.
+    : > /tmp/m108-openrc-local-ran
+    exit 0
+elif grep -q 'b1nix.smoke=pku' /proc/cmdline 2>/dev/null; then
+    # M124 protection keys on an emulated CPU that has them. Under TCG the
+    # whole suite would take the better part of an hour, so this instance runs
+    # the one binary whose subject is the CPU feature, then restarts.
+    mkdir -p /mnt/host 2>/dev/null || true
+    mount -t 9p hostshare /mnt/host 2>/dev/null || true
+    [ -x /mnt/host/bin/m124_smoke ] && cp -f /mnt/host/bin/m124_smoke /bin/m124_smoke
+    /bin/m124_smoke
+    ( /bin/usleep 200000; /bin/reboot -f ) &
+    exit 0
+elif grep -q 'b1nix.smoke=iommu' /proc/cmdline 2>/dev/null; then
+    # The IOMMU instances: the kernel's self-tests are the whole check and they
+    # have run by the time userspace is up. End by RESTARTING through the real
+    # syscall, which is the one test of the reset path: the harness passes it
+    # only when QEMU (-no-reboot) then exits on its own.
+    # A fifth of a second for this script to exit first, not a whole one.
+    # The VT-d instance restarts through RESTART2 with a reason, the call
+    # `reboot bootloader` makes on a phone; the AMD-Vi one through the plain
+    # restart, so both commands stay covered.
+    # Both boot the same ISO, so the lane is told apart by the unit the
+    # kernel found, not by the command line.
+    if ! dmesg 2>/dev/null | grep -q 'amdvi: unit at' &&
+       [ -x /bin/reboot2_smoke ]; then
+        ( /bin/usleep 200000; /bin/reboot2_smoke bootloader; /bin/reboot -f ) &
+    else
+        ( /bin/usleep 200000; /bin/reboot -f ) &
+    fi
+    exit 0
+else
+    SMOKE_SYS=1
+    SMOKE_SYSNET=1
+    SMOKE_GFX=1
+    SMOKE_POSIX=1
+    SMOKE_BLK=1
+fi
+
+# Auto-mount 9P host share if present for zero-rebuild fast iteration
+mkdir -p /mnt/host 2>/dev/null || true
+mount -t 9p hostshare /mnt/host 2>/dev/null || true
+
+run_test() {
+    bin="$1"
+    inst="$2"
+
+    # Refresh the rootfs copy from the host share, then run it from its own
+    # path. The share exists so a rebuilt binary reaches the guest without
+    # repacking half a gigabyte of root.img -- but EXECUTING off the 9P mount
+    # is not the same thing: m13_smoke, m24_stress and native_smoke all loaded
+    # from /mnt/host/bin and then emitted not one marker, not even their start
+    # line. Copying keeps the delivery path and drops the exec path, and leaves
+    # argv[0] as the canonical /bin/... the tests were written against.
+    # This instance's tests only. The copy below used to run first, so every
+    # lane pulled every other lane's binaries across 9P before skipping them.
+    case "$inst" in
+        sys) [ "$SMOKE_SYS" = "1" ] || return ;;
+        sysnet) [ "$SMOKE_SYSNET" = "1" ] || return ;;
+        blk) [ "$SMOKE_BLK" = "1" ] || return ;;
+        posix) [ "$SMOKE_POSIX" = "1" ] || return ;;
+        gfx) [ "$SMOKE_GFX" = "1" ] || return ;;
+        *) return ;;
+    esac
+
+    bname="${bin##*/}"
+    if [ -x "/mnt/host/bin/$bname" ]; then
+        cp -f "/mnt/host/bin/$bname" "$bin" 2>/dev/null || bin="/mnt/host/bin/$bname"
+    fi
+    [ -x "$bin" ] || return
+
+    "$bin"
+}
+
+# m47_smoke owns /dev/fb0 for its fb-persist check: it writes pixels, unmaps,
+# remaps and expects them back, so nothing else may draw to the framebuffer
+# while it runs.
+if [ "$SMOKE_GFX" = "1" ]; then
+    run_test /bin/m47_smoke gfx
+fi
+
+# ---- sys (kernel, ipc, elf, selftest, diag, misc) ----
+run_test /bin/native_smoke sys
+run_test /bin/m12_smoke sys
+run_test /bin/m13_smoke sys
+run_test /bin/m15_smoke sys
+run_test /bin/m17_smoke sys
+run_test /bin/m56_smoke sys
+run_test /bin/m57_smoke sys
+run_test /bin/m75_smoke sys
+run_test /bin/m8_aio_test sys
+run_test /bin/test_sync sys
+run_test /bin/m25_smoke sys
+run_test /bin/m26_smoke sys
+run_test /bin/m27_smoke sys
+run_test /bin/m32_smoke sysnet
+run_test /bin/m32_nettool sysnet
+run_test /bin/m32_pcre2_smoke sysnet
+run_test /bin/m53_zlib_smoke sys
+run_test /bin/m53_libpng_smoke sys
+run_test /bin/m53_libjpeg_smoke sys
+run_test /bin/m53_libwebp_smoke sys
+run_test /bin/m53_libvpx_smoke sys
+run_test /bin/m53_wapcaplet_smoke sys
+run_test /bin/m53_parserutils_smoke sys
+run_test /bin/m53_hubbub_smoke sys
+run_test /bin/m53_libcss_smoke sys
+run_test /bin/m53_libdom_smoke sys
+run_test /bin/m53_nslibs_smoke sys
+run_test /bin/m34_smoke sys
+run_test /bin/m35_smoke sys
+run_test /bin/m77_smoke sys
+run_test /bin/m30_pie sys
+run_test /bin/cxx_smoke sys
+run_test /bin/m55_iostream sys
+run_test /bin/m64_clang_smoke sys
+run_test /bin/m97_tools_smoke sys
+run_test /bin/m104_pam_smoke sysnet
+run_test /bin/net_smoke sysnet
+run_test /bin/m_posixmm_smoke sys
+run_test /bin/shmshare_smoke sys
+run_test /bin/musl_posix_smoke sys
+run_test /bin/b1cc_selfsmoke sys
+run_test /bin/m30_dynamic sys
+run_test /bin/m24_stress sys
+run_test /bin/m39_smoke sys
+run_test /bin/m110_9p_smoke sys
+run_test /bin/m119_smoke sys
+
+# ---- blk (storage) ----
+run_test /bin/m14_smoke blk
+# M109 needs the virtio-blk scratch disk and the nvme ext4 image, and it mounts
+# the latter at /mnt/ext4nvme — so it runs after m14_smoke has released it.
+run_test /bin/m109_smoke blk
+run_test /bin/m24b_smoke sys
+# Flash, as flash rather than as a slow disk. Only this instance is given a
+# chip (see tests/smoke.sh, which passes the pflash pair).
+if [ "$SMOKE_BLK" = "1" ] && [ -e /dev/mtd0 ]; then
+    /bin/sh /etc/mtd-smoke.sh
+fi
+
+run_test /bin/diskbench blk
+run_test /bin/ext_stress blk
+
+# ---- gfx (graphics) ----
+run_test /bin/m53_virgl_smoke gfx
+run_test /bin/m38_sound gfx
+run_test /bin/m79_sound gfx
+run_test /bin/m48_smoke gfx
+run_test /bin/m49_libwayland gfx
+run_test /bin/m49_libwayland_server gfx
+run_test /bin/m50_smoke gfx
+run_test /bin/m101t_smoke gfx
+run_test /bin/m100_smoke gfx
+run_test /bin/m51_smoke gfx
+run_test /bin/m51_pixman_smoke gfx
+run_test /bin/m51_freetype_smoke gfx
+run_test /bin/m51_cairo_smoke gfx
+run_test /bin/m51_xkb_smoke gfx
+run_test /bin/m51_harfbuzz_smoke gfx
+run_test /bin/m51_fontconfig_smoke gfx
+# Composition, both paths. Software (pixman) and accelerated (GLES on a DRM
+# render node) are separate supported configurations, so each is run on purpose
+# and each carries its own marker — see /etc/render-smoke.sh. A shell script
+# rather than an ELF because the subject is the compositor and its clients.
+if [ "$SMOKE_GFX" = "1" ] && [ -x /etc/render-smoke.sh ]; then
+    /bin/sh /etc/render-smoke.sh
+fi
+
+# ---- posix (shell, coreutils, job control) ----
+run_test /bin/m13_job_control posix
+run_test /bin/m29_smoke posix
+run_test /bin/m31_smoke posix
+run_test /bin/m73_smoke posix
+run_test /bin/m80_smoke posix
+# m108 (su's fixed 3 s failed-login delay) and m42 (three alarm(1) waits) run on
+# sys: posix was the pool's tail at 22 s while sys finished at 9 s, and both
+# are self-contained and graded from the combined log.
+run_test /bin/m108_smoke sys
+run_test /bin/m86_smoke posix
+run_test /bin/m95_smoke posix
+run_test /bin/m96_smoke posix
+run_test /bin/m107_smoke posix
+# M109: the uevent hot-plug channel. Creates and destroys /dev/loop8 and runs
+# mdev, so it must not overlap another test touching /dev — hence the same
+# sequential group.
+run_test /bin/m109_uevent_smoke posix
+run_test /bin/m63_smoke posix
+run_test /bin/m123_smoke posix
+run_test /bin/m124_smoke posix
+# M127: cgroup v2 resource control. It moves processes between cgroups, kills
+# inside one, and loads every CPU on the machine for a few seconds -- so it runs
+# in the sequential group, where nothing else is measuring anything.
+run_test /bin/m127_smoke posix
+# M123: the same namespaces through Alpine's unshare, nsenter and bubblewrap.
+if [ "$SMOKE_POSIX" = "1" ] && [ -x /etc/m123-tools-smoke.sh ]; then
+    /bin/sh /etc/m123-tools-smoke.sh
+    [ -x /usr/bin/podman ] && /bin/sh /etc/m123-podman-smoke.sh
+fi
+run_test /bin/m71_aslr posix
+run_test /bin/m42_w5pre_smoke sys
+run_test /bin/m46_smoke posix
+run_test /bin/lock_smoke posix
+run_test /bin/futex_stress posix
+run_test /bin/invite_stress posix
+run_test /bin/pipe_eof posix
+run_test /bin/fd_visibility posix
+run_test /bin/clock_sanity posix
+run_test /bin/fpu_ctx_smoke posix
+run_test /bin/vdso_smoke posix
+run_test /bin/yield_fairness posix
+run_test /bin/m27_cmdline posix
+run_test /bin/m11_pipe_smoke posix
+run_test /bin/m22_smoke posix
+run_test /bin/m58_smoke posix
+run_test /bin/m92_abi_smoke posix
+
+if [ "$SMOKE_SYS" = "1" ]; then
+    for s in /etc/posix-smoke.sh /etc/initctl-smoke.sh /etc/zsh-smoke.sh \
+             /etc/m40-smoke.sh; do
+        [ -x "$s" ] || continue
+        case "$s" in
+            /etc/zsh-smoke.sh) /bin/zsh "$s" ;;
+            *) /bin/sh "$s" ;;
+        esac
+    done
+fi
+
+# Where the run's CPU time went, sampled by the timer tick on every core
+# (kernel/lib/kprof.c). Reading /proc/b1nix-prof is what prints it -- the
+# counters are kept all along and nothing else in the tree asks for them, so
+# they were collected every run and read none. The user/kernel/idle
+# distribution costs one increment per tick and is always on; the per-function
+# histogram needs b1nix.sysprof on the kernel command line.
+# Not guarded by [ -r ]: that test was false here (the node is a VFS_DEVICE)
+# and the read silently did not happen, which looks exactly like a profile of
+# zero. Let a missing file say so instead.
+cat /proc/b1nix-prof || echo "SMOKE: /proc/b1nix-prof unreadable — no CPU profile"
+
+echo "B1NIX-TEST: done"
+
+# Powering off is how a QEMU instance ends: the host has the serial log already,
+# so there is nothing left to read on the guest. A board whose only console is
+# its own panel is the opposite case — switching it off is what destroys the
+# results. `b1nix.keep-running` leaves the machine up with the last screenful of
+# markers still on it.
+grep -q 'b1nix.keep-running' /proc/cmdline 2>/dev/null && exit 0
+
+( sleep 1; /bin/poweroff -f || /bin/halt -f ) &

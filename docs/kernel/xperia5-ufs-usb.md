@@ -16,8 +16,8 @@ phone. Two drivers take the rootfs out of the boot image instead.
 
 ```sh
 make bahamut-ufs                                  # kernel + rescue ramdisk + 1 GiB rootfs image
-./tools/boards/sony-xperia-5/flash_ufs_rootfs.sh  # system_a + boot_a, set slot A, reboot
-./tools/boards/sony-xperia-5/restore_slot_b.sh    # back to Android, as before
+./tools/board/sony-xperia-5/flash_ufs_rootfs.sh  # system_a + boot_a, set slot A, reboot
+./tools/board/sony-xperia-5/restore_slot_b.sh    # back to Android, as before
 ```
 
 `flash_ufs_rootfs.sh` compares the image size with the size fastboot reports for

@@ -15,7 +15,7 @@ BUILD_ROOT ?= build
 BUILD_DIR := $(BUILD_ROOT)/$(ARCH)
 
 # The Linux release linuxkpi imports from: the filesystems, the DRM core and
-# i915 are staged out of this one tarball (tools/fs, tools/drm pin its SHA256).
+# i915 are staged out of this one tarball (tools/import/fs, tools/import/drm pin its SHA256).
 # One shim serves all three, so they move together.
 export LKPI_LINUX_VERSION ?= 6.18.51
 INC_DIR := $(BUILD_DIR)/inc
@@ -123,13 +123,13 @@ INITRAMFS_TLSTEST_INC := $(INC_DIR)/initramfs_tlstest.inc
 INITRAMFS_DROPBEAR_INC := $(INC_DIR)/initramfs_dropbear.inc
 INITRAMFS_TESTWAV_INC := $(INC_DIR)/initramfs_testwav.inc
 INITRAMFS_TESTFONT_INC := $(INC_DIR)/initramfs_testfont.inc
-# M40: a committed static Linux x86_64 ELF blob (tools/blobs/linux_hello.bin)
+# M40: a committed static Linux x86_64 ELF blob (tests/support/linux-abi/linux_hello.bin)
 # embedded as /bin/m40-linux-hello to validate the Linux ABI compat layer.
 INITRAMFS_M40_LINUX_INC := $(INC_DIR)/initramfs_m40_linux.inc
 # M53: NetSurf framebuffer browser + resources + test page.
 
 # Applet manifest for /bin replacement (M42 items 3 and 4).
-APPLET_MANIFEST := tools/configs/applet-manifest.conf
+APPLET_MANIFEST := tools/image/applet-manifest.conf
 # BusyBox's BB_SUID_REQUIRE applets: they need euid 0 for /etc/shadow, so their
 # /bin links point at the setuid copy of the multicall ELF, never the plain one.
 BB_SUID_APPLETS := su passwd login
@@ -137,9 +137,9 @@ BB_SUID_APPLETS := su passwd login
 # The list of userspace programs that used to be embedded in the kernel image as
 # `xxd -i` is a vim binary, and a host without vim fails every .inc rule with
 # "xxd: command not found" -- an error that names a generated file and not the
-# missing package. tools/build/xxd-i.sh produces byte-identical output, so the build
+# missing package. tools/toolchain/xxd-i.sh produces byte-identical output, so the build
 # uses whichever is present and needs neither documented as a prerequisite.
-XXD := $(shell command -v xxd 2>/dev/null || echo 'sh tools/build/xxd-i.sh')
+XXD := $(shell command -v xxd 2>/dev/null || echo 'sh tools/toolchain/xxd-i.sh')
 
 # xxd byte arrays lived here, together with one .inc rule per program. Under
 # musl every one of them ships in the ext4 rootfs instead, and the variable that
@@ -316,8 +316,8 @@ B1NIX_TLS ?= mbedtls
 # Kernel build toolchain selector (Clang/LLVM).
 TOOLCHAIN ?= clang
 # ISO builder. Limine (BSD-2-Clause) + xorriso replaced GRUB's grub-mkrescue
-# (GPLv3) — see tools/images/mkiso.sh and boot/limine/limine.conf.in.
-MKISO := tools/images/mkiso.sh
+# (GPLv3) — see tools/image/mkiso.sh and tools/image/limine/limine.conf.in.
+MKISO := tools/image/mkiso.sh
 # Copy into the staging root only where the bytes differ.
 #
 # The root image is repacked whenever anything under the staging tree is newer
@@ -325,7 +325,7 @@ MKISO := tools/images/mkiso.sh
 # `cp` of identical content still stamps a new mtime, so that test answered
 # "changed" on every build and the image was rewritten every time, including
 # the builds where only the kernel moved.
-CIC := tools/build/copy-if-changed.sh
+CIC := tools/toolchain/copy-if-changed.sh
 # The PAM policies are written out and then copied, for the same reason.
 PAMSTAGE := $(BUILD_DIR)/.pam-stage
 LIMINE := $(shell command -v limine 2>/dev/null)
@@ -586,6 +586,7 @@ KERNEL_SOURCES := \
 	kernel/mm/page_cache.c \
 	kernel/mm/page_audit.c \
 	kernel/mm/swap.c \
+	kernel/mm/psi.c \
 	kernel/mm/eviction.c \
 	kernel/sched/scheduler.c \
 	kernel/syscall/syscall.c \
@@ -877,7 +878,7 @@ endif
 #                      warning here would be noise we cannot act on without
 #                      editing it, which the milestone forbids.
 #
-# The staged tree is produced by tools/drm/fetch-drm-core.sh and is not tracked.
+# The staged tree is produced by tools/import/drm/fetch-drm-core.sh and is not tracked.
 # Nothing under it is ever edited: a patch to imported source is a bug in the
 # shim.
 DRM_IMPORT_DIR := build/src/drm-core-$(LKPI_LINUX_VERSION)
@@ -1091,12 +1092,12 @@ endif
 
 .PHONY: kernel-dist i915-fetch bootstrap
 i915-fetch:
-	@LINUX_VERSION=$(LKPI_LINUX_VERSION) sh tools/drm/fetch-i915.sh
+	@LINUX_VERSION=$(LKPI_LINUX_VERSION) sh tools/import/drm/fetch-i915.sh
 
 
 # ── linuxkpi-fs: btrfs, ext4 and jbd2, imported ───────────────────────────
 #
-# The imported filesystems, staged by tools/fs/fetch-linux-fs.sh and never
+# The imported filesystems, staged by tools/import/fs/fetch-linux-fs.sh and never
 # edited, exactly as the DRM import is.
 #
 # btrfs and ext4 are ON by default when that tree is present (ext2/3/4 mounts
@@ -1106,7 +1107,7 @@ i915-fetch:
 # implementation, checked by the same self-test and by the host's btrfs check
 # afterwards. A machine without the staged sources builds without it and says
 # so at mount, the same way it does without the staged i915.
-# The Linux release the filesystems are imported from (tools/fs/fetch-linux-fs.sh
+# The Linux release the filesystems are imported from (tools/import/fs/fetch-linux-fs.sh
 # pins its tarball).
 FS_LINUX_VERSION ?= $(LKPI_LINUX_VERSION)
 FS_IMPORT_DIR := build/src/fs-$(FS_LINUX_VERSION)
@@ -1278,10 +1279,10 @@ endif
 
 .PHONY: fs-fetch fs-probe
 fs-fetch:
-	@LINUX_VERSION=$(FS_LINUX_VERSION) sh tools/fs/fetch-linux-fs.sh
-	@LINUX_VERSION=$(FS_LINUX_VERSION) sh tools/fs/gen-shim-headers.sh
+	@LINUX_VERSION=$(FS_LINUX_VERSION) sh tools/import/fs/fetch-linux-fs.sh
+	@LINUX_VERSION=$(FS_LINUX_VERSION) sh tools/import/fs/gen-shim-headers.sh
 fs-probe:
-	@sh tools/fs/probe-headers.sh --syntax
+	@sh tools/import/fs/probe-headers.sh --syntax
 
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_SOURCES)) \
@@ -1347,10 +1348,10 @@ KALLSYMS_O := $(BUILD_DIR)/kallsyms.o
 #   pass 2 → final kernel.elf with the blob appended into .kallsyms
 # The blob lands after .text/.rodata/.data, so the pass-1 addresses it records
 # remain correct in the final image.
-$(KERNEL_ELF): $(OBJECTS) $(LINKER_SCRIPT) tools/build/kernel/gen_kallsyms.sh
+$(KERNEL_ELF): $(OBJECTS) $(LINKER_SCRIPT) tools/toolchain/kernel/gen_kallsyms.sh
 	@mkdir -p $(dir $@)
 	$(LD) $(ARCH_LDFLAGS) $(LD_ERROR_LIMIT) -T $(LINKER_SCRIPT) -o $@.stage1 $(OBJECTS)
-	NM='$(NM)' sh tools/build/kernel/gen_kallsyms.sh $@.stage1 > $(KALLSYMS_S)
+	NM='$(NM)' sh tools/toolchain/kernel/gen_kallsyms.sh $@.stage1 > $(KALLSYMS_S)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $(KALLSYMS_S) -o $(KALLSYMS_O)
 	$(LD) $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -o $@ $(OBJECTS) $(KALLSYMS_O)
 ifeq ($(ARCH),aarch64)
@@ -1439,15 +1440,15 @@ $(eval $(call B1NIX_MODULE_RULE,ntp,kernel/net/ntp.c))
 
 .PHONY: modules
 modules: $(MODULE_KOS)
-	sh tools/build/kernel/check-module-syms.sh $(MODULE_KOS)
+	sh tools/toolchain/kernel/check-module-syms.sh $(MODULE_KOS)
 
 # Packaging also runs the symbol gate: a module with a symbol neither the
 # kernel nor another module exports fails the build instead of failing insmod.
-$(INITRAMFS_MODULES_INC): $(MODULE_KOS) tools/build/kernel/gen_modules_initramfs.sh \
+$(INITRAMFS_MODULES_INC): $(MODULE_KOS) tools/toolchain/kernel/gen_modules_initramfs.sh \
                           kernel/module/ksyms.c kernel/include/b1nix/version.h
 	@mkdir -p $(dir $@)
-	sh tools/build/kernel/check-module-syms.sh $(MODULE_KOS)
-	NM='$(NM)' RELEASE='$(B1NIX_RELEASE)' BUILTIN='$(MODULES_BUILTIN)' sh tools/build/kernel/gen_modules_initramfs.sh $@ $(MODULE_KOS)
+	sh tools/toolchain/kernel/check-module-syms.sh $(MODULE_KOS)
+	NM='$(NM)' RELEASE='$(B1NIX_RELEASE)' BUILTIN='$(MODULES_BUILTIN)' sh tools/toolchain/kernel/gen_modules_initramfs.sh $@ $(MODULE_KOS)
 	@# Stage the same images into the rootfs under the CURRENT release. The
 	@# x86_64 flow gets this from root-image, but the aarch64 smoke lane only
 	@# builds kernel.elf and boots an ext4 image made straight from
@@ -1500,49 +1501,49 @@ $(MUSL_SYSROOT_MARKER):
 
 $(I915_SOURCE_MARKER):
 	@echo "  BOOTSTRAP imported i915 sources (one-time)"
-	@LINUX_VERSION=$(LKPI_LINUX_VERSION) sh tools/drm/fetch-i915.sh
+	@LINUX_VERSION=$(LKPI_LINUX_VERSION) sh tools/import/drm/fetch-i915.sh
 
 $(DRM_CORE_MARKER):
 	@echo "  BOOTSTRAP imported DRM core sources (one-time)"
-	@LINUX_VERSION=$(LKPI_LINUX_VERSION) sh tools/drm/fetch-drm-core.sh
+	@LINUX_VERSION=$(LKPI_LINUX_VERSION) sh tools/import/drm/fetch-drm-core.sh
 
 bootstrap: $(MUSL_SYSROOT_MARKER) $(I915_SOURCE_MARKER) $(DRM_CORE_MARKER)
 
 $(BUILD_DIR)/.userspace-headers-installed: \
 	$(MUSL_SYSROOT_MARKER) \
-	$(wildcard userspace/libc/*.c) \
-	$(wildcard userspace/include/*.h) \
-	$(wildcard userspace/include/*/*.h) \
-	$(wildcard userspace/include/*/*/*.h) \
-	$(wildcard userspace/crt/*.S) \
-	userspace/Makefile
+	$(wildcard tests/programs/libc/*.c) \
+	$(wildcard third_party/b1cc-sysroot/*.h) \
+	$(wildcard third_party/b1cc-sysroot/*/*.h) \
+	$(wildcard third_party/b1cc-sysroot/*/*/*.h) \
+	$(wildcard tests/programs/crt/*.S) \
+	tests/programs/Makefile
 	# Build libs + headers into sysroot in one serialized pass, then mark done.
 	# Port scripts check B1NIX_HEADERS_INSTALLED=1 and skip their own sub-makes.
-	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install-headers-libs
+	@$(MAKE) -C tests/programs B1NIX_ARCH=$(ARCH) install-headers-libs
 	@touch $@
 
 # Second stamp: build ALL userspace binaries after libraries are ready.
 # .inc rules depend on this so they can safely xxd pre-built outputs without
-# spawning competing $(MAKE) -C userspace processes in parallel.
+# spawning competing $(MAKE) -C tests/programs processes in parallel.
 #
-# IMPORTANT: This stamp MUST list every port library that userspace/Makefile
+# IMPORTANT: This stamp MUST list every port library that tests/programs/Makefile
 # rules link against. Without these deps, the root-level parallel build can
-# invoke port build scripts at the same time as $(MAKE) -C userspace does
+# invoke port build scripts at the same time as $(MAKE) -C tests/programs does
 # (which triggers the same port scripts internally) → corrupt concurrent builds.
-# After all ports are listed here, $(MAKE) -C userspace just compiles ELF
+# After all ports are listed here, $(MAKE) -C tests/programs just compiles ELF
 # binaries and finds all libraries already present — no port script is invoked.
 #
 # Port libraries that are only ever referenced by .inc rules that already have
-# them as explicit dependencies (and NOT used directly by userspace/Makefile
-# targets) do NOT need to be listed here. Only list libs that userspace/Makefile
+# them as explicit dependencies (and NOT used directly by tests/programs/Makefile
+# targets) do NOT need to be listed here. Only list libs that tests/programs/Makefile
 # pulls in transitively (wayland, libffi, pcre2, zlib, pixman,
 # freetype, cairo, xkbcommon, harfbuzz, fontconfig, expat, libjpeg, libpng,
 # libwebp, libvpx, all NetSurf platform libs, libidn2).
 $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
-	$(wildcard userspace/bin/*/*.c) $(wildcard userspace/bin/*/*.cpp) \
-	$(wildcard userspace/bin/*/*.S) \
-	$(wildcard userspace/src/*.c) \
-	$(wildcard userspace/b1cc/src/*.c userspace/b1cc/src/*/*.c) \
+	$(wildcard tests/programs/bin/*/*.c) $(wildcard tests/programs/bin/*/*.cpp) \
+	$(wildcard tests/programs/bin/*/*.S) \
+	$(wildcard tests/programs/src/*.c) \
+	$(wildcard third_party/b1cc/src/*.c third_party/b1cc/src/*/*.c) \
 	$(LIBM_LIB) \
 	$(PCRE2_LIB) \
 	$(PIXMAN_LIB) \
@@ -1563,23 +1564,23 @@ $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
 	$(PAM_LIB) \
 	$(LIBCXX_LIB) \
 	$(COMPILER_RT_STAMP)
-	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
+	@$(MAKE) -C tests/programs B1NIX_ARCH=$(ARCH) install
 	@touch $@
 
 $(LIBCXX_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libcxx >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh libcxx >/dev/null
 
 $(COMPILER_RT_STAMP): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh compiler-rt >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh compiler-rt >/dev/null
 	@touch $@
 
 
 
 
-$(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/helpers/native_smoke.S $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/native_smoke
+$(INITRAMFS_NATIVE_SMOKE_INC): tests/programs/bin/helpers/native_smoke.S $(USERSPACE_DEPS)
+	@$(MAKE) -C tests/programs ../../build/$(ARCH)/programs/bin/native_smoke
 	@mkdir -p $(dir $@)
-	$(XXD) -i -n vfs_native_smoke_elf userspace/build/$(ARCH)/bin/native_smoke > $@
+	$(XXD) -i -n vfs_native_smoke_elf build/$(ARCH)/programs/bin/native_smoke > $@
 
 # The compiled-in fallback command line, as a header so a changed KERNEL_CMDLINE
 # rebuilds what reads it. .PHONY so the recipe runs every build; the file is
@@ -1593,43 +1594,43 @@ $(KERNEL_CMDLINE_INC): force-cmdline-header
 	@cmp -s $@.tmp $@ || mv $@.tmp $@
 	@rm -f $@.tmp
 
-$(INITRAMFS_M109_SWITCHROOT_INC): userspace/bin/helpers/m109_switchroot_init.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m109_switchroot_init
+$(INITRAMFS_M109_SWITCHROOT_INC): tests/programs/bin/helpers/m109_switchroot_init.c $(USERSPACE_DEPS)
+	@$(MAKE) -C tests/programs ../../build/$(ARCH)/programs/bin/m109_switchroot_init
 	@mkdir -p $(dir $@)
-	$(XXD) -i -n vfs_m109_switchroot_elf userspace/build/$(ARCH)/bin/m109_switchroot_init > $@
+	$(XXD) -i -n vfs_m109_switchroot_elf build/$(ARCH)/programs/bin/m109_switchroot_init > $@
 
-$(INITRAMFS_B1CC_M34_INC): tools/images/gen_b1cc_m34_initramfs.sh userspace/bin/compiler/b1cc_m34_corpus.c userspace/Makefile $(wildcard userspace/b1cc/tests/*.c) $(USERSPACE_DEPS)
+$(INITRAMFS_B1CC_M34_INC): tools/image/gen_b1cc_m34_initramfs.sh tests/programs/bin/compiler/b1cc_m34_corpus.c tests/programs/Makefile $(wildcard third_party/b1cc/tests/*.c) $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
-	B1NIX_ARCH=$(ARCH) sh tools/images/gen_b1cc_m34_initramfs.sh $@
+	B1NIX_ARCH=$(ARCH) sh tools/image/gen_b1cc_m34_initramfs.sh $@
 
-# userspace/bin is grouped by purpose (see userspace/Makefile's BIN_CATS), so a
+# tests/programs/bin is grouped by purpose (see tests/programs/Makefile's BIN_CATS), so a
 # program's source is looked up by name rather than assumed to sit at a fixed
 # path — moving one between categories does not touch this rule.
 USER_BIN_CATS := smoke gfx helpers tools gui compiler
-user_bin_src = $(firstword $(wildcard $(addsuffix /$(1).c,$(addprefix userspace/bin/,$(USER_BIN_CATS))) $(addsuffix /$(1).cpp,$(addprefix userspace/bin/,$(USER_BIN_CATS)))) userspace/bin/$(1).c)
+user_bin_src = $(firstword $(wildcard $(addsuffix /$(1).c,$(addprefix tests/programs/bin/,$(USER_BIN_CATS))) $(addsuffix /$(1).cpp,$(addprefix tests/programs/bin/,$(USER_BIN_CATS)))) tests/programs/bin/$(1).c)
 .SECONDEXPANSION:
 $(INC_DIR)/initramfs_%.inc: $$(call user_bin_src,$$*) $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/$*
+	@$(MAKE) -C tests/programs ../../build/$(ARCH)/programs/bin/$*
 	@mkdir -p $(dir $@)
-	$(XXD) -i -n vfs_$*_elf userspace/build/$(ARCH)/bin/$* > $@
+	$(XXD) -i -n vfs_$*_elf build/$(ARCH)/programs/bin/$* > $@
 
 # M32/M33: bundle the on-device b1cc + its static-link inputs into one .inc.
 # b1cc is a multi-source binary built from the separate b1cc repo via b1nix-cc
-# (see userspace/Makefile /bin/b1cc rule); crt0.o and libb1nix.a are the same
+# (see tests/programs/Makefile /bin/b1cc rule); crt0.o and libb1nix.a are the same
 # artifacts b1cc's internal linker consumes, shipped to /lib/b1cc on device.
-# Depend on the b1cc *sources* (same glob as userspace/Makefile's B1CC_SRCDIR) so
+# Depend on the b1cc *sources* (same glob as tests/programs/Makefile's B1CC_SRCDIR) so
 # editing b1cc re-embeds it — otherwise the .inc looks up-to-date vs
 # USERSPACE_DEPS and the stale compiler binary gets shipped.
-# One directory deep as well — see the note in userspace/Makefile.
-B1CC_SELFHOST_SRCS := $(wildcard $(or $(B1CC_SRCDIR),userspace/b1cc/src)/*.c \
-                                 $(or $(B1CC_SRCDIR),userspace/b1cc/src)/*/*.c)
+# One directory deep as well — see the note in tests/programs/Makefile.
+B1CC_SELFHOST_SRCS := $(wildcard $(or $(B1CC_SRCDIR),third_party/b1cc/src)/*.c \
+                                 $(or $(B1CC_SRCDIR),third_party/b1cc/src)/*/*.c)
 $(INC_DIR)/initramfs_b1cc_selfhost.inc: $(USERSPACE_DEPS) $(B1CC_SELFHOST_SRCS)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/b1cc
+	@$(MAKE) -C tests/programs ../../build/$(ARCH)/programs/bin/b1cc
 	@mkdir -p $(dir $@)
-	$(XXD) -i -n vfs_b1cc_elf userspace/build/$(ARCH)/bin/b1cc > $@
-	$(XXD) -i -n vfs_b1cc_crt0 userspace/build/$(ARCH)/crt/crt0.o >> $@
-	$(XXD) -i -n vfs_b1cc_libc userspace/build/$(ARCH)/libb1nix.a >> $@
-	$(XXD) -i -n vfs_b1cc_crt0dyn userspace/build/$(ARCH)/crt/crt0-dynamic.o >> $@
+	$(XXD) -i -n vfs_b1cc_elf build/$(ARCH)/programs/bin/b1cc > $@
+	$(XXD) -i -n vfs_b1cc_crt0 build/$(ARCH)/programs/crt/crt0.o >> $@
+	$(XXD) -i -n vfs_b1cc_libc build/$(ARCH)/programs/libb1nix.a >> $@
+	$(XXD) -i -n vfs_b1cc_crt0dyn build/$(ARCH)/programs/crt/crt0-dynamic.o >> $@
 
 # Depends on $(CURL_ELF): building curl (with B1NIX_TLS=mbedtls) produces the
 # static mbedTLS archives that m32_nettool's tls-server links against, so curl
@@ -1637,65 +1638,65 @@ $(INC_DIR)/initramfs_b1cc_selfhost.inc: $(USERSPACE_DEPS) $(B1CC_SELFHOST_SRCS)
 # PCRE2: cross-build the static 8-bit library, then link the smoke against it.
 PCRE2_LIB := build/$(ARCH)/pkg/pcre2/lib/libpcre2-8.a
 $(PCRE2_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh pcre2 >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh pcre2 >/dev/null
 
 # M51: pixman (generic C), cross-built static, linked into m51_pixman_smoke.
 PIXMAN_LIB := build/$(ARCH)/pkg/pixman/lib/libpixman-1.so.0
 $(PIXMAN_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh pixman >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh pixman >/dev/null
 
 # M51: FreeType (TrueType + smooth rasterizer), cross-built static.
 FREETYPE_LIB := build/$(ARCH)/pkg/freetype/lib/libfreetype.a
 $(FREETYPE_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh freetype >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh freetype >/dev/null
 
 # M51: Cairo — Alpine package (shared library, X11 backend accepted).
 CAIRO_LIB := build/$(ARCH)/pkg/cairo/lib/libcairo.so
 $(CAIRO_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh cairo > /dev/null
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libx11 > /dev/null
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libxext > /dev/null
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libxrender > /dev/null
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libxcb > /dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh cairo > /dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh libx11 > /dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh libxext > /dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh libxrender > /dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh libxcb > /dev/null
 
 # M51: xkbcommon (keymap compile + keysym translation), cross-built static.
 XKB_LIB := build/$(ARCH)/pkg/xkbcommon/lib/libxkbcommon.a
 $(XKB_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh xkbcommon >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh xkbcommon >/dev/null
 
 # M49: libwayland-client/server share one generated source/build tree. Build it
 # once at the top level so parallel initramfs packaging cannot race two nested
-# userspace make invocations through tools/packages/pkg-prefix.sh.
+# userspace make invocations through tools/image/alpine/pkg-prefix.sh.
 WAYLAND_CLIENT_LIB := build/$(ARCH)/pkg/wayland/lib/libwayland-client.so.0
 WAYLAND_SERVER_LIB := build/$(ARCH)/pkg/wayland/lib/libwayland-server.so.0
 $(WAYLAND_CLIENT_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh wayland >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh wayland >/dev/null
 $(WAYLAND_SERVER_LIB): $(WAYLAND_CLIENT_LIB)
 
 # M51: HarfBuzz (HB_TINY, unified C++ build via cross g++), cross-built static.
 HB_LIB := build/$(ARCH)/pkg/harfbuzz/lib/libharfbuzz.a
 $(HB_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh harfbuzz >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh harfbuzz >/dev/null
 
 # M51: expat (XML) + Fontconfig (font discovery), cross-built static.
 EXPAT_LIB := build/$(ARCH)/pkg/expat/lib/libexpat.a
 $(EXPAT_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh expat >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh expat >/dev/null
 FONTCONFIG_LIB := build/$(ARCH)/pkg/fontconfig/lib/libfontconfig.a
 $(FONTCONFIG_LIB): $(PKG_DEPS) $(EXPAT_LIB) $(FREETYPE_LIB)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh fontconfig >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh fontconfig >/dev/null
 
 # M104: Linux-PAM (authentication stack + pam_unix.so), Alpine package.
 PAM_LIB := build/$(ARCH)/pkg/pam/lib/libpam.so
 $(PAM_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh pam >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh pam >/dev/null
 
 # M53: zlib (image-codec dependency for the NetSurf browser platform).
 #
 # Alpine's package, not a from-source port: it is the same zlib, built for the
 # same musl and the same architecture, and taking it deletes a build script
-# along with the duty to keep it building. tools/packages/alpine-fetch.sh pins
-# every package's sha256 in tools/packages/alpine.lock; the package model is
+# along with the duty to keep it building. tools/image/alpine/alpine-fetch.sh pins
+# every package's sha256 in tools/image/alpine/alpine.lock; the package model is
 # summarised in docs/kernel/platforms.md.
 #
 # Both shapes come down: libz.so.1 is what binaries link and what the image
@@ -1703,34 +1704,34 @@ $(PAM_LIB): $(PKG_DEPS)
 # (libpng, NetSurf) and link it statically.
 # What a package-backed port depends on: the fetcher, the pinned hashes, and the
 # port-to-package table. Any of the three changing re-runs the install.
-PKG_DEPS := tools/packages/pkg-prefix.sh tools/packages/alpine-fetch.sh \
-            tools/packages/alpine.lock tools/packages/alpine-ports.map
+PKG_DEPS := tools/image/alpine/pkg-prefix.sh tools/image/alpine/alpine-fetch.sh \
+            tools/image/alpine/alpine.lock tools/image/alpine/alpine-ports.map
 
 ZLIB_PREFIX := build/$(ARCH)/pkg/zlib
 ZLIB_LIB := $(ZLIB_PREFIX)/lib/libz.a
 ZLIB_SO := $(ZLIB_PREFIX)/lib/libz.so.1
 $(ZLIB_LIB) $(ZLIB_SO): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh zlib >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh zlib >/dev/null
 
 # M53: libpng (over zlib + libm) — NetSurf image-codec dependency.
 LIBPNG_LIB := build/$(ARCH)/pkg/libpng/lib/libpng16.a
 $(LIBPNG_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libpng >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh libpng >/dev/null
 
 # M53: libjpeg (IJG) — NetSurf image-codec dependency.
 LIBJPEG_LIB := build/$(ARCH)/pkg/libjpeg/lib/libjpeg.a
 $(LIBJPEG_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libjpeg >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh libjpeg >/dev/null
 
 # M53: libwebp (image + VP8 video-keyframe codec) — NetSurf codec dependency.
 LIBWEBP_LIB := build/$(ARCH)/pkg/libwebp/lib/libwebp.a
 $(LIBWEBP_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libwebp >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh libwebp >/dev/null
 
 # M53: libvpx (VP8 full-motion video decode) — NetSurf/WebM video codec.
 LIBVPX_LIB := build/$(ARCH)/pkg/libvpx/lib/libvpx.so.9
 $(LIBVPX_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libvpx >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh libvpx >/dev/null
 
 
 
@@ -1739,26 +1740,26 @@ $(LIBVPX_LIB): $(PKG_DEPS)
 
 
 # M53: userspace VirGL smoke — drives /dev/virtio-gpu (host-GPU-accelerated 3D).
-# Alpine's OpenRC with the test-image configuration from tools/configs/openrc.
+# Alpine's OpenRC with the test-image configuration from tools/image/openrc.
 # The target is an installed file, so a wiped rootfs stages it again.
 OPENRC_INIT := $(BUILD_DIR)/rootfs/sbin/openrc
-$(OPENRC_INIT): tools/packages/stage-openrc.sh tools/packages/alpine.lock \
-                $(wildcard tools/configs/openrc/*)
-	B1NIX_ARCH=$(ARCH) sh tools/packages/stage-openrc.sh
+$(OPENRC_INIT): tools/image/alpine/stage-openrc.sh tools/image/alpine/alpine.lock \
+                $(wildcard tools/image/openrc/*)
+	B1NIX_ARCH=$(ARCH) sh tools/image/alpine/stage-openrc.sh
 	@touch $@
 
 CURLBUILD_STAMP := build/$(ARCH)/pkg/curlbuild/lib/libcurl.a
 $(CURLBUILD_STAMP): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh curlbuild >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh curlbuild >/dev/null
 
 PKGROOT_STAMP := $(PKGROOT)/.installed
 $(PKGROOT_STAMP): $(PKG_DEPS)
 	B1NIX_ARCH=$(ARCH) ALPINE_LAYOUT=native \
-		tools/packages/pkg-prefix.sh --into $(PKGROOT) programs >/dev/null
+		tools/image/alpine/pkg-prefix.sh --into $(PKGROOT) programs >/dev/null
 	@# libidn2 and libpsl are pulled in by curl, but their libunistring
 	@# runtime dependency is not included transitively by this package list.
 	B1NIX_ARCH=$(ARCH) ALPINE_LAYOUT=native \
-		tools/packages/pkg-prefix.sh --into $(PKGROOT) libunistring-runtime >/dev/null
+		tools/image/alpine/pkg-prefix.sh --into $(PKGROOT) libunistring-runtime >/dev/null
 	@# B1NIX_BROWSER=1 bakes chromium and its closure into the image. Installing
 	@# it inside the guest instead does not fit: 175 packages and 618 MB, which
 	@# outlasted the hour a passthrough run gets and ran the root filesystem out
@@ -1771,7 +1772,7 @@ $(PKGROOT_STAMP): $(PKG_DEPS)
 	@if [ "$(B1NIX_KDE)" = "1" ]; then \
 		B1NIX_ARCH=$(ARCH) ALPINE_LAYOUT=native \
 		ALPINE_SKIP_DEPS="busybox busybox-binsh alpine-baselayout alpine-baselayout-data alpine-keys alpine-release musl musl-utils musl-locales libc6-compat scanelf ssl_client openrc runit icu-data" \
-			tools/packages/pkg-prefix.sh --into $(PKGROOT) kde >/dev/null \
+			tools/image/alpine/pkg-prefix.sh --into $(PKGROOT) kde >/dev/null \
 			|| { echo "$@: staging the kde package group failed" >&2; exit 1; }; \
 		if [ -f "$(PKGROOT)/bin/login" ] && [ ! -L "$(PKGROOT)/bin/login" ]; then \
 			mkdir -p "$(PKGROOT)/sbin"; \
@@ -1781,13 +1782,13 @@ $(PKGROOT_STAMP): $(PKG_DEPS)
 	@if [ "$(B1NIX_GPU_DRV)" = "1" ]; then \
 		B1NIX_ARCH=$(ARCH) ALPINE_LAYOUT=native \
 		ALPINE_SKIP_DEPS="busybox busybox-binsh alpine-baselayout alpine-baselayout-data alpine-keys alpine-release musl musl-utils musl-locales libc6-compat scanelf ssl_client openrc runit" \
-			tools/packages/pkg-prefix.sh --into $(PKGROOT) gpudrv >/dev/null \
+			tools/image/alpine/pkg-prefix.sh --into $(PKGROOT) gpudrv >/dev/null \
 			|| { echo "$@: staging the gpudrv package group failed" >&2; exit 1; }; \
 	fi
 	@if [ "$(B1NIX_BROWSER)" = "1" ]; then \
 		B1NIX_ARCH=$(ARCH) ALPINE_LAYOUT=native \
 		ALPINE_SKIP_DEPS="busybox busybox-binsh alpine-baselayout alpine-baselayout-data alpine-keys alpine-release musl musl-utils musl-locales libc6-compat scanelf ssl_client openrc runit mesa-dri-gallium" \
-			tools/packages/pkg-prefix.sh --into $(PKGROOT) browser >/dev/null; \
+			tools/image/alpine/pkg-prefix.sh --into $(PKGROOT) browser >/dev/null; \
 	fi
 	@touch $@
 $(CURL_ELF) $(DROPBEAR_ELF) $(BMAKE_ELF) $(SAMU_ELF): $(PKGROOT_STAMP)
@@ -1811,38 +1812,38 @@ $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
 
 OPENSSL_LIB := build/$(ARCH)/pkg/openssl/lib/libssl.a
 $(OPENSSL_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh openssl >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh openssl >/dev/null
 
 LIBIDN2_LIB := build/$(ARCH)/pkg/libidn2/lib/libidn2.a
 $(LIBIDN2_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libidn2 >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh libidn2 >/dev/null
 
 LIBPSL_LIB := build/$(ARCH)/pkg/libpsl/lib/libpsl.a
 $(LIBPSL_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libpsl >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh libpsl >/dev/null
 
 LIBFFI_LIB := $(FFI_LIB)
 $(LIBFFI_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libffi >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh libffi >/dev/null
 
 $(MBEDTLS_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh mbedtls >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh mbedtls >/dev/null
 
 $(LIBUNISTRING_LIB): $(PKG_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libunistring >/dev/null
+	B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh libunistring >/dev/null
 
 
 CACERT_PEM := build/cacert.pem
-$(CACERT_PEM): tools/images/fetch-cacert.sh
-	tools/images/fetch-cacert.sh $(CACERT_PEM)
+$(CACERT_PEM): tools/image/fetch-cacert.sh
+	tools/image/fetch-cacert.sh $(CACERT_PEM)
 
 $(INITRAMFS_CACERT_INC): $(CACERT_PEM)
 	@mkdir -p $(dir $@)
 	$(XXD) -i -n vfs_cacert_pem $(CACERT_PEM) > $@
 
-$(BUILTIN_FW_I915_DMC_INC): tools/drm/stage-i915-firmware.sh
+$(BUILTIN_FW_I915_DMC_INC): tools/import/drm/stage-i915-firmware.sh
 	@mkdir -p $(dir $@) $(BUILD_DIR)/fw
-	@sh tools/drm/stage-i915-firmware.sh $(BUILD_DIR)/fw
+	@sh tools/import/drm/stage-i915-firmware.sh $(BUILD_DIR)/fw
 	@if [ -f $(BUILD_DIR)/fw/lib/firmware/i915/kbl_dmc_ver1_04.bin ]; then \
 		$(XXD) -i -n vfs_i915_dmc \
 			$(BUILD_DIR)/fw/lib/firmware/i915/kbl_dmc_ver1_04.bin > $@.tmp; \
@@ -1853,31 +1854,31 @@ $(BUILTIN_FW_I915_DMC_INC): tools/drm/stage-i915-firmware.sh
 	fi
 	@mv -f $@.tmp $@
 
-$(INITRAMFS_TESTWAV_INC): tools/images/gen_test_wav.py
+$(INITRAMFS_TESTWAV_INC): tools/image/gen_test_wav.py
 	@mkdir -p $(dir $@)
-	python3 tools/images/gen_test_wav.py $(BUILD_DIR)/test.wav
+	python3 tools/image/gen_test_wav.py $(BUILD_DIR)/test.wav
 	$(XXD) -i -n vfs_testwav $(BUILD_DIR)/test.wav > $@
 
 # M51: the project's own scalable font (B1nix Mono) used by the
 # FreeType/Cairo/HarfBuzz smokes. Mounted at /share/fonts/B1nixMono-Regular.ttf.
-$(INITRAMFS_TESTFONT_INC): userspace/share/fonts/B1nixMono-Regular.ttf
+$(INITRAMFS_TESTFONT_INC): tests/support/fonts/B1nixMono-Regular.ttf
 	@mkdir -p $(dir $@)
-	$(XXD) -i -n vfs_testfont userspace/share/fonts/B1nixMono-Regular.ttf > $@
+	$(XXD) -i -n vfs_testfont tests/support/fonts/B1nixMono-Regular.ttf > $@
 
 # M40: embed the committed static Linux x86_64 ELF blob. The blob is checked in
-# (regenerated by hand via tools/blobs/build-linux-hello.sh) so the kernel build
+# (regenerated by hand via tests/support/linux-abi/build-linux-hello.sh) so the kernel build
 # does not require a Linux assembler on the build host.
-$(INITRAMFS_M40_LINUX_INC): tools/blobs/linux_hello.bin
+$(INITRAMFS_M40_LINUX_INC): tests/support/linux-abi/linux_hello.bin
 	@mkdir -p $(dir $@)
-	$(XXD) -i -n vfs_m40_linux_hello tools/blobs/linux_hello.bin > $@
+	$(XXD) -i -n vfs_m40_linux_hello tests/support/linux-abi/linux_hello.bin > $@
 
 # Self-contained TLS test PKI (CA + server cert/key) embedded under
 # /etc/tls-test for the M32 loopback HTTPS smoke. No network dependency.
 TLS_TEST_DIR := build/tls-test
 # Grouped target (&:): one script run produces all three PEMs. Without &: a
 # parallel `make -j` runs this recipe once per output, racing on ca-key.pem.
-$(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem $(TLS_TEST_DIR)/server-key.pem &: tools/images/gen-tls-test-certs.sh
-	sh tools/images/gen-tls-test-certs.sh $(TLS_TEST_DIR) >/dev/null
+$(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem $(TLS_TEST_DIR)/server-key.pem &: tools/image/gen-tls-test-certs.sh
+	sh tools/image/gen-tls-test-certs.sh $(TLS_TEST_DIR) >/dev/null
 
 $(INITRAMFS_TLSTEST_INC): $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem $(TLS_TEST_DIR)/server-key.pem
 	@mkdir -p $(dir $@)
@@ -1890,7 +1891,7 @@ $(INITRAMFS_TLSTEST_INC): $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem
 ifdef LIBC_SO
 # Musl libc + dev + linux-headers from Alpine packages.
 $(LIBC_SO) $(LIBM_LIB): $(PKG_DEPS)
-	@B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh musl >/dev/null
+	@B1NIX_ARCH=$(ARCH) tools/image/alpine/pkg-prefix.sh musl >/dev/null
 	@mkdir -p build/$(ARCH)/ports/musl
 	@rm -rf build/$(ARCH)/ports/musl/install
 	@# -sfn, not -sf: the target is a symlink to a DIRECTORY, and without
@@ -1904,32 +1905,32 @@ $(INITRAMFS_LD_MUSL_INC): $(LIBC_SO)
 	$(XXD) -i -n $(LIBC_INC_SYM) $(LIBC_SO) > $@
 endif
 
-$(INC_DIR)/initramfs_m92_musl_dyn_smoke.inc: userspace/bin/helpers/m92_musl_dyn_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+$(INC_DIR)/initramfs_m92_musl_dyn_smoke.inc: tests/programs/bin/helpers/m92_musl_dyn_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/toolchain/bin/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-dyn-smoke
 	$(XXD) -i -n vfs_m92_musl_dyn_smoke_elf $(BUILD_DIR)/m92-musl-dyn-smoke > $@
 
-$(INC_DIR)/initramfs_m92_musl_ldso_smoke.inc: userspace/bin/helpers/m92_musl_ldso_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+$(INC_DIR)/initramfs_m92_musl_ldso_smoke.inc: tests/programs/bin/helpers/m92_musl_ldso_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/toolchain/bin/b1nix-musl-cc -ldso $< -o $(BUILD_DIR)/m92-musl-ldso-smoke
 	$(XXD) -i -n vfs_m92_musl_ldso_smoke_elf $(BUILD_DIR)/m92-musl-ldso-smoke > $@
 
-$(INC_DIR)/initramfs_musl_posix_smoke.inc: userspace/bin/smoke/musl_posix_smoke.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+$(INC_DIR)/initramfs_musl_posix_smoke.inc: tests/programs/bin/smoke/musl_posix_smoke.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/toolchain/bin/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/musl-posix-smoke
 	$(XXD) -i -n vfs_musl_posix_smoke_elf $(BUILD_DIR)/musl-posix-smoke > $@
 
-$(INC_DIR)/initramfs_m92_musl_hello.inc: userspace/bin/helpers/m92_musl_hello.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+$(INC_DIR)/initramfs_m92_musl_hello.inc: tests/programs/bin/helpers/m92_musl_hello.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/toolchain/bin/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-hello
 	$(XXD) -i -n vfs_m92_musl_hello_elf $(BUILD_DIR)/m92-musl-hello > $@
 
-$(INC_DIR)/initramfs_m92_musl_step2.inc: userspace/bin/helpers/m92_musl_step2.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+$(INC_DIR)/initramfs_m92_musl_step2.inc: tests/programs/bin/helpers/m92_musl_step2.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/toolchain/bin/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-step2
 	$(XXD) -i -n vfs_m92_musl_step2_elf $(BUILD_DIR)/m92-musl-step2 > $@
 
-$(INC_DIR)/initramfs_m92_musl_raw_diag.inc: userspace/bin/helpers/m92_musl_raw_diag.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+$(INC_DIR)/initramfs_m92_musl_raw_diag.inc: tests/programs/bin/helpers/m92_musl_raw_diag.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/toolchain/bin/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-raw-diag
 	$(XXD) -i -n vfs_m92_musl_raw_diag_elf $(BUILD_DIR)/m92-musl-raw-diag > $@
@@ -2241,7 +2242,7 @@ iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-pku iso-init iso-swit
 	@# build asked for it or not. That is how images meant to be forty
 	@# megabytes kept coming out at five hundred and fifty.
 	@$(if $(or $(SMOKE_ROOT_MODULE),$(filter iso-blk iso-switchroot,$@)),,rm -f $(BUILD_DIR)/$@/boot/rootfs.img)
-	@$(if $(filter iso-blk iso-switchroot,$@),ROOT_FS='$(ROOT_FS)' ROOT_MODULE_COMPRESS='$(ROOT_MODULE_COMPRESS)' sh tools/images/trim-root-module.sh $(BUILD_DIR)/rootfs $(ROOT_IMAGE) $(ROOT_MODULE) $(ROOT_MODULE_ROOM),)
+	@$(if $(filter iso-blk iso-switchroot,$@),ROOT_FS='$(ROOT_FS)' ROOT_MODULE_COMPRESS='$(ROOT_MODULE_COMPRESS)' sh tools/image/trim-root-module.sh $(BUILD_DIR)/rootfs $(ROOT_IMAGE) $(ROOT_MODULE) $(ROOT_MODULE_ROOM),)
 	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-$(@:iso-%=%).iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(SMOKE_CMDLINE_$(@:iso-%=%))" \
@@ -2309,10 +2310,10 @@ userspace: $(USERSPACE_DEPS)
 .PHONY: iso-soak iso-soak-quick
 .PHONY: check-b1cc-sync
 check-b1cc-sync:
-	@tools/check/check-b1cc-sync.sh
+	@tools/toolchain/check-b1cc-sync.sh
 
 userspace-install: userspace
-	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
+	@$(MAKE) -C tests/programs B1NIX_ARCH=$(ARCH) install
 
 # Cross-toolchain (LLVM/Clang + musl sysroot). Required by busybox and all
 # native-compiled ports. Preserved across `make clean` (lives under build/<arch>/toolchain/).
@@ -2332,10 +2333,10 @@ toolchain:
 busybox-package: toolchain
 	@if [ -x $(BUILD_DIR)/ports/busybox/busybox ] && \
 	   [ -x $(BUILD_DIR)/rootfs/bin/busybox ] && \
-	   [ ! tools/packages/alpine.lock -nt $(BUILD_DIR)/ports/busybox/busybox ]; then \
+	   [ ! tools/image/alpine/alpine.lock -nt $(BUILD_DIR)/ports/busybox/busybox ]; then \
 		echo "  busybox up to date"; \
 	else \
-		B1NIX_ARCH=$(ARCH) sh tools/packages/stage-busybox.sh; \
+		B1NIX_ARCH=$(ARCH) sh tools/image/alpine/stage-busybox.sh; \
 	fi
 
 # Everything the image takes from Alpine, plus the userspace tests. Both arches
@@ -2467,8 +2468,8 @@ bahamut-test:
 		FB_BOOT_MARKERS=$(BAHAMUT_SPLASH_FB) \
 		KERNEL_CMDLINE=$(BAHAMUT_TEST_CMDLINE) \
 		FB_FONT_SCALE=$(BAHAMUT_FONT_SCALE) build/aarch64/kernel.elf
-	sh tools/boards/sony-xperia-5/mkramdisk_bahamut.sh
-	BAHAMUT_BOOTARGS=$(BAHAMUT_TEST_CMDLINE) python3 tools/boards/sony-xperia-5/mkbootimg_bahamut.py
+	sh tools/board/sony-xperia-5/mkramdisk_bahamut.sh
+	BAHAMUT_BOOTARGS=$(BAHAMUT_TEST_CMDLINE) python3 tools/board/sony-xperia-5/mkbootimg_bahamut.py
 
 bahamut:
 	@rm -f build/aarch64/kernel.elf build/aarch64/Image
@@ -2480,20 +2481,20 @@ bahamut:
 	@# BusyBox, musl and the test binaries all live in the rootfs, which needs a
 	@# block device the phone does not provide. Built here so `make bahamut`
 	@# produces a bootable image.
-	sh tools/boards/sony-xperia-5/mkramdisk_bahamut.sh
-	BAHAMUT_BOOTARGS=$(BAHAMUT_CMDLINE) python3 tools/boards/sony-xperia-5/mkbootimg_bahamut.py
+	sh tools/board/sony-xperia-5/mkramdisk_bahamut.sh
+	BAHAMUT_BOOTARGS=$(BAHAMUT_CMDLINE) python3 tools/board/sony-xperia-5/mkbootimg_bahamut.py
 
 bahamut-fast:
 	$(MAKE) ARCH=aarch64 KERNEL_BASE=$(BAHAMUT_KERNEL_BASE) \
 		FB_BOOT_MARKERS=$(BAHAMUT_SPLASH_FB) \
 		KERNEL_CMDLINE=$(BAHAMUT_CMDLINE) \
 		FB_FONT_SCALE=$(BAHAMUT_FONT_SCALE) build/aarch64/kernel.elf
-	sh tools/boards/sony-xperia-5/mkramdisk_bahamut.sh
-	python3 tools/boards/sony-xperia-5/mkbootimg_bahamut.py
+	sh tools/board/sony-xperia-5/mkramdisk_bahamut.sh
+	python3 tools/board/sony-xperia-5/mkbootimg_bahamut.py
 
 # The same board with its rootfs on the phone's own UFS flash instead of in the
 # boot image: kernel/dev/ufs.c (b1nix.ufs) finds the ext4 labelled b1nix-root
-# that tools/boards/sony-xperia-5/flash_ufs_rootfs.sh writes to system_a. The
+# that tools/board/sony-xperia-5/flash_ufs_rootfs.sh writes to system_a. The
 # boot image keeps the trimmed ramdisk as a rescue system, relabelled so it
 # cannot win the root selection; the kernel falls back to it by name when UFS
 # does not come up. BAHAMUT_ROOTFS_MB sizes the rootfs image.
@@ -2519,20 +2520,20 @@ bahamut-ufs:
 		FB_BOOT_MARKERS=$(BAHAMUT_SPLASH_FB) \
 		KERNEL_CMDLINE=$(BAHAMUT_UFS_CMDLINE) \
 		FB_FONT_SCALE=$(BAHAMUT_FONT_SCALE) build/aarch64/kernel.elf
-	RAMDISK_LABEL=b1nix-rescue RAMDISK_MB=$(BAHAMUT_RESCUE_MB) FORCE_RAMDISK=1 sh tools/boards/sony-xperia-5/mkramdisk_bahamut.sh \
+	RAMDISK_LABEL=b1nix-rescue RAMDISK_MB=$(BAHAMUT_RESCUE_MB) FORCE_RAMDISK=1 sh tools/board/sony-xperia-5/mkramdisk_bahamut.sh \
 		build/aarch64/rootfs build/aarch64/bahamut-rescue.ext4
-	ROOTFS_MB=$(BAHAMUT_ROOTFS_MB) sh tools/boards/sony-xperia-5/mkrootfs_bahamut.sh
-	BAHAMUT_BOOTARGS=$(BAHAMUT_UFS_CMDLINE) python3 tools/boards/sony-xperia-5/mkbootimg_bahamut.py \
-		build/aarch64/Image tools/boards/dts/sm8150-sony-bahamut.dtb \
+	ROOTFS_MB=$(BAHAMUT_ROOTFS_MB) sh tools/board/sony-xperia-5/mkrootfs_bahamut.sh
+	BAHAMUT_BOOTARGS=$(BAHAMUT_UFS_CMDLINE) python3 tools/board/sony-xperia-5/mkbootimg_bahamut.py \
+		build/aarch64/Image tools/board/dts/sm8150-sony-bahamut.dtb \
 		build/aarch64/b1nix_bahamut_boot.img build/aarch64/bahamut-rescue.ext4
 
 run-rpi4: $(BUILD_DIR)/Image
 	@command -v qemu-system-aarch64 >/dev/null || (echo "missing qemu-system-aarch64"; exit 1)
-	qemu-system-aarch64 -machine raspi4b -m 2G -kernel $(BUILD_DIR)/Image -dtb tools/boards/dts/bcm2711-rpi-4-b.dtb -serial stdio -serial null -display none
+	qemu-system-aarch64 -machine raspi4b -m 2G -kernel $(BUILD_DIR)/Image -dtb tools/board/dts/bcm2711-rpi-4-b.dtb -serial stdio -serial null -display none
 
 run-rpi4-test: $(BUILD_DIR)/Image
 	@command -v qemu-system-aarch64 >/dev/null || (echo "missing qemu-system-aarch64"; exit 1)
-	qemu-system-aarch64 -machine raspi4b -m 2G -kernel $(BUILD_DIR)/Image -dtb tools/boards/dts/bcm2711-rpi-4-b.dtb -serial stdio -serial null -display none -append "init=/bin/m12_smoke b1nix.test=1"
+	qemu-system-aarch64 -machine raspi4b -m 2G -kernel $(BUILD_DIR)/Image -dtb tools/board/dts/bcm2711-rpi-4-b.dtb -serial stdio -serial null -display none -append "init=/bin/m12_smoke b1nix.test=1"
 
 run-x86_64: run
 
@@ -2554,7 +2555,7 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 	@# so the prune can be blunt without being wrong. What it removes and why is
 	@# in the script, along with the stamp that keeps it from running -- and
 	@# dirtying the tree -- on every build.
-	@sh tools/images/prune-optional-roots.sh $(BUILD_DIR) $(PKGROOT) \
+	@sh tools/image/prune-optional-roots.sh $(BUILD_DIR) $(PKGROOT) \
 		pkgroot-browser pkgroot-kde pkgroot-gpudrv
 	@# M95: the same .ko images the initramfs carries, plus the generated
 	@# modules.dep / modules.alias, so insmod/rmmod/modprobe keep working after
@@ -2580,20 +2581,20 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 	@# whenever anything in the tree is.
 	@printf '%s\n' "b1nix persistent root" | cmp -s - $(BUILD_DIR)/rootfs/etc/motd 2>/dev/null || \
 		printf '%s\n' "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
-	@# Smoke test runner (static file, not generated — edit tools/images/00-smoke.start)
+	@# Smoke test runner (static file, not generated — edit tests/support/00-smoke.start)
 	@mkdir -p $(BUILD_DIR)/rootfs/etc/local.d
 	@# --mode rather than a chmod afterwards: a mode set after the copy leaves
 	@# the destination permanently unequal to its source, so it is copied again
 	@# on every build.
-	@$(CIC) --mode 755 tools/images/00-smoke.start $(BUILD_DIR)/rootfs/etc/local.d/00-smoke.start
+	@$(CIC) --mode 755 tests/support/00-smoke.start $(BUILD_DIR)/rootfs/etc/local.d/00-smoke.start
 	@# M51 test font. The FreeType/HarfBuzz/Cairo/Fontconfig smokes open
 	@# /share/fonts/B1nixMono-Regular.ttf; it used to arrive via the xxd
 	@# initramfs (bootstrap-only since the ext4-root migration), so stage it
 	@# into the rootfs the tests actually run against.
 	@mkdir -p $(BUILD_DIR)/rootfs/share/fonts
-	@$(CIC) userspace/share/fonts/B1nixMono-Regular.ttf $(BUILD_DIR)/rootfs/share/fonts/
+	@$(CIC) tests/support/fonts/B1nixMono-Regular.ttf $(BUILD_DIR)/rootfs/share/fonts/
 	@# M38: Stage /test.wav for the m38_sound smoke (WAV parse/playback). The
-	@# file is generated by tools/images/gen_test_wav.py and must exist in the
+	@# file is generated by tools/image/gen_test_wav.py and must exist in the
 	@# rootfs the test actually runs against.
 	@$(MAKE) --no-print-directory $(NO_KERNEL_DEPS) $(INITRAMFS_TESTWAV_INC)
 	@$(CIC) $(BUILD_DIR)/test.wav $(BUILD_DIR)/rootfs/test.wav
@@ -2606,12 +2607,12 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 	@# 16 MiB is the smallest mkfs.btrfs will make (mixed block groups, 4 KiB
 	@# nodes). Built here rather than committed: a binary blob in the tree is a
 	@# thing nobody can review.
-	@sh tools/images/mk-btrfs-test-image.sh $(BUILD_DIR) || true
+	@sh tools/image/mk-btrfs-test-image.sh $(BUILD_DIR) || true
 	@if [ -f $(BUILD_DIR)/btrfs-test.img ]; then $(CIC) $(BUILD_DIR)/btrfs-test.img $(BUILD_DIR)/rootfs/btrfs-test.img; fi
 	@# And an ISO 9660 one, for the module tests: what they check is that a
 	@# mounted filesystem pins the module providing it, and btrfs stopped being
 	@# a module when the imported implementation replaced ours.
-	@sh tools/images/mk-isofs-test-image.sh $(BUILD_DIR) || true
+	@sh tools/image/mk-isofs-test-image.sh $(BUILD_DIR) || true
 	@if [ -f $(BUILD_DIR)/isofs-test.img ]; then $(CIC) $(BUILD_DIR)/isofs-test.img $(BUILD_DIR)/rootfs/isofs-test.img; fi
 	@# Self-contained TLS test PKI. The loopback HTTPS smokes (M32 curl, M53
 	@# NetSurf-over-TLS) verify the server cert against this CA, so the PEMs
@@ -2684,11 +2685,11 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 		fi; \
 	done; \
 	touch "$$stamp"
-	@# Mesa is Alpine's (mesa-egl/-gles/-gbm/-gl/-glapi, tools/packages/
+	@# Mesa is Alpine's (mesa-egl/-gles/-gbm/-gl/-glapi, tools/image/alpine/
 	@# alpine-ports.map), so it arrives through $(PKGROOT) with everything else
 	@# on the image — there is no Mesa staging of its own here any more.
 	@# Also stage from userspace build dir
-	@for so in userspace/build/$(ARCH)/lib*.so userspace/build/$(ARCH)/lib*.so.*; do \
+	@for so in build/$(ARCH)/programs/lib*.so build/$(ARCH)/programs/lib*.so.*; do \
 		if [ -f "$$so" ] && ! [ -L "$$so" ]; then $(CIC) "$$so" $(BUILD_DIR)/rootfs/lib/; fi; \
 	done
 	@# M69: the runtime-dlopen plugin. Under musl it is served from the ext4
@@ -2696,16 +2697,16 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 	@# the M30/M69 dlopen smoke can dlopen("/lib/m69_plugin.so") at runtime. Build
 	@# it (it lives in bin/ with a non-lib* name, so the generic glob above misses
 	@# it) and stage it into rootfs/lib.
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m69_plugin.so >/dev/null 2>&1 || true
-	@if [ -f userspace/build/$(ARCH)/bin/m69_plugin.so ]; then \
-		$(CIC) userspace/build/$(ARCH)/bin/m69_plugin.so $(BUILD_DIR)/rootfs/lib/m69_plugin.so; \
+	@$(MAKE) -C tests/programs ../../build/$(ARCH)/programs/bin/m69_plugin.so >/dev/null 2>&1 || true
+	@if [ -f build/$(ARCH)/programs/bin/m69_plugin.so ]; then \
+		$(CIC) build/$(ARCH)/programs/bin/m69_plugin.so $(BUILD_DIR)/rootfs/lib/m69_plugin.so; \
 	fi
 	@# The i915 display microcontroller's firmware, when the build machine has
 	@# it. Without it the driver disables runtime power management at probe and
 	@# says so; the blobs are Intel's and are taken from the host rather than
 	@# committed here (see the script).
 ifeq ($(B1NIX_I915),1)
-	@sh tools/drm/stage-i915-firmware.sh $(BUILD_DIR)/rootfs
+	@sh tools/import/drm/stage-i915-firmware.sh $(BUILD_DIR)/rootfs
 endif
 	@# M104: Linux-PAM (from Alpine packages). The library itself is staged
 	@# HERE, beside its modules, and not left to the generic pkg loop: that loop
@@ -2739,28 +2740,28 @@ endif
 	@mkdir -p $(PAMSTAGE)
 	@# The two smoke policies authenticate with nodelay: a rejected password is
 	@# what they check, and pam_unix's two-second failure delay is only wall time.
-	@printf '# M104 smoke policy (userspace/bin/smoke/m104_pam_smoke.c)\nauth       required     pam_unix.so nodelay\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(PAMSTAGE)/m104-pam-smoke
+	@printf '# M104 smoke policy (tests/programs/bin/smoke/m104_pam_smoke.c)\nauth       required     pam_unix.so nodelay\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(PAMSTAGE)/m104-pam-smoke
 	@printf '# Default policy for services without a specific /etc/pam.d/<service> file.\nauth       required     pam_unix.so\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(PAMSTAGE)/other
 	@printf '# b1nix PAM policy for dropbear sshd\nauth       required     pam_unix.so\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(PAMSTAGE)/sshd
-	@printf '# M108 smoke policy (userspace/bin/smoke/m108_smoke.c): pam_unix.so reads\n# the same /etc/shadow "$$6$$" hashes BusyBox su/passwd read and write.\nauth       required     pam_unix.so nodelay\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(PAMSTAGE)/m108-smoke
+	@printf '# M108 smoke policy (tests/programs/bin/smoke/m108_smoke.c): pam_unix.so reads\n# the same /etc/shadow "$$6$$" hashes BusyBox su/passwd read and write.\nauth       required     pam_unix.so nodelay\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(PAMSTAGE)/m108-smoke
 	@$(CIC) $(PAMSTAGE)/m104-pam-smoke $(PAMSTAGE)/other $(PAMSTAGE)/sshd $(PAMSTAGE)/m108-smoke $(BUILD_DIR)/rootfs/etc/pam.d/
 	@# M108: the su/passwd/init smoke ELF links libpam.so as DT_NEEDED.
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m108_smoke >/dev/null 2>&1 || true
-	@if [ -f userspace/build/$(ARCH)/bin/m108_smoke ]; then \
-		$(CIC) userspace/build/$(ARCH)/bin/m108_smoke $(BUILD_DIR)/rootfs/bin/m108_smoke; \
+	@$(MAKE) -C tests/programs ../../build/$(ARCH)/programs/bin/m108_smoke >/dev/null 2>&1 || true
+	@if [ -f build/$(ARCH)/programs/bin/m108_smoke ]; then \
+		$(CIC) build/$(ARCH)/programs/bin/m108_smoke $(BUILD_DIR)/rootfs/bin/m108_smoke; \
 		[ -x $(BUILD_DIR)/rootfs/bin/m108_smoke ] || chmod +x $(BUILD_DIR)/rootfs/bin/m108_smoke; \
 	fi
 	@# M104: the PAM smoke ELF (links libpam.so as DT_NEEDED).
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m104_pam_smoke >/dev/null 2>&1 || true
-	@if [ -f userspace/build/$(ARCH)/bin/m104_pam_smoke ]; then \
-		$(CIC) userspace/build/$(ARCH)/bin/m104_pam_smoke $(BUILD_DIR)/rootfs/bin/m104_pam_smoke; \
+	@$(MAKE) -C tests/programs ../../build/$(ARCH)/programs/bin/m104_pam_smoke >/dev/null 2>&1 || true
+	@if [ -f build/$(ARCH)/programs/bin/m104_pam_smoke ]; then \
+		$(CIC) build/$(ARCH)/programs/bin/m104_pam_smoke $(BUILD_DIR)/rootfs/bin/m104_pam_smoke; \
 		[ -x $(BUILD_DIR)/rootfs/bin/m104_pam_smoke ] || chmod +x $(BUILD_DIR)/rootfs/bin/m104_pam_smoke; \
 	fi
 	@# M104/dropbear: dropbearmulti (server + dbclient + dropbearkey +
 	@# dropbearconvert, dispatched by argv[0]) was built by install-ports
 	@# ($(DROPBEAR_ELF)) but — like every binary here — needs a real copy in
 	@# rootfs/bin; nothing staged it before M104 added PAM support, so
-	@# userspace/rootfs-overlay/etc/init.d/sshd's /bin/dropbear* calls had no
+	@# tools/image/overlay/etc/init.d/sshd's /bin/dropbear* calls had no
 	@# binary to find. Real copies (not symlinks), same reasoning as above.
 
 	@# Stage sysroot C++ runtime .so.
@@ -2970,12 +2971,12 @@ endif
 	@# the x86_64 pair everywhere made the aarch64 loader refuse both with
 	@# "ARCH MISMATCH", the shell then tried to run them as scripts, and all
 	@# 27 M40 checks failed for want of the file that was sitting right there.
-	@if [ -f tools/blobs/linux_hello$(M40_BLOB_SUFFIX).bin ]; then \
-		$(CIC) tools/blobs/linux_hello$(M40_BLOB_SUFFIX).bin $(BUILD_DIR)/rootfs/bin/m40-linux-hello; \
+	@if [ -f tests/support/linux-abi/linux_hello$(M40_BLOB_SUFFIX).bin ]; then \
+		$(CIC) tests/support/linux-abi/linux_hello$(M40_BLOB_SUFFIX).bin $(BUILD_DIR)/rootfs/bin/m40-linux-hello; \
 		[ -x $(BUILD_DIR)/rootfs/bin/m40-linux-hello ] || chmod +x $(BUILD_DIR)/rootfs/bin/m40-linux-hello; \
 	fi
-	@if [ -f tools/blobs/linux_abi_test$(M40_BLOB_SUFFIX).bin ]; then \
-		$(CIC) tools/blobs/linux_abi_test$(M40_BLOB_SUFFIX).bin $(BUILD_DIR)/rootfs/bin/m40-linux-abi; \
+	@if [ -f tests/support/linux-abi/linux_abi_test$(M40_BLOB_SUFFIX).bin ]; then \
+		$(CIC) tests/support/linux-abi/linux_abi_test$(M40_BLOB_SUFFIX).bin $(BUILD_DIR)/rootfs/bin/m40-linux-abi; \
 		[ -x $(BUILD_DIR)/rootfs/bin/m40-linux-abi ] || chmod +x $(BUILD_DIR)/rootfs/bin/m40-linux-abi; \
 	fi
 	@# Trim rootfs: remove LLVM static archives and shared lib (200+ MB) that
@@ -3024,11 +3025,11 @@ endif
 	@# Repacked, and stamped with the ownership every file in it must have,
 	@# only when the staged tree actually changed. See the script.
 	@ROOT_IMAGE_FORCE='$(ROOT_IMAGE_FORCE)' ROOT_FS='$(ROOT_FS)' ROOT_BTRFS_COMPRESS='$(ROOT_BTRFS_COMPRESS)' ROOT_BTRFS_SHRINK='$(ROOT_BTRFS_SHRINK)' \
-		sh tools/images/mk-root-image.sh $(BUILD_DIR)/rootfs $(ROOT_IMAGE) $(ROOT_IMAGE_SIZE)
+		sh tools/image/mk-root-image.sh $(BUILD_DIR)/rootfs $(ROOT_IMAGE) $(ROOT_IMAGE_SIZE)
 
 # Everything in the rootfs links dynamically against /lib/libc.so. This gate
 # fails the build on a statically linked executable that is not listed (with a
-# reason) in tools/configs/static-allowlist.txt — so a `-static` slipped into a
+# reason) in tools/toolchain/static-allowlist.txt — so a `-static` slipped into a
 # port script breaks the ISO instead of quietly shipping a second copy of libc.
 #
 # Ordered after root-image, and that ordering is load-bearing.
@@ -3049,15 +3050,15 @@ endif
 ROOTFS_CHECK_STAMP := $(BUILD_DIR)/.rootfs-checks-ok
 check-dynamic: root-image
 	@if [ -f $(ROOTFS_CHECK_STAMP) ] && \
-	   [ -z "$$(find $(BUILD_DIR)/rootfs tools/check/check-dynamic.sh tools/check/check-rootfs-links.sh \
-	          tools/configs/static-allowlist.txt tools/configs/unresolved-allowlist.txt \
+	   [ -z "$$(find $(BUILD_DIR)/rootfs tools/toolchain/check-dynamic.sh tools/toolchain/check-rootfs-links.sh \
+	          tools/toolchain/static-allowlist.txt tools/toolchain/unresolved-allowlist.txt \
 	          -cnewer $(ROOTFS_CHECK_STAMP) -print -quit 2>/dev/null)" ]; then \
 		echo "check-dynamic: rootfs unchanged since the last clean check"; \
 	else \
 		rm -f $(ROOTFS_CHECK_STAMP); \
 		touch $(ROOTFS_CHECK_STAMP).new && \
-		sh tools/check/check-dynamic.sh $(BUILD_DIR)/rootfs && \
-		sh tools/check/check-rootfs-links.sh $(BUILD_DIR)/rootfs && \
+		sh tools/toolchain/check-dynamic.sh $(BUILD_DIR)/rootfs && \
+		sh tools/toolchain/check-rootfs-links.sh $(BUILD_DIR)/rootfs && \
 		mv -f $(ROOTFS_CHECK_STAMP).new $(ROOTFS_CHECK_STAMP); \
 	fi
 
@@ -3095,7 +3096,7 @@ clean:
 		[ -d "$$TC_SAVE/toolchain" ] && mv "$$TC_SAVE/toolchain" $(BUILD_DIR)/toolchain 2>/dev/null || true; \
 		rm -rf "$$TC_SAVE"; \
 	fi
-	@$(MAKE) -C userspace clean
+	@$(MAKE) -C tests/programs clean
 
 distclean: clean
 	rm -rf build
@@ -3130,14 +3131,14 @@ smoke-b1cc:
 # the developer machine without starting QEMU or building kernel ISO.
 test-b1cc:
 	@echo "Running b1cc host tests..."
-	$(MAKE) -C userspace/b1cc test
+	$(MAKE) -C third_party/b1cc test
 
 # M26 native-Clang KERNEL self-host: b1nix compiles its own kernel's C TUs with
 # its native clang and links a complete kernel.elf with native ld.lld, in-guest.
 # Needs build/native-clang/b1nix (clang + ld.lld) and a host kernel build (make
 # ARCH=x86_64 iso) for the staged .S/kallsyms objects. Wants >=16GB guest RAM.
 selfhost-clang:
-	sh tools/selfhost/selfhost-proof.sh
+	sh tests/selfhost/selfhost-proof.sh
 
 graphics-smoke:
 	sh tests/graphics-smoke.sh $(ARCH)
@@ -3153,14 +3154,14 @@ memory-smoke:
 .PHONY: debian-image debian-smoke systemd-image systemd-smoke
 
 debian-image:
-	ARCH=$(ARCH) sh tools/images/mk-debian-image.sh
+	ARCH=$(ARCH) sh tools/image/mk-debian-image.sh
 
 debian-smoke:
 	sh tests/debian-smoke.sh $(ARCH)
 
 # The same tree with Debian's systemd (and its dependency closure) as PID 1.
 systemd-image:
-	ARCH=$(ARCH) PROFILE=systemd sh tools/images/mk-debian-image.sh
+	ARCH=$(ARCH) PROFILE=systemd sh tools/image/mk-debian-image.sh
 
 systemd-smoke:
 	sh tests/systemd-smoke.sh $(ARCH)

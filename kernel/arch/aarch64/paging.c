@@ -1,3 +1,5 @@
+#include <b1nix/cgroup.h>
+#include <b1nix/psi.h>
 #include <b1nix/vfs.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/rwlock.h>
@@ -736,7 +738,13 @@ static int swap_in_fault(u64 *l3, usize i3, u64 va, u64 entry) {
   /* Called with the page-table lock NOT held: swap_in is a block read, and
    * this kernel's block reads sleep. The leaf is re-checked under the lock
    * afterwards — another CPU may have faulted the same page in meanwhile. */
-  if (swap_in(slot, &frame) < 0)
+  /* A major fault: the task waits for a disk read before it can go on. Counted
+   * for PSI and in its cgroup's memory.stat, as on x86_64. */
+  psi_stall_begin(PSI_MEM);
+  int swrc = swap_in(slot, &frame);
+  psi_stall_end(PSI_MEM);
+  cgroup_mem_note_majfault();
+  if (swrc < 0)
     return -1;
 
   u64 flags = VMM_PRESENT | VMM_WRITABLE;

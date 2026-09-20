@@ -4,7 +4,7 @@
 
 /*
  * The MMIO read/write tracepoint, as nothing. Upstream's header is plain
- * GPL-2.0 ftrace plumbing and is not staged (see tools/drm/fetch-i915.sh); the
+ * GPL-2.0 ftrace plumbing and is not staged (see tools/import/drm/fetch-i915.sh); the
  * register access it wraps runs either way.
  */
 #include "i915_reg_defs.h"

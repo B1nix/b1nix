@@ -636,7 +636,7 @@ run_qemu() {
 		if [ "${SMOKE_RASPI:-0}" = "1" ]; then
 			set -- qemu-system-aarch64 -machine raspi4b \
 				-kernel "$PROJECT_DIR/build/aarch64/Image.rpi" \
-				-dtb "$PROJECT_DIR/tools/boards/dts/bcm2711-rpi-4-b.dtb" \
+				-dtb "$PROJECT_DIR/tools/board/dts/bcm2711-rpi-4-b.dtb" \
 				-sd "$RASPI_SD" \
 				-serial stdio -serial null \
 				-display none -monitor none -no-reboot \
@@ -801,7 +801,7 @@ run_qemu() {
 
 # Check that a pattern appears in the log
 # Literal markers each lane log is known to contain, loaded once after the
-# guests stop (tools/check/grade-index.py). A listed marker passes without a
+# guests stop (tests/support/grade-index.py). A listed marker passes without a
 # grep fork; anything unlisted is asked of grep exactly as before.
 GRADE_NL='
 '
@@ -809,7 +809,7 @@ grade_index_build() {
 	_gi_dir="$PROJECT_DIR/smoke_run/.grade-index-$ARCH"
 	rm -rf "$_gi_dir"
 	command -v python3 >/dev/null 2>&1 || return 0
-	python3 "$PROJECT_DIR/tools/check/grade-index.py" "$PROJECT_DIR/tests/smoke.sh" "$_gi_dir" \
+	python3 "$PROJECT_DIR/tests/support/grade-index.py" "$PROJECT_DIR/tests/smoke.sh" "$_gi_dir" \
 		LOG="$LOG" SMP_LOG="$SMP_LOG" SYS_LOG="$SYS_LOG" SYSNET_LOG="$SYSNET_LOG" \
 		BLK_LOG="$BLK_LOG" POSIX_LOG="$POSIX_LOG" GFX_LOG="$GFX_LOG" INIT_LOG="$INIT_LOG" \
 		SWITCHROOT_LOG="$SWITCHROOT_LOG" IOMMU_LOG="$IOMMU_LOG" AMDVI_LOG="$AMDVI_LOG" \
@@ -1018,7 +1018,7 @@ _mkimg() {  # mkimg <instance-suffix>
                 cp -f "$SMOKE_ROOT_IMG" "$_sata"
             touch "$_sata"
         else
-            ROOT_FS="${ROOT_FS:-btrfs}" sh "$PROJECT_DIR/tools/images/mk-root-image.sh" "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512 >/dev/null || {
+            ROOT_FS="${ROOT_FS:-btrfs}" sh "$PROJECT_DIR/tools/image/mk-root-image.sh" "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512 >/dev/null || {
                 echo "Error: Failed to build aarch64 rootfs image."; exit 1
             }
             rm -f "$_sata.manifest"
@@ -1889,13 +1889,13 @@ check_output "$LOG" "init: /sbin/init pid=" "the default PID 1 (/sbin/init, Busy
 check_output "$LOG" "M94-INIT:" "M94 init-path parsing self-test runs"
 check_output "$LOG" "M94-INIT: ok \(default\|init=\|no-override-flags\)" "M94 init-path logic correct"
 # Linking policy: the rootfs must not carry a statically linked executable that
-# is not in tools/configs/static-allowlist.txt with a reason. Run the same gate
+# is not in tools/toolchain/static-allowlist.txt with a reason. Run the same gate
 # the build uses, so a regression shows up as a failed check and not only as a
 # build error someone might bypass.
-if sh "$PROJECT_DIR/tools/check/check-dynamic.sh" "$PROJECT_DIR/build/$ARCH/rootfs" >/dev/null 2>&1; then
+if sh "$PROJECT_DIR/tools/toolchain/check-dynamic.sh" "$PROJECT_DIR/build/$ARCH/rootfs" >/dev/null 2>&1; then
 	pass "rootfs has no unexpected statically linked executables"
 else
-	fail "rootfs has no unexpected statically linked executables" "$(sh "$PROJECT_DIR/tools/check/check-dynamic.sh" "$PROJECT_DIR/build/$ARCH/rootfs" 2>&1 | head -3 | tr '\n' ' ')"
+	fail "rootfs has no unexpected statically linked executables" "$(sh "$PROJECT_DIR/tools/toolchain/check-dynamic.sh" "$PROJECT_DIR/build/$ARCH/rootfs" 2>&1 | head -3 | tr '\n' ' ')"
 fi
 check_output "$LOG" "M94-CTL: ok tmpfs-mount" "tmpfs mounts on a VFS directory (the /run an init system expects)"
 check_output "$LOG" "M94-CTL: ok tmpfs-state" "state written through a dirfd inside the tmpfs is visible afterwards"
@@ -2133,7 +2133,7 @@ check_output "$LOG" "MM-SMOKE: done" "MM smoke completes"
 # architecture's historical syscall numbers, the aarch64 pair uses asm-generic
 # (which renumbers everything and has no open/getdents/arch_prctl at all, so a
 # few steps drive different calls to check the same property). See
-# tools/blobs/build-linux-hello.sh and build-linux-abi-test.sh.
+# tests/support/linux-abi/build-linux-hello.sh and build-linux-abi-test.sh.
 if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 	section "M40 Linux ABI Compatibility"
 	check_output "$LOG" "M40-LINUX: start" "M40 Linux ABI smoke starts"
@@ -2154,7 +2154,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 	check_output "$LOG" "M40-LINUX: done" "M40 Linux ABI smoke completes"
 
 	# M40 closeout: the rest of the translated Linux surface, exercised by a
-	# second static Linux ELF (tools/blobs/linux_abi_test.c).
+	# second static Linux ELF (tests/support/linux-abi/linux_abi_test.c).
 	check_output "$LOG" "M40-ABI: start" "M40 Linux ABI conformance blob starts"
 	check_output "$LOG" "M40-ABI: ok pread64" "Linux pread64 reads at an explicit offset and leaves the fd offset untouched"
 	check_output "$LOG" "M40-ABI: ok pwrite64" "Linux pwrite64 writes at an explicit offset"
@@ -2739,7 +2739,7 @@ check_output "$LOG" "FPU-CTX: ok ymm-across-signal" "a signal handler's use of t
 check_output "$LOG" "FPU-CTX: ok xmm-across-yield" "the SSE registers survive a context switch"
 # The vDSO: clock readings a process takes without entering the kernel
 # (kernel/user/vdso.c, kernel/vdso/). Each marker is printed by
-# userspace/bin/smoke/vdso_smoke.c only after the property was checked.
+# tests/programs/bin/smoke/vdso_smoke.c only after the property was checked.
 check_output "$LOG" "VDSO-SMOKE: ok auxv-ehdr" "AT_SYSINFO_EHDR points at an ELF exporting the clock functions under Linux's symbol version, with DT_HASH"
 check_output "$LOG" "VDSO-SMOKE: ok maps" "/proc/self/maps shows [vdso] r-xp at AT_SYSINFO_EHDR and [vvar] r--p directly below it"
 check_output "$LOG" "VDSO-SMOKE: ok agree-realtime" "every vDSO CLOCK_REALTIME reading lies between system calls made just before and after it"
@@ -3078,6 +3078,20 @@ if [ "$ARCH" = "x86_64" ]; then
 else
 	skipped "protection keys with the hardware" "arm64 keys need the Permission Overlay Extension, which QEMU does not model"
 fi
+# ── M127: cgroup v2 resource control, the OOM killer and PSI (m127_smoke) ──
+check_output "$LOG" "M127-SMOKE: ok cg-controllers" "cgroup.controllers lists cpu, io, memory and pids; the filesystem is CGROUP2_SUPER_MAGIC; enabling a controller in the parent creates its files in the children at their documented defaults, and withdrawing it removes them"
+check_output "$LOG" "M127-SMOKE: ok pids-max" "a fork past pids.max fails with EAGAIN, pids.current never exceeds the limit and pids.events counts the refusal"
+check_output "$LOG" "M127-SMOKE: ok mem-current" "memory.current is the resident memory of the cgroup's members, measured: 0 when empty, at least what a holder touched while it lives, and 0 again once it is gone; memory.peak and memory.stat's pgfault follow"
+check_output "$LOG" "M127-SMOKE: ok mem-max-kill" "a runaway in a cgroup with memory.max is SIGKILLed, memory.events records max/oom/oom_kill, and a process holding memory in another cgroup is untouched"
+check_output "$LOG" "M127-SMOKE: ok mem-oom-adj" "the cgroup OOM killer takes the small process whose oom_score_adj is 1000 before the big one at 0"
+check_output "$LOG" "M127-SMOKE: ok oom-score" "/proc/<pid>/oom_score_adj round-trips, refuses a value out of range, is inherited across fork, and moves /proc/<pid>/oom_score"
+check_output "$LOG" "M127-SMOKE: ok cpu-weight" "two cgroups of two spinners each at cpu.weight 100 and 1000 divide the CPU by group weight, measured from each cgroup's own cpu.stat"
+check_output "$LOG" "M127-SMOKE: ok cpu-max" "cpu.max holds a spinner to its quota over real periods, and cpu.stat counts the periods it was throttled in"
+check_output "$LOG" "M127-SMOKE: ok io-stat" "reads that reach a block device are counted per device in that cgroup's io.stat, and io.max round-trips in MAJ:MIN key=value form"
+check_output "$LOG" "M127-SMOKE: ok psi-format" "/proc/pressure/{cpu,memory,io} parse as Linux prints them, with no full line for cpu"
+check_output "$LOG" "M127-SMOKE: ok psi-cpu" "contending for the CPU moves /proc/pressure/cpu's some total"
+check_output "$LOG" "M127-SMOKE: ok psi-io" "reading a block device moves /proc/pressure/io's some total"
+check_output "$LOG" "M127-SMOKE: done" "M127 resource-control suite completes"
 # ── M123: namespaces complete enough for containers (m123_smoke) ──
 check_output "$LOG" "M123-SMOKE: ok userns-unpriv" "an unprivileged task creates a user namespace, reads the overflow uid until it maps itself, then is root with every capability there"
 check_output "$LOG" "M123-SMOKE: ok userns-map-rules" "uid_map is written once; an unprivileged task maps only its own id, and gid_map only after setgroups is denied"
@@ -3462,7 +3476,7 @@ check_output "$LOG" "M97-TOOLS: ok samu-build" "samurai executes a build.ninja e
 check_output "$LOG" "M97-TOOLS: ok samu-uptodate" "re-running a satisfied build graph is a no-op"
 check_output "$LOG" "M97-TOOLS: done" "M98 GNU-free build-tool suite completes"
 # ── M104: Linux-PAM (real libpam.so.0 + pam_unix.so authenticating against
-# /etc/shadow via musl crypt(3)) — userspace/bin/smoke/m104_pam_smoke.c.
+# /etc/shadow via musl crypt(3)) — tests/programs/bin/smoke/m104_pam_smoke.c.
 check_output "$LOG" "M104-PAM: ok libpam-linked" "libpam loaded and its API is callable"
 check_output "$LOG" "M104-PAM: ok auth-correct-password" "pam_authenticate() succeeds for the real pamtest /etc/shadow entry with its correct password"
 check_output "$LOG" "M104-PAM: ok acct-mgmt" "pam_acct_mgmt() succeeds for the authenticated account"
@@ -3720,7 +3734,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 		# it at the frequency the guest said it was playing.
 		_audio_wav="${GFX_LOG%.log}-audio.wav"
 		if [ -f "$_audio_wav" ]; then
-			_audio_out="$(python3 "$PROJECT_DIR/tools/check/verify-tone-wav.py" "$_audio_wav" 440 2>&1)"
+			_audio_out="$(python3 "$PROJECT_DIR/tests/support/verify-tone-wav.py" "$_audio_wav" 440 2>&1)"
 			# A `case`, not a pipe into grep: `echo` in this script is a
 			# function that prefixes the instance name, which would put text
 			# in front of the anchor and never match.
@@ -3997,7 +4011,7 @@ check_output "$LOG" "M101-SMOKE: ok crc32c" "M101: CRC-32C gives the published c
 	check_output "$LOG" "RENDER-SMOKE: done" "the renderer smoke runs to the end"
 	# The accelerated path needs a GL driver in the image, which the ordinary
 	# image deliberately does not carry (mesa-dri-gallium is 184 MB with LLVM
-	# behind it — see tools/packages/alpine-ports.map). Where it IS there, the
+	# behind it — see tools/image/alpine/alpine-ports.map). Where it IS there, the
 	# frame is required; where it is not, the run says so in its own words and
 	# that is reported as a skip rather than passed over in silence.
 	if grep -q "RENDER-SMOKE: accel-status available" "$LOG" 2>/dev/null; then

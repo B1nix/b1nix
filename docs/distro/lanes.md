@@ -16,6 +16,7 @@ stage* failed, and they must never pass by accident.
 
 | Lane | What it proves | Phase |
 |---|---|---|
+| `PKG-SMOKE` | the overlay packages build, publish and install into a clean Debian | A |
 | `DISTRO-SMOKE` | the installed image boots to a systemd target, apt works, the two-kernel fallback works | B |
 | `INSTALL-SMOKE` | Calamares installs onto a blank disk, and the installed disk boots | D |
 | `DESKTOP-SMOKE` | login, browser, sound, and suspend once it exists | D |
@@ -59,7 +60,7 @@ unit, and on a young kernel there will be some. The lane does not accept
 units against a list checked into the tree, one unit per line with a reason:
 
 ```
-# tools/configs/known-degraded.txt
+# tests/support/known-degraded.txt
 systemd-networkd-wait-online.service   no carrier in the smoke topology
 ```
 
@@ -69,6 +70,32 @@ systemd-networkd-wait-online.service   no carrier in the smoke topology
   breakage hides.
 - Every line needs a reason. A list of unit names with no reasons is a way of
   forgetting.
+
+## The tools a lane uses
+
+Three scripts, so that no lane writes its own version of any of them:
+
+- `tools/run/run-distro.sh` boots a disk image. It asks for KVM (emulation costs
+  minutes per attempt), boots from a snapshot so the image is never written and
+  several boots can run at once, and watches the console: when the last line
+  stops changing — ignoring its timestamp, because a guest repeating one
+  message a thousand times a second is stuck, not busy — it kills the guest and
+  prints where it stopped. A wedge costs 45 seconds instead of seven minutes.
+- `tools/image/push-kernel.sh` writes a freshly built kernel straight into the
+  image's ESP with mtools, in under a second, instead of rebuilding the package,
+  the repository and the image for eight minutes. It is for the iteration loop
+  only: a release image is built by `mk-b1nix-image.sh` from the repository.
+- `tools/toolchain/unreferenced-scripts.sh` lists the scripts nothing in the tree
+  mentions. Not proof that one is dead — `docs/distro/cleanup.md` says what
+  proof is — but it is the short list worth reading.
+
+`mk-b1nix-image.sh` reuses the root tree when neither the packages nor the
+files it stages have changed, which turns a rebuild from four minutes into
+about fifteen seconds; `REUSE=0` forces the long way.
+
+Everything that enters the chroot runs under a hard timeout
+(`STEP_TIMEOUT`, 900 s by default): apt waiting on a mirror and dpkg waiting on
+a lock it will never get both used to sit until a person noticed.
 
 ## Timeouts
 

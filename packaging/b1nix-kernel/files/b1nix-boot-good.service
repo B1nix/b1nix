@@ -1,0 +1,19 @@
+[Unit]
+Description=Mark this b1nix kernel's boot entry as good
+Documentation=file:/usr/share/doc/b1nix-kernel/boot-counting
+# After the system is actually usable, not merely started: on a desktop that
+# means the graphical target, and on anything else multi-user. Ordering after
+# both is correct -- a target that is not part of this boot is simply ignored.
+After=multi-user.target graphical.target
+ConditionPathExists=/boot/b1nix
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/b1nix-boot-good
+# The script never fails on purpose; this makes sure a surprise cannot turn
+# `systemctl is-system-running` into "degraded" over a bookkeeping file.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target

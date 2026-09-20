@@ -34,6 +34,19 @@ static int filelock_owner(void) {
   return current_task ? (int)task_tgid(current_task) : 0;
 }
 
+/* Who a record belongs to.
+ *
+ * A POSIX lock is owned by a process and an OFD lock by an open file
+ * description, and the two kinds sit in the same table and conflict with each
+ * other exactly as they do on Linux. Everything that used to compare pids now
+ * asks this instead, so a record can never be mistaken for the caller's own
+ * because their pids happen to match. */
+static int lock_is_mine(const struct file_lock *l, int my_pid, void *my_ofd) {
+  if (my_ofd)
+    return l->ofd == my_ofd;
+  return l->ofd == 0 && l->pid == my_pid;
+}
+
 void filelock_init(void) {
   memset(file_locks, 0, sizeof(file_locks));
   filelock_initialized = 1;
@@ -89,15 +102,17 @@ static int can_merge(u64 start1, u64 len1, u64 start2, u64 len2) {
   return (start1 <= end2 + 1) && (start2 <= end1 + 1);
 }
 
-static void merge_adjacent_locks(struct vfs_inode *inode, int pid) {
+static void merge_adjacent_locks(struct vfs_inode *inode, int pid, void *ofd) {
   int merged;
   do {
     merged = 0;
     for (int i = 0; i < MAX_FILE_LOCKS; i++) {
-      if (!file_locks[i].active || file_locks[i].inode != inode || file_locks[i].pid != pid)
+      if (!file_locks[i].active || file_locks[i].inode != inode ||
+          !lock_is_mine(&file_locks[i], pid, ofd))
         continue;
       for (int j = i + 1; j < MAX_FILE_LOCKS; j++) {
-        if (!file_locks[j].active || file_locks[j].inode != inode || file_locks[j].pid != pid)
+        if (!file_locks[j].active || file_locks[j].inode != inode ||
+            !lock_is_mine(&file_locks[j], pid, ofd))
           continue;
         if (file_locks[i].lock_type != file_locks[j].lock_type)
           continue;
@@ -127,10 +142,11 @@ static void merge_adjacent_locks(struct vfs_inode *inode, int pid) {
  * [start, start+len) request of type `l_type`. Factored out so the blocking
  * F_SETLKW path can re-test the predicate after publishing BLOCKED. */
 static int filelock_conflict_exists(struct vfs_inode *inode, int my_pid,
-                                    u64 start, u64 len, int l_type) {
+                                    void *my_ofd, u64 start, u64 len,
+                                    int l_type) {
   for (int i = 0; i < MAX_FILE_LOCKS; i++) {
     if (file_locks[i].active && file_locks[i].inode == inode &&
-        file_locks[i].pid != my_pid) {
+        !lock_is_mine(&file_locks[i], my_pid, my_ofd)) {
       if (lock_overlaps(file_locks[i].start, file_locks[i].len, start, len)) {
         if (lock_conflicts(&file_locks[i], l_type)) {
           return 1;
@@ -141,7 +157,10 @@ static int filelock_conflict_exists(struct vfs_inode *inode, int my_pid,
   return 0;
 }
 
-int filelock_set_lock(int fd, int cmd, struct flock *fl) {
+/* One implementation for both kinds. `ofd` is the open file description for an
+ * OFD lock and null for a POSIX one; nothing else differs, which is the point
+ * -- the two must see each other's locks. */
+static int filelock_do(int fd, int cmd, struct flock *fl, void *ofd) {
   if (!filelock_initialized || fd < 0)
     return -EINVAL;
 
@@ -151,6 +170,7 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
 
   struct vfs_inode *inode = h->node->inode;
   int my_pid = filelock_owner();
+  void *my_ofd = ofd;
 
   u64 start = fl->l_start;
   if (fl->l_whence == B1NIX_SEEK_CUR) {
@@ -166,7 +186,8 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
   if (cmd == F_GETLK) {
     struct file_lock *conflicting = NULL;
     for (int i = 0; i < MAX_FILE_LOCKS; i++) {
-      if (file_locks[i].active && file_locks[i].inode == inode && file_locks[i].pid != my_pid) {
+      if (file_locks[i].active && file_locks[i].inode == inode &&
+          !lock_is_mine(&file_locks[i], my_pid, my_ofd)) {
         if (lock_overlaps(file_locks[i].start, file_locks[i].len, start, fl->l_len)) {
           if (lock_conflicts(&file_locks[i], fl->l_type)) {
             conflicting = &file_locks[i];
@@ -179,7 +200,10 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
       fl->l_type = conflicting->lock_type;
       fl->l_start = conflicting->start;
       fl->l_len = conflicting->len;
-      fl->l_pid = conflicting->pid;
+      /* Linux reports -1 for a holder that is an open file description: there
+       * is no process to name, and a pid there would send the caller after
+       * the wrong one. */
+      fl->l_pid = conflicting->ofd ? -1 : conflicting->pid;
       fl->l_whence = B1NIX_SEEK_SET;
     } else {
       fl->l_type = F_UNLCK;
@@ -189,14 +213,16 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
   }
 
   if (fl->l_type != F_UNLCK) {
-    if (filelock_conflict_exists(inode, my_pid, start, fl->l_len, fl->l_type)) {
+    if (filelock_conflict_exists(inode, my_pid, my_ofd, start, fl->l_len,
+                                 fl->l_type)) {
       if (cmd == F_SETLK) {
         spin_unlock_irqrestore(&filelock_lock, fl_flags);
         return -EAGAIN;
       }
     }
     unsigned long waited = 0;
-    while (filelock_conflict_exists(inode, my_pid, start, fl->l_len, fl->l_type)) {
+    while (filelock_conflict_exists(inode, my_pid, my_ofd, start, fl->l_len,
+                                    fl->l_type)) {
       if (scheduler_signal_pending()) {
         spin_unlock_irqrestore(&filelock_lock, fl_flags);
         return -ERESTARTSYS;
@@ -211,7 +237,7 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
         int holder = 0;
         for (int i = 0; i < MAX_FILE_LOCKS; i++) {
           if (file_locks[i].active && file_locks[i].inode == inode &&
-              file_locks[i].pid != my_pid) {
+              !lock_is_mine(&file_locks[i], my_pid, my_ofd)) {
             holder = file_locks[i].pid;
             break;
           }
@@ -230,7 +256,8 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
        * NOT yield, so calling it under the spinlock is safe; the sleep
        * (commit) happens only after the unlock. */
       scheduler_wait_prepare(inode);
-      if (!filelock_conflict_exists(inode, my_pid, start, fl->l_len, fl->l_type)) {
+      if (!filelock_conflict_exists(inode, my_pid, my_ofd, start, fl->l_len,
+                                    fl->l_type)) {
         scheduler_wait_cancel();
         continue;
       }
@@ -247,7 +274,8 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
   }
   int needs_split = 0;
   for (int i = 0; i < MAX_FILE_LOCKS; i++) {
-    if (file_locks[i].active && file_locks[i].inode == inode && file_locks[i].pid == my_pid) {
+    if (file_locks[i].active && file_locks[i].inode == inode &&
+        lock_is_mine(&file_locks[i], my_pid, my_ofd)) {
       u64 L_end = file_locks[i].len ? file_locks[i].start + file_locks[i].len - 1 : (u64)-1;
       if (file_locks[i].start < start && L_end > end) {
         needs_split = 1;
@@ -264,7 +292,8 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
 
   // Apply split/shrink/delete for our own locks in this range
   for (int i = 0; i < MAX_FILE_LOCKS; i++) {
-    if (file_locks[i].active && file_locks[i].inode == inode && file_locks[i].pid == my_pid) {
+    if (file_locks[i].active && file_locks[i].inode == inode &&
+        lock_is_mine(&file_locks[i], my_pid, my_ofd)) {
       if (lock_overlaps(file_locks[i].start, file_locks[i].len, start, fl->l_len)) {
         u64 L_start = file_locks[i].start;
         u64 L_end = file_locks[i].len ? L_start + file_locks[i].len - 1 : (u64)-1;
@@ -274,6 +303,7 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
           if (!L2) { spin_unlock_irqrestore(&filelock_lock, fl_flags); return -ENOMEM; } /* pre-check reserved this; defensive */
           L2->inode = inode;
           L2->pid = my_pid;
+          L2->ofd = my_ofd;
           L2->lock_type = file_locks[i].lock_type;
           L2->start = end + 1;
           L2->len = (L_end == (u64)-1) ? 0 : (L_end - L2->start + 1);
@@ -296,16 +326,57 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
     if (!lock) { spin_unlock_irqrestore(&filelock_lock, fl_flags); return -ENOMEM; } /* pre-check reserved this; defensive */
     lock->inode = inode;
     lock->pid = my_pid;
+    lock->ofd = my_ofd;
     lock->lock_type = fl->l_type;
     lock->start = start;
     lock->len = fl->l_len;
 
-    merge_adjacent_locks(inode, my_pid);
+    merge_adjacent_locks(inode, my_pid, my_ofd);
   }
 
   spin_unlock_irqrestore(&filelock_lock, fl_flags);
   scheduler_wake_all(inode);
   return 0;
+}
+
+int filelock_set_lock(int fd, int cmd, struct flock *fl) {
+  return filelock_do(fd, cmd, fl, 0);
+}
+
+/* fcntl(F_OFD_*): the same three operations, owned by the open file. */
+int filelock_set_lock_ofd(int fd, int cmd, struct flock *fl) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  int base;
+
+  if (!h)
+    return -EBADF;
+  switch (cmd) {
+  case F_OFD_GETLK: base = F_GETLK; break;
+  case F_OFD_SETLK: base = F_SETLK; break;
+  case F_OFD_SETLKW: base = F_SETLKW; break;
+  default: return -EINVAL;
+  }
+  /* Linux requires l_pid to be zero on the way in for an OFD lock, and says
+   * EINVAL when it is not. Callers rely on that check to tell the two
+   * interfaces apart. */
+  if (fl->l_pid != 0)
+    return -EINVAL;
+  return filelock_do(fd, base, fl, h);
+}
+
+void filelock_release_all_by_ofd(void *ofd) {
+  u64 flags;
+
+  if (!filelock_initialized || !ofd)
+    return;
+  spin_lock_irqsave(&filelock_lock, &flags);
+  for (int i = 0; i < MAX_FILE_LOCKS; i++) {
+    if (file_locks[i].active && file_locks[i].ofd == ofd)
+      free_lock(&file_locks[i]);
+  }
+  spin_unlock_irqrestore(&filelock_lock, flags);
+  /* Someone may be blocked on exactly what was just dropped. */
+  scheduler_wake_all(0);
 }
 
 int filelock_unlock(int fd) {

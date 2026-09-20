@@ -6,7 +6,7 @@
 /* M47: evdev-style input event devices (/dev/input/event0..N).
  *
  * Event record layout is identical on both arches (16 bytes, no padding):
- * userspace mirrors this struct in userspace/include/b1nix/input.h — keep
+ * userspace mirrors this struct in third_party/b1cc-sysroot/b1nix/input.h — keep
  * them matched. */
 struct b1nix_input_event {
   u64 time_ticks; /* scheduler uptime ticks at enqueue */

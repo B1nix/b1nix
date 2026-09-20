@@ -5,7 +5,9 @@
 #include <b1nix/lockdep.h>
 #include <b1nix/sched.h>
 #include <b1nix/errno.h>
+#include <b1nix/cgroup.h>
 #include <b1nix/mm.h>
+#include <b1nix/psi.h>
 #include <b1nix/rwlock.h>
 #include <b1nix/vfs.h>
 #include <b1nix/page_cache.h>
@@ -2839,7 +2841,14 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     // swap_in allocates a frame and does blocking disk I/O — outside the lock.
     u64 new_frame = 0;
     u32 swslot = (u32)((pte & PAGE_ENTRY_ADDRESS_MASK) >> 12);
-    if (swap_in(swslot, &new_frame) < 0) {
+    /* A major fault: the task waits for a disk read before it can go on, and
+     * that wait is memory pressure by any definition. Counted for PSI and, for
+     * the cgroup the task belongs to, in memory.stat's pgmajfault. */
+    psi_stall_begin(PSI_MEM);
+    int swrc = swap_in(swslot, &new_frame);
+    psi_stall_end(PSI_MEM);
+    cgroup_mem_note_majfault();
+    if (swrc < 0) {
       console_write("pf: swap in failed for 0x");
       console_write_hex64(page_aligned);
       console_write("\n");

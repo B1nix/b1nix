@@ -8,7 +8,7 @@
  * Two different things use this header and they need different treatment:
  *
  *   - Filesystems that keep their tracepoints in include/trace/events/. Those
- *     headers are not staged, and tools/fs/gen-shim-headers.sh generates a
+ *     headers are not staged, and tools/import/fs/gen-shim-headers.sh generates a
  *     no-op macro per tracepoint from the pinned source instead.
  *   - Filesystems that keep them in their OWN directory — fs/iomap/trace.h is
  *     one — which IS staged and is therefore compiled. That file contains real

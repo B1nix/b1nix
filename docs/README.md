@@ -36,3 +36,4 @@ lands when something is installable. They meet in
 | [distro/install-guide.md](distro/install-guide.md) | Draft of the user-facing install guide |
 | [distro/release-checklist.md](distro/release-checklist.md) | The mechanical checklist for cutting a release |
 | [versioning.md](versioning.md) | Kernel, ABI, release and package versions |
+| [repo-layout.md](repo-layout.md) | Where things live, what moves where, and why |
