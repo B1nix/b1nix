@@ -4232,6 +4232,64 @@ static struct vfs_handle **fdtable_release(struct task *t, int **flags_out,
   return tbl;
 }
 
+/* io_uring's SQPOLL thread adopts the ring owner's context.
+ *
+ * Linux creates that thread with create_io_thread(), which is a clone sharing
+ * the creator's address space and descriptor table. b1nix's kernel threads are
+ * born with neither, so the thread calls this on itself once, naming the task
+ * it serves: the same pointers CLONE_VM|CLONE_FILES would have shared are
+ * taken over, which means the existing last-holder teardown (mm_release_user
+ * and fdtable_release, just above) counts this thread and cannot free an
+ * address space or a descriptor table out from under it.
+ *
+ * Returns 0, or -1 when the owner is gone or has no address space — in which
+ * case the caller has nothing to serve and must stop. */
+int scheduler_adopt_owner_context(usize owner_pid) {
+  struct task *t = current_task;
+  struct task *o = scheduler_task_by_pid(owner_pid);
+  struct vfs_handle **tbl;
+  int *fl = 0;
+  usize cap = 0;
+  u64 flags;
+
+  if (!t || !o || o == t || o->state == TASK_UNUSED || !o->pml4_phys ||
+      !o->fd_table)
+    return -1;
+
+  /* Give up the private descriptor table a kernel thread is born with. */
+  tbl = fdtable_release(t, &fl, &cap);
+  if (tbl) {
+    for (usize i = 0; i < cap; i++)
+      if (tbl[i])
+        vfs_close_handle(tbl[i], (int)t->id);
+    kfree(tbl);
+    kfree(fl);
+  }
+
+  spin_lock_irqsave(&g_mm_release_lock, &flags);
+  if (o->state == TASK_UNUSED || !o->pml4_phys || !o->fd_table) {
+    spin_unlock_irqrestore(&g_mm_release_lock, flags);
+    return -1;
+  }
+  t->fd_table = o->fd_table;
+  t->fd_flags = o->fd_flags;
+  t->fd_capacity = o->fd_capacity;
+  t->pml4_phys = o->pml4_phys;
+  spin_unlock_irqrestore(&g_mm_release_lock, flags);
+
+  t->fd_lock = 0;
+  {
+    struct task *owner = g_task_fdlock_owner[task_index(o)];
+
+    g_task_fdlock_owner[task_index(t)] = owner ? owner : o;
+  }
+  t->vma_list = o->vma_list;
+  t->user_brk = o->user_brk;
+  t->heap_start = o->heap_start;
+  paging_switch_address_space(t->pml4_phys);
+  return 0;
+}
+
 int g_has_any_thread = 0;
 
 /* CLONE_VFORK: the parent must not run until the child has execve()d or

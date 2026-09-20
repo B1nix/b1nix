@@ -87,6 +87,7 @@
  * for every request a cancel or a failed link took down. Linux's values. */
 #define ETIME 62
 #define ECANCELED 125
+#define EOWNERDEAD 130 /* Owner died (io_uring: the SQPOLL thread is gone) */
 #define ERESTARTSYS     512 /* Restart system call */
 /* Restart only if no handler runs: select, poll, epoll_wait and the SysV IPC
  * waits return EINTR after a handler whatever SA_RESTART says, as on Linux. */

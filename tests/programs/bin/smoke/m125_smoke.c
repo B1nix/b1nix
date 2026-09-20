@@ -15,8 +15,12 @@
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -32,6 +36,70 @@
 #ifndef __NR_io_uring_register
 #define __NR_io_uring_register 427
 #endif
+
+/* Opcodes and flags newer than the uapi header this is compiled against. The
+ * values are the ABI's, taken from the same enum the kernel's copy holds. */
+#define IOU_OP_SETXATTR         42
+#define IOU_OP_SOCKET           45
+#define IOU_OP_SEND_ZC          47
+#define IOU_OP_WAITID           50
+#define IOU_OP_FIXED_FD_INSTALL 54
+#define IOU_OP_FTRUNCATE        55
+#define IOU_OP_BIND             56
+#define IOU_OP_LISTEN           57
+#define IOU_OP_PIPE             62
+
+#ifndef IORING_SETUP_NO_SQARRAY
+#define IORING_SETUP_NO_SQARRAY (1U << 16)
+#endif
+#ifndef IORING_SETUP_DEFER_TASKRUN
+#define IORING_SETUP_DEFER_TASKRUN (1U << 13)
+#endif
+#ifndef IORING_SETUP_SINGLE_ISSUER
+#define IORING_SETUP_SINGLE_ISSUER (1U << 12)
+#endif
+#ifndef IORING_REGISTER_PBUF_RING
+#define IORING_REGISTER_PBUF_RING 22
+#define IORING_UNREGISTER_PBUF_RING 23
+#endif
+#ifndef IORING_REGISTER_SYNC_CANCEL
+#define IORING_REGISTER_SYNC_CANCEL 24
+#endif
+#ifndef IORING_REGISTER_FILE_ALLOC_RANGE
+#define IORING_REGISTER_FILE_ALLOC_RANGE 25
+#endif
+#ifndef IORING_REGISTER_PBUF_STATUS
+#define IORING_REGISTER_PBUF_STATUS 26
+#endif
+
+/* struct io_uring_buf_status, which the 6.6 uapi header does not carry. */
+struct iou_buf_status {
+  unsigned int buf_group;
+  unsigned int head;
+  unsigned int resv[8];
+};
+#ifndef IORING_FILE_INDEX_ALLOC
+#define IORING_FILE_INDEX_ALLOC (~0U)
+#endif
+#ifndef IORING_ACCEPT_MULTISHOT
+#define IORING_ACCEPT_MULTISHOT (1U << 0)
+#endif
+#ifndef IORING_RECV_MULTISHOT
+#define IORING_RECV_MULTISHOT (1U << 1)
+#endif
+#ifndef IORING_CQE_BUFFER_SHIFT
+#define IORING_CQE_BUFFER_SHIFT 16
+#endif
+
+/* struct io_uring_buf / io_uring_buf_ring, in the shape the ABI fixes: the
+ * ring tail is overlaid on the first entry's resv field. */
+struct iou_buf_ent {
+  unsigned long long addr;
+  unsigned int len;
+  unsigned short bid;
+  unsigned short resv;
+};
+#define IOU_PBUF_TAIL(base) (*(volatile unsigned short *)((char *)(base) + 14))
 
 static int fails;
 
@@ -202,23 +270,24 @@ static void check_setup(void) {
   ring_free(&r);
 
   /* A flag the kernel cannot honour must be refused here, not accepted and
-   * then mishandled. */
+   * then mishandled. IORING_SETUP_SQ_AFF asks for the submission thread to be
+   * pinned to sq_thread_cpu, which this kernel cannot promise. */
   struct io_uring_params p;
 
   memset(&p, 0, sizeof(p));
-  p.flags = IORING_SETUP_SQPOLL;
+  p.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
   int fd = io_uring_setup_(8, &p);
 
-  judge("refuses-sqpoll", fd < 0 && errno == EINVAL,
-        "IORING_SETUP_SQPOLL was accepted", (long)fd);
+  judge("refuses-sq-aff", fd < 0 && errno == EINVAL,
+        "IORING_SETUP_SQ_AFF was accepted", (long)fd);
   if (fd >= 0)
     close(fd);
 
   memset(&p, 0, sizeof(p));
-  p.flags = IORING_SETUP_IOPOLL;
+  p.flags = IORING_SETUP_ATTACH_WQ;
   fd = io_uring_setup_(8, &p);
-  judge("refuses-iopoll", fd < 0 && errno == EINVAL,
-        "IORING_SETUP_IOPOLL was accepted", (long)fd);
+  judge("refuses-attach-wq", fd < 0 && errno == EINVAL,
+        "IORING_SETUP_ATTACH_WQ was accepted", (long)fd);
   if (fd >= 0)
     close(fd);
 
@@ -748,17 +817,28 @@ static void check_probe(void) {
     ring_free(&r);
     return;
   }
-  int nop_ok = 0, read_ok = 0, madvise_reported = 1;
+  int nop_ok = 0, read_ok = 0, openat_ok = 0, statx_ok = 0, pbuf_ok = 0;
+  int xattr_reported = 1;
 
   for (unsigned i = 0; i < p->ops_len; i++) {
     if (p->ops[i].op == IORING_OP_NOP)
       nop_ok = (p->ops[i].flags & IO_URING_OP_SUPPORTED) != 0;
     if (p->ops[i].op == IORING_OP_READ)
       read_ok = (p->ops[i].flags & IO_URING_OP_SUPPORTED) != 0;
-    if (p->ops[i].op == IORING_OP_MADVISE)
-      madvise_reported = (p->ops[i].flags & IO_URING_OP_SUPPORTED) == 0;
+    if (p->ops[i].op == IORING_OP_OPENAT)
+      openat_ok = (p->ops[i].flags & IO_URING_OP_SUPPORTED) != 0;
+    if (p->ops[i].op == IORING_OP_STATX)
+      statx_ok = (p->ops[i].flags & IO_URING_OP_SUPPORTED) != 0;
+    if (p->ops[i].op == IORING_OP_PROVIDE_BUFFERS)
+      pbuf_ok = (p->ops[i].flags & IO_URING_OP_SUPPORTED) != 0;
+    /* Extended attributes do not exist in this VFS, so the probe must not
+     * claim the four xattr opcodes. */
+    if (p->ops[i].op == IOU_OP_SETXATTR)
+      xattr_reported = (p->ops[i].flags & IO_URING_OP_SUPPORTED) == 0;
   }
-  judge("probe", p->ops_len > 0 && nop_ok && read_ok && madvise_reported,
+  judge("probe",
+        p->ops_len > 0 && nop_ok && read_ok && openat_ok && statx_ok &&
+            pbuf_ok && xattr_reported,
         "the probe does not tell the truth about which opcodes work",
         (long)p->ops_len);
 
@@ -767,7 +847,7 @@ static void check_probe(void) {
   struct io_uring_cqe cqe;
   struct io_uring_sqe *sqe = sq_get(&r);
 
-  sqe->opcode = IORING_OP_MADVISE;
+  sqe->opcode = IOU_OP_SETXATTR;
   sqe->fd = -1;
   sqe->user_data = 61;
   rc = submit_wait(&r, 1, &cqe);
@@ -947,6 +1027,1577 @@ static void check_overflow(void) {
   ring_free(&r);
 }
 
+/* ---- the checks added when the refused features were implemented -------- */
+
+/* A ring shape helper that also reports the CQE stride, so IORING_SETUP_CQE32
+ * can be walked correctly. */
+static struct io_uring_cqe *cqe_at(struct ring *r, unsigned idx,
+                                   size_t stride) {
+  return (struct io_uring_cqe *)((char *)r->cqes +
+                                 (size_t)(idx & *r->cq_mask) * stride);
+}
+
+static void check_sqpoll(void) {
+  struct io_uring_params p;
+  struct ring r;
+  int i;
+
+  memset(&r, 0, sizeof(r));
+  memset(&p, 0, sizeof(p));
+  p.flags = IORING_SETUP_SQPOLL;
+  p.sq_thread_idle = 50;
+  r.p = p;
+  r.fd = io_uring_setup_(8, &r.p);
+  if (r.fd < 0) {
+    bad("sqpoll-setup", "IORING_SETUP_SQPOLL was refused", (long)r.fd);
+    return;
+  }
+  r.sq_sz = r.p.sq_off.array + r.p.sq_entries * sizeof(unsigned);
+  size_t cq_sz =
+      r.p.cq_off.cqes + r.p.cq_entries * sizeof(struct io_uring_cqe);
+
+  if (cq_sz > r.sq_sz)
+    r.sq_sz = cq_sz;
+  r.sq_ptr = mmap(0, r.sq_sz, PROT_READ | PROT_WRITE,
+                  MAP_SHARED | MAP_POPULATE, r.fd, IORING_OFF_SQ_RING);
+  r.sqes_sz = r.p.sq_entries * sizeof(struct io_uring_sqe);
+  r.sqes = mmap(0, r.sqes_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+                r.fd, IORING_OFF_SQES);
+  if (r.sq_ptr == MAP_FAILED || r.sqes == MAP_FAILED) {
+    bad("sqpoll-setup", "the SQPOLL ring would not map", -1);
+    close(r.fd);
+    return;
+  }
+  char *b = (char *)r.sq_ptr;
+
+  r.sq_head = (unsigned *)(b + r.p.sq_off.head);
+  r.sq_tail = (unsigned *)(b + r.p.sq_off.tail);
+  r.sq_mask = (unsigned *)(b + r.p.sq_off.ring_mask);
+  r.sq_entries = (unsigned *)(b + r.p.sq_off.ring_entries);
+  r.sq_flags = (unsigned *)(b + r.p.sq_off.flags);
+  r.sq_dropped = (unsigned *)(b + r.p.sq_off.dropped);
+  r.sq_array = (unsigned *)(b + r.p.sq_off.array);
+  r.cq_head = (unsigned *)(b + r.p.cq_off.head);
+  r.cq_tail = (unsigned *)(b + r.p.cq_off.tail);
+  r.cq_mask = (unsigned *)(b + r.p.cq_off.ring_mask);
+  r.cq_entries = (unsigned *)(b + r.p.cq_off.ring_entries);
+  r.cq_overflow = (unsigned *)(b + r.p.cq_off.overflow);
+  r.cqes = (struct io_uring_cqe *)(b + r.p.cq_off.cqes);
+  ok("sqpoll-setup");
+
+  /* The whole point: a submission with NO io_uring_enter at all. */
+  struct io_uring_sqe *sqe = sq_get(&r);
+
+  sqe->opcode = IORING_OP_NOP;
+  sqe->user_data = 0x59504cull;
+
+  struct io_uring_cqe cqe;
+  int got = 0;
+
+  for (i = 0; i < 4000 && !got; i++) {
+    got = cq_get(&r, &cqe);
+    if (!got)
+      usleep(1000);
+  }
+  judge("sqpoll-submits-without-enter",
+        got && cqe.user_data == 0x59504cull && cqe.res == 0,
+        "the submission thread did not consume the queue on its own",
+        got ? (long)cqe.res : -1);
+
+  /* After sq_thread_idle with nothing to do the thread must publish
+   * IORING_SQ_NEED_WAKEUP, and a wakeup through io_uring_enter must get it
+   * working again. */
+  int saw_need_wakeup = 0;
+
+  for (i = 0; i < 4000 && !saw_need_wakeup; i++) {
+    if (__atomic_load_n(r.sq_flags, __ATOMIC_ACQUIRE) & IORING_SQ_NEED_WAKEUP)
+      saw_need_wakeup = 1;
+    else
+      usleep(1000);
+  }
+  judge("sqpoll-need-wakeup", saw_need_wakeup,
+        "IORING_SQ_NEED_WAKEUP was never published after the idle period", 0);
+
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_NOP;
+  sqe->user_data = 0x59504dull;
+  int rc = io_uring_enter_(r.fd, 1, 0, IORING_ENTER_SQ_WAKEUP, 0, 0);
+
+  got = 0;
+  for (i = 0; i < 4000 && !got; i++) {
+    got = cq_get(&r, &cqe);
+    if (!got)
+      usleep(1000);
+  }
+  judge("sqpoll-wakeup", rc >= 0 && got && cqe.user_data == 0x59504dull,
+        "IORING_ENTER_SQ_WAKEUP did not restart the submission thread",
+        got ? (long)cqe.user_data : (long)rc);
+
+  /* And it must move real data, which means it is running in the owner's
+   * address space and can reach the owner's descriptors. */
+  int pfd[2];
+
+  if (pipe(pfd) == 0) {
+    static char src[64] = "sqpoll-carried-this";
+    char dst[64];
+
+    memset(dst, 0, sizeof(dst));
+    sqe = sq_get(&r);
+    sqe->opcode = IORING_OP_WRITE;
+    sqe->fd = pfd[1];
+    sqe->addr = (unsigned long long)(uintptr_t)src;
+    sqe->len = 20;
+    sqe->off = (unsigned long long)-1;
+    sqe->user_data = 0x77;
+    io_uring_enter_(r.fd, 1, 0, IORING_ENTER_SQ_WAKEUP, 0, 0);
+    got = 0;
+    for (i = 0; i < 4000 && !got; i++) {
+      got = cq_get(&r, &cqe);
+      if (!got)
+        usleep(1000);
+    }
+    int n = (int)read(pfd[0], dst, sizeof(dst));
+
+    judge("sqpoll-moves-data",
+          got && cqe.res == 20 && n == 20 && memcmp(dst, src, 20) == 0,
+          "the submission thread could not reach the owner's memory or fds",
+          got ? (long)cqe.res : -1);
+    close(pfd[0]);
+    close(pfd[1]);
+  } else {
+    bad("sqpoll-moves-data", "pipe failed", -1);
+  }
+
+  munmap(r.sqes, r.sqes_sz);
+  munmap(r.sq_ptr, r.sq_sz);
+  close(r.fd);
+}
+
+static void check_iopoll(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  const char *path = "/tmp/m125-iopoll";
+  char buf[64], in[64];
+  int fd;
+
+  if (ring_make(&r, 8, IORING_SETUP_IOPOLL, 0) < 0) {
+    bad("iopoll", "IORING_SETUP_IOPOLL was refused", -1);
+    return;
+  }
+  fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    bad("iopoll", "no file", -1);
+    ring_free(&r);
+    return;
+  }
+  memset(buf, 0, sizeof(buf));
+  strcpy(buf, "iopoll-data");
+  struct io_uring_sqe *sqe = sq_get(&r);
+
+  sqe->opcode = IORING_OP_WRITE;
+  sqe->fd = fd;
+  sqe->addr = (unsigned long long)(uintptr_t)buf;
+  sqe->len = 16;
+  sqe->off = 0;
+  sqe->user_data = 0x10;
+  int rc = submit_wait(&r, 1, &cqe);
+  int wrote = (rc == 0 && cqe.res == 16);
+
+  memset(in, 0, sizeof(in));
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_READ;
+  sqe->fd = fd;
+  sqe->addr = (unsigned long long)(uintptr_t)in;
+  sqe->len = 16;
+  sqe->off = 0;
+  sqe->user_data = 0x11;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("iopoll",
+        wrote && rc == 0 && cqe.res == 16 && memcmp(in, buf, 16) == 0,
+        "an IOPOLL ring did not move data reaped from GETEVENTS",
+        rc == 0 ? (long)cqe.res : (long)rc);
+  close(fd);
+  unlink(path);
+  ring_free(&r);
+}
+
+static void check_provided_buffers(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  static char pool[4 * 64];
+  int sv[2];
+
+  if (ring_make(&r, 8, 0, 0) < 0) {
+    bad("provide-buffers", "no ring", 0);
+    return;
+  }
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    bad("provide-buffers", "socketpair failed", -1);
+    ring_free(&r);
+    return;
+  }
+  memset(pool, 0, sizeof(pool));
+
+  struct io_uring_sqe *sqe = sq_get(&r);
+
+  sqe->opcode = IORING_OP_PROVIDE_BUFFERS;
+  sqe->fd = 4;                    /* how many */
+  sqe->addr = (unsigned long long)(uintptr_t)pool;
+  sqe->len = 64;                  /* each */
+  sqe->off = 100;                 /* first buffer id */
+  sqe->buf_group = 7;
+  sqe->user_data = 0x20;
+  int rc = submit_wait(&r, 1, &cqe);
+
+  judge("provide-buffers", rc == 0 && cqe.res == 0,
+        "IORING_OP_PROVIDE_BUFFERS did not take the buffers",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* A receive that chooses one of them. */
+  const char *msg = "chosen-buffer";
+
+  write(sv[1], msg, 14);
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_RECV;
+  sqe->fd = sv[0];
+  sqe->len = 0; /* take the whole buffer */
+  sqe->flags = IOSQE_BUFFER_SELECT;
+  sqe->buf_group = 7;
+  sqe->user_data = 0x21;
+  rc = submit_wait(&r, 1, &cqe);
+  int bid = (int)(cqe.flags >> IORING_CQE_BUFFER_SHIFT);
+  int have_flag = (cqe.flags & IORING_CQE_F_BUFFER) != 0;
+
+  judge("buffer-select",
+        rc == 0 && cqe.res == 14 && have_flag && bid == 100 &&
+            memcmp(pool, msg, 14) == 0,
+        "the chosen buffer was not reported or not the one written into",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* The next one must be a different buffer. */
+  write(sv[1], "second", 7);
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_RECV;
+  sqe->fd = sv[0];
+  sqe->len = 0;
+  sqe->flags = IOSQE_BUFFER_SELECT;
+  sqe->buf_group = 7;
+  sqe->user_data = 0x22;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("buffer-select-advances",
+        rc == 0 && cqe.res == 7 &&
+            (int)(cqe.flags >> IORING_CQE_BUFFER_SHIFT) == 101 &&
+            memcmp(pool + 64, "second", 7) == 0,
+        "the second selection did not move on to the next buffer",
+        rc == 0 ? (long)(cqe.flags >> IORING_CQE_BUFFER_SHIFT) : (long)rc);
+
+  /* Take the remaining two away and prove the group is then empty. */
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_REMOVE_BUFFERS;
+  sqe->fd = 2;
+  sqe->buf_group = 7;
+  sqe->user_data = 0x23;
+  rc = submit_wait(&r, 1, &cqe);
+  int removed = (rc == 0 && cqe.res == 2);
+
+  write(sv[1], "third", 6);
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_RECV;
+  sqe->fd = sv[0];
+  sqe->len = 0;
+  sqe->flags = IOSQE_BUFFER_SELECT;
+  sqe->buf_group = 7;
+  sqe->user_data = 0x24;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("remove-buffers", removed && rc == 0 && cqe.res == -ENOBUFS,
+        "an empty buffer group did not answer -ENOBUFS",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* Drain what is still queued on the socket so the next check starts clean. */
+  char sink[64];
+
+  recv(sv[0], sink, sizeof(sink), MSG_DONTWAIT);
+  close(sv[0]);
+  close(sv[1]);
+  ring_free(&r);
+}
+
+static void check_buffer_ring(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  int sv[2];
+  void *bring;
+  static char pool[4 * 64];
+  const unsigned entries = 4;
+
+  if (ring_make(&r, 8, 0, 0) < 0) {
+    bad("pbuf-ring", "no ring", 0);
+    return;
+  }
+  bring = mmap(0, 4096, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+  if (bring == MAP_FAILED) {
+    bad("pbuf-ring", "no memory for the buffer ring", -1);
+    ring_free(&r);
+    return;
+  }
+  memset(bring, 0, 4096);
+  memset(pool, 0, sizeof(pool));
+
+  struct io_uring_buf_reg reg;
+
+  memset(&reg, 0, sizeof(reg));
+  reg.ring_addr = (unsigned long long)(uintptr_t)bring;
+  reg.ring_entries = entries;
+  reg.bgid = 9;
+  int rc = io_uring_register_(r.fd, IORING_REGISTER_PBUF_RING, &reg, 1);
+
+  judge("pbuf-ring-register", rc == 0,
+        "IORING_REGISTER_PBUF_RING was refused", (long)rc);
+  if (rc < 0) {
+    munmap(bring, 4096);
+    ring_free(&r);
+    return;
+  }
+
+  /* Publish two buffers the way the ABI says: write the entries, then the
+   * tail. */
+  struct iou_buf_ent *ents = (struct iou_buf_ent *)bring;
+
+  for (unsigned i = 0; i < 2; i++) {
+    ents[i].addr = (unsigned long long)(uintptr_t)(pool + i * 64);
+    ents[i].len = 64;
+    ents[i].bid = (unsigned short)(200 + i);
+  }
+  __atomic_store_n(&IOU_PBUF_TAIL(bring), (unsigned short)2, __ATOMIC_RELEASE);
+
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    bad("pbuf-ring-recv", "socketpair failed", -1);
+    munmap(bring, 4096);
+    ring_free(&r);
+    return;
+  }
+  write(sv[1], "ring-buffer", 12);
+
+  struct io_uring_sqe *sqe = sq_get(&r);
+
+  sqe->opcode = IORING_OP_RECV;
+  sqe->fd = sv[0];
+  sqe->len = 0;
+  sqe->flags = IOSQE_BUFFER_SELECT;
+  sqe->buf_group = 9;
+  sqe->user_data = 0x30;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("pbuf-ring-recv",
+        rc == 0 && cqe.res == 12 && (cqe.flags & IORING_CQE_F_BUFFER) &&
+            (int)(cqe.flags >> IORING_CQE_BUFFER_SHIFT) == 200 &&
+            memcmp(pool, "ring-buffer", 12) == 0,
+        "the receive did not take the first entry of the buffer ring",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* The kernel's head must have moved by exactly one. */
+  struct iou_buf_status st;
+
+  memset(&st, 0, sizeof(st));
+  st.buf_group = 9;
+  rc = io_uring_register_(r.fd, IORING_REGISTER_PBUF_STATUS, &st, 1);
+  judge("pbuf-ring-status", rc == 0 && st.head == 1,
+        "the buffer ring head is not where the one consumed buffer left it",
+        rc == 0 ? (long)st.head : (long)rc);
+
+  rc = io_uring_register_(r.fd, IORING_UNREGISTER_PBUF_RING, &reg, 1);
+  judge("pbuf-ring-unregister", rc == 0,
+        "IORING_UNREGISTER_PBUF_RING was refused", (long)rc);
+
+  close(sv[0]);
+  close(sv[1]);
+  munmap(bring, 4096);
+  ring_free(&r);
+}
+
+static void check_multishot(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  int pfd[2];
+
+  if (ring_make(&r, 8, 0, 0) < 0) {
+    bad("multishot-poll", "no ring", 0);
+    return;
+  }
+  if (pipe(pfd) < 0) {
+    bad("multishot-poll", "pipe failed", -1);
+    ring_free(&r);
+    return;
+  }
+  struct io_uring_sqe *sqe = sq_get(&r);
+
+  sqe->opcode = IORING_OP_POLL_ADD;
+  sqe->fd = pfd[0];
+  sqe->poll32_events = POLLIN;
+  sqe->len = IORING_POLL_ADD_MULTI;
+  sqe->user_data = 0x40;
+  int rc = io_uring_enter_(r.fd, 1, 0, 0, 0, 0);
+  int reports = 0, all_more = 1;
+  char c;
+
+  for (int round = 0; round < 2; round++) {
+    write(pfd[1], "x", 1);
+    if (io_uring_enter_(r.fd, 0, 1, IORING_ENTER_GETEVENTS, 0, 0) < 0)
+      break;
+    if (!cq_get(&r, &cqe))
+      break;
+    if (cqe.user_data != 0x40 || !(cqe.res & POLLIN))
+      break;
+    if (!(cqe.flags & IORING_CQE_F_MORE))
+      all_more = 0;
+    reports++;
+    /* Consume the readiness so the next write is a fresh edge. */
+    if (read(pfd[0], &c, 1) != 1)
+      break;
+    /* Let the sweep see the pipe empty again. */
+    io_uring_enter_(r.fd, 0, 0, 0, 0, 0);
+  }
+  judge("multishot-poll", rc >= 0 && reports == 2 && all_more,
+        "a multishot poll did not report twice with IORING_CQE_F_MORE",
+        (long)reports);
+
+  /* Cancelling it ends the series. */
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_ASYNC_CANCEL;
+  sqe->addr = 0x40;
+  sqe->user_data = 0x41;
+  rc = io_uring_enter_(r.fd, 1, 2, IORING_ENTER_GETEVENTS, 0, 0);
+  int saw_cancel = 0, saw_final = 0;
+
+  while (cq_get(&r, &cqe)) {
+    if (cqe.user_data == 0x41 && cqe.res == 0)
+      saw_cancel = 1;
+    if (cqe.user_data == 0x40 && cqe.res == -ECANCELED &&
+        !(cqe.flags & IORING_CQE_F_MORE))
+      saw_final = 1;
+  }
+  judge("multishot-poll-cancel", rc >= 0 && saw_cancel && saw_final,
+        "cancelling a multishot poll did not end it without CQE_F_MORE",
+        (long)rc);
+  close(pfd[0]);
+  close(pfd[1]);
+  ring_free(&r);
+}
+
+static void check_multishot_recv(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  static char pool[4 * 32];
+  int sv[2];
+
+  if (ring_make(&r, 8, 0, 0) < 0) {
+    bad("multishot-recv", "no ring", 0);
+    return;
+  }
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    bad("multishot-recv", "socketpair failed", -1);
+    ring_free(&r);
+    return;
+  }
+  memset(pool, 0, sizeof(pool));
+
+  struct io_uring_sqe *sqe = sq_get(&r);
+
+  sqe->opcode = IORING_OP_PROVIDE_BUFFERS;
+  sqe->fd = 4;
+  sqe->addr = (unsigned long long)(uintptr_t)pool;
+  sqe->len = 32;
+  sqe->off = 0;
+  sqe->buf_group = 11;
+  sqe->user_data = 0x50;
+  int rc = submit_wait(&r, 1, &cqe);
+
+  if (rc < 0 || cqe.res != 0) {
+    bad("multishot-recv", "the buffers would not go in",
+        rc == 0 ? (long)cqe.res : (long)rc);
+    close(sv[0]);
+    close(sv[1]);
+    ring_free(&r);
+    return;
+  }
+
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_RECV;
+  sqe->fd = sv[0];
+  sqe->len = 0;
+  sqe->ioprio = IORING_RECV_MULTISHOT;
+  sqe->flags = IOSQE_BUFFER_SELECT;
+  sqe->buf_group = 11;
+  sqe->user_data = 0x51;
+  io_uring_enter_(r.fd, 1, 0, 0, 0, 0);
+
+  int got = 0, all_more = 1;
+  int bids[2] = {-1, -1};
+
+  for (int round = 0; round < 2; round++) {
+    char m[8];
+
+    snprintf(m, sizeof(m), "ms%d", round);
+    write(sv[1], m, 4);
+    if (io_uring_enter_(r.fd, 0, 1, IORING_ENTER_GETEVENTS, 0, 0) < 0)
+      break;
+    if (!cq_get(&r, &cqe) || cqe.user_data != 0x51 || cqe.res != 4)
+      break;
+    if (!(cqe.flags & IORING_CQE_F_MORE))
+      all_more = 0;
+    bids[round] = (int)(cqe.flags >> IORING_CQE_BUFFER_SHIFT);
+    got++;
+  }
+  judge("multishot-recv",
+        got == 2 && all_more && bids[0] == 0 && bids[1] == 1 &&
+            memcmp(pool, "ms0", 3) == 0 && memcmp(pool + 32, "ms1", 3) == 0,
+        "a multishot receive did not deliver twice into two chosen buffers",
+        (long)got);
+  close(sv[0]);
+  close(sv[1]);
+  ring_free(&r);
+}
+
+static void check_multishot_accept(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct sockaddr_un sa;
+  const char *sock = "/tmp/m125-msaccept";
+  int srv;
+
+  if (ring_make(&r, 8, 0, 0) < 0) {
+    bad("multishot-accept", "no ring", 0);
+    return;
+  }
+  unlink(sock);
+  srv = socket(AF_UNIX, SOCK_STREAM, 0);
+  memset(&sa, 0, sizeof(sa));
+  sa.sun_family = AF_UNIX;
+  strncpy(sa.sun_path, sock, sizeof(sa.sun_path) - 1);
+  if (srv < 0 || bind(srv, (struct sockaddr *)&sa, sizeof(sa)) < 0 ||
+      listen(srv, 4) < 0) {
+    bad("multishot-accept", "the listening socket would not come up", -1);
+    if (srv >= 0)
+      close(srv);
+    ring_free(&r);
+    return;
+  }
+
+  struct io_uring_sqe *sqe = sq_get(&r);
+
+  sqe->opcode = IORING_OP_ACCEPT;
+  sqe->fd = srv;
+  sqe->ioprio = IORING_ACCEPT_MULTISHOT;
+  sqe->user_data = 0x60;
+  io_uring_enter_(r.fd, 1, 0, 0, 0, 0);
+
+  int accepted = 0, all_more = 1;
+  int cfd[2] = {-1, -1};
+
+  for (int i = 0; i < 2; i++) {
+    cfd[i] = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (cfd[i] < 0 || connect(cfd[i], (struct sockaddr *)&sa, sizeof(sa)) < 0)
+      break;
+    if (io_uring_enter_(r.fd, 0, 1, IORING_ENTER_GETEVENTS, 0, 0) < 0)
+      break;
+    if (!cq_get(&r, &cqe) || cqe.user_data != 0x60 || cqe.res < 0)
+      break;
+    if (!(cqe.flags & IORING_CQE_F_MORE))
+      all_more = 0;
+    /* Prove the accepted descriptor is a working connection. */
+    {
+      char m[8] = "hi";
+      char in[8];
+
+      memset(in, 0, sizeof(in));
+      if (write(cfd[i], m, 3) == 3 && read(cqe.res, in, 3) == 3 &&
+          memcmp(in, "hi", 3) == 0)
+        accepted++;
+    }
+    close(cqe.res);
+  }
+  judge("multishot-accept", accepted == 2 && all_more,
+        "a multishot accept did not take two connections with CQE_F_MORE",
+        (long)accepted);
+  for (int i = 0; i < 2; i++)
+    if (cfd[i] >= 0)
+      close(cfd[i]);
+  close(srv);
+  unlink(sock);
+  ring_free(&r);
+}
+
+static void check_fs_opcodes(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe;
+  const char *dir = "/tmp/m125-fs";
+  const char *file = "/tmp/m125-fs/a";
+  const char *file2 = "/tmp/m125-fs/b";
+  const char *link = "/tmp/m125-fs/l";
+  int rc;
+
+  if (ring_make(&r, 16, 0, 0) < 0) {
+    bad("op-mkdirat", "no ring", 0);
+    return;
+  }
+  unlink(link);
+  unlink(file);
+  unlink(file2);
+  rmdir(dir);
+
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_MKDIRAT;
+  sqe->fd = AT_FDCWD;
+  sqe->addr = (unsigned long long)(uintptr_t)dir;
+  sqe->len = 0755;
+  sqe->user_data = 1;
+  rc = submit_wait(&r, 1, &cqe);
+  struct stat stbuf;
+
+  judge("op-mkdirat",
+        rc == 0 && cqe.res == 0 && stat(dir, &stbuf) == 0 &&
+            S_ISDIR(stbuf.st_mode),
+        "IORING_OP_MKDIRAT did not make the directory",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* OPENAT creating a file, then a write through the descriptor it returned. */
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_OPENAT;
+  sqe->fd = AT_FDCWD;
+  sqe->addr = (unsigned long long)(uintptr_t)file;
+  sqe->open_flags = O_RDWR | O_CREAT | O_TRUNC;
+  sqe->len = 0644;
+  sqe->user_data = 2;
+  rc = submit_wait(&r, 1, &cqe);
+  int ofd = (rc == 0) ? cqe.res : -1;
+  int wrote = 0;
+
+  if (ofd >= 0)
+    wrote = (write(ofd, "opened-by-ring", 15) == 15);
+  judge("op-openat", ofd >= 0 && wrote,
+        "IORING_OP_OPENAT did not return a usable descriptor",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* STATX on the same path must report the size just written. */
+  struct statx sx;
+
+  memset(&sx, 0, sizeof(sx));
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_STATX;
+  sqe->fd = AT_FDCWD;
+  sqe->addr = (unsigned long long)(uintptr_t)file;
+  sqe->len = STATX_BASIC_STATS;
+  sqe->off = (unsigned long long)(uintptr_t)&sx;
+  sqe->user_data = 3;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-statx", rc == 0 && cqe.res == 0 && sx.stx_size == 15,
+        "IORING_OP_STATX did not report the file it was asked about",
+        rc == 0 ? (long)sx.stx_size : (long)rc);
+
+  /* FTRUNCATE, then STATX again. */
+  sqe = sq_get(&r);
+  sqe->opcode = IOU_OP_FTRUNCATE;
+  sqe->fd = ofd;
+  sqe->off = 8;
+  sqe->user_data = 4;
+  rc = submit_wait(&r, 1, &cqe);
+  int truncated = (rc == 0 && cqe.res == 0 && stat(file, &stbuf) == 0 &&
+                   stbuf.st_size == 8);
+
+  judge("op-ftruncate", truncated,
+        "IORING_OP_FTRUNCATE did not shorten the file",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* FALLOCATE grows it back. */
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_FALLOCATE;
+  sqe->fd = ofd;
+  sqe->off = 0;
+  sqe->addr = 4096;
+  sqe->len = 0;
+  sqe->user_data = 5;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-fallocate",
+        rc == 0 && cqe.res == 0 && stat(file, &stbuf) == 0 &&
+            stbuf.st_size == 4096,
+        "IORING_OP_FALLOCATE did not allocate the range",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* RENAMEAT, LINKAT, SYMLINKAT, UNLINKAT. */
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_RENAMEAT;
+  sqe->fd = AT_FDCWD;
+  sqe->addr = (unsigned long long)(uintptr_t)file;
+  sqe->len = AT_FDCWD;
+  sqe->addr2 = (unsigned long long)(uintptr_t)file2;
+  sqe->user_data = 6;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-renameat",
+        rc == 0 && cqe.res == 0 && stat(file2, &stbuf) == 0 &&
+            stat(file, &stbuf) < 0,
+        "IORING_OP_RENAMEAT did not move the file",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_LINKAT;
+  sqe->fd = AT_FDCWD;
+  sqe->addr = (unsigned long long)(uintptr_t)file2;
+  sqe->len = AT_FDCWD;
+  sqe->addr2 = (unsigned long long)(uintptr_t)file;
+  sqe->user_data = 7;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-linkat",
+        rc == 0 && cqe.res == 0 && stat(file, &stbuf) == 0 &&
+            stbuf.st_nlink == 2,
+        "IORING_OP_LINKAT did not make a second name for the file",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_SYMLINKAT;
+  sqe->fd = AT_FDCWD;
+  sqe->addr = (unsigned long long)(uintptr_t)"b";
+  sqe->addr2 = (unsigned long long)(uintptr_t)link;
+  sqe->user_data = 8;
+  rc = submit_wait(&r, 1, &cqe);
+  char lbuf[8];
+  ssize_t ln = readlink(link, lbuf, sizeof(lbuf));
+
+  judge("op-symlinkat",
+        rc == 0 && cqe.res == 0 && ln == 1 && lbuf[0] == 'b',
+        "IORING_OP_SYMLINKAT did not make the link it was asked for",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_UNLINKAT;
+  sqe->fd = AT_FDCWD;
+  sqe->addr = (unsigned long long)(uintptr_t)file;
+  sqe->user_data = 9;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-unlinkat", rc == 0 && cqe.res == 0 && stat(file, &stbuf) < 0,
+        "IORING_OP_UNLINKAT did not remove the name",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  if (ofd >= 0)
+    close(ofd);
+  unlink(link);
+  unlink(file2);
+  rmdir(dir);
+  ring_free(&r);
+}
+
+static void check_net_opcodes(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe;
+  struct sockaddr_un sa;
+  const char *sock = "/tmp/m125-net";
+  int rc;
+
+  if (ring_make(&r, 16, 0, 0) < 0) {
+    bad("op-socket", "no ring", 0);
+    return;
+  }
+  unlink(sock);
+
+  /* SOCKET, BIND and LISTEN, all through the ring. */
+  sqe = sq_get(&r);
+  sqe->opcode = IOU_OP_SOCKET;
+  sqe->fd = AF_UNIX;
+  sqe->off = SOCK_STREAM;
+  sqe->len = 0;
+  sqe->user_data = 1;
+  rc = submit_wait(&r, 1, &cqe);
+  int srv = (rc == 0) ? cqe.res : -1;
+
+  judge("op-socket", srv >= 0, "IORING_OP_SOCKET did not return a socket",
+        rc == 0 ? (long)cqe.res : (long)rc);
+  if (srv < 0) {
+    ring_free(&r);
+    return;
+  }
+  memset(&sa, 0, sizeof(sa));
+  sa.sun_family = AF_UNIX;
+  strncpy(sa.sun_path, sock, sizeof(sa.sun_path) - 1);
+
+  sqe = sq_get(&r);
+  sqe->opcode = IOU_OP_BIND;
+  sqe->fd = srv;
+  sqe->addr = (unsigned long long)(uintptr_t)&sa;
+  sqe->addr2 = sizeof(sa);
+  sqe->user_data = 2;
+  rc = submit_wait(&r, 1, &cqe);
+  int bound = (rc == 0 && cqe.res == 0);
+
+  sqe = sq_get(&r);
+  sqe->opcode = IOU_OP_LISTEN;
+  sqe->fd = srv;
+  sqe->len = 4;
+  sqe->user_data = 3;
+  rc = submit_wait(&r, 1, &cqe);
+  int listening = (rc == 0 && cqe.res == 0);
+
+  int cli = socket(AF_UNIX, SOCK_STREAM, 0);
+  int connected = (cli >= 0 &&
+                   connect(cli, (struct sockaddr *)&sa, sizeof(sa)) == 0);
+
+  judge("op-bind-listen", bound && listening && connected,
+        "a socket bound and listened through the ring did not accept a client",
+        (long)(bound * 4 + listening * 2 + connected));
+
+  /* SHUTDOWN on the client end: the server's accepted socket then reads EOF. */
+  int acc = accept(srv, 0, 0);
+
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_SHUTDOWN;
+  sqe->fd = cli;
+  sqe->len = SHUT_WR;
+  sqe->user_data = 4;
+  rc = submit_wait(&r, 1, &cqe);
+  char sink[4];
+  int eof = (acc >= 0 && read(acc, sink, sizeof(sink)) == 0);
+
+  judge("op-shutdown", rc == 0 && cqe.res == 0 && eof,
+        "IORING_OP_SHUTDOWN did not close the writing direction",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* SENDMSG and RECVMSG over a fresh pair. */
+  int sv[2];
+
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+    char out[] = "msghdr-carried";
+    char in[32];
+    struct iovec iov;
+    struct msghdr mh;
+
+    memset(in, 0, sizeof(in));
+    iov.iov_base = out;
+    iov.iov_len = 15;
+    memset(&mh, 0, sizeof(mh));
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+
+    sqe = sq_get(&r);
+    sqe->opcode = IORING_OP_SENDMSG;
+    sqe->fd = sv[1];
+    sqe->addr = (unsigned long long)(uintptr_t)&mh;
+    sqe->user_data = 5;
+    rc = submit_wait(&r, 1, &cqe);
+    int sent = (rc == 0 && cqe.res == 15);
+
+    struct iovec riov;
+    struct msghdr rmh;
+
+    riov.iov_base = in;
+    riov.iov_len = sizeof(in);
+    memset(&rmh, 0, sizeof(rmh));
+    rmh.msg_iov = &riov;
+    rmh.msg_iovlen = 1;
+    sqe = sq_get(&r);
+    sqe->opcode = IORING_OP_RECVMSG;
+    sqe->fd = sv[0];
+    sqe->addr = (unsigned long long)(uintptr_t)&rmh;
+    sqe->user_data = 6;
+    rc = submit_wait(&r, 1, &cqe);
+    judge("op-sendmsg-recvmsg",
+          sent && rc == 0 && cqe.res == 15 && memcmp(in, out, 15) == 0,
+          "a message did not survive SENDMSG into RECVMSG",
+          rc == 0 ? (long)cqe.res : (long)rc);
+
+    /* SEND_ZC posts two completions: the transfer with CQE_F_MORE and the
+     * notification. */
+    sqe = sq_get(&r);
+    sqe->opcode = IOU_OP_SEND_ZC;
+    sqe->fd = sv[1];
+    sqe->addr = (unsigned long long)(uintptr_t)out;
+    sqe->len = 15;
+    sqe->user_data = 7;
+    rc = io_uring_enter_(r.fd, 1, 2, IORING_ENTER_GETEVENTS, 0, 0);
+    int data_cqe = 0, notif_cqe = 0;
+
+    while (cq_get(&r, &cqe)) {
+      if (cqe.user_data != 7)
+        continue;
+      if (cqe.flags & IORING_CQE_F_NOTIF)
+        notif_cqe = 1;
+      else if (cqe.res == 15 && (cqe.flags & IORING_CQE_F_MORE))
+        data_cqe = 1;
+    }
+    memset(in, 0, sizeof(in));
+    int back = (int)read(sv[0], in, sizeof(in));
+
+    judge("op-send-zc",
+          rc >= 0 && data_cqe && notif_cqe && back == 15 &&
+              memcmp(in, out, 15) == 0,
+          "SEND_ZC did not post both completions or did not send the data",
+          (long)(data_cqe * 2 + notif_cqe));
+    close(sv[0]);
+    close(sv[1]);
+  } else {
+    bad("op-sendmsg-recvmsg", "socketpair failed", -1);
+    bad("op-send-zc", "socketpair failed", -1);
+  }
+
+  if (acc >= 0)
+    close(acc);
+  close(cli);
+  close(srv);
+  unlink(sock);
+  ring_free(&r);
+}
+
+static void check_misc_opcodes(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe;
+  int rc;
+
+  if (ring_make(&r, 16, 0, 0) < 0) {
+    bad("op-splice", "no ring", 0);
+    return;
+  }
+
+  /* SPLICE: a pipe into a file. */
+  {
+    const char *path = "/tmp/m125-splice";
+    int pfd[2], fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+
+    if (pipe(pfd) == 0 && fd >= 0) {
+      char check[32];
+
+      write(pfd[1], "spliced-bytes", 14);
+      sqe = sq_get(&r);
+      sqe->opcode = IORING_OP_SPLICE;
+      sqe->splice_fd_in = pfd[0];
+      sqe->splice_off_in = (unsigned long long)-1;
+      sqe->fd = fd;
+      sqe->off = 0;
+      sqe->len = 14;
+      sqe->user_data = 1;
+      rc = submit_wait(&r, 1, &cqe);
+      memset(check, 0, sizeof(check));
+      int n = (int)pread(fd, check, 14, 0);
+
+      judge("op-splice",
+            rc == 0 && cqe.res == 14 && n == 14 &&
+                memcmp(check, "spliced-bytes", 14) == 0,
+            "IORING_OP_SPLICE did not move the pipe's bytes into the file",
+            rc == 0 ? (long)cqe.res : (long)rc);
+      close(pfd[0]);
+      close(pfd[1]);
+    } else {
+      bad("op-splice", "no pipe or file", -1);
+    }
+    if (fd >= 0)
+      close(fd);
+    unlink(path);
+  }
+
+  /* EPOLL_CTL: add a pipe read end and prove epoll_wait then sees it. */
+  {
+    int ep = epoll_create1(0);
+    int pfd[2];
+    struct epoll_event ev;
+    struct epoll_event out[2];
+
+    if (ep >= 0 && pipe(pfd) == 0) {
+      memset(&ev, 0, sizeof(ev));
+      ev.events = EPOLLIN;
+      ev.data.u64 = 0xe0ull;
+      sqe = sq_get(&r);
+      sqe->opcode = IORING_OP_EPOLL_CTL;
+      sqe->fd = ep;
+      sqe->len = EPOLL_CTL_ADD;
+      sqe->off = (unsigned long long)pfd[0];
+      sqe->addr = (unsigned long long)(uintptr_t)&ev;
+      sqe->user_data = 2;
+      rc = submit_wait(&r, 1, &cqe);
+      write(pfd[1], "e", 1);
+      int n = epoll_wait(ep, out, 2, 1000);
+
+      judge("op-epoll-ctl",
+            rc == 0 && cqe.res == 0 && n == 1 && out[0].data.u64 == 0xe0ull,
+            "IORING_OP_EPOLL_CTL did not register the descriptor",
+            rc == 0 ? (long)cqe.res : (long)rc);
+      close(pfd[0]);
+      close(pfd[1]);
+    } else {
+      bad("op-epoll-ctl", "no epoll or pipe", -1);
+    }
+    if (ep >= 0)
+      close(ep);
+  }
+
+  /* MSG_RING: a completion posted into a second ring. */
+  {
+    struct ring r2;
+
+    if (ring_make(&r2, 8, 0, 0) == 0) {
+      sqe = sq_get(&r);
+      sqe->opcode = IORING_OP_MSG_RING;
+      sqe->fd = r2.fd;
+      sqe->addr = 0; /* IORING_MSG_DATA */
+      sqe->len = 0x1234;
+      sqe->off = 0xfeedull;
+      sqe->user_data = 3;
+      rc = submit_wait(&r, 1, &cqe);
+      int sender_ok = (rc == 0 && cqe.res == 0);
+      struct io_uring_cqe c2;
+      int got = cq_get(&r2, &c2);
+
+      judge("op-msg-ring",
+            sender_ok && got && c2.user_data == 0xfeedull &&
+                c2.res == 0x1234,
+            "IORING_OP_MSG_RING did not deliver into the other ring",
+            got ? (long)c2.res : (long)rc);
+      ring_free(&r2);
+    } else {
+      bad("op-msg-ring", "no second ring", -1);
+    }
+  }
+
+  /* WAITID: reap a child that has already exited. */
+  {
+    pid_t pid = fork();
+
+    if (pid == 0)
+      _exit(7);
+    if (pid > 0) {
+      siginfo_t si;
+
+      memset(&si, 0, sizeof(si));
+      sqe = sq_get(&r);
+      sqe->opcode = IOU_OP_WAITID;
+      sqe->fd = pid;
+      sqe->len = P_PID;
+      sqe->file_index = WEXITED;
+      sqe->addr2 = (unsigned long long)(uintptr_t)&si;
+      sqe->user_data = 4;
+      rc = submit_wait(&r, 1, &cqe);
+      judge("op-waitid",
+            rc == 0 && cqe.res == 0 && si.si_pid == pid && si.si_status == 7,
+            "IORING_OP_WAITID did not report the child's exit",
+            rc == 0 ? (long)cqe.res : (long)rc);
+    } else {
+      bad("op-waitid", "fork failed", -1);
+    }
+  }
+
+  /* MADVISE and FADVISE: accepted for a sane advice, refused for nonsense. */
+  {
+    void *m = mmap(0, 4096, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    sqe = sq_get(&r);
+    sqe->opcode = IORING_OP_MADVISE;
+    sqe->addr = (unsigned long long)(uintptr_t)m;
+    sqe->off = 4096;
+    sqe->fadvise_advice = MADV_WILLNEED;
+    sqe->user_data = 5;
+    rc = submit_wait(&r, 1, &cqe);
+    int madv_ok = (rc == 0 && cqe.res == 0);
+    long madv_res = (rc == 0) ? (long)cqe.res : (long)rc;
+
+    int fd = open("/tmp/m125-fadvise", O_RDWR | O_CREAT | O_TRUNC, 0644);
+
+    sqe = sq_get(&r);
+    sqe->opcode = IORING_OP_FADVISE;
+    sqe->fd = fd;
+    sqe->off = 0;
+    sqe->addr = 4096;
+    sqe->fadvise_advice = POSIX_FADV_SEQUENTIAL;
+    sqe->user_data = 6;
+    rc = submit_wait(&r, 1, &cqe);
+    int fadv_ok = (rc == 0 && cqe.res == 0);
+
+    sqe = sq_get(&r);
+    sqe->opcode = IORING_OP_FADVISE;
+    sqe->fd = fd;
+    sqe->fadvise_advice = 99;
+    sqe->user_data = 7;
+    rc = submit_wait(&r, 1, &cqe);
+    int fadv_bad = (rc == 0 && cqe.res == -EINVAL);
+
+    judge("op-madvise", madv_ok, "IORING_OP_MADVISE did not accept MADV_WILLNEED",
+          (long)madv_res);
+    judge("op-fadvise", fadv_ok && fadv_bad,
+          "IORING_OP_FADVISE did not accept sane advice or refuse nonsense",
+          (long)(fadv_ok * 2 + fadv_bad));
+    if (m != MAP_FAILED)
+      munmap(m, 4096);
+    if (fd >= 0)
+      close(fd);
+    unlink("/tmp/m125-fadvise");
+  }
+
+  /* PIPE: two working descriptors out of one SQE. */
+  {
+    int fds[2] = {-1, -1};
+
+    sqe = sq_get(&r);
+    sqe->opcode = IOU_OP_PIPE;
+    sqe->addr = (unsigned long long)(uintptr_t)fds;
+    sqe->user_data = 8;
+    rc = submit_wait(&r, 1, &cqe);
+    char in[8];
+    int worked = 0;
+
+    if (rc == 0 && cqe.res == 0 && fds[0] >= 0 && fds[1] >= 0) {
+      memset(in, 0, sizeof(in));
+      worked = (write(fds[1], "pp", 3) == 3 && read(fds[0], in, 3) == 3 &&
+                memcmp(in, "pp", 3) == 0);
+      close(fds[0]);
+      close(fds[1]);
+    }
+    judge("op-pipe", worked, "IORING_OP_PIPE did not produce a working pipe",
+          rc == 0 ? (long)cqe.res : (long)rc);
+  }
+
+  ring_free(&r);
+}
+
+static void check_direct_descriptors(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe;
+  const char *path = "/tmp/m125-direct";
+  int rc;
+
+  if (ring_make(&r, 8, 0, 0) < 0) {
+    bad("direct-openat", "no ring", 0);
+    return;
+  }
+  /* A sparse registered set to install into. */
+  struct io_uring_rsrc_register rr;
+
+  memset(&rr, 0, sizeof(rr));
+  rr.nr = 4;
+  rr.flags = IORING_RSRC_REGISTER_SPARSE;
+  rc = io_uring_register_(r.fd, IORING_REGISTER_FILES2, &rr, sizeof(rr));
+  if (rc < 0) {
+    bad("direct-openat", "the sparse file set was refused", (long)rc);
+    ring_free(&r);
+    return;
+  }
+
+  unlink(path);
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_OPENAT;
+  sqe->fd = AT_FDCWD;
+  sqe->addr = (unsigned long long)(uintptr_t)path;
+  sqe->open_flags = O_RDWR | O_CREAT | O_TRUNC;
+  sqe->len = 0644;
+  sqe->file_index = 2; /* slot 1, biased by one */
+  sqe->user_data = 1;
+  rc = submit_wait(&r, 1, &cqe);
+  int opened_direct = (rc == 0 && cqe.res == 0);
+
+  /* The slot must now be usable through IOSQE_FIXED_FILE. */
+  static char msg[] = "direct-write";
+  char back[32];
+
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_WRITE;
+  sqe->flags = IOSQE_FIXED_FILE;
+  sqe->fd = 1;
+  sqe->addr = (unsigned long long)(uintptr_t)msg;
+  sqe->len = 13;
+  sqe->off = 0;
+  sqe->user_data = 2;
+  rc = submit_wait(&r, 1, &cqe);
+  memset(back, 0, sizeof(back));
+  int fd = open(path, O_RDONLY);
+  int n = (fd >= 0) ? (int)read(fd, back, sizeof(back)) : -1;
+
+  judge("direct-openat",
+        opened_direct && rc == 0 && cqe.res == 13 && n == 13 &&
+            memcmp(back, msg, 13) == 0,
+        "a direct open did not land in the registered slot it named",
+        rc == 0 ? (long)cqe.res : (long)rc);
+  if (fd >= 0)
+    close(fd);
+
+  /* IORING_FILE_INDEX_ALLOC picks the slot itself and reports which. */
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_OPENAT;
+  sqe->fd = AT_FDCWD;
+  sqe->addr = (unsigned long long)(uintptr_t)path;
+  sqe->open_flags = O_RDONLY;
+  sqe->file_index = IORING_FILE_INDEX_ALLOC;
+  sqe->user_data = 3;
+  rc = submit_wait(&r, 1, &cqe);
+  int slot = (rc == 0) ? cqe.res : -1;
+
+  judge("direct-alloc", slot >= 0 && slot < 4 && slot != 1,
+        "IORING_FILE_INDEX_ALLOC did not report a free slot",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* FIXED_FD_INSTALL turns a slot back into an ordinary descriptor. */
+  sqe = sq_get(&r);
+  sqe->opcode = IOU_OP_FIXED_FD_INSTALL;
+  sqe->flags = IOSQE_FIXED_FILE;
+  sqe->fd = 1;
+  sqe->user_data = 4;
+  rc = submit_wait(&r, 1, &cqe);
+  int newfd = (rc == 0) ? cqe.res : -1;
+
+  memset(back, 0, sizeof(back));
+  n = (newfd >= 0) ? (int)pread(newfd, back, 13, 0) : -1;
+  judge("fixed-fd-install",
+        newfd >= 0 && n == 13 && memcmp(back, msg, 13) == 0,
+        "IORING_OP_FIXED_FD_INSTALL did not hand back a working descriptor",
+        rc == 0 ? (long)cqe.res : (long)rc);
+  if (newfd >= 0)
+    close(newfd);
+
+  unlink(path);
+  ring_free(&r);
+}
+
+static void check_register_extras(void) {
+  struct ring r;
+  int rc;
+
+  if (ring_make(&r, 8, 0, 0) < 0) {
+    bad("register-buffers2", "no ring", 0);
+    return;
+  }
+  /* BUFFERS2 in its sparse form, then BUFFERS_UPDATE filling a slot, then a
+   * WRITE_FIXED that uses it. */
+  struct io_uring_rsrc_register rr;
+
+  memset(&rr, 0, sizeof(rr));
+  rr.nr = 2;
+  rr.flags = IORING_RSRC_REGISTER_SPARSE;
+  rc = io_uring_register_(r.fd, IORING_REGISTER_BUFFERS2, &rr, sizeof(rr));
+  int sparse_ok = (rc == 0);
+
+  static char buf[64];
+  struct iovec iov;
+  struct io_uring_rsrc_update2 up;
+
+  memset(buf, 0, sizeof(buf));
+  strcpy(buf, "registered-later");
+  iov.iov_base = buf;
+  iov.iov_len = sizeof(buf);
+  memset(&up, 0, sizeof(up));
+  up.offset = 1;
+  up.nr = 1;
+  up.data = (unsigned long long)(uintptr_t)&iov;
+  rc = io_uring_register_(r.fd, IORING_REGISTER_BUFFERS_UPDATE, &up,
+                          sizeof(up));
+  int update_ok = (rc == 1);
+
+  const char *path = "/tmp/m125-buf2";
+  int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe = sq_get(&r);
+
+  sqe->opcode = IORING_OP_WRITE_FIXED;
+  sqe->fd = fd;
+  sqe->addr = (unsigned long long)(uintptr_t)buf;
+  sqe->len = 17;
+  sqe->off = 0;
+  sqe->buf_index = 1;
+  sqe->user_data = 1;
+  rc = submit_wait(&r, 1, &cqe);
+  char back[32];
+
+  memset(back, 0, sizeof(back));
+  int n = (fd >= 0) ? (int)pread(fd, back, 17, 0) : -1;
+
+  judge("register-buffers2",
+        sparse_ok && update_ok && rc == 0 && cqe.res == 17 && n == 17 &&
+            memcmp(back, buf, 17) == 0,
+        "a buffer registered by BUFFERS2 + BUFFERS_UPDATE did not work",
+        rc == 0 ? (long)cqe.res : (long)rc);
+  if (fd >= 0)
+    close(fd);
+  unlink(path);
+
+  /* IOWQ_MAX_WORKERS reports the previous values. */
+  {
+    unsigned vals[2] = {4, 4};
+
+    rc = io_uring_register_(r.fd, IORING_REGISTER_IOWQ_MAX_WORKERS, vals, 2);
+    int first = (rc == 0);
+    unsigned again[2] = {8, 8};
+
+    rc = io_uring_register_(r.fd, IORING_REGISTER_IOWQ_MAX_WORKERS, again, 2);
+    judge("iowq-max-workers",
+          first && rc == 0 && again[0] == 4 && again[1] == 4,
+          "IORING_REGISTER_IOWQ_MAX_WORKERS did not report the old values",
+          rc == 0 ? (long)again[0] : (long)rc);
+  }
+
+  /* SYNC_CANCEL takes down an armed poll from the register path. */
+  {
+    int pfd[2];
+
+    if (pipe(pfd) == 0) {
+      struct io_uring_sqe *s = sq_get(&r);
+
+      s->opcode = IORING_OP_POLL_ADD;
+      s->fd = pfd[0];
+      s->poll32_events = POLLIN;
+      s->user_data = 0x515;
+      io_uring_enter_(r.fd, 1, 0, 0, 0, 0);
+
+      struct io_uring_sync_cancel_reg sc;
+
+      memset(&sc, 0, sizeof(sc));
+      sc.addr = 0x515;
+      sc.fd = -1;
+      sc.timeout.tv_sec = -1;
+      sc.timeout.tv_nsec = -1;
+      rc = io_uring_register_(r.fd, IORING_REGISTER_SYNC_CANCEL, &sc, 1);
+      struct io_uring_cqe c;
+      int got = 0;
+
+      io_uring_enter_(r.fd, 0, 0, 0, 0, 0);
+      while (cq_get(&r, &c))
+        if (c.user_data == 0x515 && c.res == -ECANCELED)
+          got = 1;
+      judge("sync-cancel", rc == 0 && got,
+            "IORING_REGISTER_SYNC_CANCEL did not cancel the armed poll",
+            (long)rc);
+      close(pfd[0]);
+      close(pfd[1]);
+    } else {
+      bad("sync-cancel", "pipe failed", -1);
+    }
+  }
+  ring_free(&r);
+
+  /* RESTRICTIONS on a disabled ring: only what was named is allowed. */
+  {
+    struct ring rd;
+
+    if (ring_make(&rd, 8, IORING_SETUP_R_DISABLED, 0) == 0) {
+      struct io_uring_restriction res[2];
+
+      memset(res, 0, sizeof(res));
+      res[0].opcode = IORING_RESTRICTION_SQE_OP;
+      res[0].sqe_op = IORING_OP_NOP;
+      res[1].opcode = IORING_RESTRICTION_SQE_FLAGS_ALLOWED;
+      res[1].sqe_flags = IOSQE_IO_LINK;
+      rc = io_uring_register_(rd.fd, IORING_REGISTER_RESTRICTIONS, res, 2);
+      int set_ok = (rc == 0);
+
+      rc = io_uring_register_(rd.fd, IORING_REGISTER_ENABLE_RINGS, 0, 0);
+      int enabled = (rc == 0);
+
+      struct io_uring_cqe c;
+      struct io_uring_sqe *s = sq_get(&rd);
+
+      s->opcode = IORING_OP_NOP;
+      s->user_data = 1;
+      rc = submit_wait(&rd, 1, &c);
+      int nop_allowed = (rc == 0 && c.res == 0);
+
+      s = sq_get(&rd);
+      s->opcode = IORING_OP_READ;
+      s->fd = 0;
+      s->user_data = 2;
+      rc = submit_wait(&rd, 1, &c);
+      int read_refused = (rc == 0 && c.res == -EACCES);
+
+      judge("restrictions",
+            set_ok && enabled && nop_allowed && read_refused,
+            "a restricted ring did not allow exactly what it was told to",
+            (long)(set_ok * 8 + enabled * 4 + nop_allowed * 2 + read_refused));
+      ring_free(&rd);
+    } else {
+      bad("restrictions", "no disabled ring", -1);
+    }
+  }
+}
+
+static void check_ring_shapes(void) {
+  struct io_uring_params p;
+  struct ring r;
+  int rc;
+
+  /* IORING_SETUP_CQE32: the CQE stride is 32 bytes and the ring still works. */
+  memset(&r, 0, sizeof(r));
+  memset(&p, 0, sizeof(p));
+  p.flags = IORING_SETUP_CQE32;
+  r.p = p;
+  r.fd = io_uring_setup_(8, &r.p);
+  if (r.fd < 0) {
+    bad("cqe32", "IORING_SETUP_CQE32 was refused", (long)r.fd);
+  } else {
+    size_t sz = r.p.cq_off.cqes + (size_t)r.p.cq_entries * 32;
+
+    if (r.p.sq_off.array + r.p.sq_entries * sizeof(unsigned) > sz)
+      sz = r.p.sq_off.array + r.p.sq_entries * sizeof(unsigned);
+    r.sq_sz = sz;
+    r.sq_ptr = mmap(0, r.sq_sz, PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_POPULATE, r.fd, IORING_OFF_SQ_RING);
+    r.sqes_sz = r.p.sq_entries * sizeof(struct io_uring_sqe);
+    r.sqes = mmap(0, r.sqes_sz, PROT_READ | PROT_WRITE,
+                  MAP_SHARED | MAP_POPULATE, r.fd, IORING_OFF_SQES);
+    if (r.sq_ptr == MAP_FAILED || r.sqes == MAP_FAILED) {
+      bad("cqe32", "the CQE32 ring would not map", -1);
+    } else {
+      char *b = (char *)r.sq_ptr;
+
+      r.sq_head = (unsigned *)(b + r.p.sq_off.head);
+      r.sq_tail = (unsigned *)(b + r.p.sq_off.tail);
+      r.sq_mask = (unsigned *)(b + r.p.sq_off.ring_mask);
+      r.sq_entries = (unsigned *)(b + r.p.sq_off.ring_entries);
+      r.sq_array = (unsigned *)(b + r.p.sq_off.array);
+      r.cq_head = (unsigned *)(b + r.p.cq_off.head);
+      r.cq_tail = (unsigned *)(b + r.p.cq_off.tail);
+      r.cq_mask = (unsigned *)(b + r.p.cq_off.ring_mask);
+      r.cq_entries = (unsigned *)(b + r.p.cq_off.ring_entries);
+      r.cqes = (struct io_uring_cqe *)(b + r.p.cq_off.cqes);
+
+      struct io_uring_sqe *s = sq_get(&r);
+
+      s->opcode = IORING_OP_NOP;
+      s->user_data = 0xc32ull;
+      rc = io_uring_enter_(r.fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0);
+      unsigned head = __atomic_load_n(r.cq_head, __ATOMIC_RELAXED);
+      unsigned tail = __atomic_load_n(r.cq_tail, __ATOMIC_ACQUIRE);
+      struct io_uring_cqe *c = cqe_at(&r, head, 32);
+
+      judge("cqe32",
+            rc >= 0 && tail - head == 1 && c->user_data == 0xc32ull &&
+                c->res == 0,
+            "a 32-byte-CQE ring did not deliver a completion at the right "
+            "stride",
+            (long)rc);
+      munmap(r.sqes, r.sqes_sz);
+      munmap(r.sq_ptr, r.sq_sz);
+    }
+    close(r.fd);
+  }
+
+  /* IORING_SETUP_SQE128: the SQE stride is 128 bytes. */
+  memset(&r, 0, sizeof(r));
+  memset(&p, 0, sizeof(p));
+  p.flags = IORING_SETUP_SQE128;
+  r.p = p;
+  r.fd = io_uring_setup_(8, &r.p);
+  if (r.fd < 0) {
+    bad("sqe128", "IORING_SETUP_SQE128 was refused", (long)r.fd);
+  } else {
+    r.sq_sz = r.p.cq_off.cqes +
+              (size_t)r.p.cq_entries * sizeof(struct io_uring_cqe);
+    void *sqp = mmap(0, r.sq_sz, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_POPULATE, r.fd, IORING_OFF_SQ_RING);
+    size_t ssz = (size_t)r.p.sq_entries * 128;
+    char *sqes = mmap(0, ssz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+                      r.fd, IORING_OFF_SQES);
+
+    if (sqp == MAP_FAILED || sqes == MAP_FAILED) {
+      bad("sqe128", "the SQE128 ring would not map", -1);
+    } else {
+      char *b = (char *)sqp;
+      unsigned *sqt = (unsigned *)(b + r.p.sq_off.tail);
+      unsigned *sqa = (unsigned *)(b + r.p.sq_off.array);
+      unsigned *cqh = (unsigned *)(b + r.p.cq_off.head);
+      unsigned *cqt = (unsigned *)(b + r.p.cq_off.tail);
+      unsigned *cqm = (unsigned *)(b + r.p.cq_off.ring_mask);
+      struct io_uring_cqe *cqes = (struct io_uring_cqe *)(b + r.p.cq_off.cqes);
+      struct io_uring_sqe *s = (struct io_uring_sqe *)(sqes + 0 * 128);
+
+      memset(sqes, 0, ssz);
+      s->opcode = IORING_OP_NOP;
+      s->user_data = 0x128ull;
+      sqa[0] = 0;
+      __atomic_store_n(sqt, 1u, __ATOMIC_RELEASE);
+      rc = io_uring_enter_(r.fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0);
+      unsigned h = __atomic_load_n(cqh, __ATOMIC_RELAXED);
+      unsigned t = __atomic_load_n(cqt, __ATOMIC_ACQUIRE);
+
+      judge("sqe128",
+            rc >= 0 && t - h == 1 && cqes[h & *cqm].user_data == 0x128ull,
+            "a 128-byte-SQE ring did not read the entry at the right stride",
+            (long)rc);
+      munmap(sqes, ssz);
+      munmap(sqp, r.sq_sz);
+    }
+    close(r.fd);
+  }
+
+  /* IORING_SETUP_NO_SQARRAY: the SQ head indexes the SQEs directly. */
+  memset(&r, 0, sizeof(r));
+  memset(&p, 0, sizeof(p));
+  p.flags = IORING_SETUP_NO_SQARRAY;
+  r.p = p;
+  r.fd = io_uring_setup_(8, &r.p);
+  if (r.fd < 0) {
+    bad("no-sqarray", "IORING_SETUP_NO_SQARRAY was refused", (long)r.fd);
+  } else {
+    size_t sz = r.p.cq_off.cqes +
+                (size_t)r.p.cq_entries * sizeof(struct io_uring_cqe);
+    char *b = mmap(0, sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+                   r.fd, IORING_OFF_SQ_RING);
+    size_t ssz = (size_t)r.p.sq_entries * sizeof(struct io_uring_sqe);
+    struct io_uring_sqe *sqes = mmap(0, ssz, PROT_READ | PROT_WRITE,
+                                     MAP_SHARED | MAP_POPULATE, r.fd,
+                                     IORING_OFF_SQES);
+
+    if (b == MAP_FAILED || sqes == MAP_FAILED) {
+      bad("no-sqarray", "the NO_SQARRAY ring would not map", -1);
+    } else {
+      unsigned *sqt = (unsigned *)(b + r.p.sq_off.tail);
+      unsigned *cqh = (unsigned *)(b + r.p.cq_off.head);
+      unsigned *cqt = (unsigned *)(b + r.p.cq_off.tail);
+      unsigned *cqm = (unsigned *)(b + r.p.cq_off.ring_mask);
+      struct io_uring_cqe *cqes = (struct io_uring_cqe *)(b + r.p.cq_off.cqes);
+
+      memset(&sqes[0], 0, sizeof(sqes[0]));
+      sqes[0].opcode = IORING_OP_NOP;
+      sqes[0].user_data = 0x5a5aull;
+      __atomic_store_n(sqt, 1u, __ATOMIC_RELEASE);
+      rc = io_uring_enter_(r.fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0);
+      unsigned h = __atomic_load_n(cqh, __ATOMIC_RELAXED);
+      unsigned t = __atomic_load_n(cqt, __ATOMIC_ACQUIRE);
+
+      judge("no-sqarray",
+            rc >= 0 && t - h == 1 && cqes[h & *cqm].user_data == 0x5a5aull,
+            "a ring without the indirection array did not read the entry",
+            (long)rc);
+      munmap(sqes, ssz);
+      munmap(b, sz);
+    }
+    close(r.fd);
+  }
+
+  /* IORING_SETUP_DEFER_TASKRUN, which Linux couples to SINGLE_ISSUER. */
+  {
+    struct ring rd;
+    struct io_uring_cqe c;
+
+    if (ring_make(&rd, 8,
+                  IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SINGLE_ISSUER,
+                  0) < 0) {
+      bad("defer-taskrun", "the flag pair was refused", -1);
+    } else {
+      struct io_uring_sqe *s = sq_get(&rd);
+
+      s->opcode = IORING_OP_NOP;
+      s->user_data = 0xdefull;
+      rc = submit_wait(&rd, 1, &c);
+      judge("defer-taskrun", rc == 0 && c.user_data == 0xdefull,
+            "a DEFER_TASKRUN ring did not complete its work",
+            (long)rc);
+      ring_free(&rd);
+    }
+    memset(&p, 0, sizeof(p));
+    p.flags = IORING_SETUP_DEFER_TASKRUN;
+    int fd = io_uring_setup_(8, &p);
+
+    judge("defer-taskrun-needs-single-issuer", fd < 0 && errno == EINVAL,
+          "DEFER_TASKRUN without SINGLE_ISSUER was accepted", (long)fd);
+    if (fd >= 0)
+      close(fd);
+  }
+}
+
 int main(void) {
   printf("M125-SMOKE: start\n");
   fflush(stdout);
@@ -979,6 +2630,19 @@ int main(void) {
   check_socket();
   check_accept_connect();
   check_overflow();
+  check_sqpoll();
+  check_iopoll();
+  check_provided_buffers();
+  check_buffer_ring();
+  check_multishot();
+  check_multishot_recv();
+  check_multishot_accept();
+  check_fs_opcodes();
+  check_net_opcodes();
+  check_misc_opcodes();
+  check_direct_descriptors();
+  check_register_extras();
+  check_ring_shapes();
 
   printf("M125-SMOKE: done\n");
   fflush(stdout);

@@ -336,4 +336,36 @@ int syscall_copyout(void *user_dst, const void *src, usize size);
 int syscall_copyinstr(char *dst, usize dst_size, const char *user_src);
 void free_kernel_array(char **k_array);
 
+/* The three system calls io_uring also offers as opcodes. They are exported
+ * rather than copied so that IORING_OP_STATX, IORING_OP_SPLICE and
+ * IORING_OP_FALLOCATE are the same operation as statx(2), splice(2) and
+ * fallocate(2), argument validation included, and cannot drift from it. The
+ * pointers are user pointers, exactly as in the system call. */
+struct statx;
+int syscall_statx(int dirfd, const char *user_path, int flags,
+                  unsigned int mask, struct statx *user_buf);
+/* The same, with the path already in kernel memory: io_uring resolves
+ * sqe->fd + sqe->addr itself before it gets here. */
+int syscall_statx_kpath(int dirfd, const char *kpath, int flags,
+                        unsigned int mask, struct statx *user_buf);
+isize syscall_splice(int fd_in, u64 *user_off_in, int fd_out,
+                     u64 *user_off_out, usize len, unsigned int flags);
+/* The pump under splice(2) and sendfile(2). Its offsets are KERNEL pointers,
+ * which is what IORING_OP_SPLICE has: the SQE carries the values, not
+ * pointers to them. */
+isize file_copy_range(int in_fd, u64 *in_off, int out_fd, u64 *out_off,
+                      usize count);
+int syscall_fallocate(int fd, int mode, u64 offset, u64 len);
+isize syscall_madvise(void *addr, usize length, int advice);
+/* waitid(2) with Linux's siginfo layout, shared by the system call and
+ * IORING_OP_WAITID. `user_info` is a user pointer and may be zero. */
+isize syscall_waitid_linux(u64 idtype, u64 id, u64 user_info, int options);
+/* sendmsg(2)/recvmsg(2) behind IORING_OP_SENDMSG and IORING_OP_RECVMSG, for
+ * the same reason: one implementation of the control-message and iovec
+ * handling, not two. `user_msg` is a user pointer to a struct msghdr. */
+struct syscall_msghdr;
+u64 syscall_sendmsg_user(int fd, const struct syscall_msghdr *user_msg,
+                         int flags);
+u64 syscall_recvmsg_user(int fd, struct syscall_msghdr *user_msg, int flags);
+
 #endif

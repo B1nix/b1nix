@@ -705,7 +705,7 @@ static isize sys_readv(int fd, const struct b1nix_iovec *uiov, int iovcnt) {
  * offset (POSIX sendfile/copy_file_range semantics: an explicit offset argument
  * leaves the descriptor position untouched). A NULL offset pointer means "use
  * and advance the fd's own offset". Returns bytes copied or -errno. */
-static isize file_copy_range(int in_fd, u64 *in_off, int out_fd, u64 *out_off,
+isize file_copy_range(int in_fd, u64 *in_off, int out_fd, u64 *out_off,
                              usize count) {
   /* Use positioned I/O (vfs_pread/pwrite) for the explicit-offset side so the
    * shared descriptor's own file offset is never disturbed — thread-safe, unlike
@@ -826,8 +826,8 @@ static isize sys_copy_file_range(int fd_in, u64 *user_off_in, int fd_out,
 /* splice(fd_in, off_in*, fd_out, off_out*, len, flags). Linux requires the
  * offset for a pipe end be NULL; we don't special-case pipes (the copy pump
  * read/writes either kind) but honor the same offset semantics. */
-static isize sys_splice(int fd_in, u64 *user_off_in, int fd_out,
-                        u64 *user_off_out, usize len, unsigned int flags) {
+isize syscall_splice(int fd_in, u64 *user_off_in, int fd_out,
+                     u64 *user_off_out, usize len, unsigned int flags) {
   (void)flags; /* SPLICE_F_* are advisory (MOVE/NONBLOCK/MORE/GIFT) */
   u64 off_in, off_out;
   u64 *pin = 0, *pout = 0;
@@ -856,7 +856,7 @@ static isize sys_splice(int fd_in, u64 *user_off_in, int fd_out,
  * filesystems allocate on write / have no preallocation primitive, so this is
  * the meaningful guarantee: the bytes exist and are zero). Hole-punching and
  * range collapse/insert/zero are not supported by the underlying drivers. */
-static int sys_fallocate(int fd, int mode, u64 offset, u64 len) {
+int syscall_fallocate(int fd, int mode, u64 offset, u64 len) {
   if (len == 0)
     return -EINVAL;
   /* Only plain allocate (0) and KEEP_SIZE are representable; the rest need
@@ -878,6 +878,9 @@ static int sys_fallocate(int fd, int mode, u64 offset, u64 len) {
  * an absolute/cwd-relative path (dirfd == AT_FDCWD) and AT_EMPTY_PATH on an fd.
  * It maps the existing stat data into the Linux struct statx layout so glibc /
  * port binaries that prefer statx get real values. */
+int syscall_statx(int dirfd, const char *user_path, int flags,
+                  unsigned int mask, struct statx *user_buf);
+
 /* Resolve a dirfd-relative path the way the *at() syscalls define it: an
  * absolute path or AT_FDCWD is used as-is, anything else is joined onto the
  * directory the fd names. b1nix has no per-fd resolution in the VFS, so the
@@ -934,8 +937,12 @@ static int linux_at_path(int dirfd, const char *user_path, u32 flags, char *out,
   return syscall_resolve_at(dirfd, kpath, out, outsz);
 }
 
-static int sys_statx(int dirfd, const char *user_path, int flags,
-                     unsigned int mask, struct statx *user_buf) {
+/* The body of statx(2), with the path already in kernel memory. io_uring's
+ * IORING_OP_STATX enters here, having resolved sqe->fd + sqe->addr itself; the
+ * system call below copies its path in first. An empty `kpath` with
+ * AT_EMPTY_PATH means the descriptor. */
+int syscall_statx_kpath(int dirfd, const char *kpath, int flags,
+                        unsigned int mask, struct statx *user_buf) {
   struct b1nix_stat st;
   int rc;
   /* The path the answer is about, kept so the mount id can be worked out from
@@ -943,14 +950,11 @@ static int sys_statx(int dirfd, const char *user_path, int flags,
    * a descriptor has an absolute path. */
   char resolved[VFS_MAX_PATH];
   resolved[0] = '\0';
-  if ((flags & AT_EMPTY_PATH) && (!user_path || user_path[0] == '\0')) {
+  if ((flags & AT_EMPTY_PATH) && (!kpath || kpath[0] == '\0')) {
     rc = vfs_fstat(dirfd, &st);
     if (vfs_fd_abspath(dirfd, resolved, sizeof(resolved)) < 0)
       resolved[0] = '\0';
   } else {
-    char kpath[VFS_MAX_PATH];
-    if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
-      return -EFAULT;
     int arc = syscall_resolve_at(dirfd, kpath, resolved, sizeof(resolved));
     if (arc < 0)
       return arc;
@@ -1039,6 +1043,76 @@ static int sys_statx(int dirfd, const char *user_path, int flags,
   if (syscall_copyout(user_buf, &sx, sizeof(sx)) < 0)
     return -EFAULT;
   return 0;
+}
+
+/* statx(dirfd, path, flags, mask, statxbuf): the path comes from userspace. */
+int syscall_statx(int dirfd, const char *user_path, int flags,
+                  unsigned int mask, struct statx *user_buf) {
+  char kpath[VFS_MAX_PATH];
+
+  kpath[0] = '\0';
+  if (!((flags & AT_EMPTY_PATH) && (!user_path || user_path[0] == '\0'))) {
+    if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
+      return -EFAULT;
+  }
+  return syscall_statx_kpath(dirfd, kpath, flags, mask, user_buf);
+}
+
+/* waitid(2) in the Linux ABI: the same wait scheduler_waitid performs, with the
+ * answer rewritten into Linux's 128-byte siginfo. b1nix packs six ints, Linux
+ * swaps si_errno and si_code and puts the CLD fields at offset 16, so the two
+ * cannot share a buffer layout. The Linux system call and IORING_OP_WAITID both
+ * enter here so that neither can drift from the other. `user_info` is a user
+ * pointer, and may be zero. */
+isize syscall_waitid_linux(u64 idtype, u64 id, u64 user_info, int options) {
+  /* waitid(2)'s fourth idtype: the id is a pidfd rather than a pid. */
+  enum { LX_P_PIDFD = 3 };
+  usize wid = (usize)id;
+  u64 widtype = idtype;
+
+  /* P_PIDFD: wait for the process a pidfd holds. It is the same wait as P_PID
+   * once the descriptor has been read back into a pid -- the difference is
+   * that the descriptor cannot have started meaning a different process in the
+   * meantime, which is the whole point of having it.
+   *
+   * systemd runs every generator this way: it forks, takes a pidfd, and waits
+   * on the descriptor. Without this the wait answered EINVAL, and PID 1
+   * reported "Failed to wait for
+   * /usr/lib/systemd/system-environment-generators/10-arch" and then "Failed
+   * to start up manager" -- the boot ended on the first generator Arch ships. */
+  if (widtype == LX_P_PIDFD) {
+    struct vfs_handle *wh = scheduler_fd_get((int)id);
+    if (!wh)
+      return -EBADF;
+    usize wpid = vfs_pidfd_pid(wh);
+    if (!wpid)
+      return -EBADF;
+    widtype = P_PID;
+    wid = wpid; /* already a kernel pid: no namespace translation */
+  } else if ((idtype == P_PID || idtype == P_PGID) && id != 0 &&
+             !(wid = namespace_pid_from_user((usize)id))) {
+    return -ECHILD;
+  }
+  int wr = scheduler_waitid((idtype_t)widtype, wid,
+                            (siginfo_t *)(usize)user_info, options);
+  if (wr < 0)
+    return wr;
+  if (user_info) {
+    siginfo_t ki;
+    if (syscall_copyin(&ki, (void *)(usize)user_info, sizeof(ki)) < 0)
+      return -EFAULT;
+    u8 lx[128];
+    memset(lx, 0, sizeof(lx));
+    *(i32 *)&lx[0] = b1nix_signo_to_linux(ki.si_signo);
+    *(i32 *)&lx[4] = ki.si_errno;
+    *(i32 *)&lx[8] = ki.si_code;
+    *(i32 *)&lx[16] = (i32)namespace_pid_to_user((usize)ki.si_pid);
+    *(i32 *)&lx[20] = ki.si_uid;
+    *(i32 *)&lx[24] = ki.si_status;
+    if (syscall_copyout((void *)(usize)user_info, lx, sizeof(lx)) < 0)
+      return -EFAULT;
+  }
+  return wr;
 }
 
 static void copy_cstr(char *dst, usize dst_size, const char *src) {
@@ -1516,7 +1590,7 @@ static isize sys_utime(const char *user_path, u64 atime, u64 mtime) {
 /* Linux utimes(2) / utimensat(2) → vfs_utime. utimes passes struct timeval[2]
  * (sec/usec), utimensat struct timespec[2] (sec/nsec) with the UTIME_NOW /
  * UTIME_OMIT nsec sentinels. Only AT_FDCWD (or an absolute path) is resolvable
- * — same restriction as sys_statx above. */
+ * — same restriction as syscall_statx above. */
 #define LX_UTIME_NOW 0x3fffffffL
 #define LX_UTIME_OMIT 0x3ffffffeL
 static isize sys_linux_utimensat(int dirfd, const char *user_path,
@@ -3494,7 +3568,7 @@ static int copyin_message(const struct syscall_msghdr *user_msg,
   return 0;
 }
 
-static u64 sys_sendmsg(int fd, const struct syscall_msghdr *user_msg,
+u64 syscall_sendmsg_user(int fd, const struct syscall_msghdr *user_msg,
                        int flags) {
   struct syscall_msghdr msg;
   struct syscall_iovec iov[SYSCALL_IOV_MAX];
@@ -3610,7 +3684,7 @@ sendmsg_fail:
   return (u64)err;
 }
 
-static u64 sys_recvmsg(int fd, struct syscall_msghdr *user_msg, int flags) {
+u64 syscall_recvmsg_user(int fd, struct syscall_msghdr *user_msg, int flags) {
   struct syscall_msghdr msg;
   struct syscall_iovec iov[SYSCALL_IOV_MAX];
   char *payload = 0;
@@ -5189,7 +5263,7 @@ int linux_modern_open_flags(int linux_flags) {
   return linux_open_flags_to_b1nix(linux_flags);
 }
 
-static isize sys_madvise(void *addr, usize length, int advice) {
+isize syscall_madvise(void *addr, usize length, int advice) {
   u64 start = (u64)(usize)addr;
   if ((start & (PAGE_SIZE - 1)) != 0)
     return -EINVAL; /* POSIX: addr must be page-aligned */
@@ -6655,62 +6729,11 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                                     linux_signo_to_b1nix((int)arg2));
       }
       /* waitid(247): idtype/id/options values match b1nix, but the siginfo
-       * layouts differ (b1nix packs 6 ints; Linux is a 128-byte struct with
-       * si_errno/si_code swapped and the CLD fields at offset 16). Let
-       * scheduler_waitid write its b1nix siginfo into the user's (larger)
-       * buffer, read it back, and rewrite it in the Linux layout. */
-      /* LINUX_NR_WAITID, not the literal 247: waitid is 95 on aarch64. */
-      if (number == LINUX_NR_WAITID) {
-        /* waitid(2)'s fourth idtype: the id is a pidfd rather than a pid. */
-        enum { LX_P_PIDFD = 3 };
-        usize wid = (usize)arg1;
-        u64 widtype = arg0;
-        /* P_PIDFD: wait for the process a pidfd holds. It is the same wait as
-         * P_PID once the descriptor has been read back into a pid -- the
-         * difference is that the descriptor cannot have started meaning a
-         * different process in the meantime, which is the whole point of
-         * having it.
-         *
-         * systemd runs every generator this way: it forks, takes a pidfd, and
-         * waits on the descriptor. Without this the wait answered EINVAL, and
-         * PID 1 reported "Failed to wait for
-         * /usr/lib/systemd/system-environment-generators/10-arch" and then
-         * "Failed to start up manager" -- the boot ended on the first
-         * generator Arch ships. */
-        if (widtype == LX_P_PIDFD) {
-          struct vfs_handle *wh = scheduler_fd_get((int)arg1);
-          if (!wh)
-            return (u64)-EBADF;
-          usize wpid = vfs_pidfd_pid(wh);
-          if (!wpid)
-            return (u64)-EBADF;
-          widtype = P_PID;
-          wid = wpid; /* already a kernel pid: no namespace translation */
-        } else if ((arg0 == P_PID || arg0 == P_PGID) && arg1 != 0 &&
-                   !(wid = namespace_pid_from_user((usize)arg1))) {
-          return (u64)-ECHILD;
-        }
-        int wr = scheduler_waitid((idtype_t)widtype, wid,
-                                  (siginfo_t *)(usize)arg2, (int)arg3);
-        if (wr < 0)
-          return (u64)wr;
-        if (arg2) {
-          siginfo_t ki;
-          if (syscall_copyin(&ki, (void *)(usize)arg2, sizeof(ki)) < 0)
-            return (u64)-EFAULT;
-          u8 lx[128];
-          memset(lx, 0, sizeof(lx));
-          *(i32 *)&lx[0] = b1nix_signo_to_linux(ki.si_signo);
-          *(i32 *)&lx[4] = ki.si_errno;
-          *(i32 *)&lx[8] = ki.si_code;
-          *(i32 *)&lx[16] = (i32)namespace_pid_to_user((usize)ki.si_pid);
-          *(i32 *)&lx[20] = ki.si_uid;
-          *(i32 *)&lx[24] = ki.si_status;
-          if (syscall_copyout((void *)(usize)arg2, lx, sizeof(lx)) < 0)
-            return (u64)-EFAULT;
-        }
-        return (u64)wr;
-      }
+       * layouts differ, so the answer is rewritten in the Linux layout. The
+       * body is syscall_waitid_linux, which IORING_OP_WAITID shares.
+       * LINUX_NR_WAITID, not the literal 247: waitid is 95 on aarch64. */
+      if (number == LINUX_NR_WAITID)
+        return (u64)syscall_waitid_linux(arg0, arg1, arg2, (int)arg3);
       /* prlimit64(pid, resource, new, old). RLIMIT_* numbers and struct
        * rlimit {u64 cur, max} match Linux; musl routes getrlimit and
        * setrlimit through here with pid 0. Another process's limits need
@@ -9167,9 +9190,9 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         for (u32 i = 0; i < vlen; i++) {
           u64 hdr = arg1 + (u64)i * 64;
           isize r = (number == LX_sendmmsg)
-                        ? sys_sendmsg(fd, (const struct syscall_msghdr *)(usize)hdr,
+                        ? syscall_sendmsg_user(fd, (const struct syscall_msghdr *)(usize)hdr,
                                       flags)
-                        : sys_recvmsg(fd, (struct syscall_msghdr *)(usize)hdr,
+                        : syscall_recvmsg_user(fd, (struct syscall_msghdr *)(usize)hdr,
                                       flags);
           if (r < 0)
             return done ? (u64)done : (u64)r;
@@ -10522,7 +10545,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return r;
   }
   case SYS_MADVISE:
-    return (u64)sys_madvise((void *)(usize)arg0, (usize)arg1, (int)arg2);
+    return (u64)syscall_madvise((void *)(usize)arg0, (usize)arg1, (int)arg2);
   case SYS_MINCORE: {
     /* SYS_MINCORE(addr, length, vec): vec[i] bit0 = the page at
      * addr + i*PAGE_SIZE is present in this address space (page-table walk).
@@ -10559,13 +10582,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                                     (u64 *)(usize)arg3, (usize)arg4,
                                     (unsigned int)arg5);
   case SYS_SPLICE:
-    return (u64)sys_splice((int)arg0, (u64 *)(usize)arg1, (int)arg2,
+    return (u64)syscall_splice((int)arg0, (u64 *)(usize)arg1, (int)arg2,
                            (u64 *)(usize)arg3, (usize)arg4,
                            (unsigned int)arg5);
   case SYS_FALLOCATE:
-    return (u64)sys_fallocate((int)arg0, (int)arg1, arg2, arg3);
+    return (u64)syscall_fallocate((int)arg0, (int)arg1, arg2, arg3);
   case SYS_STATX:
-    return (u64)sys_statx((int)arg0, (const char *)(usize)arg1, (int)arg2,
+    return (u64)syscall_statx((int)arg0, (const char *)(usize)arg1, (int)arg2,
                           (unsigned int)arg3, (struct statx *)(usize)arg4);
   case SYS_MSYNC:
     return (u64)sys_msync((void *)(usize)arg0, (usize)arg1, (int)arg2);
@@ -10862,10 +10885,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return sys_recvfrom((int)arg0, (void *)(usize)arg1, (usize)arg2, (int)arg3,
                         (void *)(usize)arg4, (u32 *)(usize)arg5);
   case SYS_SENDMSG:
-    return sys_sendmsg((int)arg0,
+    return syscall_sendmsg_user((int)arg0,
                        (const struct syscall_msghdr *)(usize)arg1, (int)arg2);
   case SYS_RECVMSG:
-    return sys_recvmsg((int)arg0, (struct syscall_msghdr *)(usize)arg1,
+    return syscall_recvmsg_user((int)arg0, (struct syscall_msghdr *)(usize)arg1,
                        (int)arg2);
   case SYS_MEMFD_CREATE: {
     char name[64];
