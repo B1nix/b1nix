@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Loadable Kernel Modules (M95/M96).
  *
  * b1nix modules are plain relocatable ELF objects (ET_REL, ".ko") built from

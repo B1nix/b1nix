@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M51 rung 6: verify the ported HarfBuzz shapes text with the built-in
  * OpenType shaper using the bundled B1nix Mono font. */
 #include <fcntl.h>

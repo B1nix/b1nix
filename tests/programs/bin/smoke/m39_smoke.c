@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* m39_smoke — M39 serial-tty half of the configurable-init self-test.
  *
  * Exercises /dev/ttyS0 as an independent tty: line discipline,

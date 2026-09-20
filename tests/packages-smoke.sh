@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # PKG-SMOKE: the overlay packages build, publish and install.
 #
 #   sh tests/packages-smoke.sh

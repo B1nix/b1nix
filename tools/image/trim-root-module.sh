@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Pack the staging root at a smaller size for the lanes that receive it as a
 # boot module. A module is read off the emulated CD into memory before the
 # kernel starts (477 MB took 31 s against 3.5 s for a module-less image), and

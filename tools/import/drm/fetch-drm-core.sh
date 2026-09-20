@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Fetch the upstream DRM core and stage it for the kernel build.
 #
 # This is the import M101 is built around: the DRM core is compiled exactly as

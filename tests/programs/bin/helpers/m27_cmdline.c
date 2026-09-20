@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * m27_cmdline — kernel command-line key=value parser self-test.
  * Ported from deleted kernel/user/programs.c (was inline in B1NXEXEC).

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* IPv6 Neighbor Discovery (RFC 4861) + stateless address autoconfiguration
  * (SLAAC, RFC 4862), enough to come up on a real link (QEMU usernet):
  *

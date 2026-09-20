@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # boot-timeline.sh — where a boot's seconds go, read off a serial log.
 #
 # Every line the kernel prints carries its uptime, so a log already contains

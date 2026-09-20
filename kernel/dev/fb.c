@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M47 — /dev/fb0: mmap-able linear framebuffer device.
  *
  * The device exposes a kernel-owned, physically contiguous shadow buffer

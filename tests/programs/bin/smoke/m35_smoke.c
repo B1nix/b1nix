@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M35 core-dump smoke. Forks a child that dereferences an unmapped address;
  * the kernel's fatal-signal path writes an ELF core to /tmp/core before the
  * child dies. The parent then validates that core:

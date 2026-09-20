@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Run the complete b1cc M34 differential corpus on B1NIX.  The source files
  * are embedded by the kernel initramfs generator; each member is compiled by
  * the on-device b1cc and then executed as a separate process. */

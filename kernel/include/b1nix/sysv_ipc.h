@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef B1NIX_SYSV_IPC_H
 #define B1NIX_SYSV_IPC_H
 

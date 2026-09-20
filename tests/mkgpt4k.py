@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Write a GPT, by default with 4 KiB logical blocks — the layout of a phone's
 UFS LUN. A PC disk wants 512-byte blocks, so the block size is an option.
 

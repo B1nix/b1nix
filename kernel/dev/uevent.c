@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Hot-plug announcements over NETLINK_KOBJECT_UEVENT (M109).
  *
  * The transport already existed (kernel/net/netlink.c); what was missing was a

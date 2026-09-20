@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * M98 T2 — IA32_PAT programming, write-combining mappings and cache
  * maintenance. See kernel/include/b1nix/memtype.h for the slot layout and why

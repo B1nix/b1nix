@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # A minimal ISO 9660 filesystem, for the module tests that need one.
 #
 # The property those tests check is that a mounted filesystem pins the module

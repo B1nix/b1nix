@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Install a port that is now an Alpine package, and print where it landed.
 #
 # This replaces the ten tools/ports/build-<name>.sh scripts that used to build

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* GRE tunnel devices — gretap (M109).
  *
  * The tunnel this stack can genuinely carry is the ethernet one: a gretap

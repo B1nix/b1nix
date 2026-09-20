@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Build kernel/dev/dwc3_gadget.c on the host against the controller model in
 # model.c and run it. See model.c.
 set -e

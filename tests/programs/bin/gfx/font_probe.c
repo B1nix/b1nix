@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The three steps pango takes to turn a font name into something cairo can
  * draw with, done one at a time and reported separately.

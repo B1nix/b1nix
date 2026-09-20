@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # M92: musl libc smoke test.
 #
 # Builds musl, compiles the dynamic smoke test against it, embeds it in the

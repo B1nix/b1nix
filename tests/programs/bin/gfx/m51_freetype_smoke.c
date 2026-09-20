@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M51 rung 3: verify the ported FreeType rasterizes a real glyph from the
  * bundled TrueType font. */
 #include <fcntl.h>

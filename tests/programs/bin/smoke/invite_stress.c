@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* The handshake a multi-process program performs when it starts a helper.
  *
  * Modelled on what Chromium does and gets stuck in: the parent creates a

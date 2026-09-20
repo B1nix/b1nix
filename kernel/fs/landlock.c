@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Landlock: unprivileged filesystem sandboxing (ABI version 3).
  *

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 set -e
 
 ARCH="${1:-x86_64}"

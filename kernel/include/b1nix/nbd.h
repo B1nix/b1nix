@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Network block device: a remote NBD export attached as a local block device.
  * The wire protocol and the one-request-at-a-time policy are described in

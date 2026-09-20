@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M84: DHCPv6 client (RFC 8415).
  *
  * SLAAC alone cannot express everything a network wants to hand a host: a

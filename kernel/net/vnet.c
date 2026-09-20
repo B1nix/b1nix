@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* The parts of the virtual-device model that belong to no single kind (M109):
  * destroying a device, and moving one under a master. Both have to dispatch on
  * what the device is, and neither belongs inside the bridge or the bond.

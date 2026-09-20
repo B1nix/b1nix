@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Minimal IPv6 datapath.
  *
  * This is the first slice of kernel IPv6: a loopback (::1) fast path and an

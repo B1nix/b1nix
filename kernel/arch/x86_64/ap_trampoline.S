@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * AP Trampoline — compiled as a flat binary linked at 0x8000.
  * The BSP copies this to physical address 0x8000 and sends SIPI with

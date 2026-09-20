@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Network protocol registry (M96).
  *
  * A tiny publish/dispatch layer that lets the IPv6 datapath, Neighbour

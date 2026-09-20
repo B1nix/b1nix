@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * M79 Sound Stack Smoke Test — AC'97 /dev/dsp1 + OSS mixer ioctls
  *

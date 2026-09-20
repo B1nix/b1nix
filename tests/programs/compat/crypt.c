@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* b1nix password hashing for userspace (su, login, dropbear, ...).
  *
  * Port of kernel/lib/crypt.c + kernel/lib/sha512.c to the userspace side, so

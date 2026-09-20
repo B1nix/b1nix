@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* virtio-console: /dev/hvc0, and a kernel console that is not a UART.
  *
  * A 16550 under a hypervisor costs an exit per byte, and the emulator behind it

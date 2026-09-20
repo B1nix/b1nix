@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * IOAPIC driver (A1 audit follow-on).
  *

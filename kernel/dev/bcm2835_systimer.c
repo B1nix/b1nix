@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The BCM2835 system timer: a free-running 64-bit counter at a fixed 1 MHz,
  * plus four compare registers the SoC raises interrupts from.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* /dev/watchdog — a software watchdog (M107).
  *
  * b1nix has no watchdog hardware on any board it runs on, so this is a real

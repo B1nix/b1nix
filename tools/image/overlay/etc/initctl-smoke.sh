@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # M94 — the pieces an init system needs at runtime, exercised the way an init
 # system uses them: a tmpfs for volatile state, and a control FIFO that a
 # separate process writes while PID 1 reads.

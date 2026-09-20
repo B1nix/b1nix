@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 // AArch64 FP/SIMD context save & restore.
 //
 // The kernel itself is built -mgeneral-regs-only and never touches V0-V31, but

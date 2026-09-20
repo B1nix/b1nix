@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* On-target (x86_64-b1nix) proof that b1cc's M34 feature set compiles and runs
  * inside the b1nix kernel. Pure computation (no libc dependency); returns 0
  * only if every feature behaves correctly. Spawned by kernel/user/programs.c,

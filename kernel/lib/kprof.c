@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* kprof — where the kernel's CPU time actually goes.
  *
  * The scheduler tick (LAPIC vector 64 on x86_64, the CNTV PPI on aarch64 — one

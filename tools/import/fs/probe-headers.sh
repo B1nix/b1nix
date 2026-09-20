@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Report how far the filesystem shim is from compiling the imported source.
 #
 # Two numbers, and both are needed:

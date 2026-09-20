@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Intel Gigabit Ethernet (e1000 / e1000e family) driver.
  *

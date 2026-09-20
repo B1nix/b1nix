@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The vDSO's clock functions (built as a shared object, not linked into the
  * kernel).

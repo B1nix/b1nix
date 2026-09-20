@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Snapshot the current build as a set of soak images the loop can run from.
 #
 # One ISO per workload, because the workload is on the kernel command line and

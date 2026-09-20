@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M40 — a tiny *static Linux aarch64* ELF used to validate b1nix's Linux ABI
  * compatibility layer end to end. Counterpart of linux_hello.S, which does the
  * same job for x86_64.

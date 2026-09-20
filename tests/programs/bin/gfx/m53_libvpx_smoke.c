@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M53 libvpx smoke: prove the ported libvpx VP8 decoder decodes real motion-video
  * bitstream data on b1nix. VP8 is the WebM / browser video codec. To get a valid
  * VP8 frame without embedding a binary blob, we lean on the already-ported

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # What is in the build tree, where each part came from, and what nothing names.
 #
 #   sh tools/toolchain/build-inventory.sh            # report

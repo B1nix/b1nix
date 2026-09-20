@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Build the full b1nix rootfs for the Xperia 5's internal UFS storage.
 #
 # The boot image has room for a trimmed shell environment and no more. With

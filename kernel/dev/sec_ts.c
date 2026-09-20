@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Xperia 5 touchscreen: a Samsung sec_ts controller (the S6SY761 family Linux
  * drives with drivers/input/touchscreen/s6sy761.c) at 0x48 on the I2C bus of

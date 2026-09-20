@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* mremap and MREMAP_MAYMOVE are GNU extensions in musl's headers. */
 #define _GNU_SOURCE
 /*

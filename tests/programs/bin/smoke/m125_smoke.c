@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M125 — io_uring.
  *
  * Drives the rings directly rather than through liburing: the point of the

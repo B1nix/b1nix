@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Fetch liburing and build its test suite, for the Debian lane to run (M125).
 #
 # liburing's tests are the only honest answer to "is this io_uring ABI the one

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M51 rung 7: verify the ported xkbcommon compiles a keymap from a string and
  * translates an evdev keycode into the right keysym. Ships its own tiny keymap
  * so there is no xkeyboard-config data dependency. */

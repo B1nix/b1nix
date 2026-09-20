@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * tmpfs — the volatile RAM filesystem an init system expects on /run, /tmp and
  * /dev/shm.

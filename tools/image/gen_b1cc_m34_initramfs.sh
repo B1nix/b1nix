@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Package the M34 corpus sources, its on-device runner, and standard headers.
 set -e
 OUT="$1"

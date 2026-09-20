@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # debian-graphics-smoke.sh — a stock Debian userspace drawing a desktop on a
 # DRM card, judged from outside the guest.
 #

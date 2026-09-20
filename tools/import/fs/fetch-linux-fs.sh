@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Fetch the upstream Linux filesystems and stage them for the kernel build.
 #
 # Same import rule as M101's DRM core, for the same reason: nothing under the

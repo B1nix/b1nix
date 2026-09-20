@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M32b — pseudo-terminal (pty) substrate.
  *
  * A pty is a bidirectional character pipe with a terminal line discipline on

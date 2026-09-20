@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* GICv3 ITS: message-signalled interrupts on aarch64.
  *
  * An MSI is a memory write. On x86 the address names the local APIC and the

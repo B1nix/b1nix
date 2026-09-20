@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M32a PCRE2 smoke: prove the ported PCRE2 (8-bit) runtime compiles a pattern
  * and matches/anti-matches correctly on b1nix. Markers (M32-PCRE2: ...) are
  * consumed by tests/smoke.sh. */

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M73 smoke: modern I/O & introspection syscalls.
  *
  * Each marker is emitted only after the operation is performed AND its result

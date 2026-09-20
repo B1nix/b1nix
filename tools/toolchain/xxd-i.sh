@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # xxd-i.sh — the one thing this build uses xxd for, without needing xxd.
 #
 # `xxd -i` ships inside vim, so a host without vim cannot build the initramfs

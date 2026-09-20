@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # kde.sh — KDE's compositor on b1nix.
 #
 # Every other desktop here is wlroots (sway, cage). kwin_wayland is Qt6 with KDE

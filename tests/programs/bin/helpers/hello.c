@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* B1NIX Userspace — hello.c
  *
  * First userspace program compiled by the external cross-toolchain

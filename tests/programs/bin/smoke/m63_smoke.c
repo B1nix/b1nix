@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M63 smoke: seccomp-bpf syscall filtering.
  *
  * Each subtest runs in a forked child so the parent stays unfiltered and can

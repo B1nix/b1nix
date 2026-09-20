@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M39 — serial tty devices (/dev/ttyS0, /dev/ttyS1).
  *
  * Each UART line gets an independent tty: its own input ring, canonical line

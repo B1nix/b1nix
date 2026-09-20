@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * M92: Raw diagnostic — no libc, no mallocng. Tests mmap/brk directly.
  * Uses Linux x86_64 syscall numbers via inline asm.

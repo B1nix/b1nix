@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* System V message queues — msgget(2), msgsnd(2), msgrcv(2), msgctl(2).
  *
  * A queue is an ordered list of typed messages. Unlike a pipe, a reader picks

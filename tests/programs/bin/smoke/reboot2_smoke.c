@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * reboot2_smoke — reboot(2) with LINUX_REBOOT_CMD_RESTART2 and a reason.
  *

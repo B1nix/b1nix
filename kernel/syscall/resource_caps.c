@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M77: Global Resource Caps — runtime-tunable hard caps.
  *
  * TCP connection slots, VFS pipe buffers, System V shared-memory segment size

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M32 network / multiplex smoke. Exercises:
  *
  *   - select() with a zero timeout on a freshly-created pipe (no data

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* virtio-input driver — binds every virtio-input PCI device QEMU exposes.
  *
  * The first device is treated as the absolute pointer (virtio-tablet-pci) so

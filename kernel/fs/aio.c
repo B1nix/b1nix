@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/aio.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Minimal utmp/utmpx login-accounting implementation for b1nix.
  *
  * musl deliberately ships no-op stubs for these (src/legacy/utmpx.c) and

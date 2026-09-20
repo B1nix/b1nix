@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * xHCI (USB 3.x host controller) driver + USB HID boot keyboard (M37).
  *

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M75: On-Device GPU Path (LLVMpipe / Mesa / DSO Constructors / Software GL)
  *
  * Tests the on-device software GPU acceleration pipeline:

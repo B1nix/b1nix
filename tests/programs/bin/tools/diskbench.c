@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* b1nix diskbench — userspace block device throughput benchmark (Ring 3). */
 
 #include <fcntl.h>

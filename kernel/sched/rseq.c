@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* rseq(2) — restartable sequences.
  *
  * A registered task hands the kernel a `struct rseq` in its own memory. The

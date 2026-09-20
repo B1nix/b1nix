@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * mdcreate — write b1nix RAID superblocks onto member disks.
  *

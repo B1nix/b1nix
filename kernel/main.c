@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/secretmem.h>
 #include <b1nix/arch.h>
 #include <b1nix/fw_cfg.h>

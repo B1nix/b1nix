@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/run/debug/build-profile.sh - time each phase of the smoke-suite build.
 #
 # The smoke suite runs one `make -j$(nproc) iso-sys iso-blk ...`, which reports

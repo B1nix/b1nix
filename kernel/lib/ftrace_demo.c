@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* ftrace demo functions (M36). This translation unit is compiled WITH
  * -finstrument-functions (see the Makefile target-specific override), so each
  * function below emits __cyg_profile_func_enter/exit calls that the ftrace

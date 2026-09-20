@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M40 — Linux x86_64 syscall-number translation table.
  *
  * Maps Linux x86_64 syscall numbers (the canonical values from the kernel's

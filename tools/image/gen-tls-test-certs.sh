@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Generate a self-contained TLS test PKI for the b1nix loopback HTTPS smoke.
 #
 # Produces an EC P-256 CA and a server certificate (SAN IP:127.0.0.1,

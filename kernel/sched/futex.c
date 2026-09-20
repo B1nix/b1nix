@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M29: Fast userspace mutex (futex) — minimal in-kernel back-end for
  * pthread mutexes/condvars.
  *

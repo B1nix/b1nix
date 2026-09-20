@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * M98 T2 on AArch64 — memory typing and cache maintenance.
  *

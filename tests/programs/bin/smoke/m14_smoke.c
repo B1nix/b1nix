@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * m14_smoke — storage, ext4, swap, block-cache, persistence tests.
  * Rewritten to use POSIX API (no b1nix raw syscalls).

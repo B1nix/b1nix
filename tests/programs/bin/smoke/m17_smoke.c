@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M17: errno matrix — ELOOP, ENAMETOOLONG, ENOTDIR, EISDIR, EROFS, plus errno
  * isolation and a dup2 round-trip. Written against POSIX: the libc wrappers set
  * errno themselves, so the test exercises the same kernel paths a real program

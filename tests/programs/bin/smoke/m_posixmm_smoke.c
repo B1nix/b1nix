@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* m_posixmm_smoke — verifies three POSIX memory/signal primitives:
  *   1. madvise(MADV_DONTNEED) drops a written anonymous page so it refaults zero
  *   2. MAP_NORESERVE large anonymous mmap succeeds and commits on touch

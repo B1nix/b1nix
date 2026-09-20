@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # One soak boot: build the cmdline into a small ISO, run it, grade the log.
 #
 # Plain QEMU, no VFIO, no privileges. The root filesystem is attached as a

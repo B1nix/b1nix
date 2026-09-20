@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M57 smoke: multiprocess broker primitives.
  *
  * Audited (and proven correct here, not just asserted):

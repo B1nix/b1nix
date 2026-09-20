@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 int main(void) {
   int fd;
   fd = open("/tmp/b1cc-file-write.out", 577, 420);

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/toolchain/build-toolchain.sh - Sets up the pure LLVM/Clang cross-toolchain for b1nix
 set -euo pipefail
 

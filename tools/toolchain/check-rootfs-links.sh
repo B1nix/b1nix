@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Fail the build when a rootfs binary cannot resolve what it links against.
 #
 # Every executable and library in the rootfs is loaded by ld.so at runtime, so

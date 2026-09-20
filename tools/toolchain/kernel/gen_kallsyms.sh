@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # gen_kallsyms.sh <kernel.elf>  >  kallsyms.S
 #
 # Emit an assembly blob mapping kernel .text addresses to function names, for

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Classic BPF socket filters (SO_ATTACH_FILTER).
  *
  * The engine is deliberately the plain interpreter Linux started with: a

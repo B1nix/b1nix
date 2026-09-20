@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M109: the initramfs /init of the switchroot smoke instance.
  *
  * This is the boot Linux describes for an initramfs: the kernel keeps the RAM

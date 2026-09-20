@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Address-space churn, with every fresh mapping proved empty.
  *
  * Two questions this answers that a heap test cannot:

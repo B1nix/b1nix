@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M13 Job Control Smoke Test
  * Written against POSIX APIs.
  */

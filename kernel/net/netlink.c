@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* AF_NETLINK / NETLINK_ROUTE (rtnetlink) — M107.
  *
  * BusyBox `ip`, and every modern replacement for ifconfig/route/arp, speaks

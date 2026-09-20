@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Intel 82801AA AC'97 audio controller driver — M79: Audio Stack
  *

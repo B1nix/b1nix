@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M51 rung 5: Cairo draws real text onto an image surface using the bundled
  * B1nix Mono font via the FreeType backend. The integration test for the whole
  * stack (cairo -> pixman compositing + freetype rasterization). */

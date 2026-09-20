@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * M92: raw Linux syscall smoke test — the syscall instruction itself, with
  * the arch's Linux numbers and no libc wrapper in between.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * m119_smoke.c — Smoke test for Developer-Centric Filesystems:
  *   1. FwCfgFS (virtual fw_cfg filesystem)

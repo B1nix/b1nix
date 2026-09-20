@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* ptrace(2) — process tracing.
  *
  * A tracer stops its tracee, reads and writes its registers and memory, and

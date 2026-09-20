@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Is there a tone in what the emulator played?
 
 QEMU's wav audio backend writes everything a guest plays to a file, so a run

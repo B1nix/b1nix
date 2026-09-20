@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Lockdep-light implementation. See kernel/include/b1nix/lockdep.h.
  *
  * Translation-unit-level no-op when KERNEL_LOCKDEP is not defined — the

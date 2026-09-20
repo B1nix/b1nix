@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* gdbstub — serial-port GDB remote stub (M36), AArch64.
  *
  * Same protocol engine and same split as kernel/arch/x86_64/gdbstub.c: the

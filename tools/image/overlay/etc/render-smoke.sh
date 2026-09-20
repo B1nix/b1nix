@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # render-smoke.sh — both composition paths, each proved on its own.
 #
 # Composition has two paths on b1nix and both are supported: pixman in the CPU,

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M71 smoke: ASLR proof.
  *
  * A PIE/ET_DYN binary is relocated to whatever base the kernel picks. With

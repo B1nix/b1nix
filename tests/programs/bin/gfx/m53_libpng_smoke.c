@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M53 libpng smoke: prove the ported libpng (over the ported zlib) encodes and
  * decodes real PNG data on b1nix. Builds a known 8x8 RGBA image, writes it to an
  * in-memory PNG via libpng (a real, standard-conformant PNG byte stream), then

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M34 procfs / sysfs smoke. Verifies the synthetic /proc and /sys
  * filesystems expose live kernel + per-process state:
  *

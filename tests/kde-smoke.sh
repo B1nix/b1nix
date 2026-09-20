@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # kde-smoke.sh — Plasma on the real DRM path, judged from outside the guest.
 #
 # The KDE image is not part of the main suite: it is a second image, an order

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # render-select.sh — which renderer does the compositor use on this machine?
 #
 # Composition on b1nix has been software since it started working: pixman, in

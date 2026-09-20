@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M53 NetSurf helper/decoder smoke: prove the ported libnsutils, libnsgif,
  * libnsbmp and libnslog work on b1nix. These are the leaf utilities and image
  * decoders the NetSurf core links against. Nothing faked:

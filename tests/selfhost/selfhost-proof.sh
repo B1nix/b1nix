@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # M26 native-Clang KERNEL self-host proof: b1nix compiles+links its OWN kernel,
 # in-guest, with its own clang + ld.lld.
 #

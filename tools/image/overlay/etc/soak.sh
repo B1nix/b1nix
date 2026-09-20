@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # /etc/soak.sh — the guest half of the overnight soak.
 #
 # One boot runs one set of workloads and says what happened in markers the host

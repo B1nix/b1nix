@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Active-backup bonding (M109).
  *
  * A bond is one interface standing in for several. In active-backup mode —

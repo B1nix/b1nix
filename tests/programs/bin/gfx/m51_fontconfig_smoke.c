@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M51: verify the ported Fontconfig scans a font directory and matches a family
  * name to the bundled B1nix Mono font. Uses an in-memory config (no reliance on
  * /etc/fonts). */

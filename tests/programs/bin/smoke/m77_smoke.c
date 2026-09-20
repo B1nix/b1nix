@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M77 global resource caps smoke. Verifies the writable sysctl knobs under
  * /proc/sys/kernel that runtime-tune the system-wide hard caps:
  *

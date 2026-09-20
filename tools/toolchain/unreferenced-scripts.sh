@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # List scripts that nothing in the tree mentions.
 #
 #   sh tools/toolchain/unreferenced-scripts.sh

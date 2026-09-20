@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * M92: Minimal musl test — just write + exit. No malloc, no printf, no fork.
  * Tests the absolute minimum: can musl's _start → __libc_start_main work?

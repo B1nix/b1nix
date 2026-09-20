@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* aarch64 signal delivery.
  *
  * Same model as kernel/arch/x86_64/signal.c — a struct b1nix_sigframe is

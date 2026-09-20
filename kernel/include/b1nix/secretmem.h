@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef B1NIX_SECRETMEM_H
 #define B1NIX_SECRETMEM_H
 /* memfd_secret(2) — see kernel/mm/secretmem.c. */

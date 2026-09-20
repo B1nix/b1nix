@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Filesystem writes under load, judged by tools that are not this kernel.
 #
 # Boots the fsverify soak workload with a fresh ext4 disk and a fresh btrfs

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # liveusb.sh — boot with root=liveiso and a live ISO plugged in as a USB stick,
 # and check that the kernel finds the boot medium.
 #

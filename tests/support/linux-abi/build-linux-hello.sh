@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # M40 — assemble + link tests/support/linux-abi/linux_hello.S into a static Linux x86_64 ELF
 # blob, then set EI_OSABI = ELFOSABI_LINUX (3) so the binary advertises a Linux
 # personality two ways (EI_OSABI and the embedded .note.ABI-tag).

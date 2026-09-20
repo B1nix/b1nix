@@ -1,3 +1,12 @@
+b1nix's own code is licensed under the GNU General Public License, version 2
+ONLY. Every b1nix source file carries `SPDX-License-Identifier: GPL-2.0-only`;
+a file with any other tag is third-party and names its origin. The text below
+is the unmodified GPLv2, and the "any later version" wording inside it is part
+of that text, not an offer b1nix makes. Third-party components are conveyed
+under their own terms — see docs/licensing.md.
+
+----------------------------------------------------------------------
+
 GNU GENERAL PUBLIC LICENSE
 Version 2, June 1991
 

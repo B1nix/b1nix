@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/image/prune-optional-roots.sh - take an optional package group back out
 # of the shared staging root.
 #

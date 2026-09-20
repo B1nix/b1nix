@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M53 libwebp smoke: prove the ported libwebp encodes and decodes real WebP data
  * on b1nix. WebP's lossy mode is a VP8 intra (keyframe) codec — the same
  * bitstream family as WebM video — so this exercises a genuine video-keyframe

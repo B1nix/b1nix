@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/arch.h>
 /* /dev/i2c-N — the PIIX4/ICH9 SMBus host controller (M107).
  *

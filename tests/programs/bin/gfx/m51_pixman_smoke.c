@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M51 rung 2: verify the ported pixman actually composites pixels. */
 #include <pixman.h>
 #include <string.h>

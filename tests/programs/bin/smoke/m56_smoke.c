@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M56 smoke test — event-loop and IPC primitives.
  *
  * Exercises each primitive for real and emits "M56-SMOKE: ok <name>" only on

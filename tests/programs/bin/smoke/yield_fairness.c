@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Does yielding the CPU actually let someone else run?
  *
  * A thread that cannot proceed until another thread does something often waits

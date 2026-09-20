@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Reassemble a kernel scanout dump and look for lost pages.
 
 The kernel prints the frame the display engine is reading as `FD<n> <y> <x>

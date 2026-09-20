@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* vDSO smoke: clock readings without a system call.
  *
  * Every marker is printed by the check that established it; a check that could

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # B1NIX Smoke Test Suite (M24)
 # Runs kernel in QEMU and checks for expected output patterns.
 # Usage: ./tests/smoke.sh [x86_64]

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* coredump — ELF core dump generation on fatal signals (M35), aarch64.
  *
  * Mirrors kernel/arch/x86_64/coredump.c: the same ET_CORE layout (one PT_NOTE

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The key retention service: add_key(2), request_key(2), keyctl(2).
  *

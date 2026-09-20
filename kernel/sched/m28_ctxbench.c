@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M28 #9 — context-switch and syscall-handler latency benchmark.
  *
  * Single-CPU only. The earlier SMP-4 prototype hit a stack-corruption

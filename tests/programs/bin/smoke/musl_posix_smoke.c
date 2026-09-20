@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Simple POSIX smoke test for musl libc — verifies the build pipeline works.
  * Uses only standard POSIX APIs, no b1nix-specific syscalls.

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # A Debian build chroot for the b1nix overlay packages.
 #
 #   sh tools/deb/debian-chroot.sh create        # fetch and prepare it

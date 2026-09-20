@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * memfd_secret(2): memory only the processes that map it can read.
  *

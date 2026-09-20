@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * AMD-Vi: ACPI IVRS, device table, command ring, page tables.
  *

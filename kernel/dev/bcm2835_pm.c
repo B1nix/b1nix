@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The BCM2835/BCM2711 Power Management and Watchdog block.
  *

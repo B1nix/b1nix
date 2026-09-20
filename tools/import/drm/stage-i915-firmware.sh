@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/import/drm/stage-i915-firmware.sh - put the i915 firmware the driver asks for
 # into the image, taken from the build machine.
 #

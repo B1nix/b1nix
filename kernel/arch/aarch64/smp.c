@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Secondary-CPU bring-up, over PSCI or a spin-table.
  *
  * There is no trampoline to write here and no real mode to leave: firmware

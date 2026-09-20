@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Extended attributes: the dispatch between a name and the handler that owns
  * its prefix.

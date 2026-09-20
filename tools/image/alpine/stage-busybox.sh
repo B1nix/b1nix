@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Stage Alpine's BusyBox into the root filesystem.
 #
 #   B1NIX_ARCH=x86_64 sh tools/image/alpine/stage-busybox.sh

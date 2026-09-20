@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # M98 — host-side collector for b1nix netconsole.
 #
 # Boot the target with, for example:

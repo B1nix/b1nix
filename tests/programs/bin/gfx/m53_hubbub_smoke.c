@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M53 libhubbub smoke: prove the ported NetSurf HTML5 tokeniser works on b1nix.
  * libhubbub is the browser's HTML parser; it feeds the DOM (libdom) the token
  * stream produced here. It parses input through the already-ported

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M47 — evdev-style input event devices (/dev/input/event0, event1).
  *
  * event0 carries keyboard EV_KEY events (raw PS/2 set-1 scancodes), event1

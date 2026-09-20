@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <stdio.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/irq.h>

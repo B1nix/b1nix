@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* GICv3: distributor, per-CPU redistributor, and the system-register CPU
  * interface.
  *

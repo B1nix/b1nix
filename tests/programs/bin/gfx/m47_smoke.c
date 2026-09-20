@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * M47 Display-Substrate Smoke Test — /dev/fb0 + /dev/input/event*
  *

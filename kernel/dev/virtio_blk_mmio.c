@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* virtio-blk over the virtio-mmio transport (QEMU aarch64 "virt" machine).
  *
  * x86_64 reaches virtio-blk over legacy virtio-PCI (kernel/dev/virtio_blk.c,

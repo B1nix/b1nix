@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * USB Ethernet gadget on a Synopsys DWC3 — the phone end of a USB cable.
  *

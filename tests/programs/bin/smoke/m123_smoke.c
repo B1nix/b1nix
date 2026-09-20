@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * m123_smoke — namespaces complete enough for containers (M123).
  *

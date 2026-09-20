@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # M40 — build tests/support/linux-abi/linux_abi_test.c into a static Linux x86_64 ELF blob and
 # stamp EI_OSABI = ELFOSABI_LINUX (3), so b1nix's loader tags it with the Linux
 # personality exactly as it does for a stock Linux binary.

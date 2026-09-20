@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M53 userspace VirGL smoke: drive host-GPU-accelerated 3D from USERSPACE
  * through /dev/virtio-gpu. This is the M52 kernel selftest's accelerated clear,
  * but issued by a userspace program over the device's ioctl/mmap ABI — exactly

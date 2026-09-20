@@ -1324,7 +1324,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 print-%:
 	@echo '$($*)'
 
-.PHONY: all analyze objects FORCE iso iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-pku iso-init iso-switchroot iso-live iso-test iso-full check-dynamic iso-pass-chromium-disk iso-pass-chromium-disk-impl \
+.PHONY: all analyze objects FORCE iso iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-pku iso-init iso-switchroot iso-live iso-test iso-full check-dynamic check-license iso-pass-chromium-disk iso-pass-chromium-disk-impl \
 	iso-chromium-min-disk iso-chromium-min-disk-impl \
 	check-ports \
 	userspace userspace-install busybox-package busybox-iso \
@@ -3079,6 +3079,9 @@ check-ports:
 	else \
 		echo "check-ports: OK — no host path leaks in generated .pc files"; \
 	fi
+
+check-license:
+	@sh tools/toolchain/check-license.sh
 
 check-tools:
 	@command -v $(CC) >/dev/null || (echo "missing $(CC)"; exit 1)

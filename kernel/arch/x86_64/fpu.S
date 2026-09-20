@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* kernel/arch/x86_64/fpu.S — x86_64 FPU/SSE state helpers.
  *
  * The kernel itself is built with -mno-sse and never touches the FPU, but

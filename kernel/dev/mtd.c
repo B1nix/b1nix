@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * CFI NOR flash, and the MTD interface over it.
  *

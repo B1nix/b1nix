@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * virtio-net (legacy, port-I/O transport) driver.
  *

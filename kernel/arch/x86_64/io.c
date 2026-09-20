@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/io.h>
 
 void outb(u16 port, u8 value)

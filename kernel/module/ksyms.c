@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Kernel symbols exported to loadable modules (M95).
  *
  * This is the module ABI: every name here is resolvable from a .ko, nothing

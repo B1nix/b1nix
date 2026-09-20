@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* When does a pipe read end?
  *
  * A browser thread was found blocked in pipe_read while every other thread of

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * MTD — raw flash, addressed as flash rather than as a disk.
  *

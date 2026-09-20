@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* /dev/rtc0 — the CMOS real-time clock as a character device (M107).
  *
  * kernel/arch/x86_64/rtc.c reads the CMOS once at boot and from then on the

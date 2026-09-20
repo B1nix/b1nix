@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/toolchain/build-musl.sh - Install musl libc, dev headers, and Linux UAPI headers via Alpine packages.
 set -eu
 

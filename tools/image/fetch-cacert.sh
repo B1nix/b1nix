@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Fetch Mozilla CA bundle (curl-maintained) for initramfs.
 
 set -eu

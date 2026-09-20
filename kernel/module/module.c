@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Loadable kernel module framework (M95/M96).
  *
  * Loads relocatable ELF objects (ET_REL) into the module region, resolves

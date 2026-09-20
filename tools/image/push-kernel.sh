@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Put the kernel that was just built straight into a disk image's ESP.
 #
 #   sh tools/image/push-kernel.sh [IMAGE]

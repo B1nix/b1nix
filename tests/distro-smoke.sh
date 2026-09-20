@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # DISTRO-SMOKE: an installed b1nix boots Debian's systemd, apt works, and a
 # kernel that cannot bring userspace up is fallen back from.
 #

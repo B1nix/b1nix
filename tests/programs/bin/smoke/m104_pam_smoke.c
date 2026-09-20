@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M104 OpenPAM smoke: exercises the REAL, dlopen-capable OpenPAM library
  * (build/<arch>/ports/openpam/install/lib/libpam.so.2, built by
  * tools/ports/build-openpam.sh) against b1nix's own pam_unix.so service

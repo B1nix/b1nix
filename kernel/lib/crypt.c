@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M31: b1nix password hashing.
  *
  * Implements a small, deterministic password-hashing function with a glibc-

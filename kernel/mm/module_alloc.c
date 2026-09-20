@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* module_alloc — the loadable-module virtual address region (M95).
  *
  * Modules live at 0xFFFFFFFFC0000000..+128 MiB, i.e. PML4 slot 511 / PDPT slot

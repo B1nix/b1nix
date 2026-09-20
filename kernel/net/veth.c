@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* veth pairs (M109).
  *
  * A veth is a two-ended cable made of software: what one end transmits, the

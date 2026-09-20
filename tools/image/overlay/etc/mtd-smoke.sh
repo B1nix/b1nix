@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # What a flash chip is, proved rather than assumed.
 #
 # A block device would pass a "write it and read it back" test by accident.

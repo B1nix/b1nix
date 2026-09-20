@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Per-task namespaces: the core (M109, completed in M123).
  *
  * Eight kinds, all real:

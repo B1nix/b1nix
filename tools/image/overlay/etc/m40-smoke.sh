@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # M40: static Linux x86_64 ABI-compat ELF smoke. The binary itself prints
 # every M40-LINUX: ok/fail marker; this wrapper only brackets it with
 # start/done so the smoke harness can tell "never ran" from "ran, some

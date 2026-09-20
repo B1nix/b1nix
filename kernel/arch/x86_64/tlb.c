@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* TLB shootdown (M28 #5). See kernel/include/b1nix/tlb.h.
  *
  * Design: a single global shootdown spinlock serialises requests, a small

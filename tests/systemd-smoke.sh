@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # systemd boot test: boot b1nix with a Debian root filesystem whose PID 1 is
 # Debian's own systemd, headless, console on the serial line.
 #

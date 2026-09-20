@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M53 zlib smoke: prove the ported zlib compiles/decompresses real data on
  * b1nix. Exercises both the one-shot (compress2/uncompress) and streaming
  * (deflate/inflate) APIs — the latter is what libpng and the NetSurf image

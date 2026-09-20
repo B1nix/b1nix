@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/kprof.h>
 #ifndef B1NIX_RWLOCK_H
 #define B1NIX_RWLOCK_H

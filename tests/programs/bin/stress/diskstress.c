@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Filesystem and block-cache churn, with everything read back.
  *
  * The write path is the one place where a bug survives a reboot, so every file

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Intel High Definition Audio (HDA) driver — M38: Sound
  *

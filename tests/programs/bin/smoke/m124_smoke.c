@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * m124_smoke — the modern system calls M124 closes: memfd_secret(2),
  * protection keys and filesystem quotas.

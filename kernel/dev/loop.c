@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/loop.h>
 #include <b1nix/klog.h>
 #include <b1nix/console.h>

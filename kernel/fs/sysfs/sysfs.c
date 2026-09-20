@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* sysfs — synthetic /sys filesystem (M34).
  *
  * Exposes kernel configuration and hardware topology as read-on-demand

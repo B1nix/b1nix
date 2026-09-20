@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* io_uring — the shared submission and completion rings (M125).
  *
  * WHAT THIS IS

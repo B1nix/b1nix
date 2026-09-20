@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # M123: namespaces as distribution tools use them — util-linux's unshare and
 # nsenter, and bubblewrap, all from Alpine and all run by an unprivileged user.
 # Each marker is printed only after every property it names was read back from

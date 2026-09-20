@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * shmshare_smoke — is a shared mapping actually shared between two processes?
  *

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """
 B1NIX Sony Xperia 5 (SM8150 / Bahamut) Android Boot Image v2 Packer
 Combines AArch64 Image + SM8150 Device Tree Blob into bootable Fastboot image.

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Build a Debian (glibc) root filesystem as an ext4 image that b1nix can boot,
 # so the Linux-ABI layer is exercised against a real glibc distribution instead
 # of against our own musl userspace.

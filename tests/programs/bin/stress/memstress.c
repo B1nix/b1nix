@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Heap churn with every block verified.
  *
  * The open compositor failure is musl's own allocator detecting that its

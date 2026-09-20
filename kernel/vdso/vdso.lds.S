@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Layout of the vDSO shared object. Preprocessed with -DVDSO_X86_64 or
  * -DVDSO_AARCH64 before the link.

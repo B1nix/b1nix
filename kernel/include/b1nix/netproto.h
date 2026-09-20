@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Network protocol registration (M96).
  *
  * The core stack (ethernet demux, the net daemon's tick, the loopback drain)

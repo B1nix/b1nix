@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 echo "POSIX-SMOKE: start"
 if ! grep -q 'b1nix.smoke=shell' /proc/cmdline; then
 true && echo "M11-SHELL: ok simple-success"

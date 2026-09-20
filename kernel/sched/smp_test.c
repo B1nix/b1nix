@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M24b SMP work-stealing self-test.
  *
  * Creates a batch of self-contained CPU-bound kernel workers (struct

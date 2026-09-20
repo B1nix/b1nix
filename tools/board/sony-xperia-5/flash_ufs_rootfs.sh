@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Flash the b1nix rootfs to system_a and the kernel boot image to boot_a, then
 # boot slot A. Built by `make bahamut-ufs`.
 #

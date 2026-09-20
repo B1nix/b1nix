@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * M38 Sound Smoke Test — WAV parser/player verification
  *

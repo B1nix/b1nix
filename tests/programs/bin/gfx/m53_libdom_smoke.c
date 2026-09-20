@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M53 libdom smoke: prove the ported NetSurf DOM works on b1nix. libdom builds
  * the document tree the browser lays out and styles; here we drive its libhubbub
  * binding (HTML -> DOM) over a real in-memory document and then navigate/query

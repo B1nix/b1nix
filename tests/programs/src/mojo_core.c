@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* B1NIX Mojo Core Implementation
  * Implements minimal Mojo IPC core over M56/M57 primitives (epoll, eventfd,
  * memfd, socketpair, SCM_RIGHTS).

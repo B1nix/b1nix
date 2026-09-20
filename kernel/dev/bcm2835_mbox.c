@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The VideoCore mailbox — how an ARM core on a Raspberry Pi asks the firmware
  * for anything the ARM side does not own.

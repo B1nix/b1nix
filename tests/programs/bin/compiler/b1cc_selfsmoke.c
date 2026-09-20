@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* b1cc_selfsmoke — M32/M33 on-device proof: /bin/b1cc, running as a B1NIX
  * process, compiles a C source AND links it with its own internal linker (no
  * host ld.lld / b1nix-cc), and the produced executable runs and exits 42.

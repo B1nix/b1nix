@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M31 user security smoke.
  * Written against standard POSIX APIs.
  */

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * ACPI table parser (RSDP -> RSDT/XSDT -> MADT).
  *

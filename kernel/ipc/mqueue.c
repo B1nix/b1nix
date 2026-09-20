@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* POSIX message queues (M123) — mq_open(3) and friends, and the "mqueue"
  * filesystem they live in.
  *

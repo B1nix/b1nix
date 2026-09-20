@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* MINIMAL_INITRAMFS selects a tiny embedded file set (init + native/b1cc smoke
  * binaries only) for the RAM-constrained in-guest self-host build. It is opt-in
  * via the build system (`make MINIMAL_INITRAMFS=1` adds -DMINIMAL_INITRAMFS; the

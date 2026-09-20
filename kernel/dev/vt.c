@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Virtual terminals, console fonts and keymaps — M107.
  *
  * b1nix had exactly one text console. This file turns it into VT 1 of six and

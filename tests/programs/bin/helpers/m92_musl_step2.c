@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * M92: Step 2 musl test — write + printf + malloc. No fork, no pthread.
  * Tests: write syscall, musl stdio formatting, musl malloc.

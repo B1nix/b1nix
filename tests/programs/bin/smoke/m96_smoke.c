@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M96 smoke: network-protocol modules, module parameters and modprobe.
  *
  * Every marker is emitted only after the operation ran AND its result was

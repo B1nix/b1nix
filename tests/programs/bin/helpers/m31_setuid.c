@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M31: setuid binary. Marked INITRAMFS_SETUID in initramfs.c so any
  * execve of this file by a non-root task elevates the new task's euid
  * to the file's owner (uid 0). Body just prints the live uid/euid so

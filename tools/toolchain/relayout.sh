@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Move a path and repoint every reference to it, in one step.
 #
 #   sh tools/toolchain/relayout.sh OLD NEW

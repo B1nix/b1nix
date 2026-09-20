@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M40 — Linux-ABI conformance test, built as a static Linux x86_64 ELF.
  *
  * Companion to tests/support/linux-abi/linux_hello.S: that blob proves a Linux binary boots

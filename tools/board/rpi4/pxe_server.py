@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """
 pxe_server.py — Zero-dependency TFTP Server & Live UART Monitor for Raspberry Pi 4
 """

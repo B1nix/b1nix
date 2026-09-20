@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # M26 kernel self-host: build the btrfs module that lets b1nix compile its own
 # kernel, in-guest, with Alpine's clang and ld.lld.
 #

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M28 #4 — SMP heap-contention benchmark.
  *
  * Measures whether the single global heap_lock serialises kmalloc/kfree across

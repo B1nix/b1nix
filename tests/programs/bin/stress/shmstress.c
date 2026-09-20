@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Shared memory between processes, checked from both ends.
  *
  * A mapping that is meant to be shared and is quietly private looks perfect

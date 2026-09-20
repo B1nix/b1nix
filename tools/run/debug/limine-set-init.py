@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Point a limine.conf's first boot entry at a different init.
 
     limine-set-init.py LIMINE_CONF INIT_PATH

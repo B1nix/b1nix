@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Build a bootable b1nix disk image: a Debian trixie root with the b1nix
 # overlay installed, an ESP carrying Limine and the kernel, and a GPT around
 # the two.

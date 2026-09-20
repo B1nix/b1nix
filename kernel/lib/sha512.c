@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M31: SHA-512 (FIPS 180-4) for password verification in the in-kernel
  * login built-in. Standard 80-round Merkle-Damgård with 64-bit words.
  * Not constant-time — only used to verify static, attacker-known shadow

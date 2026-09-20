@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* System V shared memory — shmget(2), shmat(2), shmdt(2), shmctl(2).
  *
  * A segment is a set of physical frames every attach maps. It belongs to the

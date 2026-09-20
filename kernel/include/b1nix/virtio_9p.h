@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef B1NIX_VIRTIO_9P_H
 #define B1NIX_VIRTIO_9P_H
 

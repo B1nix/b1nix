@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M95 smoke: the loadable-kernel-module framework and the device/filesystem
  * modules built on it.
  *

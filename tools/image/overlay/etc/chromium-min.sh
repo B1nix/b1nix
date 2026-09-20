@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # chromium-min.sh — the smallest browser case, on its own, in seconds.
 #
 # The window run costs ten minutes: fetch packages, start a compositor, wait for

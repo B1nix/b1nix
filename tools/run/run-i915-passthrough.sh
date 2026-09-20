@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Run b1nix with a real Intel GPU handed to it through VFIO.
 #
 # This is how the imported i915 is proved against hardware rather than against

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Host-side model of the Synopsys DWC3 in device mode, for driving
  * kernel/dev/dwc3_gadget.c without the phone.

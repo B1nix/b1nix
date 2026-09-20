@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Boot a real machine on the LAN from this host over PXE, instead of writing a
 # USB stick for every build.
 #

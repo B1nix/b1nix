@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # M32c — host-to-guest SSH over QEMU user-mode networking (hostfwd).
 #
 # This is the "external SSH access" smoke: it boots b1nix in NORMAL mode (no

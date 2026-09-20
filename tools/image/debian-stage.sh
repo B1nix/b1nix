@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # b1nix Debian glibc harness — OUR file, not Debian's.
 #
 # Booted as `init=/b1nix-stage.sh` (PID 1) or run from /etc/inittab under real

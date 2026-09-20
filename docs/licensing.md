@@ -5,14 +5,13 @@ b1nix's own code is under the GNU General Public License, version 2 only
 document is the inventory of third-party material: every component is conveyed
 under its own terms, which this licence does not replace or override.
 
-> **Open question, for the owner to settle.** The `LICENSING.md` this document
-> absorbed said the opposite — that original b1nix code is MIT — while `LICENSE`
-> and the inventory below say GPL-2.0-only, and the kernel imports GPL-2.0
-> source (Linux's filesystems and DRM core) that a MIT claim could not cover.
-> The GPL statement is kept here because it is the one `LICENSE` makes and the
-> one the imported code requires. The MIT text is not deleted from history; it
-> is recorded here so the contradiction is decided deliberately rather than by
-> whichever file someone opens first.
+Version **2 only** — not "or later". b1nix's own code carries
+`SPDX-License-Identifier: GPL-2.0-only` in every file, and a file that carries a
+different tag is third-party and says where it came from. The `LICENSE` text is
+the unmodified GPLv2; the "any later version" sentence inside it is part of that
+text and is not b1nix's offer. The `LICENSING.md` this document absorbed claimed
+original b1nix code was MIT; that claim is withdrawn — it contradicted `LICENSE`
+and could not cover the GPL-2.0 Linux source the kernel imports.
 
 
 This is the complete inventory of the third-party libraries, toolchains,
@@ -27,6 +26,7 @@ runtimes and applications integrated or ported for b1nix.
 | **Linux DRM core** (`drivers/gpu/drm`, `include/drm`, `include/uapi/drm`, `drivers/video/{hdmi,nomodeset}.c`, `drivers/gpu/buddy.c`, `include/linux/gpu_buddy.h`) | `build/src/drm-core-6.18.51/` | Linux 6.18.51, SHA-256 `ba2f60f8…58df613` | MIT (`drivers/gpu/drm`, `include/drm`, the buddy allocator); GPL-2.0 WITH Linux-syscall-note (`include/uapi/drm`) | <https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.51.tar.xz> |
 | **Linux filesystems** (`fs/{btrfs,ext4,jbd2,iomap,quota}`, `fs/mbcache.c`, `lib/{maple_tree,xarray,radix-tree,idr,xxhash}.c`, `lib/{zlib_*,lzo,zstd}`) | `build/src/fs-6.18.51/` | Linux 6.18.51, SHA-256 `ba2f60f8…58df613` | GPL-2.0-only (zstd: BSD-3-Clause OR GPL-2.0) | <https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.51.tar.xz> |
 
+| **Linux io_uring uAPI** (`include/uapi/linux/io_uring.h`) | `kernel/include/b1nix/io_uring_abi.h`, vendored verbatim | Linux 6.18.51 | `GPL-2.0 WITH Linux-syscall-note` OR MIT upstream; MIT taken here | <https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.51.tar.xz> |
 | **Intel i915** (`drivers/gpu/drm/i915`) | `build/src/i915-6.18.51/` | Linux 6.18.51, SHA-256 `ba2f60f8…58df613` | MIT, and the historical X11-style permission grant on the untagged files | <https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.51.tar.xz> |
 
 i915 is staged **only on request** (`make i915-fetch`), and built only when asked
@@ -55,6 +55,32 @@ carried there copied from Linux 6.18.51 and marked as such — `xarray.h`,
 `lib/{xarray,radix-tree,idr,maple_tree}.c`),
 `cleanup.h`, `args.h` and `unaligned.h` — under GPL-2.0, which b1nix's own
 GPL-2.0-only licence is compatible with.
+
+---
+
+## 1a. Third-party files carried in the tree
+
+Everything above is fetched at build time. A short list of files is carried in
+the repository itself, and each keeps the licence it came with:
+
+| File(s) | Origin | License |
+| --- | --- | --- |
+| `kernel/include/b1nix/io_uring_abi.h` | Linux 6.18.51 `include/uapi/linux/io_uring.h`, verbatim | MIT (upstream is `GPL-2.0 WITH Linux-syscall-note` OR MIT) |
+| `kernel/include/linux/{xarray,maple_tree}.h` | Linux 6.18.51, verbatim | GPL-2.0+ |
+| `kernel/include/linux/radix-tree.h` | Linux 6.18.51, verbatim | GPL-2.0-or-later |
+| `kernel/include/linux/idr.h` | Linux 6.18.51, verbatim | GPL-2.0-only |
+| `kernel/include/linux/{cleanup,args,unaligned}.h`, `kernel/include/linux/unaligned/`, `kernel/include/vdso/unaligned.h` | Linux 6.18.51, verbatim | GPL-2.0 |
+| `tools/board/rp2350/{uart-bridge.c,usb-descriptors.c,tusb_config.h}` | pico-sdk / TinyUSB examples | MIT |
+
+`kernel/include/uapi/linux/` and `kernel/include/linux/` otherwise hold b1nix's
+own shims — the guards spell `LKPI_`, the prose is ours — and they are
+`GPL-2.0-only` like the rest. They are not installed into the image, so the
+Linux syscall-note exception, which exists for headers userspace compiles
+against, does not apply to them.
+
+`tools/toolchain/check-license.sh` (also `make check-license`) is the enforcing
+copy of this list: it fails on a source file with no SPDX tag, and on one whose
+tag is neither `GPL-2.0-only` nor the entry recorded for it there.
 
 ---
 

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 .section .text
 .global arch_context_switch
 .type arch_context_switch, %function

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # gen_modules_initramfs.sh <out.inc> <module.ko>...
 #
 # Packages the built loadable kernel modules into the initramfs, together with

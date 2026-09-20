@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* ftrace engine (M36). Holds the trace ring buffer and the GCC/clang
  * instrumentation hooks. This file is NOT compiled with -finstrument-functions
  * (so its own functions are never traced); the hooks are additionally marked

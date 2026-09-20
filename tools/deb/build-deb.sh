@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Build the b1nix overlay packages.
 #
 #   sh tools/deb/build-deb.sh              # every source package

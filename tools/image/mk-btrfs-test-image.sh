@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # A minimal real btrfs filesystem, for the tests that need one.
 #
 # Built rather than committed: a binary blob in the tree is a thing nobody can

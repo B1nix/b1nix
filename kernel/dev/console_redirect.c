@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * TIOCCONS — send the kernel console somewhere else.
  *

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * M63: seccomp-bpf — classic-BPF syscall filtering.
  *

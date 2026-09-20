@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * M92: musl dynamic linking smoke test — verifies the kernel's in-kernel
  * eager dynamic linker can load musl's libc.so and resolve symbols.

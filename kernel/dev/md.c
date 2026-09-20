@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Software RAID: striping and mirroring, as a real block device.
  *

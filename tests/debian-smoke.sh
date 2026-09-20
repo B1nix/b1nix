@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Debian (glibc) boot test: boot b1nix with a real debian:bookworm root
 # filesystem attached as a virtio-blk disk and let the distro's own binaries
 # exercise the Linux-ABI layer.

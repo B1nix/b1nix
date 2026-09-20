@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* kernel/dev/r8169.c — Realtek RTL8169/8168/8111/8101/810xE Gigabit/Fast
  * Ethernet driver (the Linux "r8169" family), plugged into the generic netdev
  * model.

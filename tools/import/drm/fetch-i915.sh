@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Stage Intel's i915 driver for M102a. Opt-in: nothing builds it by default.
 #
 # The DRM core is staged unconditionally because the kernel links it. i915 is

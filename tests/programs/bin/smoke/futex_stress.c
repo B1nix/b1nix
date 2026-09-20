@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Lost-wakeup torture for the futex path.
  *
  * Written after a browser's main thread was found parked forever on a futex

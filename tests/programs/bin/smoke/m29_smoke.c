@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M29 POSIX threads / futex / TLS smoke test.
  *
  * Each phase emits a "M29-PTHREAD: ok <name>" marker on success or

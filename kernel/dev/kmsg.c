@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* /dev/kmsg, /proc/kmsg and syslog(2) — M107.
  *
  * See b1nix/kmsg.h for the shape. The ring holds whole records; console output

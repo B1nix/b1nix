@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Build the ext4 ramdisk that ships inside the Xperia 5 boot image.
 #
 # The phone has no block device this kernel can drive (UFS is unsupported), so

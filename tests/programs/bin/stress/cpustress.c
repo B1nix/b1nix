@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Scheduler and timekeeping under more runnable threads than cores.
  *
  * Three separate claims are checked, because a scheduler can fail in ways that

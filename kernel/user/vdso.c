@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The vDSO, kernel side: the data page, the embedded image, and mapping both
  * into a process at exec.

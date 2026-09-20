@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef B1NIX_SYSCALL_LINUX_MODERN_H
 #define B1NIX_SYSCALL_LINUX_MODERN_H
 #include <b1nix/types.h>

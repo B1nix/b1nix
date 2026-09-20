@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Just enough of the kernel for kernel/dev/dwc3_gadget.c to build on the host. */
 #ifndef DWC3_MODEL_SHIM_H
 #define DWC3_MODEL_SHIM_H

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Process creation, execution and reaping, at speed and from many threads.
  *
  * Forking from a multithreaded process is the hard case and the one the

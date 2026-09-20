@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Build the image an imported filesystem is tested against.
 #
 #   make-lkpi-image.sh btrfs|ext4 [out.img]

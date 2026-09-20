@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # check-module-syms.sh <module.ko>...
 #
 # Every undefined symbol of a built module must be resolvable at insmod time,

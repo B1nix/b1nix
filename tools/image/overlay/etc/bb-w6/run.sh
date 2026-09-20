@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 BB=/bin/busybox
 echo "BB-W6: start accounts"
 

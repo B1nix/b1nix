@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * framecheck — did the compositor actually paint the colour it was told to?
  *

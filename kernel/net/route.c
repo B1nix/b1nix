@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M84: forwarding information base (FIB), IPv4 and IPv6.
  *
  * Before this the IP layer had no routing table at all: ipv4_send() assumed a

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * M98 T1 — netconsole: the kernel log shipped as UDP datagrams.
  *

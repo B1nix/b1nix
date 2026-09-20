@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/ktime.h>
 #include <b1nix/console.h>
 /* procfs — synthetic /proc filesystem (M34).

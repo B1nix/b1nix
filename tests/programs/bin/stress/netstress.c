@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* The socket layer under concurrent load, over every transport in the image.
  *
  * Loopback rather than the wire: the question is whether the kernel's socket,

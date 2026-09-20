@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * fpu_ctx_smoke — vector register state across context switches.
  *

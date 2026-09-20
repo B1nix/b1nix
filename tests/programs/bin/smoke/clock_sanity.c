@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Does the clock a browser schedules on actually move?
  *
  * Chromium — like anything with an event loop — decides when work is due by

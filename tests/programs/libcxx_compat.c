@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Shims and compatibility helpers for running LLVM libc++ against musl libc on b1nix. */
 #include <stddef.h>
 

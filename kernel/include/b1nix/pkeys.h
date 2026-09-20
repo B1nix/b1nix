@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef B1NIX_PKEYS_H
 #define B1NIX_PKEYS_H
 /* Memory protection keys: pkey_alloc(2), pkey_free(2), pkey_mprotect(2).

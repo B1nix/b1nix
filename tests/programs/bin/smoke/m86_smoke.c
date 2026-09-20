@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M86 smoke: per-thread CPU accounting, thread-directed signals, and
  * pthread_exit return values.
  *

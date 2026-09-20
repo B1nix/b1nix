@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/image/stamp-root-modes.sh - the setuid and private modes a root needs.
 #
 #   stamp-root-modes.sh ROOTFS

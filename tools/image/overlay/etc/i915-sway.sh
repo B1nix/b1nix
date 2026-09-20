@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 
 # i915-sway.sh — sway on the real display, through the passed-through GPU.
 #

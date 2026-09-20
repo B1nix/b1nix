@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M49: prove the upstream libwayland-client API against displayd. */
 #include <stdio.h>
 #include <string.h>

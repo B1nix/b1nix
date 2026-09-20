@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # run-debian-graphics.sh — boot the Debian graphics image on this kernel and
 # photograph its scanout from the host.
 #

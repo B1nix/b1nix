@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * m13_smoke — userspace ABI, libc, stdio, execve, argv/envp, fd inheritance.
  * Rewritten to use POSIX API (no b1nix raw syscalls).

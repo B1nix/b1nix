@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # kde-boot-time.sh — how long the KDE image takes to reach its desktop.
 #
 # Boots the KDE root image N times with one kernel and prints, per boot, the

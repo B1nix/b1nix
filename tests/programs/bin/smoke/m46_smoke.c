@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M46 smoke: VFS integrity + POSIX process-conformance fixes.
  * Covers: exit-status encoding vs signal death, kill(0)/kill(-1), waitpid on
  * a process group, setpgid POSIX errnos, getpgid, nice/getpriority,

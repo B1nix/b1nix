@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * m127_smoke — cgroup v2 resource control: the memory, cpu, io and pids
  * controllers, the OOM killer that chooses by cgroup and oom_score_adj, and

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* gdbstub — serial-port GDB remote stub (M36).
  *
  * Implements the GDB Remote Serial Protocol (RSP) over COM1 so a host

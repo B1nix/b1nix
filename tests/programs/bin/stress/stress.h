@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Shared scaffolding for the soak stressors.
  *
  * Every program here is run in a loop for hours, so three properties matter

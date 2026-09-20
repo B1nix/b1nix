@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * m22_smoke — utility smoke tests (pwd, ls, cp, ln, readlink, lstat,
  * grep, date, uname, id, whoami, ps, head, tail, wc, tree, path-norm,

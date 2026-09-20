@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/lapic.h>
 #include <b1nix/io.h>
 #include <b1nix/serial.h>

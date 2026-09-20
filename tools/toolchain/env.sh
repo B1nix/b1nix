@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/toolchain/env.sh
 #
 # Shared, POSIX-sh sourceable helper that resolves the per-architecture build

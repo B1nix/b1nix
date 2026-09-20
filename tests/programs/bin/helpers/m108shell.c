@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M108: the login shell of the m108user account. It exists so the su smoke can
  * tell "su ran THE ACCOUNT'S shell" from "su ran whatever shell it inherited":
  * only this binary prints the line below, and only /etc/passwd points at it.

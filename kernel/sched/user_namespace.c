@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* User namespaces (M123): id maps and namespace-relative capabilities.
  *
  * See <b1nix/user_namespace.h> for the model. The maps are written once, from

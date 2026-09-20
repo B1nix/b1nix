@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 .section .text
 .global vector_table_el1
 .global x86_user_jump

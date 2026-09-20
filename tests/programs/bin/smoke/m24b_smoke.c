@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M24b BKL proof: several CPU-bound userspace processes that sample which core
  * they run on. A SINGLE busy process is never migrated — it stays RUNNING on
  * the BSP, and an AP can only claim a task that is READY, so proving AP

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * BCM2711 EMMC2 — the SD card controller a Raspberry Pi 4 boots from.
  *

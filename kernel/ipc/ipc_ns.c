@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* What every System V IPC object shares: the namespace it lives in and the
  * permission rules Linux's ipc/util.c applies to it (M123). */
 

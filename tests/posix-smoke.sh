@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # POSIX Smoke Test for B1NIX — M11 Shell & Utilities
 # Each test emits a deterministic marker on success.
 # Tests are ordered from simple to complex so failures are easy to isolate.

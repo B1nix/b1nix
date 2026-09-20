@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M108 smoke: BusyBox owns su, passwd and init.
  *
  * Every marker is emitted only after the operation ran AND its result was

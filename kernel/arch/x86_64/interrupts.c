@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/input.h>
 #include <b1nix/virtio_console.h>
 #include <b1nix/arch_x86_64.h>

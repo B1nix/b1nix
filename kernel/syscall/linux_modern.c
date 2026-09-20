@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * System calls Linux added after the table b1nix's ABI layer was built from:
  * memory policy, protection keys, sched_setattr, kcmp, pidfd_getfd,

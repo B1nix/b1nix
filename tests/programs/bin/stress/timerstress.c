@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* What a timer actually waits, measured against the clock it was set from.
  *
  * A compositor asks for the next frame in sixteen milliseconds and then waits

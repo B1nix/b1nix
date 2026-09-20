@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M53 libcss smoke: prove the ported NetSurf CSS engine works on b1nix. libcss
  * lexes/parses CSS and runs the cascade/selection that gives the DOM its
  * computed styles. It interns through libwapcaplet and parses input through

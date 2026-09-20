@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Count what is actually in a frame QEMU dumped from the guest's scanout.
 
 A screendump of a display that never drew is not empty -- it is a solid

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Interrupts-off accounting for the kernel profiler (b1nix.sysprof).
  *
  * The tick sampler charges a delayed tick to the instruction that re-enabled

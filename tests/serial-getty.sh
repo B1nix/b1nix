@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # M39 — end-to-end serial getty/login session over COM1.
 #
 # Boots b1nix in NORMAL mode (no in-kernel test suite). The inittab supervisor

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Install an Alpine package into a build prefix, instead of building it here.
 #
 # Most of tools/ports/ rebuilds, from source, on every fresh checkout, software

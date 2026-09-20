@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * m110_9p_smoke — VirtIO-9P (9P2000.L) filesystem smoke test.
  */

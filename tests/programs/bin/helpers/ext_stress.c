@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * ext_stress — ext4 filesystem stress test (mkdir/open/write/symlink/link/
  * rename/unlink/rmdir cycle).  Ported from deleted kernel/user/programs.c

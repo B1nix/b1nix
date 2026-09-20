@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # M123: a rootless container with Alpine's podman and crun, started by an
 # ordinary user. podman takes the user's subordinate ids through newuidmap, and
 # crun builds the namespaces, the mounts and the pivot inside them; the marker

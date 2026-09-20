@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # On-demand M41 check: prove that the x86_64 kernel uses a 16 GiB firmware map.
 
 set -eu

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Qualcomm restart reasons: reboot(LINUX_REBOOT_CMD_RESTART2, "bootloader").
  *

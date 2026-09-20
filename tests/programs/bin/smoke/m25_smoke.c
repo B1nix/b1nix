@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* The native C compiler is b1cc (M98 retired the TCC port).
  *
  * --target is passed explicitly: without it b1cc does not select its native

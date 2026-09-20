@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Fail the build when a statically linked executable lands in the rootfs.
 #
 # b1nix links everything dynamically against the one-blob musl libc.so, the way

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Stage Alpine's OpenRC into the root filesystem, with the b1nix test-image
 # configuration from tools/image/openrc on top.
 #

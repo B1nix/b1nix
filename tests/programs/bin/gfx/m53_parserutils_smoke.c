@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M53 libparserutils smoke: prove the ported NetSurf input/charset library
  * works on b1nix. libparserutils sits under libhubbub/libcss/libdom — every
  * byte of HTML/CSS the browser parses flows through its input streams and its

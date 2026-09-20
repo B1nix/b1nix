@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M80 smoke: /proc/<pid>/task, /proc/<pid>/{auxv,mem} and crashpad-shaped
  * crash capture.
  *

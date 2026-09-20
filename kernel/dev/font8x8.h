@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef FONT8X8_H
 #define FONT8X8_H
 

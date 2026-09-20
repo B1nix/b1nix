@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/lapic.h>
 #include <b1nix/lockdep.h>
 #include <b1nix/runqueue.h>

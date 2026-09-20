@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Print the licence of every Alpine package the image ships, from the package
 # index itself.
 #

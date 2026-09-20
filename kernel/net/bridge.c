@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Software ethernet bridge (M109).
  *
  * A bridge is a struct netdev with ports. What makes it a bridge rather than a

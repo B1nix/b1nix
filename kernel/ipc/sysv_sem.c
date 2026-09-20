@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* System V semaphores — semget(2), semop(2), semtimedop(2), semctl(2).
  *
  * A set is an array of counting semaphores operated on atomically: either the

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/toolchain/copy-if-changed.sh - copy files into the staging rootfs, but only the
 # ones whose contents actually differ.
 #

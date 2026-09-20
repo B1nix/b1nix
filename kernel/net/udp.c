@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/namespace.h>
 #include <b1nix/net.h>
 #include <b1nix/netproto.h>

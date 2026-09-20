@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * M92-LDSO: userspace ld.so smoke test (musl-port.md).
  *

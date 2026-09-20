@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* selfhost_build — replay the host kernel build inside b1nix (M26).
  *
  * /mnt/build/cmds.txt holds one compile per line and /mnt/build/link.txt the

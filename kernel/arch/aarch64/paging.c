@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/cgroup.h>
 #include <b1nix/psi.h>
 #include <b1nix/vfs.h>

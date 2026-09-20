@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M53 libwapcaplet smoke: prove the ported NetSurf string-internment library
  * works on b1nix. libwapcaplet is the lowest layer of the NetSurf browser lib
  * chain (libcss/libdom intern every selector and attribute name through it).

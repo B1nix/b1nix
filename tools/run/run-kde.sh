@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # run-kde.sh — boot the KDE image and photograph its scanout from the host.
 #
 # The picture is taken with the QEMU monitor's `screendump`, which reads the

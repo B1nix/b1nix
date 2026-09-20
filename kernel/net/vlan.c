@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* 802.1Q VLAN devices (M109).
  *
  * A vlan device is a struct netdev stacked on a real one: everything it

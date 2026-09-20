@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * m11_pipe_smoke — pipe EOF, nonblocking read/write tests.
  * Ported from deleted kernel/user/programs.c (in-kernel shell pipe tests).

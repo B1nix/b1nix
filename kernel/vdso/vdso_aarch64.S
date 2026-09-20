@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The vDSO's two machine-level helpers on aarch64: the system call it falls
  * back to, and the counter read. Both are leaf functions with standard CFI so

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * m24_stress — scheduler stress: sequential spawn-wait of /bin/true across
  * 24 iterations to verify task slot recycling under load.

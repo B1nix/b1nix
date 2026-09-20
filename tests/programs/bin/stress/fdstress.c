@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Descriptor-table churn: many kinds of file, opened and closed at speed.
  *
  * A descriptor table is shared between threads and rewritten on every open and

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M53 libjpeg smoke: prove the ported IJG libjpeg encodes and decodes real JPEG
  * data on b1nix. Builds a smooth 16x16 RGB gradient, compresses it to an
  * in-memory JPEG (jpeg_mem_dest), then decompresses it back (jpeg_mem_src) — the

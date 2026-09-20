@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Boot the b1nix disk image and print what the guest reported.
 #
 #   sh tools/run/run-distro.sh [IMAGE] [-- extra qemu args...]

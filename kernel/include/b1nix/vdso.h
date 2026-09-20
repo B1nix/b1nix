@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The vDSO: clock readings a process takes without entering the kernel.
  *

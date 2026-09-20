@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # Turn the built .debs into a signed, static apt repository -- a directory tree
 # that can be served by GitHub Pages, a web server or file:// with no software
 # behind it.

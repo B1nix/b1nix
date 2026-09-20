@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* coredump — ELF core dump generation on fatal signals (M35).
  *
  * When a user process dies on a fatal CPU-fault signal (SIGSEGV/SIGABRT/

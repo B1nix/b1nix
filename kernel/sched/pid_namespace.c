@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* PID namespaces (M109, completed in M123).
  *
  * The kernel numbers tasks once, globally, with ids that are never reused. A

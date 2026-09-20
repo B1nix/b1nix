@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Does /proc/self/fd tell a process the truth about its own descriptors?
  *
  * A multi-process program closes what it does not want a helper to inherit by

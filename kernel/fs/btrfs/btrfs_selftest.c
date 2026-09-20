@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* btrfs read checks.
  *
  * In the kernel rather than in the driver module on purpose: the test drives

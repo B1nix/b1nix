@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The AGP GMCH aperture, which b1nix does not drive.
  *

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M51 rung 0: verify the ported libm (openlibm) actually computes at runtime.
  * Inputs are volatile so the compiler cannot constant-fold the calls away —
  * this is exactly the path the old recursive-inline math.h turned into a

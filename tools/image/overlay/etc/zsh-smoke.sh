@@ -1,4 +1,5 @@
 #!/bin/zsh
+# SPDX-License-Identifier: GPL-2.0-only
 # Feature coverage for the interactive shell, which is zsh since M98 retired
 # GNU bash. Every check below is the zsh equivalent of what BASH-SMOKE used to
 # assert, so the shell swap does not quietly lose coverage: arrays, [[ ]] glob

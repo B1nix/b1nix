@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* State shared by the namespace core (namespace.c), PID namespaces
  * (pid_namespace.c) and user namespaces (user_namespace.c). Nothing outside
  * those three files includes this. */

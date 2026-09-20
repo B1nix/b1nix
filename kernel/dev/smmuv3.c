@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * ARM SMMUv3 — the DMA remapping unit in front of this board's PCIe devices.
  *

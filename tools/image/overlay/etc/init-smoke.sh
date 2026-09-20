@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # M108: init smoke hook, run by /etc/inittab as a `::wait:` action — i.e. by
 # PID 1 itself, after `openrc default` has finished. On any boot that is not the
 # init smoke instance this exits immediately and changes nothing.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * net_smoke — network smoke tests ported from deleted kernel/user/programs.c.
  * Tests: ping gateway (NET-SMOKE), UDP send/recv (UDP-SMOKE),

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* The new mount API — fsopen, fsconfig, fsmount, open_tree, move_mount and
  * mount_setattr.
  *

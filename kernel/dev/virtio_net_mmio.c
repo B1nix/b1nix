@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* virtio-net over the virtio-mmio transport (QEMU aarch64 "virt" machine).
  *
  * The mmio counterpart of kernel/dev/virtio_net.c, exactly as

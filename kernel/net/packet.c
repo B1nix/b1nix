@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* AF_PACKET — ethernet frames as they appear on the wire.
  *
  * A packet socket is the one way a program can see or send a frame the IP

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/pkeys.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/arch.h>

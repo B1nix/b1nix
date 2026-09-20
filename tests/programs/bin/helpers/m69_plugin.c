@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * m69_plugin.c — a real shared object dlopen'd at runtime by the M69 smoke.
  *

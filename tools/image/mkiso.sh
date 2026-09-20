@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/image/mkiso.sh - build a bootable b1nix ISO with the Limine bootloader.
 #
 # Replaces grub-mkrescue (GPLv3) with Limine (BSD-2-Clause) + xorriso: it stages

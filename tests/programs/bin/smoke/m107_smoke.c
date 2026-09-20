@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M107 smoke: the kernel subsystems BusyBox applets were blocked on.
  *
  * Every marker is emitted only after the operation ran AND its result was

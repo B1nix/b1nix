@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * UFS — Universal Flash Storage, the internal storage of every recent phone.
  *

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * lock_smoke — POSIX fcntl file locking tests.
  * Ported from deleted kernel/user/programs.c lock_smoke_main().

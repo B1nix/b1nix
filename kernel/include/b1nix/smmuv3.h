@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * ARM SMMUv3: the DMA remapping unit of an arm64 system-on-chip.
  *

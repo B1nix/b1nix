@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M30 PIE smoke. Compiled with -fPIC -pie so the linker emits ET_DYN with
  * R_X86_64_RELATIVE relocations. The in-kernel loader picks a load base
  * (`PIE_LOAD_BASE` in process.c), offsets every PT_LOAD vaddr by that

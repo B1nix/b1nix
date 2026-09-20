@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/image/mk-root-image.sh - pack the staging root into a filesystem image.
 #
 #   ROOT_FS=btrfs|ext4 mk-root-image.sh ROOTFS IMAGE SIZE_MB

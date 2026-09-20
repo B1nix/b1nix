@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* M51: Wayland clipboard (wl_data_device selection) round-trip. Opens two
  * connections to displayd: A owns the selection (a data_source), B reads it
  * back through a pipe. Exercises set_selection -> data_offer -> receive ->
