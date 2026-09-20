@@ -4482,7 +4482,8 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
 #if defined(__x86_64__)
     /* A framebuffer the display engine reads straight from memory: the
      * compositor's stores must not sit in the cache (see mmap_wc). */
-    if (node->inode->mmap_wc && pat_available())
+    if (node->inode->mmap_wc && pat_available() &&
+        bootinfo_get_u32("b1nix.drm-mmap-wc", 1))
       dev_flags |= VMM_WC;
 #endif
     for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {

@@ -905,8 +905,11 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 		timeout 900 /usr/bin/kwin_wayland --drm --socket wayland-1 \
 			--no-lockscreen > /tmp/kde-kwin.log 2>&1 &
 		KWINPID=$!
+		# Up to a minute: a monitor still waking from deep sleep answers
+		# its DDC late, the kernel polls the port for it, and kwin brings
+		# the output up when the hotplug arrives.
 		w=0
-		while [ $w -lt 750 ]; do
+		while [ $w -lt 3000 ]; do
 			[ -S /run/user/0/wayland-1 ] && break
 			kill -0 $KWINPID 2>/dev/null || break
 			usleep 20000

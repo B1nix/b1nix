@@ -29,6 +29,7 @@
 #include <linux/errno.h>
 #include <linux/i2c.h>
 #include <linux/i2c-algo-bit.h>
+#include <linux/ktime.h>
 #include <linux/printk.h>
 #include <lkpi/env.h>
 
@@ -200,6 +201,7 @@ static int bit_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 {
 	struct i2c_algo_bit_data *bit = adap ? adap->algo_data : 0;
 	int i, ret = 0;
+	u64 t0 = ktime_get_ns();
 
 	if (!bit || !bit->setsda || !bit->setscl)
 		return -ENODEV;
@@ -289,6 +291,13 @@ out:
 	if (bit->post_xfer)
 		bit->post_xfer(adap);
 
+	{
+		u64 ms = (ktime_get_ns() - t0) / 1000000ull;
+
+		if (ms >= 20 || ret < 0)
+			pr_info("lkpi: bit-bang i2c: %d msgs, %llu ms, ret %d\n", num,
+			        (unsigned long long)ms, ret);
+	}
 	return ret;
 }
 

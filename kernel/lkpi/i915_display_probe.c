@@ -29,6 +29,7 @@
 #include "display/intel_display_power.h"
 #include "display/intel_cdclk.h"
 #include "display/intel_gmbus_regs.h"
+#include "display/intel_hotplug.h"
 #include "display/intel_cdclk.h"
 #include "i915_reg.h"
 #include "intel_uncore.h"
@@ -1874,10 +1875,14 @@ static int fc_copy_page(struct i915_ggtt *ggtt, u32 addr, u8 *dst)
 
 	if (!src)
 		return -1;
-	for (l = 0; l < 4096; l += 64)
-		asm volatile("clflush (%0)" :: "r"(src + l) : "memory");
-	asm volatile("mfence" ::: "memory");
-	memcpy(dst, src, 4096);
+	/* Line by line, flush then copy at once: flushing the whole page first
+	 * and copying afterwards gave a hardware prefetcher time to bring a line
+	 * back from the cache instead of from memory, and the copy then showed
+	 * stale 32-byte runs that were never on the panel. */
+	for (l = 0; l < 4096; l += 64) {
+		asm volatile("clflush (%0)\n\tmfence" :: "r"(src + l) : "memory");
+		memcpy(dst + l, src + l, 64);
+	}
 	return 0;
 }
 
@@ -2426,6 +2431,62 @@ void lkpi_i915_dump_infoframes(struct drm_device *dev)
  * Linux's edid_firmware option does. This prints them in a form that can be
  * pasted back into a build.
  */
+/*
+ * The EDID bytes as they come off the wire, whatever DRM thinks of them.
+ *
+ * drm_edid_read() keeps only a block that passes its checksum, so a monitor
+ * whose bytes arrive slightly wrong shows up as "disconnected" and nothing
+ * else. This reads the 128-byte base block twice per connector with plain I2C
+ * transfers on the connector's own DDC adapter and prints both, so the wrong
+ * bytes can be seen: a shifted bit, a stuck nibble and a stale byte are
+ * different bus faults. b1nix.i915-edid-raw; runs a few seconds after the
+ * card is up, when the compositor's own probe has already happened.
+ */
+static int i915_edid_raw_thread(void *arg)
+{
+	struct drm_device *dev = arg;
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	int pass;
+
+	lkpi_sleep_ms(8000);
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		if (!connector->ddc)
+			continue;
+		for (pass = 0; pass < 2; pass++) {
+			u8 start = 0, buf[128];
+			struct i2c_msg msgs[2] = {
+				{ .addr = 0x50, .flags = 0, .len = 1, .buf = &start },
+				{ .addr = 0x50, .flags = I2C_M_RD, .len = 128, .buf = buf },
+			};
+			int ret = i2c_transfer(connector->ddc, msgs, 2);
+			unsigned sum = 0, i, col = 0;
+			char line[80];
+
+			for (i = 0; i < 128; i++)
+				sum += buf[i];
+			pr_info("EDIDRAW %s pass %d ret %d sum %02x\n", connector->name,
+			        pass, ret, sum & 0xff);
+			if (ret != 2)
+				continue;
+			for (i = 0; i < 128; i++) {
+				static const char hex[] = "0123456789abcdef";
+
+				line[col++] = hex[buf[i] >> 4];
+				line[col++] = hex[buf[i] & 0xf];
+				if (col >= 64 || i + 1 == 128) {
+					line[col] = 0;
+					pr_info("EDIDRAW %s %s\n", connector->name, line);
+					col = 0;
+				}
+			}
+		}
+	}
+	drm_connector_list_iter_end(&iter);
+	return 0;
+}
+
 void lkpi_i915_dump_edid(struct drm_device *dev)
 {
 	struct drm_connector_list_iter iter;
@@ -3095,6 +3156,8 @@ void lkpi_i915_register_card(struct drm_device *dev)
 
 	lkpi_i915_gmbus_recover(dev);
 	lkpi_i915_apply_power_saving(to_i915_checked(dev)->display);
+	if (lkpi_bootflag("b1nix.i915-edid-raw"))
+		lkpi_fs_kthread_run(i915_edid_raw_thread, dev, "i915-edid-raw");
 
 	/*
 	 * Which south bridge the driver decided it is sitting next to.
@@ -3112,6 +3175,35 @@ void lkpi_i915_register_card(struct drm_device *dev)
 	 */
 	pr_info("i915-probe: pch_type %d\n",
 	        (int)to_i915_checked(dev)->display->pch_type);
+
+	/*
+	 * A monitor that is asleep answers its DDC with nothing, or with garbage,
+	 * for a while after the signal wakes it, and no hotplug says when it has
+	 * recovered: its HPD line never moved. One probe at start then leaves a
+	 * working monitor "disconnected" for the whole session. Linux's answer
+	 * for a port whose hotplug cannot be trusted is to poll it: i915's own
+	 * poll (intel_hpd_poll_enable) marks the connectors POLL_CONNECT |
+	 * POLL_DISCONNECT and the DRM helper re-detects them every ten seconds,
+	 * sending the hotplug event -- to the console client here, and as a
+	 * uevent to the compositor -- when one changes. Enabled when nothing was
+	 * found at probe time, or always with b1nix.i915-hpd-poll.
+	 */
+	{
+		struct drm_connector_list_iter it;
+		struct drm_connector *c;
+		int connected = 0;
+
+		drm_connector_list_iter_begin(dev, &it);
+		drm_for_each_connector_iter(c, &it)
+			if (c->status == connector_status_connected)
+				connected++;
+		drm_connector_list_iter_end(&it);
+		if (!connected || lkpi_bootflag("b1nix.i915-hpd-poll")) {
+			pr_info("i915-probe: %d connector(s) connected at probe, "
+			        "polling the ports for a display\n", connected);
+			intel_hpd_poll_enable(to_i915_checked(dev)->display);
+		}
+	}
 
 	lkpi_drm_register_device(dev, i915_gem_page_phys);
 	lkpi_i915_start_tearwatch(dev);
