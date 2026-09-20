@@ -115,6 +115,28 @@ On that GPU:
 A laptop with a UHD 620 runs the same stack on its own panel, booted over PXE.
 Photos are in `docs/images/`.
 
+Two things the passed-through card needed that the driver does not do on its
+own. Userspace maps a dumb buffer write-combining (`vfs_inode.mmap_wc`, as
+Linux does for i915): with a cacheable mapping the compositor's frame stayed in
+the CPU cache and the display engine read DRAM, which looked like tearing while
+a window was dragged; `b1nix.drm-mmap-wc=0` restores the old mapping for
+comparison. And a monitor waking from deep sleep answers its DDC late while its
+hotplug line never moves, so a probe that finds no display switches on i915's
+port polling (`intel_hpd_poll_enable`): the ports are re-detected every ten
+seconds and the hotplug reaches both the console and the compositor;
+`b1nix.i915-hpd-poll` forces it, `b1nix.i915-edid-raw` prints the EDID bytes as
+they come off the wire.
+
+The instruments that settled those, all command-line flags, are in
+`kernel/lkpi/i915_display_probe.c`: `b1nix.drm-framecap=N` keeps the last N
+frames as they were at the moment the display latched them, with a hash taken
+again at the end of the same frame (a difference is a write into the buffer
+being scanned out) and the bounding box of that write; `b1nix.drm-eventwatch`
+compares the armed and the live surface at every flip completion handed to the
+compositor; `b1nix.drm-cadence` counts the frames each image was held. Their
+verdict on the tearing was: pages consistent (`b1nix.pageaudit`), events never
+early, the surface changing under the display -- the cache, not the driver.
+
 An `uncore->lock` lockup during probe used to hit about one boot in five. It
 did not reproduce in 30 probe-only boots, before or after the latest changes,
 so no fix can be claimed for it. The loop that measures it boots
