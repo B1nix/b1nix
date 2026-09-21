@@ -435,6 +435,15 @@ run_qemu() {
 		# RAM: QEMU's default (128 MiB) starves the graphics tests (setcrtc,
 		# console-reclaim), so the headroom stays.
 		local mem_args="-m ${SMOKE_MEM_MB:-1024}"
+		# A guest larger than the host's RAM: the kernel's own page tables and
+		# allocator metadata for it are megabytes, and nothing touches the rest,
+		# so the memory can be a sparse file on disk. This is how the >64 GiB
+		# claim in M128 is measured on a 27 GiB machine. SMOKE_MEM_FILE names
+		# the backing file; the host's heuristic overcommit refuses an anonymous
+		# mapping that big, which is what "cannot set up guest memory" means.
+		if [ -n "${SMOKE_MEM_FILE:-}" ]; then
+			mem_args="$mem_args -object memory-backend-file,id=bigram,mem-path=${SMOKE_MEM_FILE},size=${SMOKE_MEM_MB:-1024}M,share=on,discard-data=on,prealloc=off -machine memory-backend=bigram"
+		fi
 		# Both x86_64 and aarch64 use 2 vCPUs by default to run PID 1 watchdog
 		# and background daemons (net_task, aio-worker) reliably without starvation.
 		local default_smp=2
@@ -949,6 +958,7 @@ else
 		# repacked seven images (two of them 268 MB), ~10 s, on every kernel
 		# change. What the lanes do use is the kernel and the checked root.
 		LANE_TARGETS="iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-iommu iso-pku iso-init iso-switchroot"
+		[ "${SMOKE_LA57:-0}" = "1" ] && LANE_TARGETS="$LANE_TARGETS iso-la57"
 		[ "$ARCH" = "aarch64" ] && LANE_TARGETS="check-dynamic build/$ARCH/kernel.elf"
 		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
 			$LANE_TARGETS \
@@ -1041,6 +1051,8 @@ _mkimg() {  # mkimg <instance-suffix>
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
     _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg pku; _mkimg smp; _mkimg switchroot
+    [ "${SMOKE_BIGMEM:-0}" = "1" ] && _mkimg bigmem
+    [ "${SMOKE_LA57:-0}" = "1" ] && _mkimg la57
 }
 rm -rf "$_MKIMG_TMPL"
 
@@ -1057,6 +1069,8 @@ SWITCHROOT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-switchroot-$ARCH.log"
 IOMMU_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-iommu-$ARCH.log"
 AMDVI_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-amdvi-$ARCH.log"
 PKU_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-pku-$ARCH.log"
+BIGMEM_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-bigmem-$ARCH.log"
+LA57_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-la57-$ARCH.log"
 RASPI_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-raspi-$ARCH.log"
 
 # Prune leftovers from earlier runs.
@@ -1350,6 +1364,18 @@ launch_posix() {
 		NVME_IMG=$(disk_img nvme posix)
 		SWAP_IMG=$(disk_img swap posix)
 		B1NIX_ISO_NAME=b1nix-posix.iso
+		# Two NUMA nodes, one CPU each, and a distance between them the
+		# firmware states rather than one the kernel assumes (M128). This is
+		# the lane m128_smoke runs in, and it is also the only place the
+		# per-node allocator is exercised by everything else the lane does.
+		# The memory is the lane's usual 1 GiB, split in half.
+		EXTRA_QEMU_ARGS="${EXTRA_QEMU_ARGS:-} \
+			-object memory-backend-ram,id=numa0,size=512M \
+			-object memory-backend-ram,id=numa1,size=512M \
+			-numa node,nodeid=0,memdev=numa0,cpus=0 \
+			-numa node,nodeid=1,memdev=numa1,cpus=1 \
+			-numa dist,src=0,dst=1,val=21"
+		export EXTRA_QEMU_ARGS
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[posix] "
 		run_qemu "$POSIX_LOG"
@@ -1563,6 +1589,59 @@ launch_pku() {
 	pid_pku=$!
 }
 
+# M128: a guest with more RAM than the host has.
+#
+# The direct map, the allocator's metadata and the page tables for 72 GiB are
+# a few tens of megabytes; nothing touches the rest, so the guest's memory can
+# be a sparse file on disk and the boot costs what any other lane's does. The
+# host's heuristic overcommit refuses an anonymous mapping that large, which is
+# what "cannot set up guest memory" means when this is tried without the file.
+#
+# Off by default because it needs ~72 GiB of free disk for the backing file:
+# SMOKE_BIGMEM=1, and SMOKE_BIGMEM_FILE to put the file somewhere with room.
+launch_bigmem() {
+	[ "${SMOKE_BIGMEM:-0}" = "1" ] || return 0
+	(
+		SATA_IMG=$(disk_img sata bigmem)
+		AHCI_IMG=$(disk_img ahci bigmem)
+		NVME_IMG=$(disk_img nvme bigmem)
+		SWAP_IMG=$(disk_img swap bigmem)
+		B1NIX_ISO_NAME=b1nix-sys.iso
+		SMOKE_MEM_MB=${SMOKE_BIGMEM_MB:-73728}
+		SMOKE_MEM_FILE=${SMOKE_BIGMEM_FILE:-$PROJECT_DIR/smoke_run/bigmem-ram.img}
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[bigmem] "
+		run_qemu "$BIGMEM_LOG"
+	) &
+	pid_bigmem=$!
+}
+
+# M128: five-level paging, on a CPU that has it.
+#
+# No machine here does, so this is QEMU's TCG with -cpu max,la57=on, the same
+# way the pku lane gets protection keys. The image is the ordinary sys boot
+# with b1nix.la57 on its command line, because the kernel only enables CR4.LA57
+# when asked. Off by default: TCG runs the whole boot suite in about ten
+# minutes. SMOKE_LA57=1 turns it on.
+launch_la57() {
+	[ "$ARCH" = "aarch64" ] && return 0
+	[ "${SMOKE_LA57:-0}" = "1" ] || return 0
+	(
+		SATA_IMG=$(disk_img sata la57)
+		AHCI_IMG=$(disk_img ahci la57)
+		NVME_IMG=$(disk_img nvme la57)
+		SWAP_IMG=$(disk_img swap la57)
+		B1NIX_ISO_NAME=b1nix-la57.iso
+		SMOKE_ACCEL=${SMOKE_LA57_ACCEL:-"-accel tcg -cpu max,la57=on"}
+		STALL_TIMEOUT=${SMOKE_LA57_STALL:-600}
+		TIMEOUT=${SMOKE_LA57_TIMEOUT:-2400}
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[la57] "
+		run_qemu "$LA57_LOG"
+	) &
+	pid_la57=$!
+}
+
 launch_smp_solo() {
 	(
 		SATA_IMG=$(disk_img sata smp)
@@ -1693,6 +1772,8 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	   qemu-system-aarch64 -machine help 2>/dev/null | grep -q "^raspi4b "; then
 		_inst_list="$_inst_list raspi"
 	fi
+	[ "${SMOKE_BIGMEM:-0}" = "1" ] && _inst_list="bigmem $_inst_list"
+	[ "${SMOKE_LA57:-0}" = "1" ] && _inst_list="la57 $_inst_list"
 	[ -n "${SMOKE_INSTANCES:-}" ] && _inst_list="$SMOKE_INSTANCES"
 	# Drop the logs of every instance this run will not start. Their checks
 	# would otherwise grep the previous run's output and report a pass nobody
@@ -1704,7 +1785,7 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	if [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMOKE_INSTANCES " | grep -q " smp "; then
 		_ran_list="$_ran_list smp"
 	fi
-	for _known in sys sysnet blk posix gfx init switchroot iommu amdvi pku raspi smp; do
+	for _known in sys sysnet blk posix gfx init switchroot iommu amdvi pku bigmem la57 raspi smp; do
 		case " $_ran_list " in
 		*" $_known "*) continue ;;
 		esac
@@ -3069,6 +3150,139 @@ check_output "$POSIX_LOG" "M125-SMOKE: ok pipe-submit-does-not-block" "submittin
 check_output "$POSIX_LOG" "M125-SMOKE: ok pipe-not-complete-yet" "that read has no completion until there is data"
 check_output "$POSIX_LOG" "M125-SMOKE: ok pipe-async" "the armed pipe read completes with the data once it arrives"
 check_output "$POSIX_LOG" "M125-SMOKE: ok async-completion" "a request left armed completes while its owner is in userspace and never re-enters the ring (io_uring_for_each_cqe reads shared memory, so a program that submits and then watches the ring makes no system call at all)"
+
+# ── M128: NUMA topology and memory policy ──
+# The posix lane is started with two nodes (see launch_posix), so the placement
+# checks have somewhere to place things; the topology checks hold on one node
+# too, which is what every other lane is.
+check_output "$POSIX_LOG" "M128-SMOKE: start" "the NUMA smoke starts"
+check_output "$POSIX_LOG" "M128-SMOKE: ok node-online" "/sys/devices/system/node/online lists the nodes the machine has"
+check_output "$POSIX_LOG" "M128-SMOKE: ok node-meminfo" "each node reports its own MemTotal and MemFree, and never more free than it has"
+check_output "$POSIX_LOG" "M128-SMOKE: ok node-distance" "each node's distance row has one entry per node and starts at 10 for itself (SLIT, as numactl prints it)"
+check_output "$POSIX_LOG" "M128-SMOKE: ok node-cpulist" "a node names the CPUs that sit on it"
+check_output "$POSIX_LOG" "M128-SMOKE: ok mems-allowed" "MPOL_F_MEMS_ALLOWED names exactly the nodes /sys lists"
+# The placement checks need a machine with more than one node. The x86_64
+# posix lane is started with two; the aarch64 port has no ACPI, so it has no
+# SRAT to read a topology out of and every machine it runs on is one node.
+if [ "$ARCH" = "aarch64" ]; then
+	check_output "$POSIX_LOG" "M128-SMOKE: one node" "the NUMA smoke says so rather than passing its placement checks for free on a single-node machine"
+	skipped "M128-SMOKE: ok bind-allocates-there" "this port reads no memory topology: SRAT and SLIT are ACPI, and the boards here describe themselves in a device tree (one node)"
+	skipped "M128-SMOKE: ok mbind-range" "same: one node, so there is nowhere to bind a range away to"
+	skipped "M128-SMOKE: ok interleave-spreads" "same: one node, so there is nothing to interleave across"
+else
+	check_output "$POSIX_LOG" "M128-SMOKE: ok bind-allocates-there" "a mapping bound to a node is served from that node — measured by the kernel's own answer per page AND by that node's free memory falling while the other node's does not"
+	check_output "$POSIX_LOG" "M128-SMOKE: ok mbind-range" "mbind binds the part of a mapping it names and leaves the rest, and MPOL_MF_MOVE migrates pages that are already on the wrong node with their contents intact"
+	check_output "$POSIX_LOG" "M128-SMOKE: ok interleave-spreads" "MPOL_INTERLEAVE reaches every node in its mask"
+fi
+check_output "$POSIX_LOG" "M128-SMOKE: ok policy-inherited" "a child reads back the memory policy its parent set"
+check_output "$POSIX_LOG" "M128-SMOKE: ok bad-node-refused" "a policy naming a node the machine does not have, an empty MPOL_BIND mask and an unknown mode are each EINVAL"
+check_output "$POSIX_LOG" "M128-SMOKE: done" "the NUMA smoke completes"
+
+# ── M128: transparent huge pages for anonymous memory ──
+# The feature is off unless the boot line asks for it (b1nix.thp), so the test
+# turns it on for itself through /sys/kernel/mm/transparent_hugepage/enabled
+# and puts the knob back. Where the knob will not move — aarch64, whose
+# page-table walkers have no huge-page support — it reports "mode never" and
+# the checks below are recorded as skipped rather than passed.
+check_output "$POSIX_LOG" "M128-THP: start" "the transparent-hugepage smoke starts"
+check_output "$POSIX_LOG" "M128-THP: ok sysfs" "/sys/kernel/mm/transparent_hugepage publishes the state and a 2 MiB hpage_pmd_size"
+if grep -qa "M128-THP: mode never" "$POSIX_LOG"; then
+	skipped "M128-THP: ok hugepage-backed" "this port installs no huge pages: aarch64's clone, unmap, mprotect and teardown walkers assume every leaf is a 4 KiB page, and a half-audited set of them is silent corruption"
+	skipped "M128-THP: ok data-intact" "same: nothing is 2 MiB-backed here"
+	skipped "M128-THP: ok fork-cow" "same"
+	skipped "M128-THP: ok mprotect-half" "same"
+	skipped "M128-THP: ok munmap-half" "same"
+	skipped "M128-THP: ok nohugepage-splits" "same"
+	skipped "M128-THP: ok no-leak" "same"
+else
+	check_output "$POSIX_LOG" "M128-THP: ok hugepage-backed" "a MADV_HUGEPAGE anonymous mapping reports AnonHugePages in /proc/self/smaps — read out of the page-directory entries themselves, not out of madvise's return value"
+	check_output "$POSIX_LOG" "M128-THP: ok data-intact" "every page of the 2 MiB-backed mapping reads back what was written to it, and the mapping's Rss counts all of it"
+	check_output "$POSIX_LOG" "M128-THP: ok fork-cow" "the data survives a fork, and a copy-on-write write in the child and in the parent leaves each of them with its own bytes"
+	check_output "$POSIX_LOG" "M128-THP: ok mprotect-half" "mprotect over part of a huge-backed range reads back the right bytes, and the rest of the mapping is untouched"
+	check_output "$POSIX_LOG" "M128-THP: ok munmap-half" "munmap of half a 2 MiB block frees only that half and leaves the other half's bytes in place"
+	check_output "$POSIX_LOG" "M128-THP: ok nohugepage-splits" "MADV_NOHUGEPAGE takes a block back apart — AnonHugePages falls to zero and not a byte of the mapping changes"
+	check_output "$POSIX_LOG" "M128-THP: ok no-leak" "eight rounds of mapping, filling and releasing 8 MiB leave the machine's free memory where it started, so no 512-frame block was leaked"
+fi
+check_output "$POSIX_LOG" "M128-THP: done" "the transparent-hugepage smoke completes"
+
+# ── M129: power management ──
+check_output "$POSIX_LOG" "M129-SMOKE: start" "the power-management smoke starts"
+check_output "$POSIX_LOG" "M129-SMOKE: ok loc-counter" "/proc/interrupts reports local timer interrupts (LOC), so how often the machine wakes can be measured at all"
+if [ "$ARCH" = "aarch64" ]; then
+	check_output "$POSIX_LOG" "M129-SMOKE: ok idle-not-worse" "the capped idle timer costs no more than the fixed beat it replaced (this port ticks at 100 Hz, where nearly every wakeup already asks for about a tick, so there is little for the cap to save)"
+else
+	check_output "$POSIX_LOG" "M129-SMOKE: ok idle-is-quiet" "an idle second costs well under what the fixed beat would: the timer really is programmed for the next deadline"
+fi
+check_output "$POSIX_LOG" "M129-SMOKE: ok idle-measured" "an idle second's timer interrupts are counted (the number itself depends on b1nix.dynticks, and the log prints it)"
+check_output "$POSIX_LOG" "M129-SMOKE: ok busy-still-ticks" "a CPU with work to do still takes its timer interrupts, so nothing goes unpreempted"
+check_output "$POSIX_LOG" "M129-SMOKE: ok cpufreq-honest" "cpufreq names the driver the machine really has, offers only governors that driver can honour, and reports a frequency (a guest whose hypervisor hides the power-management leaves says \"none\" rather than offering a governor that moves nothing)"
+check_output "$POSIX_LOG" "M129-SMOKE: ok cpuidle-sysfs" "/sys/devices/system/cpu/cpu0/cpuidle/state0 names the idle state this machine really uses and its counters move"
+check_output "$POSIX_LOG" "M129-SMOKE: done" "the power-management smoke completes"
+
+# ── M129: suspend (s2idle behind /sys/power/state) ──
+check_output "$POSIX_LOG" "M129-SUSPEND: start" "the suspend smoke starts"
+check_output "$POSIX_LOG" "M129-SUSPEND: ok state-lists-freeze" "/sys/power/state names the states this machine really has, and freeze is one of them"
+check_output "$POSIX_LOG" "M129-SUSPEND: ok unknown-state-refused" "a state the machine does not have is refused with EINVAL rather than accepted and ignored"
+check_output "$POSIX_LOG" "M129-SUSPEND: ok freeze-without-alarm" "a suspend with no alarm armed still returns and leaves the machine working — a keypress is a wake source, and refusing to suspend a laptop because nobody set an alarm would be the wrong behaviour to lock in"
+check_output "$POSIX_LOG" "M129-SUSPEND: ok alarm-armed" "RTC_WKALM_SET arms the alarm a few seconds ahead of the hardware clock"
+check_output "$POSIX_LOG" "M129-SUSPEND: ok slept-the-interval" "the write to /sys/power/state blocked for about the interval the alarm was armed for -- the machine waited for the wake instead of returning at once"
+check_output "$POSIX_LOG" "M129-SUSPEND: ok child-frozen" "a child that does nothing but spin has a hole of that length in its OWN CLOCK_MONOTONIC timeline: userspace really stopped running"
+check_output "$POSIX_LOG" "M129-SUSPEND: ok child-runs-again" "the thaw puts it back: the same child is counting again after the resume"
+check_output "$POSIX_LOG" "M129-SUSPEND: ok rtc-irq-counted" "/proc/interrupts RTC row moved, so the alarm interrupt was really routed, taken and acknowledged (IRQ 8 on x86_64 interrupted nothing at all before M129)"
+check_output "$POSIX_LOG" "M129-SUSPEND: ok machine-alive" "after the resume a file round-trip, a fork that is waited for and a syscall all still work"
+check_output "$POSIX_LOG" "M129-SUSPEND: done" "the suspend smoke completes"
+check_output "$POSIX_LOG" "power: freeze," "the kernel reports the freeze, how many tasks it is holding and which wake source is armed"
+
+# ── M134: the AML interpreter, on the firmware's own bytecode ──
+#
+# Every check below is against QEMU's real DSDT and SSDTs, not a fixture. The
+# battery and thermal rows are deliberately two-sided: this machine's firmware
+# declares neither, so "no-battery" and "no-thermal-zone" are the expected
+# outcomes HERE, while a machine that has them must publish working files.
+check_output "$POSIX_LOG" "M134-AML: start" "the AML smoke starts"
+check_output "$POSIX_LOG" "M134-AML: ok namespace-roots" "the namespace has the predefined roots the ACPI specification requires an OS to create (\\_SB_, \\_GPE, \\_SI_)"
+if [ "$ARCH" = "x86_64" ]; then
+	check_output "$POSIX_LOG" "M134-AML: ok dsdt-loaded" "the DSDT was found through the FADT and decoded; /proc/b1nix-acpi names it"
+	check_output "$POSIX_LOG" "M134-AML: ok namespace-size" "the loader built hundreds of objects out of the byte stream, not the handful this kernel predefines -- a parser that gave up early cannot pass this"
+	check_output "$POSIX_LOG" "M134-AML: ok devices-found" "the firmware's Device() declarations became devices in the namespace"
+	check_output "$POSIX_LOG" "M134-AML: ok s5-sleep-type" "\\_S5_ evaluates to a sleep package whose first element is the three-bit SLP_TYP this machine wants for soft-off -- the value a kernel powers the machine off with, and one only an evaluator can produce"
+	check_output "$POSIX_LOG" "M134-AML: ok pci0-hid" "\\_SB_.PCI0._HID reads back as the compressed EISA id of a PCI host bridge (PNP0A03 or PNP0A08) and nothing else"
+	check_output "$POSIX_LOG" "M134-AML: ok pci0-crs" "\\_SB_.PCI0._CRS is a resource template: a Buffer object that ends in the small end tag"
+	check_output "$POSIX_LOG" "M134-AML: ok method-with-args\|M134-AML: ok method-args-absent" "a firmware method called WITH AN ARGUMENT runs: CSTA(n) writes the CPU selector to its SystemIO operation region and reads the enabled bit back, answering 0x0F for a processor that exists and 0 for one that does not (or the marker saying this firmware has no such method)"
+	check_output "$POSIX_LOG" "M134-AML: ok pci-config-refused\|M134-AML: ok pci-config-absent" "an operation region in an address space this interpreter does not implement (PCI config, here the PIIX link devices' routing registers) is REFUSED: the evaluation fails with region-refused rather than answering a plausible number"
+	check_output "$POSIX_LOG" "M134-AML: ok refusal-recorded\|M134-AML: ok pci-config-absent" "the refusal is recorded in /proc/b1nix-acpi, so a machine whose firmware needs an address space this kernel lacks says which one"
+	check_output "$POSIX_LOG" "M134-AML: ok no-battery\|M134-AML: ok battery-sysfs" "the battery sysfs agrees with the firmware: QEMU declares no ACPI battery, so /sys/class/power_supply is empty rather than showing an invented one"
+	check_output "$POSIX_LOG" "M134-AML: ok no-thermal-zone\|M134-AML: ok thermal-sysfs" "the thermal sysfs agrees with the firmware: no thermal zone with a _TMP means no /sys/class/thermal/thermal_zone0"
+else
+	check_output "$POSIX_LOG" "M134-AML: ok no-acpi-firmware" "a machine with no ACPI at all -- every board on this architecture -- reports exactly that: the interpreter is there, it built only the predefined roots, and it publishes no battery and no thermal zone rather than inventing either"
+fi
+check_output "$POSIX_LOG" "M134-AML: done" "the AML smoke completes"
+check_absent "$POSIX_LOG" "M134-AML: fail" "no AML check failed"
+
+# M128: the >64 GiB claim, when the bigmem lane ran (SMOKE_BIGMEM=1). The
+# numbers are read from the kernel's own report, and the lane has to reach the
+# end: a machine that boots and then dies in a driver reaching through a direct
+# map that no longer covers its BAR is not a machine that supports the memory.
+if [ "${SMOKE_BIGMEM:-0}" = "1" ]; then
+	_bigmem_mb=$((${SMOKE_BIGMEM_MB:-73728} - 1))
+	check_output "$BIGMEM_LOG" "pmm: firmware RAM $_bigmem_mb MiB" "the allocator sees every megabyte of a guest larger than 64 GiB"
+	check_output "$BIGMEM_LOG" "nvme: controller enabled" "a PCI device whose 64-bit BAR sits above the direct map is still reachable (that is where the first 72 GiB boot faulted)"
+	check_output "$BIGMEM_LOG" "B1NIX-TEST: done" "the large-memory guest runs the whole boot suite to the end"
+else
+	skipped "pmm: firmware RAM (bigmem lane)" "off by default: it needs ~72 GiB of free disk for the guest's backing file — SMOKE_BIGMEM=1 runs it"
+fi
+
+# M128: five-level paging, when the la57 lane ran (SMOKE_LA57=1). CR4 is read
+# back rather than assumed, and the lane has to finish the whole boot suite:
+# the interesting failures of a paging change are not at the switch, they are
+# in the fork, the shootdown and the teardown that come after it.
+if [ "${SMOKE_LA57:-0}" = "1" ] && [ "$ARCH" != "aarch64" ]; then
+	check_output "$LA57_LOG" "paging: 5-level (LA57) enabled, cr4=0x0000000000001020" "CR4.LA57 is set and read back on a CPU that has five-level paging"
+	check_output "$LA57_LOG" "SMP-CPUSTATE: ok cr0/cr4/xcr0/efer/pat identical" "every CPU agrees on the number of paging levels (an AP that left LA57 clear would walk the PML5 as a PML4)"
+	check_output "$LA57_LOG" "B1NIX-TEST: done" "the whole boot suite runs with five-level paging"
+elif [ "$ARCH" != "aarch64" ]; then
+	skipped "paging: 5-level (LA57) enabled" "off by default: no host CPU here has LA57, so the lane runs under TCG and takes about ten minutes — SMOKE_LA57=1 runs it"
+fi
 check_output "$POSIX_LOG" "M125-SMOKE: ok poll-add" "IORING_OP_POLL_ADD reports POLLIN when the pipe becomes readable"
 check_output "$POSIX_LOG" "M125-SMOKE: ok timeout" "IORING_OP_TIMEOUT expires with -ETIME after its interval and not before"
 check_output "$POSIX_LOG" "M125-SMOKE: ok cancel" "IORING_OP_ASYNC_CANCEL takes down a pending poll: -ECANCELED for it, 0 for the cancel"

@@ -303,6 +303,20 @@ if grep -qa "fio-io_uring" "$LOG" 2>/dev/null; then
 	check_output "DEBIAN-SMOKE: ok fio-io_uring-fixed" "fio reads it back with registered files and registered buffers"
 fi
 
+# M129. Suspend through util-linux's rtcwake, when the image has it.
+#
+# The kernel's own suspend is proved on the Alpine lane (M129-SUSPEND, eleven
+# checks: the freezer holds userspace, the RTC alarm wakes the machine, the
+# frozen child's timeline has a hole of the right length). This is the other
+# half: a Debian userspace, util-linux's own tool, arming /dev/rtc0 and
+# writing /sys/power/state. Nothing here is a b1nix interface.
+if grep -qa "DEBIAN-SMOKE: rtcwake rc=" "$LOG" 2>/dev/null; then
+	check_output "DEBIAN-SMOKE: ok suspend-rtcwake" "util-linux's rtcwake suspends this kernel and the RTC alarm wakes it — the distribution's own suspend path, not a b1nix interface"
+	check_output "DEBIAN-SMOKE: ok suspend-alive" "the machine writes files and reads /proc after coming back from suspend"
+	sed -n 's/.*DEBIAN-SMOKE: \(rtcwake rc=.*\)/  \1/p' "$LOG" | tail -1
+else
+	printf "  ${YELLOW}SKIP${NC} suspend-rtcwake - this image has no rtcwake, or no /sys/power/state was found\n"
+fi
 check_output "DEBIAN-SMOKE: done" "harness reached the end"
 
 if grep -qa -E "KERNEL PANIC|\[PANIC\]" "$LOG" 2>/dev/null; then

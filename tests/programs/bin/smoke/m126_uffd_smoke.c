@@ -267,15 +267,20 @@ static void check_copy_and_zeropage(void) {
   volatile char v0 = region[0];
   volatile char v1 = region[PAGE + 17];
 
+  /* Stop the monitor and join it before looking at its counters. The faulting
+   * thread is released by UFFDIO_COPY itself, so it can return and read
+   * mon.served while the monitor has not yet incremented it for the second
+   * page: reading the count without the join is a race in the test. */
+  mon.stop = 1;
+  pthread_join(th, NULL);
+
   int served_ok = (v0 == 0x5A) && (v1 == 0x5A) && mon.served >= 2;
 
   judge("copy", served_ok,
         "the page the faulting thread read was not the monitor's",
         (long)(unsigned char)v0);
 
-  /* Zero page, served by hand on the third page while the monitor sleeps. */
-  mon.stop = 1;
-  pthread_join(th, NULL);
+  /* Zero page, served by hand on the third page, the monitor now gone. */
 
   struct uffdio_zeropage zp;
 

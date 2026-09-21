@@ -989,6 +989,40 @@ else
 	echo "DEBIAN-SMOKE: note perf is not installed in this image"
 fi
 
+# ── Stage 17: suspend, through the distribution's own tools (M129) ─────────
+# `rtcwake` is what a Debian user (and every laptop lid) reaches for: it arms
+# the RTC alarm through /dev/rtc0's ioctls and writes the state to
+# /sys/power/state. Nothing here is a b1nix interface — if this works, the
+# kernel's suspend is the one util-linux expects.
+if [ -r /sys/power/state ]; then
+	echo "DEBIAN-SMOKE: power states [$(cat /sys/power/state 2>/dev/null | tr -d '\r')]"
+	if command -v rtcwake >/dev/null 2>&1; then
+		sus_t0=$(date +%s)
+		rtcwake -m freeze -s 3 >/tmp/rtcwake.out 2>&1
+		sus_rc=$?
+		sus_dt=$(( $(date +%s) - sus_t0 ))
+		echo "DEBIAN-SMOKE: rtcwake rc=$sus_rc slept ${sus_dt}s"
+		sed 's/^/DEBIAN-SMOKE: rtcwake-out /' /tmp/rtcwake.out 2>/dev/null | tr -d '\r'
+		# Three seconds asked for; two is the slack a one-second clock gives.
+		if [ "$sus_rc" = "0" ] && [ "$sus_dt" -ge 2 ] && [ "$sus_dt" -le 20 ]; then
+			ok suspend-rtcwake
+		else
+			bad suspend-rtcwake
+		fi
+		if echo alive > /tmp/after-suspend && [ "$(cat /tmp/after-suspend)" = "alive" ] &&
+			ls /proc/1/status >/dev/null 2>&1; then
+			ok suspend-alive
+		else
+			bad suspend-alive
+		fi
+		rm -f /tmp/after-suspend /tmp/rtcwake.out
+	else
+		echo "DEBIAN-SMOKE: note rtcwake is not installed in this image"
+	fi
+else
+	echo "DEBIAN-SMOKE: note /sys/power/state is absent"
+fi
+
 echo "DEBIAN-SMOKE: done"
 
 # Let QEMU exit on its own where possible; the host harness kills it on timeout

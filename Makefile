@@ -578,10 +578,18 @@ KERNEL_SOURCES := \
 	kernel/mm/module_alloc.c \
 	kernel/module/module.c \
 	kernel/module/ksyms.c \
+	kernel/dev/cpuidle.c \
+	kernel/dev/suspend.c \
+	kernel/dev/cpufreq.c \
+	kernel/dev/aml.c \
+	kernel/dev/acpi_power.c \
 	kernel/dev/b1nix_splash.c \
 	kernel/dev/panic_screen.c \
 	kernel/dev/panic_otter.c \
 	kernel/mm/pmm.c \
+	kernel/mm/numa.c \
+	kernel/mm/mempolicy.c \
+	kernel/mm/thp.c \
 	kernel/mm/secretmem.c \
 	kernel/mm/vma_trace.c \
 	kernel/mm/page_cache.c \
@@ -1331,7 +1339,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 print-%:
 	@echo '$($*)'
 
-.PHONY: all analyze objects FORCE iso iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-pku iso-init iso-switchroot iso-live iso-test iso-full check-dynamic check-license iso-pass-chromium-disk iso-pass-chromium-disk-impl \
+.PHONY: all analyze objects FORCE iso iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-pku iso-la57 iso-init iso-switchroot iso-live iso-test iso-full check-dynamic check-license iso-pass-chromium-disk iso-pass-chromium-disk-impl \
 	iso-chromium-min-disk iso-chromium-min-disk-impl \
 	check-ports \
 	userspace userspace-install busybox-package busybox-iso \
@@ -1982,7 +1990,8 @@ $(AP_TRAMPOLINE_OFFSETS): $(AP_TRAMP_OBJ)
 		$$3 == "percpu_ptr"   { printf "#define TRAMP_PCPU_OFF    0x%s\n", $$1 } \
 		$$3 == "cpu_id"       { printf "#define TRAMP_CPU_OFF     0x%s\n", $$1 } \
 		$$3 == "ready_flag"   { printf "#define TRAMP_READY_OFF   0x%s\n", $$1 } \
-		$$3 == "ap_main_ptr"  { printf "#define TRAMP_APMAIN_OFF  0x%s\n", $$1 }' \
+		$$3 == "ap_main_ptr"  { printf "#define TRAMP_APMAIN_OFF  0x%s\n", $$1 } \
+		$$3 == "la57_on"      { printf "#define TRAMP_LA57_OFF    0x%s\n", $$1 }' \
 		| sed 's/0x00*\([0-9a-f]\)/0x\1/' >> $@
 	@printf '#endif\n' >> $@
 
@@ -2108,6 +2117,10 @@ SMOKE_CMDLINE_iommu=b1nix.test=1 b1nix.smoke=iommu b1nix.acs-keep=00:1b.0
 # M124 protection keys: a CPU that has them (TCG -cpu max; the KVM lanes run on
 # whatever the host is). m124_smoke alone, then a restart.
 SMOKE_CMDLINE_pku=b1nix.test=1 b1nix.smoke=pku
+# M128: five-level paging. The kernel only turns CR4.LA57 on when the command
+# line asks, so the lane that checks it needs an image that asks. Everything
+# else about the instance is the ordinary sys boot.
+SMOKE_CMDLINE_la57=b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.e1000-subnet=3 b1nix.smoke=sys b1nix.la57
 # M108 init: the default boot, checked as such. PID 1 is /sbin/init (BusyBox
 # init, no `init=` needed) and /etc/inittab drives OpenRC's runlevels under it.
 # This instance runs no part of the ordinary suite — it exists to prove the
@@ -2244,7 +2257,7 @@ ROOT_MODULE_ROOM ?= 96
 ROOT_MODULE_COMPRESS ?= zstd
 ROOT_MODULE = $(BUILD_DIR)/root-module.img
 
-iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-pku iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
+iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-pku iso-la57 iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
 	@# The stage directory is reused between builds, so a module staged by an
 	@# earlier one is still sitting in it and lands in the image whether this
 	@# build asked for it or not. That is how images meant to be forty

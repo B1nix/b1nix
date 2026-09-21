@@ -377,6 +377,17 @@ BINARIES += $(BUILD)/bin/m126_bpf_smoke
 BINARIES += $(BUILD)/bin/m127_smoke
 # M127: compressed swap (zram), cgroup-targeted reclaim, memory.swap.current.
 BINARIES += $(BUILD)/bin/m127_swap_smoke
+# M128: NUMA — the topology under /sys and the memory policy that places pages.
+BINARIES += $(BUILD)/bin/m128_smoke
+# M128: transparent huge pages — a mapping that really is 2 MiB-backed, and
+# every walker a 2 MiB entry has to survive.
+BINARIES += $(BUILD)/bin/m128_thp_smoke
+# M129: power management — tickless idle, cpuidle states.
+BINARIES += $(BUILD)/bin/m129_smoke
+# M129: suspend — s2idle behind /sys/power/state, woken by the RTC alarm.
+BINARIES += $(BUILD)/bin/m129_suspend_smoke
+# M134: the AML interpreter, against the firmware's own DSDT and SSDTs.
+BINARIES += $(BUILD)/bin/m134_aml_smoke
 # reboot(RESTART2, "bootloader"): the iommu lane ends through it.
 BINARIES += $(BUILD)/bin/reboot2_smoke
 BINARIES += $(BUILD)/bin/m42_w5pre_smoke
@@ -1157,7 +1168,7 @@ endif
 	@# 0400 is what stamp-root-modes.sh leaves; compared against anything else
 	@# the copy differs on every build and the root image is repacked.
 	@$(CIC) --mode 0400 $(ETCSTAGE)/shadow $(ROOTFS)/etc/
-	@# rootfs-overlay: /etc/rc, posix/zsh smoke scripts,
+	@# tools/image/overlay: /etc/inittab, /etc/rc, posix/zsh smoke scripts,
 	@# sshd init.d, bb-w6/bb-w2b fixtures — real files (not embedded kernel C
 	@# strings) copied verbatim onto the ext4 root. cp -R preserves the tree
 	@# structure and creates /etc, /bin, /pkgs subdirs as needed.
@@ -1165,7 +1176,14 @@ endif
 	@# the merge in root-image, which runs after this and wins anyway. Writing
 	@# ours here first only for it to be overwritten a moment later put a fresh
 	@# timestamp on the tree every build (etc/fonts/fonts.conf).
-	@$(CIC) --skip-if-in ../../build/$(B1NIX_ARCH)/pkgroot -r rootfs-overlay/. $(ROOTFS)/
+	@# The overlay's tracked home is tools/image/overlay (docs/repo-layout.md);
+	@# the path here still named a `rootfs-overlay` directory that is in no
+	@# checkout, so a clean tree built a root image with no /etc/inittab at all
+	@# -- BusyBox init fell back to its built-in table, looked for
+	@# /etc/init.d/rcS, found nothing, and no smoke lane ran. Build trees that
+	@# predated the move kept working on their stale copies, which is why it
+	@# went unnoticed.
+	@$(CIC) --skip-if-in ../../build/$(B1NIX_ARCH)/pkgroot -r ../../tools/image/overlay/. $(ROOTFS)/
 	@# BusyBox applet symlinks: every command in applet-manifest.conf (M42) is
 	@# "upstream" (native in-kernel dispatch was retired with the Ring 3 init
 	@# rewrite), so they become /bin/<cmd> -> /bin/busybox.
