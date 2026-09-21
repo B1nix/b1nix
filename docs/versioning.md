@@ -27,7 +27,7 @@ rewritten.
   working `apt`. Before that, everything is 0.x and nothing is promised.
 
 The milestone number lives in `docs/kernel/roadmap.md` and nowhere else. A release
-commit is `build: version 0.124.0`, and every bump gets a tag `v0.124.0` — the
+commit is `build: version 0.127.0`, and every bump gets a tag `v0.127.0` — the
 tag is part of the bump, not an afterthought, because the Debian package
 version is derived from `git describe`.
 
@@ -43,7 +43,7 @@ in the commit body which features earned it.
 `B1NIX_RELEASE_STR` composes the two and needs no rule of its own:
 
 ```
-uname -r  →  6.6.0-b1nix-0.124.0
+uname -r  →  6.6.0-b1nix-0.127.0
 ```
 
 ## Distribution release — a counter and a codename
