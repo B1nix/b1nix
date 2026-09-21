@@ -993,6 +993,32 @@ static u32 net_ip_as_be(struct ipv4_addr a) {
          ((u32)a.bytes[3] << 24);
 }
 
+/* The same count the FIONREAD ioctl reports, for a caller inside the kernel.
+ *
+ * The ioctl copies its answer OUT to a user address, which is right for a
+ * system call and wrong for io_uring's SOCKET_URING_OP_SIOCINQ: that one has
+ * to return the number as its own result, and handing the ioctl a kernel
+ * pointer earns an EFAULT. Returns the byte count, or a negative errno. */
+int vfs_socket_bytes_available(struct vfs_handle *h, int outgoing) {
+  struct vfs_socket_state *s = h ? (struct vfs_socket_state *)h->private_data : 0;
+  usize n = 0;
+
+  if (!s)
+    return -ENOTSOCK;
+  if (outgoing) {
+    /* Nothing here queues on the send side beyond what the driver has
+     * already taken, so the outgoing queue is empty by construction. */
+    return 0;
+  }
+  if (s->domain == B1NIX_AF_UNIX)
+    n = unix_bytes_available(s);
+  else if (s->type == B1NIX_SOCK_STREAM)
+    n = tcp_bytes_available((struct tcp_conn *)s->tcp_conn);
+  else if (s->udp_q_count > 0)
+    n = s->udp_q_len[s->udp_q_head];
+  return (int)n;
+}
+
 /* FIONREAD: how many bytes a read would return right now. Every event-driven
  * server asks this — sway's IPC server calls it on each client and drops any
  * client it fails for, which is exactly what it did here while the socket

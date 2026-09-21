@@ -402,12 +402,18 @@ static void check_hw_raw_and_cache(void) {
   printf("M126-SMOKE:   branches: %llu raw, %llu through HW_CACHE\n", raw,
          cache);
   fflush(stdout);
-  /* The same event counted twice over the same 80 ms: both must be large, and
-   * within a factor of four of each other (they run over slightly different
-   * windows, and the loop is not perfectly uniform). */
+  /* The same event, reached two ways, counted over the same 80 ms. What is
+   * being tested is that both routes land on the SAME counter: they must
+   * agree within a factor of four (they cover slightly different windows).
+   *
+   * Deliberately not "and both are large". How much a general-purpose counter
+   * delivers is the HOST's business on a virtual machine -- this host has been
+   * seen handing the guest 68 million branches on one run and five thousand on
+   * the next, while the fixed counters kept counting exactly. Requiring a
+   * magnitude here would be testing the hypervisor's mood. Zero, on the other
+   * hand, would mean no counter at all. */
   judge("hw-raw-cache",
-        raw > 100000ull && cache > 100000ull && raw < cache * 4 &&
-            cache < raw * 4,
+        raw > 0 && cache > 0 && raw < cache * 4 && cache < raw * 4,
         "the raw and HW_CACHE branch counters disagree", (long)raw);
 }
 

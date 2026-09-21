@@ -40,6 +40,9 @@
 /* Opcodes and flags newer than the uapi header this is compiled against. The
  * values are the ABI's, taken from the same enum the kernel's copy holds. */
 #define IOU_OP_SETXATTR         42
+/* Zero-copy receive: it needs a NIC-driven refill ring (see the roadmap), so
+ * it is the opcode this kernel genuinely does not have. */
+#define IOU_OP_RECV_ZC          58
 #define IOU_OP_SOCKET           45
 #define IOU_OP_SEND_ZC          47
 #define IOU_OP_WAITID           50
@@ -52,6 +55,44 @@
 #ifndef IORING_SETUP_NO_SQARRAY
 #define IORING_SETUP_NO_SQARRAY (1U << 16)
 #endif
+/* The opcodes and register commands this kernel implements that the
+ * distribution's header is older than. Their numbers are ABI. */
+#ifndef IORING_OP_FSETXATTR
+#define IORING_OP_FSETXATTR 41
+#define IORING_OP_SETXATTR 42
+#define IORING_OP_FGETXATTR 43
+#define IORING_OP_GETXATTR 44
+#endif
+#ifndef IORING_OP_URING_CMD
+#define IORING_OP_URING_CMD 46
+#endif
+#ifndef IORING_OP_FUTEX_WAIT
+#define IORING_OP_FUTEX_WAIT 51
+#define IORING_OP_FUTEX_WAKE 52
+#define IORING_OP_FUTEX_WAITV 53
+#endif
+#ifndef IORING_OP_READV_FIXED
+#define IORING_OP_READV_FIXED 60
+#define IORING_OP_WRITEV_FIXED 61
+#endif
+#ifndef IORING_REGISTER_PERSONALITY
+#define IORING_REGISTER_PERSONALITY 9
+#define IORING_UNREGISTER_PERSONALITY 10
+#endif
+#ifndef IORING_REGISTER_RING_FDS
+#define IORING_REGISTER_RING_FDS 20
+#define IORING_UNREGISTER_RING_FDS 21
+#endif
+#ifndef IORING_ENTER_REGISTERED_RING
+#define IORING_ENTER_REGISTERED_RING (1U << 4)
+#endif
+#ifndef SOCKET_URING_OP_SIOCINQ
+#define SOCKET_URING_OP_SIOCINQ 0
+#define SOCKET_URING_OP_SIOCOUTQ 1
+#define SOCKET_URING_OP_GETSOCKOPT 2
+#define SOCKET_URING_OP_SETSOCKOPT 3
+#endif
+
 #ifndef IORING_SETUP_DEFER_TASKRUN
 #define IORING_SETUP_DEFER_TASKRUN (1U << 13)
 #endif
@@ -818,7 +859,8 @@ static void check_probe(void) {
     return;
   }
   int nop_ok = 0, read_ok = 0, openat_ok = 0, statx_ok = 0, pbuf_ok = 0;
-  int xattr_reported = 1;
+  int xattr_ok = 0;
+  int zc_reported = 1;
 
   for (unsigned i = 0; i < p->ops_len; i++) {
     if (p->ops[i].op == IORING_OP_NOP)
@@ -831,14 +873,16 @@ static void check_probe(void) {
       statx_ok = (p->ops[i].flags & IO_URING_OP_SUPPORTED) != 0;
     if (p->ops[i].op == IORING_OP_PROVIDE_BUFFERS)
       pbuf_ok = (p->ops[i].flags & IO_URING_OP_SUPPORTED) != 0;
-    /* Extended attributes do not exist in this VFS, so the probe must not
-     * claim the four xattr opcodes. */
+    /* The xattr opcodes are implemented, so the probe must say so... */
     if (p->ops[i].op == IOU_OP_SETXATTR)
-      xattr_reported = (p->ops[i].flags & IO_URING_OP_SUPPORTED) == 0;
+      xattr_ok = (p->ops[i].flags & IO_URING_OP_SUPPORTED) != 0;
+    /* ... and zero-copy receive is not, so it must say that too. */
+    if (p->ops[i].op == IOU_OP_RECV_ZC)
+      zc_reported = (p->ops[i].flags & IO_URING_OP_SUPPORTED) == 0;
   }
   judge("probe",
         p->ops_len > 0 && nop_ok && read_ok && openat_ok && statx_ok &&
-            pbuf_ok && xattr_reported,
+            pbuf_ok && xattr_ok && zc_reported,
         "the probe does not tell the truth about which opcodes work",
         (long)p->ops_len);
 
@@ -847,7 +891,7 @@ static void check_probe(void) {
   struct io_uring_cqe cqe;
   struct io_uring_sqe *sqe = sq_get(&r);
 
-  sqe->opcode = IOU_OP_SETXATTR;
+  sqe->opcode = IOU_OP_RECV_ZC;
   sqe->fd = -1;
   sqe->user_data = 61;
   rc = submit_wait(&r, 1, &cqe);
@@ -2598,6 +2642,618 @@ static void check_ring_shapes(void) {
   }
 }
 
+
+/* ── the last of the opcode surface (M125 completion) ───────────────────── */
+
+static void check_xattr_opcodes(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe;
+  const char *path = "/tmp/m125-xattr";
+  int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+  char value[64];
+  int rc;
+
+  if (ring_make(&r, 8, 0, 0) < 0 || fd < 0) {
+    bad("op-xattr", "no ring or file", (long)fd);
+    if (fd >= 0)
+      close(fd);
+    return;
+  }
+
+  /* SETXATTR by path, then GETXATTR reads back exactly what was set. */
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_SETXATTR;
+  sqe->addr = (unsigned long long)(uintptr_t) "user.b1nix";
+  sqe->addr2 = (unsigned long long)(uintptr_t)path;
+  sqe->addr3 = (unsigned long long)(uintptr_t) "through-the-ring";
+  sqe->len = 16;
+  sqe->user_data = 1;
+  rc = submit_wait(&r, 1, &cqe);
+  int set_ok = rc == 0 && cqe.res >= 0;
+
+  memset(value, 0, sizeof(value));
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_GETXATTR;
+  sqe->addr = (unsigned long long)(uintptr_t) "user.b1nix";
+  sqe->addr2 = (unsigned long long)(uintptr_t)path;
+  sqe->addr3 = (unsigned long long)(uintptr_t)value;
+  sqe->len = sizeof(value);
+  sqe->user_data = 2;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-xattr",
+        set_ok && rc == 0 && cqe.res == 16 &&
+            memcmp(value, "through-the-ring", 16) == 0,
+        "SETXATTR/GETXATTR did not round-trip an attribute",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* The f-forms, on the open descriptor. */
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_FSETXATTR;
+  sqe->fd = fd;
+  sqe->addr = (unsigned long long)(uintptr_t) "user.byfd";
+  sqe->addr3 = (unsigned long long)(uintptr_t) "fd-form";
+  sqe->len = 7;
+  sqe->user_data = 3;
+  rc = submit_wait(&r, 1, &cqe);
+  int fset_ok = rc == 0 && cqe.res >= 0;
+
+  memset(value, 0, sizeof(value));
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_FGETXATTR;
+  sqe->fd = fd;
+  sqe->addr = (unsigned long long)(uintptr_t) "user.byfd";
+  sqe->addr3 = (unsigned long long)(uintptr_t)value;
+  sqe->len = sizeof(value);
+  sqe->user_data = 4;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-fxattr",
+        fset_ok && rc == 0 && cqe.res == 7 && memcmp(value, "fd-form", 7) == 0,
+        "FSETXATTR/FGETXATTR did not round-trip an attribute on a descriptor",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  close(fd);
+  unlink(path);
+  ring_free(&r);
+}
+
+static void check_vectored_fixed(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe;
+  static char buf[8192];
+  struct iovec reg = {.iov_base = buf, .iov_len = sizeof(buf)};
+  struct iovec seg[2];
+  const char *path = "/tmp/m125-vfixed";
+  int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+  int rc;
+
+  if (ring_make(&r, 8, 0, 0) < 0 || fd < 0) {
+    bad("op-writev-fixed", "no ring or file", (long)fd);
+    if (fd >= 0)
+      close(fd);
+    return;
+  }
+  if (io_uring_register_(r.fd, IORING_REGISTER_BUFFERS, &reg, 1) < 0) {
+    bad("op-writev-fixed", "registering the buffer", -1);
+    close(fd);
+    ring_free(&r);
+    return;
+  }
+
+  memcpy(buf, "AAAABBBB", 8);
+  seg[0].iov_base = buf;
+  seg[0].iov_len = 4;
+  seg[1].iov_base = buf + 4;
+  seg[1].iov_len = 4;
+
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_WRITEV_FIXED;
+  sqe->fd = fd;
+  sqe->addr = (unsigned long long)(uintptr_t)seg;
+  sqe->len = 2;
+  sqe->off = 0;
+  sqe->buf_index = 0;
+  sqe->user_data = 1;
+  rc = submit_wait(&r, 1, &cqe);
+  int wrote = (rc == 0) ? cqe.res : -1;
+
+  /* Read it back into two segments of the same registered buffer. */
+  memset(buf + 16, 0, 16);
+  seg[0].iov_base = buf + 16;
+  seg[0].iov_len = 4;
+  seg[1].iov_base = buf + 20;
+  seg[1].iov_len = 4;
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_READV_FIXED;
+  sqe->fd = fd;
+  sqe->addr = (unsigned long long)(uintptr_t)seg;
+  sqe->len = 2;
+  sqe->off = 0;
+  sqe->buf_index = 0;
+  sqe->user_data = 2;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-writev-fixed",
+        wrote == 8 && rc == 0 && cqe.res == 8 &&
+            memcmp(buf + 16, "AAAABBBB", 8) == 0,
+        "the vectored fixed-buffer forms did not move the bytes",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* A segment outside the registration must be refused, which is the whole
+   * point of registering. */
+  seg[0].iov_base = (char *)buf - 4096;
+  seg[0].iov_len = 4;
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_READV_FIXED;
+  sqe->fd = fd;
+  sqe->addr = (unsigned long long)(uintptr_t)seg;
+  sqe->len = 1;
+  sqe->off = 0;
+  sqe->buf_index = 0;
+  sqe->user_data = 3;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-vfixed-bounds", rc == 0 && cqe.res == -EFAULT,
+        "a segment outside the registered buffer was accepted",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  close(fd);
+  unlink(path);
+  ring_free(&r);
+}
+
+static void check_futex_opcodes(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe;
+  static volatile unsigned int word;
+  int rc;
+
+  if (ring_make(&r, 8, 0, 0) < 0) {
+    bad("op-futex", "no ring", 0);
+    return;
+  }
+
+  /* A wait whose word already differs is EAGAIN, exactly as futex(2) says --
+   * and it is the case a lock's fast path takes. */
+  word = 5;
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_FUTEX_WAIT;
+  sqe->addr = (unsigned long long)(uintptr_t)&word;
+  sqe->off = 99; /* expect 99, the word holds 5 */
+  sqe->user_data = 1;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-futex-eagain", rc == 0 && cqe.res == -EAGAIN,
+        "a futex wait on a word that had already moved did not report EAGAIN",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* A real wait: submit it, change the word from this thread, and the ring
+   * completes it. */
+  word = 1;
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_FUTEX_WAIT;
+  sqe->addr = (unsigned long long)(uintptr_t)&word;
+  sqe->off = 1;
+  sqe->user_data = 2;
+  if (io_uring_enter_(r.fd, 1, 0, 0, 0, 0) != 1) {
+    bad("op-futex", "submitting the wait", -1);
+    ring_free(&r);
+    return;
+  }
+  /* Nothing has changed yet: the ring must have nothing to report. */
+  int early = cq_get(&r, &cqe); /* 1 if something was already there */
+
+  word = 2; /* the wake condition */
+  rc = io_uring_enter_(r.fd, 0, 1, IORING_ENTER_GETEVENTS, 0, 0);
+  int got = cq_get(&r, &cqe);
+
+  judge("op-futex-wait",
+        early == 0 && rc >= 0 && got == 1 && cqe.user_data == 2 &&
+            cqe.res == 0,
+        "a futex wait did not complete when its word changed",
+        got == 1 ? (long)cqe.res : (long)got);
+
+  /* FUTEX_WAKE reports how many it woke -- zero here, because nothing is
+   * parked on that word, and that is a number not an error. */
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_FUTEX_WAKE;
+  sqe->addr = (unsigned long long)(uintptr_t)&word;
+  sqe->off = 1;
+  sqe->user_data = 3;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-futex-wake", rc == 0 && cqe.res >= 0,
+        "FUTEX_WAKE did not report a count", rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* WAITV over two words, completing with the INDEX that moved. */
+  static volatile unsigned int w2[2];
+  struct {
+    unsigned long long val;
+    unsigned long long uaddr;
+    unsigned int flags;
+    unsigned int reserved;
+  } wv[2];
+
+  w2[0] = 10;
+  w2[1] = 20;
+  memset(wv, 0, sizeof(wv));
+  wv[0].val = 10;
+  wv[0].uaddr = (unsigned long long)(uintptr_t)&w2[0];
+  wv[1].val = 20;
+  wv[1].uaddr = (unsigned long long)(uintptr_t)&w2[1];
+
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_FUTEX_WAITV;
+  sqe->addr = (unsigned long long)(uintptr_t)wv;
+  sqe->len = 2;
+  sqe->user_data = 4;
+  if (io_uring_enter_(r.fd, 1, 0, 0, 0, 0) != 1) {
+    bad("op-futex-waitv", "submitting", -1);
+    ring_free(&r);
+    return;
+  }
+  w2[1] = 21; /* the second one moves */
+  io_uring_enter_(r.fd, 0, 1, IORING_ENTER_GETEVENTS, 0, 0);
+  got = cq_get(&r, &cqe);
+  judge("op-futex-waitv", got == 1 && cqe.user_data == 4 && cqe.res == 1,
+        "FUTEX_WAITV did not report which word moved",
+        got == 1 ? (long)cqe.res : (long)got);
+  ring_free(&r);
+}
+
+static void check_uring_cmd(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe;
+  int sv[2];
+  int rc;
+
+  if (ring_make(&r, 8, 0, 0) < 0) {
+    bad("op-uring-cmd", "no ring", 0);
+    return;
+  }
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    bad("op-uring-cmd", "socketpair", -1);
+    ring_free(&r);
+    return;
+  }
+  /* Put bytes in, then ask the socket how many are waiting. */
+  if (write(sv[1], "0123456789", 10) != 10) {
+    bad("op-uring-cmd", "write", -1);
+    close(sv[0]);
+    close(sv[1]);
+    ring_free(&r);
+    return;
+  }
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_URING_CMD;
+  sqe->fd = sv[0];
+  sqe->cmd_op = SOCKET_URING_OP_SIOCINQ;
+  sqe->user_data = 1;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-uring-cmd", rc == 0 && cqe.res == 10,
+        "SOCKET_URING_OP_SIOCINQ did not report the queued bytes",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* And a socket option through the same door. */
+  int bufsz = 0;
+  socklen_t bl = sizeof(bufsz);
+
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_URING_CMD;
+  sqe->fd = sv[0];
+  sqe->cmd_op = SOCKET_URING_OP_GETSOCKOPT;
+  /* level and optname overlay `addr` as two u32s in the ABI, and the
+   * distribution's header is older than those names. */
+  sqe->addr = ((unsigned long long)SO_TYPE << 32) | (unsigned)SOL_SOCKET;
+  sqe->addr3 = (unsigned long long)(uintptr_t)&bufsz;
+  sqe->len = bl;
+  sqe->user_data = 2;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-uring-cmd-getsockopt",
+        rc == 0 && cqe.res >= 0 && bufsz == SOCK_STREAM,
+        "SOCKET_URING_OP_GETSOCKOPT did not read the socket's type",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  close(sv[0]);
+  close(sv[1]);
+  ring_free(&r);
+}
+
+static void check_drain_and_rings(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe;
+  int pfd[2];
+  int rc;
+
+  if (ring_make(&r, 16, 0, 0) < 0) {
+    bad("io-drain", "no ring", 0);
+    return;
+  }
+  if (pipe(pfd) != 0) {
+    bad("io-drain", "pipe", -1);
+    ring_free(&r);
+    return;
+  }
+
+  /* A read that cannot complete yet, then a NOP with IOSQE_IO_DRAIN behind
+   * it. The drain must NOT complete while the read is outstanding -- that is
+   * the whole promise of the flag. */
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_READ;
+  sqe->fd = pfd[0];
+  {
+    static char rbuf[8];
+
+    sqe->addr = (unsigned long long)(uintptr_t)rbuf;
+  }
+  sqe->len = 8;
+  sqe->off = (unsigned long long)-1;
+  sqe->user_data = 100;
+
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_NOP;
+  sqe->flags = IOSQE_IO_DRAIN;
+  sqe->user_data = 200;
+
+  if (io_uring_enter_(r.fd, 2, 0, 0, 0, 0) != 2) {
+    bad("io-drain", "submitting", -1);
+    close(pfd[0]);
+    close(pfd[1]);
+    ring_free(&r);
+    return;
+  }
+  io_uring_enter_(r.fd, 0, 0, IORING_ENTER_GETEVENTS, 0, 0);
+  int early = cq_get(&r, &cqe);
+  int early_was_drain = (early == 1 && cqe.user_data == 200);
+
+  /* Let the read finish; the drain may then run, and must come second. */
+  write(pfd[1], "12345678", 8);
+  rc = io_uring_enter_(r.fd, 0, 2, IORING_ENTER_GETEVENTS, 0, 0);
+  struct io_uring_cqe first, second;
+  int g1 = cq_get(&r, &first);
+  int g2 = cq_get(&r, &second);
+
+  judge("io-drain",
+        !early_was_drain && rc >= 0 && g1 == 1 && g2 == 1 &&
+            first.user_data == 100 && second.user_data == 200,
+        "IOSQE_IO_DRAIN did not wait for the requests before it",
+        g1 == 1 ? (long)first.user_data : (long)g1);
+  close(pfd[0]);
+  close(pfd[1]);
+
+  /* A registered ring descriptor: enter by index instead of by fd. */
+  {
+    struct io_uring_rsrc_update upd;
+
+    memset(&upd, 0, sizeof(upd));
+    upd.data = (unsigned long long)r.fd;
+    rc = io_uring_register_(r.fd, IORING_REGISTER_RING_FDS, &upd, 1);
+    if (rc != 1) {
+      bad("registered-ring", "IORING_REGISTER_RING_FDS", (long)rc);
+    } else {
+      sqe = sq_get(&r);
+      sqe->opcode = IORING_OP_NOP;
+      sqe->user_data = 300;
+      int n = io_uring_enter_((int)upd.offset, 1, 1,
+                              IORING_ENTER_GETEVENTS |
+                                  IORING_ENTER_REGISTERED_RING,
+                              0, 0);
+      int got = cq_get(&r, &cqe);
+
+      judge("registered-ring",
+            n == 1 && got == 1 && cqe.user_data == 300,
+            "entering by a registered ring index did not work", (long)n);
+      io_uring_register_(r.fd, IORING_UNREGISTER_RING_FDS, &upd, 1);
+    }
+  }
+  ring_free(&r);
+}
+
+/* A ring full of drains, which is what liburing's defer.t submits: 64 NOPs
+ * each carrying IOSQE_IO_DRAIN, so every one of them waits for all the ones
+ * before it. The shape is a chain of completions, and the thing being checked
+ * is that the kernel walks it rather than recursing through it. */
+static void check_drain_storm(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe;
+  const unsigned n = 64;
+  unsigned got = 0;
+  int rc;
+
+  if (ring_make(&r, 128, 0, 0) < 0) {
+    bad("drain-storm", "no ring", 0);
+    return;
+  }
+  for (unsigned i = 0; i < n; i++) {
+    sqe = sq_get(&r);
+    sqe->opcode = IORING_OP_NOP;
+    sqe->flags = IOSQE_IO_DRAIN;
+    sqe->user_data = 1000 + i;
+  }
+  rc = io_uring_enter_(r.fd, n, n, IORING_ENTER_GETEVENTS, 0, 0);
+  for (unsigned i = 0; i < n; i++) {
+    if (!cq_get(&r, &cqe))
+      break;
+    if (cqe.user_data != 1000 + got)
+      break; /* drains must complete in submission order */
+    got++;
+  }
+  judge("drain-storm", rc >= 0 && got == n,
+        "64 drained NOPs did not all complete in order", (long)got);
+  ring_free(&r);
+}
+
+/* liburing's defer.t in miniature: overflow the completion queue hundreds of
+ * times, then submit drained requests behind the pile. The drain has to
+ * consider every request still on the ring, and the completions have to be
+ * walked rather than recursed through -- the machine panicked with a kernel
+ * stack overflow on exactly this shape. */
+static void check_drain_after_overflow(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe;
+  int rc;
+  unsigned reaped = 0;
+
+  if (ring_make(&r, 8, 0, 0) < 0) {
+    bad("drain-overflow", "no ring", 0);
+    return;
+  }
+  /* Submit far more than the completion queue holds, reaping nothing. */
+  for (int round = 0; round < 40; round++) {
+    for (int i = 0; i < 8; i++) {
+      sqe = sq_get(&r);
+      if (!sqe)
+        break;
+      sqe->opcode = IORING_OP_NOP;
+      sqe->user_data = 5000 + round * 8 + i;
+    }
+    if (io_uring_enter_(r.fd, 8, 0, 0, 0, 0) < 0)
+      break;
+  }
+  /* Then ten drained NOPs behind the pile. */
+  for (int i = 0; i < 10; i++) {
+    sqe = sq_get(&r);
+    if (!sqe)
+      break;
+    sqe->opcode = IORING_OP_NOP;
+    sqe->flags = IOSQE_IO_DRAIN;
+    sqe->user_data = 9000 + i;
+  }
+  rc = io_uring_enter_(r.fd, 10, 1, IORING_ENTER_GETEVENTS, 0, 0);
+
+  /* Drain the ring: every completion must eventually come out, and the
+   * machine must still be alive to hand them over. */
+  for (int guard = 0; guard < 2000; guard++) {
+    if (cq_get(&r, &cqe)) {
+      reaped++;
+      continue;
+    }
+    if (io_uring_enter_(r.fd, 0, 0, IORING_ENTER_GETEVENTS, 0, 0) < 0)
+      break;
+    if (!cq_get(&r, &cqe))
+      break;
+    reaped++;
+  }
+  judge("drain-overflow", rc >= 0 && reaped > 100,
+        "drained requests behind an overflowed completion queue did not come "
+        "back",
+        (long)reaped);
+  ring_free(&r);
+}
+
+/* The same drains, on the two ring shapes defer.t also runs them on: a
+ * kernel-submitted (SQPOLL) ring and an IOPOLL one. A drain is a rule about
+ * ORDER, and the order is decided in a different place when the submitting
+ * thread is the kernel's own. */
+static void check_drain_other_rings(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe;
+  int ok_sq = 0, ok_poll = 0;
+
+  if (ring_make(&r, 32, IORING_SETUP_SQPOLL, 0) == 0) {
+    unsigned got = 0;
+
+    for (unsigned i = 0; i < 16; i++) {
+      sqe = sq_get(&r);
+      if (!sqe)
+        break;
+      sqe->opcode = IORING_OP_NOP;
+      sqe->flags = IOSQE_IO_DRAIN;
+      sqe->user_data = 7000 + i;
+    }
+    /* The kernel thread picks them up; ask it to, then wait. */
+    io_uring_enter_(r.fd, 16, 0, IORING_ENTER_SQ_WAKEUP, 0, 0);
+    for (int spin = 0; spin < 200 && got < 16; spin++) {
+      io_uring_enter_(r.fd, 0, 1, IORING_ENTER_GETEVENTS, 0, 0);
+      while (cq_get(&r, &cqe))
+        got++;
+    }
+    ok_sq = (got == 16);
+    ring_free(&r);
+  } else {
+    ok_sq = 1; /* no SQPOLL on this machine: nothing to prove */
+  }
+
+  if (ring_make(&r, 32, IORING_SETUP_IOPOLL, 0) == 0) {
+    unsigned got = 0;
+
+    for (unsigned i = 0; i < 16; i++) {
+      sqe = sq_get(&r);
+      if (!sqe)
+        break;
+      sqe->opcode = IORING_OP_NOP;
+      sqe->flags = IOSQE_IO_DRAIN;
+      sqe->user_data = 8000 + i;
+    }
+    io_uring_enter_(r.fd, 16, 0, 0, 0, 0);
+    for (int spin = 0; spin < 200 && got < 16; spin++) {
+      io_uring_enter_(r.fd, 0, 1, IORING_ENTER_GETEVENTS, 0, 0);
+      while (cq_get(&r, &cqe))
+        got++;
+    }
+    ok_poll = (got == 16);
+    ring_free(&r);
+  } else {
+    ok_poll = 1;
+  }
+
+  judge("drain-sqpoll-iopoll", ok_sq && ok_poll,
+        "drained requests did not all complete on an SQPOLL or IOPOLL ring",
+        (long)((ok_sq ? 2 : 0) + (ok_poll ? 1 : 0)));
+}
+
+static void check_personality(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  struct io_uring_sqe *sqe;
+  int id, rc;
+
+  if (ring_make(&r, 8, 0, 0) < 0) {
+    bad("personality", "no ring", 0);
+    return;
+  }
+  id = io_uring_register_(r.fd, IORING_REGISTER_PERSONALITY, NULL, 0);
+  if (id <= 0) {
+    bad("personality", "IORING_REGISTER_PERSONALITY", (long)id);
+    ring_free(&r);
+    return;
+  }
+
+  /* A request that runs under the registered identity. Registered as root and
+   * run as root, so what is proved here is that the id is accepted, applied
+   * and released -- and that an id nobody registered is refused. */
+  const char *path = "/tmp/m125-pers";
+
+  unlink(path);
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_OPENAT;
+  sqe->fd = AT_FDCWD;
+  sqe->addr = (unsigned long long)(uintptr_t)path;
+  sqe->open_flags = O_CREAT | O_RDWR;
+  sqe->len = 0644;
+  sqe->personality = (unsigned short)id;
+  sqe->user_data = 1;
+  rc = submit_wait(&r, 1, &cqe);
+  int opened = (rc == 0 && cqe.res >= 0);
+
+  if (opened)
+    close(cqe.res);
+  unlink(path);
+
+  int bad_unreg = io_uring_register_(r.fd, IORING_UNREGISTER_PERSONALITY, NULL,
+                                    (unsigned)id + 7);
+  int good_unreg =
+      io_uring_register_(r.fd, IORING_UNREGISTER_PERSONALITY, NULL, (unsigned)id);
+
+  judge("personality", opened && bad_unreg < 0 && good_unreg == 0,
+        "a registered personality was not applied and released",
+        (long)(opened ? good_unreg : -1));
+  ring_free(&r);
+}
+
 int main(void) {
   printf("M125-SMOKE: start\n");
   fflush(stdout);
@@ -2643,6 +3299,15 @@ int main(void) {
   check_direct_descriptors();
   check_register_extras();
   check_ring_shapes();
+  check_xattr_opcodes();
+  check_vectored_fixed();
+  check_futex_opcodes();
+  check_uring_cmd();
+  check_drain_and_rings();
+  check_drain_storm();
+  check_drain_after_overflow();
+  check_drain_other_rings();
+  check_personality();
 
   printf("M125-SMOKE: done\n");
   fflush(stdout);

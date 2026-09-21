@@ -24,6 +24,7 @@
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
+#include <b1nix/io_uring.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/syscall.h>
@@ -663,6 +664,9 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
     } else {
       g_futex_wake_hit++;
     }
+    /* A ring may have a FUTEX_WAIT parked on this word; its waiter sleeps on
+     * the poll channel, which this wake does not otherwise touch. */
+    io_uring_futex_hint();
     return woken;
   }
 

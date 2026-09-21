@@ -3129,6 +3129,19 @@ check_output "$POSIX_LOG" "M125-SMOKE: ok no-sqarray" "IORING_SETUP_NO_SQARRAY i
 check_output "$POSIX_LOG" "M125-SMOKE: ok defer-taskrun" "IORING_SETUP_DEFER_TASKRUN completes its work"
 check_output "$POSIX_LOG" "M125-SMOKE: ok defer-taskrun-needs-single-issuer" "DEFER_TASKRUN without SINGLE_ISSUER is EINVAL, as on Linux"
 check_output "$POSIX_LOG" "M125-SMOKE: done" "M125 suite completes"
+check_output "$POSIX_LOG" "M125-SMOKE: ok op-xattr" "SETXATTR and GETXATTR round-trip an extended attribute by path"
+check_output "$POSIX_LOG" "M125-SMOKE: ok op-fxattr" "FSETXATTR and FGETXATTR do the same on an open descriptor"
+check_output "$POSIX_LOG" "M125-SMOKE: ok op-writev-fixed" "READV_FIXED and WRITEV_FIXED move bytes through segments of a registered buffer"
+check_output "$POSIX_LOG" "M125-SMOKE: ok op-vfixed-bounds" "a vectored segment outside the registered buffer is EFAULT, which is what registering it is for"
+check_output "$POSIX_LOG" "M125-SMOKE: ok op-futex-eagain" "a futex wait on a word that had already moved reports EAGAIN, as futex(2) does"
+check_output "$POSIX_LOG" "M125-SMOKE: ok op-futex-wait" "a futex wait completes when its word changes, without blocking the submitter"
+check_output "$POSIX_LOG" "M125-SMOKE: ok op-futex-wake" "FUTEX_WAKE reports how many waiters it woke"
+check_output "$POSIX_LOG" "M125-SMOKE: ok op-futex-waitv" "FUTEX_WAITV waits on several words and reports which one moved"
+check_output "$POSIX_LOG" "M125-SMOKE: ok op-uring-cmd" "SOCKET_URING_OP_SIOCINQ reports the bytes queued on a socket"
+check_output "$POSIX_LOG" "M125-SMOKE: ok op-uring-cmd-getsockopt" "SOCKET_URING_OP_GETSOCKOPT reads a socket option through the ring"
+check_output "$POSIX_LOG" "M125-SMOKE: ok io-drain" "IOSQE_IO_DRAIN holds a request until everything submitted before it has completed"
+check_output "$POSIX_LOG" "M125-SMOKE: ok registered-ring" "a ring registered with IORING_REGISTER_RING_FDS is entered by index instead of by descriptor"
+check_output "$POSIX_LOG" "M125-SMOKE: ok personality" "a registered personality is applied to a request and released, and an unknown id is refused"
 
 # ── M126: perf_event_open ─────────────────────────────────────────────────
 check_output "$POSIX_LOG" "M126-SMOKE: start" "the perf_event_open smoke starts"
@@ -3149,7 +3162,7 @@ if grep -qa "M126-SMOKE: skip hw-counters" "$POSIX_LOG" 2>/dev/null; then
 else
 	check_output "$POSIX_LOG" "M126-SMOKE: ok hw-counters" "the CPU's own counters move with real work: 120 ms of a tight loop retires millions of instructions and burns millions of cycles"
 	check_output "$POSIX_LOG" "M126-SMOKE: ok hw-per-task" "a hardware counter follows its task: a child blocked on a pipe is not credited with the parent's 120 ms of work"
-	check_output "$POSIX_LOG" "M126-SMOKE: ok hw-raw-cache" "PERF_TYPE_RAW and PERF_TYPE_HW_CACHE reach the same branch counter and agree within a factor of four"
+	check_output "$POSIX_LOG" "M126-SMOKE: ok hw-raw-cache" "PERF_TYPE_RAW and PERF_TYPE_HW_CACHE reach the same branch counter and agree within a factor of four (the magnitude is the host PMU's business, not this kernel's)"
 fi
 check_output "$POSIX_LOG" "M126-SMOKE: ok refuses-unknown-hw" "a hardware event with no architectural counter behind it is EOPNOTSUPP rather than answered from another event"
 check_output "$POSIX_LOG" "M126-SMOKE: ok refuses-unknown-sample-type" "a sample_type with no field behind it is refused at open"

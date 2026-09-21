@@ -882,6 +882,9 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
 int vfs_getsockname(int fd, void *addr, usize *addrlen);
 int vfs_getpeername(int fd, void *addr, usize *addrlen);
 int vfs_shutdown(int fd, int how);
+/* The FIONREAD/TIOCOUTQ counts, returned rather than copied out to a user
+ * address: io_uring's SOCKET_URING_OP_SIOCINQ needs the number itself. */
+int vfs_socket_bytes_available(struct vfs_handle *h, int outgoing);
 int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len,
                         const void *src_ip, int src_is_v6, u16 src_port_net);
 usize vfs_socket_last_srcaddr(int fd, void *addr, usize cap);

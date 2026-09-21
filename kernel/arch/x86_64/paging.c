@@ -3359,6 +3359,7 @@ int paging_user_writable(u64 pml4_phys, u64 vaddr) {
 }
 
 int paging_set_writable_in_space(u64 pml4_phys, u64 vaddr, int writable) {
+  extern void tlb_shootdown_page(u64 vaddr);
   u64 flags;
   int changed = 0;
 
