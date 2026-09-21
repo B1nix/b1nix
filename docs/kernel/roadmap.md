@@ -216,3 +216,20 @@ Detail in [xperia5-ufs-usb.md](xperia5-ufs-usb.md).
 - [x] DWC3 USB gadget (CDC-ECM `usb0`, 172.16.42.1): enumerates on macOS; ping (4-30 ms), `ssh root@172.16.42.1` and netconsole work.
 - [x] The page allocator's window on SM8150 is clipped to ABL's `/memory` banks: it covered a 52 MiB hypervisor hole (0xbcc00000-0xc0000000) that froze the CPU on first touch.
 - [ ] `partial` `reboot bootloader`: `LINUX_REBOOT_CMD_RESTART2` reaches the kernel (was EINVAL; iommu smoke lane restarts through it), the SPMI PMIC arbiter driver writes the PON restart reason and IMEM word and configures a warm reset — but ABL still boots normally and every reset lands cold. Open: which value/reset path this ABL honours; slot A's GPT tries are not reset by b1nix (`gpt` in `b1nix.ufs-rw` opens the tables for that).
+
+## M133: Close the ABI gaps
+
+Every open row of [abi-gaps.md](abi-gaps.md) that no other milestone owns,
+collected as one piece of work because they share a definition of done: the
+Debian lane green with no workaround, and that table shorter. This is the
+milestone the distribution waits on — the phases in
+[../distro/roadmap.md](../distro/roadmap.md) trip over these, not over NUMA or
+Wi-Fi — so it runs before M128-M131.
+
+- [ ] `planned` A relocatable kernel, so the distribution boots under UEFI: multiboot2 tag 10 and page tables that do not assume a load at 1 MiB. Every machine sold in the last fifteen years boots that way; today the ISO goes through Limine's BIOS path.
+- [ ] `planned` The four Debian units that still fail: `/proc/self/mountinfo` naming a mount by the path the caller used rather than the path it was recorded with (`tmp.mount`, `run-lock.mount`), `sched_setscheduler` accepting what `CPUSchedulingPolicy=` asks for (`e2scrub_reap.service` exits `214/SETSCHEDULER`), and `systemd-sysusers`.
+- [ ] `planned` `apt-get update` against a `file:` repository: `symlink()` with an empty target, and whatever apt's `store:` method does to read an index.
+- [ ] `planned` The AHCI probe stops hanging on a port with an empty ATAPI device, so QEMU's q35 boots without `-machine pc`.
+- [ ] `planned` The io_uring remainder: `RECV_ZC`, io-wq affinity, NAPI busy-poll, buffer cloning, ring resizing, memory regions and the query interface, and a `SEND_ZC` that pins the caller's pages instead of copying.
+- [ ] `planned` The observability remainder: tracepoints and kprobes, and eBPF with a JIT, BTF and CO-RE, so a `bpftrace` script or a CO-RE toolchain's program loads instead of being refused with a reason.
+- [ ] `planned` Proof: the Debian and systemd lanes pass with no lane-side workaround, an ISO boots on a UEFI machine, and every row this milestone names is gone from the gap table.
