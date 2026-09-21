@@ -24,6 +24,7 @@
 #include <b1nix/types.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
+#include <b1nix/bpf.h>
 #include <b1nix/fanotify.h>
 #include <b1nix/userfaultfd.h>
 #include <b1nix/vfs.h>
@@ -1347,6 +1348,8 @@ int linux_modern_syscall(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4,
     if (userfaultfd_syscall(nr, a0, ret))
       return 1;
     if (fanotify_syscall(nr, a0, a1, a2, a3, a4, ret))
+      return 1;
+    if (bpf_syscall(nr, a0, a1, a2, ret))
       return 1;
     if (landlock_syscall(nr, a0, a1, a2, a3, ret))
       return 1;

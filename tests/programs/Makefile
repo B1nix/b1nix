@@ -371,6 +371,8 @@ BINARIES += $(BUILD)/bin/m126_smoke
 BINARIES += $(BUILD)/bin/m126_uffd_smoke
 # M126: fanotify — watching a mount, and refusing an open.
 BINARIES += $(BUILD)/bin/m126_fanotify_smoke
+# M126: eBPF — verifier, interpreter, maps, and a program on a perf event.
+BINARIES += $(BUILD)/bin/m126_bpf_smoke
 # M127: cgroup v2 resource control, the OOM killer and PSI.
 BINARIES += $(BUILD)/bin/m127_smoke
 # M127: compressed swap (zram), cgroup-targeted reclaim, memory.swap.current.

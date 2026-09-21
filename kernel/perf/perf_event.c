@@ -53,6 +53,7 @@
 #include <b1nix/perf_event.h>
 
 #include <b1nix/arch.h>
+#include <b1nix/bpf.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
@@ -120,6 +121,12 @@ struct perf_ev {
   /* A hardware counter, when this event is one: the slot the PMU driver gave
    * us, or -1 for a software counter. */
   int pmu_slot;
+
+  /* An eBPF program attached with PERF_EVENT_IOC_SET_BPF. It runs on every
+   * sample this event takes, and its return value decides whether the sample
+   * is kept -- which is how a profiler turns a firehose of records into a
+   * histogram it builds in a map. */
+  void *bpf_prog;
 
   /* The ring buffer, kernel-owned physical pages the process maps. */
   u64 rb_phys;
@@ -433,7 +440,10 @@ static void perf_emit_sample(struct perf_ev *ev, u64 pc, u64 fp, int in_user,
 
 /* Does this event want the task that was running when the tick landed? */
 static int perf_watches(const struct perf_ev *ev, struct task *t, int cpu) {
-  if (!ev->enabled || !ev->data)
+  /* A sampling event needs somewhere for the sample to go: a ring buffer, or
+   * an attached program, which IS the consumer -- a profiler that counts into
+   * a map never maps a buffer at all. */
+  if (!ev->enabled || (!ev->data && !ev->bpf_prog))
     return 0;
   if (ev->cpu >= 0 && ev->cpu != cpu)
     return 0;
@@ -476,6 +486,20 @@ void perf_event_tick_sample(u64 pc, u64 fp, int in_user, int cpu) {
       period = ev->period_ns;
     }
 
+    /* An attached program sees the sample first. Zero means "drop it", which
+     * is what a program that is counting into a map returns: it has already
+     * recorded what it wanted and no record needs to reach userspace. */
+    if (ev->bpf_prog) {
+      u64 pid_tgid = 0;
+
+      if (current_task)
+        pid_tgid = ((u64)task_tgid(current_task) << 32) | (u32)current_task->id;
+      if (bpf_run_perf(ev->bpf_prog, pc, pid_tgid, (u64)cpu) == 0)
+        continue;
+    }
+
+    if (!ev->data)
+      continue; /* the program was the consumer; there is no buffer to fill */
     perf_emit_sample(ev, pc, fp, in_user, cpu, period);
     woke = 1;
 
@@ -602,6 +626,10 @@ void perf_event_task_exit(struct task *t) {
 static const struct vfs_file_ops perf_file_ops;
 
 static void perf_free(struct perf_ev *ev) {
+  if (ev->bpf_prog) {
+    bpf_prog_put(ev->bpf_prog);
+    ev->bpf_prog = 0;
+  }
   if (ev->pmu_slot >= 0) {
     perf_pmu_slot_free(ev->pmu_slot);
     ev->pmu_slot = -1;
@@ -733,6 +761,23 @@ static int perf_handle_ioctl(struct vfs_handle *h, u64 request, void *arg) {
       ev->period_ns = p;
       ev->ns_left = p;
     }
+    break;
+  }
+  case PERF_EVENT_IOC_SET_BPF: {
+    /* The argument is a descriptor for a loaded program. Attaching takes a
+     * reference so the program stays alive while samples can still run it,
+     * even after the loader closes its own descriptor. */
+    void *prog = bpf_prog_get((int)(usize)arg);
+
+    if (!prog) {
+      rc = -EBADF;
+      break;
+    }
+    void *old = ev->bpf_prog;
+
+    ev->bpf_prog = prog;
+    if (old)
+      bpf_prog_put(old);
     break;
   }
   case PERF_EVENT_IOC_ID: {

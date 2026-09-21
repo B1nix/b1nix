@@ -3170,6 +3170,17 @@ check_output "$POSIX_LOG" "M126-FAN: ok perm-allow" "a permission event stops th
 check_output "$POSIX_LOG" "M126-FAN: ok perm-deny" "FAN_DENY makes the same open fail with EPERM"
 check_output "$POSIX_LOG" "M126-FAN: ok close-write" "a writable descriptor's close is FAN_CLOSE_WRITE and a read-only one's is FAN_CLOSE_NOWRITE"
 check_output "$POSIX_LOG" "M126-FAN: done" "M126 fanotify suite completes"
+# ── M126: eBPF — verifier, interpreter, maps, perf attach (m126_bpf_smoke) ──
+check_output "$POSIX_LOG" "M126-BPF: ok map" "hash and array maps round-trip keys and values through bpf(2), and a missing key is ENOENT"
+check_output "$POSIX_LOG" "M126-BPF: ok load-run" "a verified program runs and returns what it computed"
+check_output "$POSIX_LOG" "M126-BPF: ok map-from-prog" "a program looks a key up, increments the value and stores it back; userspace reads the count afterwards"
+check_output "$POSIX_LOG" "M126-BPF: ok helpers" "ktime_get_ns advances and get_current_pid_tgid returns the caller's real pid"
+check_output "$POSIX_LOG" "M126-BPF: ok reject-uninit" "the verifier refuses a program that reads a register nothing wrote"
+check_output "$POSIX_LOG" "M126-BPF: ok reject-oob" "the verifier refuses a stack access outside the 512-byte frame"
+check_output "$POSIX_LOG" "M126-BPF: ok reject-loop" "the verifier refuses a backward jump, which is what makes the walk terminate"
+check_output "$POSIX_LOG" "M126-BPF: ok reject-null" "the verifier refuses a map value used before it was tested for NULL"
+check_output "$POSIX_LOG" "M126-BPF: ok perf-attach" "a program attached with PERF_EVENT_IOC_SET_BPF runs on the event's samples and counts them in its map"
+check_output "$POSIX_LOG" "M126-BPF: done" "M126 eBPF suite completes"
 check_output "$POSIX_LOG" "M126-SMOKE: done" "M126 suite completes"
 # Protection keys. The lanes above run on the host's CPU; one without PKU must
 # answer as Linux does there. The pku lane (TCG -cpu max) has the hardware.

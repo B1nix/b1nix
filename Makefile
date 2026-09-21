@@ -593,6 +593,7 @@ KERNEL_SOURCES := \
 	kernel/sched/scheduler.c \
 	kernel/perf/perf_event.c \
 	kernel/perf/pmu_x86.c \
+	kernel/bpf/bpf_core.c \
 	kernel/syscall/syscall.c \
 	kernel/syscall/linux_abi.c \
 	kernel/syscall/linux_modern.c \
