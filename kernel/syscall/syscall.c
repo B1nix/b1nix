@@ -12,6 +12,7 @@
 #include <b1nix/kmsg.h>
 #include <b1nix/linux_abi.h>
 #include <b1nix/mm.h>
+#include <b1nix/thp.h>
 #include <b1nix/memtype.h>
 
 /* arch/x86_64/tlb.c; a no-op on a single-CPU boot. */
@@ -4528,8 +4529,35 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
      * semantic regression. NORESERVE *with* access (prot != PROT_NONE, e.g. a
      * read-only or RW lazy-commit region) keeps the eager path so its protection
      * bits are honored on fault-in. */
+    /* M128: leave whole 2 MiB blocks of a private anonymous mapping with no
+     * page table at all, so the fault path can put a transparent huge page
+     * there.
+     *
+     * A block is only taken when nothing describes it yet — that is what lets
+     * the huge-page code avoid ever retiring a page table, and retiring one is
+     * the single thing it cannot do safely (vmm_set_lazy walks without the
+     * page-table lock and would be left holding a pointer into a freed frame).
+     * The markers are an optimisation, not a requirement: a fault with no leaf
+     * inside an anonymous VMA is zero-filled by the same handler, reading the
+     * protection off the mapping instead of off the marker.
+     *
+     * Only when the feature is on, so a default boot marks exactly what it
+     * always did. */
+    u64 thp_lo = 0, thp_hi = 0;
+
+    if (thp_mode() != THP_MODE_NEVER && !(flags & MAP_SHARED) &&
+        length >= THP_SIZE) {
+      thp_lo = (vaddr + THP_SIZE - 1) & ~(THP_SIZE - 1);
+      thp_hi = (vaddr + length) & ~(THP_SIZE - 1);
+      if (thp_hi < thp_lo)
+        thp_hi = thp_lo;
+    }
     if (prot != PROT_NONE) {
       for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
+        if (v >= thp_lo && v < thp_hi) {
+          v = thp_hi - PAGE_SIZE; /* the loop's increment steps past the last */
+          continue;
+        }
         vmm_set_lazy(v);
         paging_mprotect_page(v, vmm_flags);
         /* A large mmap (V8's multi-GB JIT regions) walks many pages; drain any
@@ -4629,7 +4657,10 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   }
 
   // Create and link a new VMA
-  struct vm_area *vma = kmalloc(sizeof(struct vm_area));
+  /* Zeroed, not merely allocated: the struct has grown fields this site
+   * does not name one by one (the memory policy, and the huge-page advice),
+   * and an uninitialised one is read as a policy the caller never set. */
+  struct vm_area *vma = kzalloc(sizeof(struct vm_area));
   if (!vma) {
     // Cleanup if VMA tracking fails
     for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
@@ -5273,6 +5304,41 @@ int linux_modern_open_flags(int linux_flags) {
   return linux_open_flags_to_b1nix(linux_flags);
 }
 
+/* Record MADV_HUGEPAGE / MADV_NOHUGEPAGE on every mapping the range touches,
+ * cutting mappings at the range's edges so the advice covers exactly what the
+ * caller named. Linux returns EINVAL for a range with no mapping under it;
+ * a partly mapped range is advised as far as it goes. */
+static isize madvise_set_thp(u64 start, u64 end, int want) {
+  struct task *t = current_task;
+  int touched = 0;
+
+  if (!t)
+    return -ESRCH;
+  for (u64 v = start; v < end;) {
+    struct vm_area *vma = vma_lookup(t, v);
+
+    if (!vma || v < vma->start || v >= vma->end) {
+      v += PAGE_SIZE;
+      continue;
+    }
+    if (vma->start < v)
+      vma = vma_split(t, vma, v);
+    if (!vma)
+      return -ENOMEM;
+    if (vma->end > end && !vma_split(t, vma, end))
+      return -ENOMEM;
+    vma->thp = (i8)want;
+    touched = 1;
+    v = vma->end;
+  }
+  /* Turning the advice off has to undo what it did: a block already installed
+   * would otherwise stay, and MADV_NOHUGEPAGE is exactly the call a program
+   * makes when it cannot live with one. */
+  if (want < 0 && touched)
+    (void)paging_thp_split_range(t->pml4_phys, start, end, 0);
+  return touched ? 0 : -ENOMEM;
+}
+
 isize syscall_madvise(void *addr, usize length, int advice) {
   u64 start = (u64)(usize)addr;
   if ((start & (PAGE_SIZE - 1)) != 0)
@@ -5294,11 +5360,14 @@ isize syscall_madvise(void *addr, usize length, int advice) {
   case MADV_WILLNEED:
   case MADV_DONTFORK:
   case MADV_DOFORK:
+    /* Accepted hints b1nix does not act on (no prefetch, no fork-inherit
+     * control) — legal POSIX no-op. */
+    return 0;
   case MADV_HUGEPAGE:
   case MADV_NOHUGEPAGE:
-    /* Accepted hints b1nix does not act on (no prefetch, no fork-inherit
-     * control, no transparent hugepages) — legal POSIX no-op. */
-    return 0;
+    /* M128: recorded on the mapping, which is what the anonymous fault path
+     * consults. A no-op only when the machine has the feature off. */
+    return madvise_set_thp(start, end, advice == MADV_HUGEPAGE ? 1 : -1);
   case MADV_FREE:
     /*
      * A hint, and only a hint.

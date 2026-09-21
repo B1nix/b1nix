@@ -152,6 +152,8 @@ void tlb_shootdown_poll(void) {
 
 /* Generic dispatch: publish op/vaddr + pending, send IPI to all-but-self,
  * wait for ACKs. Caller must hold g_tlb_lock + IRQs disabled. */
+u64 paging_cr3_to_pml4(u64 cr3);
+
 static inline u64 read_cr3(void) {
     u64 cr3;
     __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
@@ -291,7 +293,11 @@ void tlb_shootdown_page(u64 vaddr) {
     spin_lock_irqsave(&g_tlb_lock, &flags);
     /* A kernel address is in every address space; a user one only in the
      * current. */
-    tlb_shootdown_dispatch(TLB_OP_PAGE, vaddr, (vaddr >> 63) ? 0 : read_cr3());
+    /* The space id the other CPUs record is a PML4 frame; under LA57 the live
+     * CR3 names a PML5, so it has to be translated or every user-page
+     * shootdown would match nobody. */
+    tlb_shootdown_dispatch(TLB_OP_PAGE, vaddr,
+                           (vaddr >> 63) ? 0 : paging_cr3_to_pml4(read_cr3()));
     spin_unlock_irqrestore(&g_tlb_lock, flags);
 }
 
@@ -315,7 +321,7 @@ void tlb_shootdown_current_mm(void) {
     if (!__atomic_load_n(&g_tlb_enabled, __ATOMIC_ACQUIRE)) return;
     u64 flags;
     spin_lock_irqsave(&g_tlb_lock, &flags);
-    tlb_shootdown_dispatch(TLB_OP_ALL, 0, read_cr3());
+    tlb_shootdown_dispatch(TLB_OP_ALL, 0, paging_cr3_to_pml4(read_cr3()));
     spin_unlock_irqrestore(&g_tlb_lock, flags);
 }
 

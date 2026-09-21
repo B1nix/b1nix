@@ -1662,6 +1662,16 @@ static void pci_selftest_stolen(void)
 	}
 }
 
+/* See the note in <b1nix/pci.h>: the direct map covers a BAR only while the
+ * MMIO hole sits inside the machine's RAM range. */
+void *pci_map_mmio(u64 phys, usize size) {
+  if (!phys || !size)
+    return 0;
+  if (phys + (u64)size <= DIRECT_MAP_SIZE)
+    return (void *)(usize)(vmm_direct_map_base() + phys);
+  return vmm_map_mmio(phys, size, VMM_WRITABLE | VMM_PCD | VMM_NO_EXECUTE);
+}
+
 void pci_selftest(void)
 {
 	if (!bootinfo_has_flag("b1nix.test=1"))

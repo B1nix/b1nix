@@ -183,9 +183,12 @@ static inline u64 vmm_user_flags_from_prot(int prot) {
 #define MADV_DONTNEED   4
 #define MADV_FREE       8
 /* Advisory hints accepted as a legal POSIX no-op (b1nix has no fork-inherit
- * control or transparent hugepages — the kernel just acknowledges them). */
+ * control — the kernel just acknowledges them). */
 #define MADV_DONTFORK   10
 #define MADV_DOFORK     11
+/* M128: transparent huge pages, per mapping. These are NOT no-ops when the
+ * feature is on (b1nix.thp): they set vm_area::thp, which is what the
+ * anonymous fault path consults before it installs a 2 MiB entry. */
 #define MADV_HUGEPAGE   14
 #define MADV_NOHUGEPAGE 15
 
@@ -203,6 +206,22 @@ static inline u64 vmm_user_flags_from_prot(int prot) {
 #define VMM_LAZY (1ULL << 10)   // Custom flag: lazy allocation
 #define VMM_COW (1ULL << 11)    // Custom flag: copy-on-write mapping
 
+/* M128: this 2 MiB directory entry is a transparent huge page belonging to a
+ * user mapping, not a slice of the kernel's identity window.
+ *
+ * The two are told apart by a flag rather than by the USER bit because the
+ * split path treats them oppositely. Splitting the identity window must strip
+ * USER from all 512 leaves (the directory entry gains the bit for the one leaf
+ * the caller is about to map, and the other 511 stay supervisor); splitting a
+ * transparent huge page must KEEP it on every leaf, or the process loses 511
+ * of its own pages and teardown stops recognising the frames as its own. */
+#define VMM_THP (1ULL << 53)
+
+/* Every transparent huge page is one of these, and buddy order 9 gives the
+ * 2 MiB alignment the hardware requires for free. */
+#define THP_SIZE (2ULL * 1024ULL * 1024ULL)
+#define THP_PAGES (THP_SIZE / PAGE_SIZE)
+
 /* Software flags must live on bits the CPU ignores, or they are not flags --
  * they are instructions to the MMU that nothing in this kernel meant to give.
  * Bits 9-11 and 52-58 are the available ones in every paging-structure entry;
@@ -212,6 +231,8 @@ static inline u64 vmm_user_flags_from_prot(int prot) {
   ((0x7ULL << 9) | (0x7fULL << 52))
 _Static_assert((VMM_SHARED & ~VMM_SW_AVAILABLE_BITS) == 0,
                "VMM_SHARED must sit on a bit the CPU ignores");
+_Static_assert((VMM_THP & ~VMM_SW_AVAILABLE_BITS) == 0,
+               "VMM_THP must sit on a bit the CPU ignores");
 _Static_assert((VMM_SWAPPED & ~VMM_SW_AVAILABLE_BITS) == 0,
                "VMM_SWAPPED must sit on a bit the CPU ignores");
 _Static_assert((VMM_LAZY & ~VMM_SW_AVAILABLE_BITS) == 0,
@@ -243,6 +264,18 @@ u64 pmm_alloc_frames(usize count);
  * memory it was asked to reach. Returns 0 when nothing under the ceiling is
  * free. Walks the used-bitmap, so it is O(limit/PAGE_SIZE): a slow-path call. */
 u64 pmm_alloc_frames_below(usize count, u64 limit);
+
+/* M128: one naturally aligned buddy block of 2^order frames, zeroed, or 0 when
+ * the tree has no such block right now. Unlike pmm_alloc_frames this NEVER runs
+ * reclaim and never falls back to the bitmap scan — it is the allocation a
+ * transparent huge page makes, and an opportunistic 2 MiB request must not push
+ * a machine into eviction on behalf of a mapping that is perfectly correct as
+ * 512 ordinary pages. Each frame of the block comes back with its own refcount
+ * of 1, so the block can later be split and freed a page at a time. */
+u64 pmm_alloc_block(int order);
+/* The same, from a particular NUMA node — `strict` refuses rather than falling
+ * back, which is what MPOL_BIND means. `node` < 0 is the local node. */
+u64 pmm_alloc_block_node(int order, int node, int strict);
 /* Physical address of the single shared zero page (zero-page dedup). Reserved
  * for the kernel's lifetime; pmm_free_frame() ignores it. */
 u64 pmm_zero_page(void);
@@ -257,6 +290,12 @@ int pmm_frame_is_page_table(u64 frame);
 u16 pmm_get_refcount(u64 frame);
 /* Reclaim hook for file pages cached outside the kernel page cache. */
 void pmm_set_fs_reclaim(unsigned long (*fn)(unsigned long));
+/* NUMA (M128). pmm_numa_reseed is called once the ACPI topology is parsed;
+ * pmm_alloc_frame_node serves a page from a particular node, strictly when the
+ * caller would rather fail than be served from another. */
+void pmm_numa_reseed(void);
+usize pmm_node_free_frames(int node);
+u64 pmm_alloc_frame_node(int node, int strict);
 u64 pmm_total_usable_memory(void);
 u64 pmm_phys_total_memory(void);
 u64 pmm_free_memory_estimate(void);

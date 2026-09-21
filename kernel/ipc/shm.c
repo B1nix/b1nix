@@ -284,7 +284,7 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
         pmm_ref_frame(pages[p]);
     }
 
-    struct vm_area *vma = kmalloc(sizeof(struct vm_area));
+    struct vm_area *vma = kzalloc(sizeof(struct vm_area)); /* see syscall_mmap */
     if (!vma) {
         for (int p = 0; p < npages; p++)
             vmm_unmap_page(vaddr + (u64)p * PAGE_SIZE);

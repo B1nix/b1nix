@@ -3,6 +3,7 @@
 #include <b1nix/kprintf.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
+#include <b1nix/numa.h>
 #include <b1nix/psi.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/klog.h>
@@ -203,11 +204,40 @@ static int bitmap_get(usize index) {
           (1u << (index % BITS_PER_BYTE))) != 0;
 }
 
+/* ── per-node free pages (M128) ──────────────────────────────────────────
+ *
+ * The bitmap is what "free" means here, so the per-node counts are kept where
+ * a bit changes rather than alongside every caller that moves free_frames.
+ * They are exact for that reason, and pmm_numa_reseed recomputes them from the
+ * bitmap when the topology first becomes known (numa_init runs long after
+ * pmm_init, and the bulk range-free at boot writes the bitmap with memset).
+ *
+ * `pmm_nodes` is 1 on every machine without an SRAT, and then the node lookup
+ * is skipped entirely: one compare on the allocator's hottest path. */
+static usize node_free_pages[NUMA_MAX_NODES];
+static int pmm_nodes = 1;
+
+static inline int pmm_node_of(u64 frame) {
+  return pmm_nodes > 1 ? numa_node_of_frame(frame) : 0;
+}
+
+static inline int pmm_node_of_index(usize index) {
+  return pmm_nodes > 1 ? numa_node_of_frame(frame_from_index(index)) : 0;
+}
+
 static void bitmap_set(usize index) {
+  if (!bitmap_get(index)) {
+    int n = pmm_node_of_index(index);
+
+    if (node_free_pages[n])
+      node_free_pages[n]--;
+  }
   pmm.bitmap[index / BITS_PER_BYTE] |= (u8)(1u << (index % BITS_PER_BYTE));
 }
 
 static void bitmap_clear(usize index) {
+  if (bitmap_get(index))
+    node_free_pages[pmm_node_of_index(index)]++;
   pmm.bitmap[index / BITS_PER_BYTE] &= (u8) ~(1u << (index % BITS_PER_BYTE));
 }
 
@@ -245,7 +275,9 @@ struct buddy_block {
   u64 magic;
 };
 
-static u64 free_area[BUDDY_MAX_ORDER + 1]; /* head frame of each order's list */
+/* Head frame of each order's list, per node. A machine with one node uses
+ * row 0 and nothing else, which is the same allocator it always was. */
+static u64 free_area[NUMA_MAX_NODES][BUDDY_MAX_ORDER + 1];
 static int buddy_ready;
 
 /* Shared zero page for zero-page dedup: one reserved physical frame mapped
@@ -291,19 +323,23 @@ static void head_clear(usize index) {
 
 static void buddy_insert(u64 frame, int order) {
   struct buddy_block *b = buddy_hdr(frame);
+  int node = pmm_node_of(frame);
+
   b->order = (u64)order;
   b->magic = BUDDY_MAGIC;
-  b->next = free_area[order];
+  b->next = free_area[node][order];
   b->prev = 0;
   if (b->next) buddy_hdr(b->next)->prev = frame;
-  free_area[order] = frame;
+  free_area[node][order] = frame;
   head_set(frame_index(frame));
 }
 
 static void buddy_unlink(u64 frame, int order) {
   struct buddy_block *b = buddy_hdr(frame);
+  int node = pmm_node_of(frame);
+
   if (b->prev) buddy_hdr(b->prev)->next = b->next;
-  else if (free_area[order] == frame) free_area[order] = b->next;
+  else if (free_area[node][order] == frame) free_area[node][order] = b->next;
   if (b->next) buddy_hdr(b->next)->prev = b->prev;
   b->next = b->prev = 0;
   head_clear(frame_index(frame));
@@ -416,15 +452,18 @@ static void pmm_return_frame(u64 frame) {
  * corruption the offending list is truncated (the bitmap is authoritative) and
  * 0 is returned so the caller can fall back to the bitmap scan. Caller holds
  * pmm_lock. */
-static u64 buddy_alloc(int order) {
+/* One node's lists. `buddy_alloc` below walks the nodes in preference order
+ * and calls this for each. */
+static u64 buddy_alloc_node(int order, int node) {
   if (order < 0 || order > BUDDY_MAX_ORDER) return 0;
+  if (node < 0 || node >= NUMA_MAX_NODES) return 0;
   for (int k = order; k <= BUDDY_MAX_ORDER; k++) {
     /* Pop each order's list head. A block whose header is corrupt truncates
      * the list — the bitmap is authoritative, so the caller's bitmap-scan
      * fallback recovers every free page and nothing is lost. The head check is
      * O(1) (head-bit + header), so this costs nothing on the hot path. */
-    while (free_area[k] != 0) {
-      u64 frame = free_area[k];
+    while (free_area[node][k] != 0) {
+      u64 frame = free_area[node][k];
       if (!buddy_is_free_block(frame, k)) {
         static int reported;
         if (!reported) {
@@ -434,7 +473,7 @@ static u64 buddy_alloc(int order) {
           console_write(" — truncating; bitmap scan recovers free frames\n");
         }
         head_clear(frame_index(frame));
-        free_area[k] = 0;
+        free_area[node][k] = 0;
         break;
       }
       buddy_unlink(frame, k);
@@ -455,6 +494,40 @@ static u64 buddy_alloc(int order) {
   return 0;
 }
 
+/* The node an allocation with no policy of its own wants: the one the CPU
+ * running this code sits on, which is where its pages will be touched from. */
+static int buddy_local_node(void) {
+  return pmm_nodes > 1 ? numa_node_here() : 0;
+}
+
+/* Allocate from `pref` if it has the block, otherwise from the nearest node
+ * that does. `strict` refuses the fallback, which is what MPOL_BIND with
+ * MPOL_MF_STRICT means: the caller would rather fail than be served from the
+ * wrong node. A negative `pref` means "wherever this CPU is". */
+static u64 buddy_alloc_pref(int order, int pref, int strict) {
+  int order_list[NUMA_MAX_NODES];
+  int n;
+
+  if (pmm_nodes <= 1)
+    return buddy_alloc_node(order, 0);
+  if (pref < 0)
+    pref = buddy_local_node();
+  if (strict)
+    return buddy_alloc_node(order, pref);
+  n = numa_node_order(pref, order_list);
+  for (int i = 0; i < n; i++) {
+    u64 frame = buddy_alloc_node(order, order_list[i]);
+
+    if (frame)
+      return frame;
+  }
+  return 0;
+}
+
+static u64 buddy_alloc(int order) {
+  return buddy_alloc_pref(order, -1, 0);
+}
+
 /* Rebuild the whole tree from the authoritative bitmap: drop every list, then
  * decompose each contiguous free run into maximal aligned blocks (largest
  * order first) — the canonical buddy representation. Whole all-used 64-bit
@@ -467,7 +540,8 @@ static u64 buddy_alloc(int order) {
  * is what lets every other path assume the tree is never stale (which is what
  * makes the O(1) buddy_is_free_block test sound). Caller holds pmm_lock. */
 static void buddy_seed_from_bitmap(void) {
-  for (int i = 0; i <= BUDDY_MAX_ORDER; i++) free_area[i] = 0;
+  for (int n = 0; n < NUMA_MAX_NODES; n++)
+    for (int i = 0; i <= BUDDY_MAX_ORDER; i++) free_area[n][i] = 0;
   memset(pmm.buddy_heads, 0, pmm.bitmap_bytes);
 
   usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
@@ -704,7 +778,8 @@ void pmm_init(const struct boot_info *boot_info) {
   pmm.bitmap_bytes = align_up_u64((frame_count + 7) / 8, PAGE_SIZE);
   usize refcounts_bytes = align_up_u64(frame_count * sizeof(u16), PAGE_SIZE);
 
-  for (int i = 0; i <= BUDDY_MAX_ORDER; i++) free_area[i] = 0;
+  for (int n = 0; n < NUMA_MAX_NODES; n++)
+    for (int i = 0; i <= BUDDY_MAX_ORDER; i++) free_area[n][i] = 0;
   buddy_ready = 0;
 
   u64 early_mem =
@@ -1868,6 +1943,32 @@ u64 pmm_alloc_frames_below(usize count, u64 limit) {
   return frame;
 }
 
+/* M128: an aligned buddy block, or nothing. See pmm_alloc_block in <b1nix/mm.h>
+ * for why this deliberately has no reclaim and no bitmap fallback. */
+u64 pmm_alloc_block(int order) { return pmm_alloc_block_node(order, -1, 0); }
+
+u64 pmm_alloc_block_node(int order, int node, int strict) {
+  u64 flags;
+  u64 frame;
+
+  if (order < 0 || order > BUDDY_MAX_ORDER)
+    return 0;
+  pmm_acquire(&flags);
+  if (!buddy_ready) {
+    pmm_release(flags);
+    return 0;
+  }
+  frame = buddy_alloc_pref(order, node, strict);
+  if (frame == 0) {
+    pmm_release(flags);
+    return 0;
+  }
+  pmm_check_handout(frame);
+  zero_frames(frame, buddy_pages(order));
+  pmm_release(flags);
+  return frame;
+}
+
 u64 pmm_alloc_frames(usize count) {
   u64 flags;
   u64 reclaim_attempts = 0;
@@ -2145,6 +2246,63 @@ u64 pmm_alloc_frames(usize count) {
     pmm_clean_alloc_streak = 0;
     return 0;
   }
+}
+
+/* ── NUMA: allocation by node, and what each node has left (M128) ────────
+ *
+ * pmm_numa_reseed runs once the topology is known — numa_init needs ACPI and
+ * the direct map, both of which come long after pmm_init, so until then every
+ * frame counts as node 0's and the free lists are one node's. Reseeding
+ * re-links every free block onto the list of the node it physically belongs
+ * to and recounts the per-node free pages from the bitmap, which is the only
+ * thing that was authoritative all along. */
+void pmm_numa_reseed(void) {
+  u64 flags;
+
+  if (numa_node_count() <= 1)
+    return;
+  pmm_acquire(&flags);
+  pmm_nodes = numa_node_count();
+  for (int n = 0; n < NUMA_MAX_NODES; n++)
+    node_free_pages[n] = 0;
+  for (usize idx = 0; idx < (usize)pmm.bitmap_bytes * BITS_PER_BYTE; idx++)
+    if (!bitmap_get(idx))
+      node_free_pages[pmm_node_of_index(idx)]++;
+  if (buddy_ready)
+    buddy_seed_from_bitmap();
+  pmm_release(flags);
+}
+
+usize pmm_node_free_frames(int node) {
+  if (node < 0 || node >= NUMA_MAX_NODES)
+    return 0;
+  if (pmm_nodes <= 1)
+    return node == 0 ? (usize)pmm.free_frames : 0;
+  return node_free_pages[node];
+}
+
+/* One frame from `node`. `strict` refuses a frame from anywhere else, which is
+ * what MPOL_BIND asks for; without it the nearest node that has one answers,
+ * as Linux's allocator does. Falls back to the ordinary path on a machine with
+ * one node, where the per-CPU caches make the allocation cheaper. */
+u64 pmm_alloc_frame_node(int node, int strict) {
+  u64 flags;
+  u64 frame;
+
+  if (pmm_nodes <= 1 || node < 0)
+    return pmm_alloc_frame();
+  pmm_acquire(&flags);
+  frame = buddy_ready ? buddy_alloc_pref(0, node, strict) : 0;
+  if (frame) {
+    pmm_check_handout(frame);
+    zero_frames(frame, 1);
+  }
+  pmm_release(flags);
+  if (frame)
+    return frame;
+  /* Nothing on that node. A strict caller wanted that answer; anyone else
+   * takes the machine's ordinary path, which reclaims before it gives up. */
+  return strict ? 0 : pmm_alloc_frames(1);
 }
 
 u64 pmm_total_usable_memory(void) { return pmm.total_usable; }

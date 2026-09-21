@@ -389,7 +389,9 @@ int r8169_probe(void)
 	}
 
 #ifdef __x86_64__
-	r_regs = (volatile u8 *)(usize)(vmm_direct_map_base() + mmio_phys);
+	/* The direct map where it reaches, a real mapping where the machine's RAM
+	 * pushed the MMIO window past it (see <b1nix/pci.h>). */
+	r_regs = (volatile u8 *)pci_map_mmio(mmio_phys, 0x1000);
 #else
 	r_regs = (volatile u8 *)vmm_map_mmio(mmio_phys, 0x1000,
 	                                     VMM_WRITABLE | VMM_PCD);

@@ -47,6 +47,11 @@ pd2:
 	.skip 4096
 pd3:
 	.skip 4096
+/* The 5-level top table (M128). Used only when the CPU has LA57 and the
+ * command line asks for it; see enable_long_mode. */
+.global pml5
+pml5:
+	.skip 4096
 
 /* The boot CPU's kernel stack, and the guard page that catches it running off
  * the bottom.
@@ -120,10 +125,11 @@ _start:
 	ljmp $0x08, $long_mode_low
 
 setup_page_tables:
-	/* Clear pml4 + pdpt + pd0..pd3 = 6 pages = 24576 bytes (6144 dwords). */
+	/* Clear pml4 + pdpt + pd0..pd3 + pml5 = 7 pages = 28672 bytes (7168
+	 * dwords). They are contiguous in .bss, in that order. */
 	movl $(pml4 - KERNEL_VMA), %edi
 	xorl %eax, %eax
-	movl $6144, %ecx
+	movl $7168, %ecx
 	rep stosl
 
 	/* pml4[0]   -> pdpt : low identity window (this code + physical access)
@@ -168,13 +174,118 @@ setup_page_tables:
 	jne .map_pd
 	ret
 
+/* ── 5-level paging (M128) ──────────────────────────────────────────────
+ *
+ * Decide whether to run with LA57: the CPU must have it (CPUID leaf 7,
+ * ECX bit 16) and the command line must ask for it (b1nix.la57). It is opt-in
+ * rather than automatic because no machine here has the feature — it is
+ * verified under QEMU's TCG with -cpu max,la57=on — and because this is the
+ * one decision that cannot be revisited once paging is on.
+ *
+ * The table is shaped so that nothing above this file has to know: PML5[0]
+ * and PML5[511] both point at the PML4 that four-level paging would have
+ * used, so the low identity window (bits 56:48 = 0) and the kernel's high
+ * windows (bits 56:48 = all ones) resolve through exactly the same entries
+ * they always did. Every existing four-level walk stays correct; what changes
+ * is only which table CR3 names.
+ *
+ * Returns with %edx = 1 when LA57 was enabled, 0 otherwise. Clobbers
+ * eax/ebx/ecx/esi/edi. */
+decide_la57:
+	xorl %edx, %edx
+	/* CPUID leaf 7 needs max-leaf >= 7. */
+	pushl %ebx
+	xorl %eax, %eax
+	cpuid
+	cmpl $7, %eax
+	jb 9f
+	movl $7, %eax
+	xorl %ecx, %ecx
+	cpuid
+	testl $(1 << 16), %ecx     /* LA57 */
+	jz 9f
+	movl $1, %edx
+9:
+	popl %ebx
+	testl %edx, %edx
+	jz 8f
+	/* The command line has to ask. Walk the Multiboot2 tag list for the
+	 * boot-command-line tag (type 1) and look for "b1nix.la57" in it. */
+	xorl %edx, %edx
+	movl (multiboot_info_saved - KERNEL_VMA), %esi
+	testl %esi, %esi
+	jz 8f
+	addl $8, %esi              /* first tag, past total_size + reserved */
+1:
+	movl (%esi), %eax          /* tag type */
+	movl 4(%esi), %ecx         /* tag size */
+	testl %eax, %eax
+	jz 8f                      /* type 0: end of list */
+	cmpl $8, %ecx
+	jb 8f                      /* a malformed list: stop rather than loop */
+	cmpl $1, %eax
+	jne 3f
+	/* Search the NUL-terminated string at %esi+8 for the flag. */
+	leal 8(%esi), %edi
+2:
+	movb (%edi), %al
+	testb %al, %al
+	jz 3f
+	pushl %esi
+	pushl %edi
+	movl $(la57_flag_string - KERNEL_VMA), %esi
+4:
+	movb (%esi), %al
+	testb %al, %al
+	jz 5f                      /* matched the whole flag */
+	movb (%edi), %bl
+	cmpb %al, %bl
+	jne 6f
+	incl %esi
+	incl %edi
+	jmp 4b
+5:
+	popl %edi
+	popl %esi
+	movl $1, %edx
+	jmp 8f
+6:
+	popl %edi
+	popl %esi
+	incl %edi
+	jmp 2b
+3:
+	addl %ecx, %esi
+	addl $7, %esi
+	andl $-8, %esi             /* tags are 8-byte aligned */
+	jmp 1b
+8:
+	ret
+
 enable_long_mode:
+	call decide_la57
+	movl %edx, (la57_enabled - KERNEL_VMA)
+	testl %edx, %edx
+	jz 7f
+	/* PML5[0] and PML5[511] -> the PML4 built above. */
+	movl $(pml4 - KERNEL_VMA), %eax
+	orl $0x003, %eax
+	movl %eax, (pml5 - KERNEL_VMA)
+	movl %eax, (pml5 - KERNEL_VMA + 511*8)
+	movl $(pml5 - KERNEL_VMA), %eax
+	movl %eax, %cr3
+	movl %cr4, %eax
+	orl $(1 << 5) | (1 << 12), %eax  /* PAE + LA57 */
+	movl %eax, %cr4
+	jmp 6f
+7:
 	movl $(pml4 - KERNEL_VMA), %eax
 	movl %eax, %cr3
 
 	movl %cr4, %eax
 	orl $(1 << 5), %eax        /* PAE */
 	movl %eax, %cr4
+6:
 
 	/* M95: probe NX support (CPUID.80000001H:EDX[20]) so EFER.NXE can be set
 	 * alongside LME. The module loader maps module data pages with PTE bit 63
@@ -273,3 +384,10 @@ multiboot_magic_saved:
 	.long 0
 multiboot_info_saved:
 	.long 0
+/* 1 when CR4.LA57 was set above; read by the C paging code, which has to
+ * build a 5-level top table for every address space it creates. */
+.global la57_enabled
+la57_enabled:
+	.long 0
+la57_flag_string:
+	.asciz "b1nix.la57"

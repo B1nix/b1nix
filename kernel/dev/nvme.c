@@ -778,12 +778,13 @@ void nvme_init(void)
     
     // Map the controller registers.
 #if defined(__x86_64__) || defined(__aarch64__)
-    /* x86_64: the direct map already covers PCI MMIO BARs. aarch64: the same
-     * is true — build_kernel_half maps the board's PCIe MMIO window as Device
-     * memory, and vmm_direct_map_base() is 0 there, so this is the identity
-     * address. Going through vmm_map_mmio instead returned NULL (it is a stub
-     * on that arch) and the first register read faulted at address 0. */
-    u64 regs_virt = vmm_direct_map_base() + bar0;
+    /* Usually the direct map already covers the BAR, and pci_map_mmio returns
+     * that address for nothing. It does not on a machine with enough RAM to
+     * push the 64-bit MMIO window above it — a 72 GiB guest puts this
+     * controller's registers at 0x7000_00000000 — and the first register read
+     * then faults in ring 0. The doorbells extend past the register header,
+     * so the mapping covers a few pages. */
+    u64 regs_virt = (u64)(usize)pci_map_mmio(bar0, 0x2000);
 #else
     // 32-bit: BAR0 lives at ~4 GB of MMIO space, above the 1 GB direct map, so
     // vmm_direct_map_base()+BAR0 overflows the 32-bit address (cap reads 0 ->

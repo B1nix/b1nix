@@ -44,6 +44,15 @@ ap_32:
      * dead one's physical page, long after the frame had been freed and handed
      * to someone else. Nothing wants PGE here; the CPUs must agree. */
     orl $(1 << 5), %eax
+    /* M128: and LA57, when the BSP is running with five-level paging. Every
+     * CPU has to agree on the number of levels — the CR3 the BSP handed us
+     * names a PML5 — and this is the only place an AP can set it, before its
+     * own CR0.PG goes on. */
+    movl (la57_on), %ebx
+    testl %ebx, %ebx
+    jz 3f
+    orl $(1 << 12), %eax
+3:
     movl %eax, %cr4
     /* M95: probe NX support (CPUID.80000001H:EDX[20]) and enable EFER.NXE
      * together with LME. Without it, an AP that touches a module data page —
@@ -68,7 +77,14 @@ ap_32:
 2:
     wrmsr
     movl %cr0, %eax
-    orl $0x80000000, %eax
+    orl $0x80000000, %eax      /* PG */
+    /* And caches ON. A processor comes out of reset with CD and NW set, and
+     * this trampoline never cleared them: every AP ran with its caches
+     * disabled, which is both enormously slow and a CR0 the boot CPU does not
+     * share -- the SMP state check reads "cr0 differs on cpu 1:
+     * 0x...e0010033 vs 0x...80010033", those two bits. The firmware clears
+     * them for the boot CPU; nobody does it for an AP but the AP. */
+    andl $~((1 << 30) | (1 << 29)), %eax
     movl %eax, %cr0
     ljmpl $0x18, $ap_64
 
@@ -116,6 +132,7 @@ gdt_ptr:    .word gdt_end - gdt - 1  /* limit */
             .quad gdt                /* base */
 ready_flag: .long 0
 ap_main_ptr: .quad 0
+la57_on:    .quad 0
 
 /* GDT with a real 32-bit code/data pair for the protected-mode phase (ap_32)
  * AND a 64-bit code segment for long mode (ap_64). The old GDT had only the

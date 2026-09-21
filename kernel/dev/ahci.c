@@ -895,13 +895,12 @@ void ahci_init(void) {
 
   // Map ABAR into kernel's virtual address space.
 #if defined(__x86_64__) || defined(__aarch64__)
-  /* x86_64: the direct map spans >=4 GB and already covers PCI MMIO BARs.
-   * aarch64: build_kernel_half maps the board's PCIe MMIO window as Device
-   * memory and vmm_direct_map_base() is 0 there, so this is the identity
-   * address — no mapping call needed. (vmm_map_mmio does build a real mapping
-   * on that arch now, but the boot map already covers this window with the
-   * right memory type, so going through it would only burn window space.) */
-  u64 abar_virt = vmm_direct_map_base() + ahci_pci_bar5;
+  /* The direct map covers this BAR on every ordinary machine, and
+   * pci_map_mmio hands back that address without building anything. A machine
+   * whose RAM pushes the 64-bit MMIO window above the direct map gets a real
+   * mapping instead of a fault (see <b1nix/pci.h>). */
+  u64 abar_virt = (u64)(usize)pci_map_mmio(ahci_pci_bar5,
+                                           sizeof(struct ahci_hba_mem));
 #else
   // 32-bit: the direct map only covers low RAM (<=1 GB), but the ABAR lives at
   // ~4 GB of MMIO space. Computing vmm_direct_map_base()+ABAR there overflows

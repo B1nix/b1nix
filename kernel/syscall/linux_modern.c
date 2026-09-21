@@ -32,6 +32,8 @@
 
 #include "linux_modern.h"
 
+#include <b1nix/mempolicy.h>
+
 /* ── numbers ─────────────────────────────────────────────────────── */
 
 /* Everything from 424 up is shared by every architecture; the older calls
@@ -82,8 +84,7 @@
 /* The task policy, kept beside the task (no fields in struct task) and
  * inherited across fork like Linux's. */
 struct lm_task_state {
-  u16 mempolicy_mode;
-  u16 mempolicy_flags;
+  u8 reserved; /* the memory policy moved to kernel/mm/mempolicy.c */
 };
 /* Sized from the task table on first use; a task that never touched a policy
  * reads as MPOL_DEFAULT either way. */
@@ -110,6 +111,7 @@ void linux_modern_task_reset(usize slot) {
 
   linux_keys_task_reset(slot);
   landlock_task_reset(slot);
+  mempolicy_task_reset(slot);
   if (s)
     memset(s, 0, sizeof(*s));
 }
@@ -120,228 +122,17 @@ void linux_modern_fork_inherit(usize parent_slot, usize child_slot) {
 
   linux_keys_fork_inherit(parent_slot, child_slot);
   landlock_fork(parent_slot, child_slot);
+  mempolicy_fork_inherit(parent_slot, child_slot);
   if (p && c)
     *c = *p;
 }
 
-static struct lm_task_state *lm_cur(void) {
-  return lm_slot(scheduler_task_index(current_task), 1);
-}
-
 /* ── memory policy ───────────────────────────────────────────────── */
 
-#define MPOL_DEFAULT        0
-#define MPOL_PREFERRED      1
-#define MPOL_BIND           2
-#define MPOL_INTERLEAVE     3
-#define MPOL_LOCAL          4
-#define MPOL_PREFERRED_MANY 5
-#define MPOL_WEIGHTED_INTERLEAVE 6
-#define MPOL_MAX            7
-#define MPOL_F_NUMA_BALANCING (1 << 13)
-#define MPOL_F_RELATIVE_NODES (1 << 14)
-#define MPOL_F_STATIC_NODES   (1 << 15)
-#define MPOL_MODE_FLAGS \
-  (MPOL_F_NUMA_BALANCING | MPOL_F_RELATIVE_NODES | MPOL_F_STATIC_NODES)
-#define MPOL_F_NODE         (1 << 0)
-#define MPOL_F_ADDR         (1 << 1)
-#define MPOL_F_MEMS_ALLOWED (1 << 2)
-#define MPOL_MF_STRICT      (1 << 0)
-#define MPOL_MF_MOVE        (1 << 1)
-#define MPOL_MF_MOVE_ALL    (1 << 2)
-#define MPOL_MF_LAZY        (1 << 3)
-
-/* Linux's MAX_NUMNODES is a build choice; the ABI bound on maxnode is a page
- * of bits. */
-#define LM_MAXNODE_LIMIT (PAGE_SIZE * 8)
-
-/* Read a user node mask of `maxnode` bits (Linux drops the last bit) and
- * report whether it is empty and whether it names any node but 0. */
-static int lm_read_nodemask(u64 uptr, u64 maxnode, int *empty, int *beyond) {
-  *empty = 1;
-  *beyond = 0;
-  if (!uptr || maxnode == 0)
-    return 0;
-  maxnode--;
-  if (maxnode > LM_MAXNODE_LIMIT)
-    return -EINVAL;
-  u64 words = (maxnode + 63) / 64;
-  for (u64 w = 0; w < words; w++) {
-    u64 v = 0;
-
-    if (syscall_copyin(&v, (const void *)(usize)(uptr + w * 8), 8) != 0)
-      return -EFAULT;
-    if (w == words - 1 && maxnode % 64)
-      v &= (1ULL << (maxnode % 64)) - 1;
-    if (v)
-      *empty = 0;
-    if (w == 0 ? (v & ~1ULL) : v)
-      *beyond = 1;
-  }
-  return 0;
-}
-
-static int lm_check_policy(u64 mode_word, u64 nmask, u64 maxnode) {
-  u32 mode = (u32)mode_word & ~(u32)MPOL_MODE_FLAGS;
-  u32 mflags = (u32)mode_word & (u32)MPOL_MODE_FLAGS;
-  int empty, beyond;
-
-  if (mode >= MPOL_MAX || (u32)(mode_word >> 32))
-    return -EINVAL;
-  if ((mflags & MPOL_F_STATIC_NODES) && (mflags & MPOL_F_RELATIVE_NODES))
-    return -EINVAL;
-  if ((mflags & MPOL_F_NUMA_BALANCING) && mode != MPOL_BIND)
-    return -EINVAL;
-  int rc = lm_read_nodemask(nmask, maxnode, &empty, &beyond);
-  if (rc)
-    return rc;
-  /* A node this machine does not have. */
-  if (beyond)
-    return -EINVAL;
-  switch (mode) {
-  case MPOL_DEFAULT:
-  case MPOL_LOCAL:
-    if (!empty || mflags)
-      return -EINVAL;
-    break;
-  case MPOL_PREFERRED:
-    break; /* an empty mask means local allocation */
-  default:
-    if (empty)
-      return -EINVAL;
-  }
-  return (int)mode;
-}
-
-static int lm_range_mapped(u64 start, u64 len) {
-  u64 end = start + len;
-  u64 flags;
-  int ok = 1;
-
-  vma_list_lock(&flags);
-  for (u64 a = start; a < end;) {
-    struct vm_area *v = vma_lookup(current_task, a);
-
-    if (!v) {
-      ok = 0;
-      break;
-    }
-    a = v->end;
-  }
-  vma_list_unlock(flags);
-  return ok;
-}
-
-static isize lm_mbind(u64 start, u64 len, u64 mode, u64 nmask, u64 maxnode,
-                      u64 flags) {
-  if (start & (PAGE_SIZE - 1))
-    return -EINVAL;
-  if (flags & ~(u64)(MPOL_MF_STRICT | MPOL_MF_MOVE | MPOL_MF_MOVE_ALL))
-    return -EINVAL;
-  if ((flags & MPOL_MF_MOVE_ALL) &&
-      !cred_has_cap(current_task->cred, CAP_SYS_NICE))
-    return -EPERM;
-  int m = lm_check_policy(mode, nmask, maxnode);
-  if (m < 0)
-    return m;
-  len = (len + PAGE_SIZE - 1) & ~(u64)(PAGE_SIZE - 1);
-  if (start + len < start || start + len > USER_SPACE_LIMIT)
-    return -EINVAL;
-  if (len == 0)
-    return 0;
-  if (!lm_range_mapped(start, len))
-    return -EFAULT;
-  /* One node: every page already lives where any valid policy asks, so there
-   * is nothing to move and nothing that could violate MPOL_MF_STRICT. */
-  return 0;
-}
-
-static isize lm_set_mempolicy(u64 mode, u64 nmask, u64 maxnode) {
-  int m = lm_check_policy(mode, nmask, maxnode);
-  struct lm_task_state *s = lm_cur();
-
-  if (m < 0)
-    return m;
-  if (s) {
-    s->mempolicy_mode = (u16)m;
-    s->mempolicy_flags = (u16)(mode & MPOL_MODE_FLAGS);
-  }
-  return 0;
-}
-
-static isize lm_write_mask(u64 uptr, u64 maxnode, int node0) {
-  if (!uptr)
-    return 0;
-  if (maxnode == 0)
-    return -EINVAL;
-  u64 words = (maxnode + 63) / 64;
-  if (maxnode > LM_MAXNODE_LIMIT)
-    return -EINVAL;
-  for (u64 w = 0; w < words; w++) {
-    u64 v = (w == 0 && node0) ? 1 : 0;
-
-    if (syscall_copyout((void *)(usize)(uptr + w * 8), &v, 8) != 0)
-      return -EFAULT;
-  }
-  return 0;
-}
-
-static isize lm_get_mempolicy(u64 umode, u64 nmask, u64 maxnode, u64 addr,
-                              u64 flags) {
-  struct lm_task_state *s = lm_cur();
-  int mode;
-
-  if (flags & ~(u64)(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED))
-    return -EINVAL;
-  if (nmask && maxnode < 1)
-    return -EINVAL;
-  if (flags & MPOL_F_MEMS_ALLOWED) {
-    if (flags & (MPOL_F_NODE | MPOL_F_ADDR))
-      return -EINVAL;
-    if (umode) {
-      int zero = 0;
-
-      if (syscall_copyout((void *)(usize)umode, &zero, sizeof(zero)))
-        return -EFAULT;
-    }
-    return lm_write_mask(nmask, maxnode, 1);
-  }
-  if (!(flags & MPOL_F_ADDR) && addr)
-    return -EINVAL;
-  if (flags & MPOL_F_ADDR) {
-    if (!lm_range_mapped(addr & ~(u64)(PAGE_SIZE - 1), PAGE_SIZE))
-      return -EFAULT;
-  }
-  if (flags & MPOL_F_NODE) {
-    /* The node the page (or the next allocation) is on: node 0. */
-    mode = 0;
-  } else {
-    mode = s ? (int)(s->mempolicy_mode | s->mempolicy_flags) : 0;
-  }
-  if (umode && syscall_copyout((void *)(usize)umode, &mode, sizeof(mode)))
-    return -EFAULT;
-  {
-    int m = s ? s->mempolicy_mode : 0;
-    int node0 = (m == MPOL_BIND || m == MPOL_INTERLEAVE ||
-                 m == MPOL_PREFERRED_MANY || m == MPOL_WEIGHTED_INTERLEAVE ||
-                 m == MPOL_PREFERRED) && !(flags & MPOL_F_NODE);
-    return lm_write_mask(nmask, maxnode, node0);
-  }
-}
-
-static isize lm_set_mempolicy_home_node(u64 start, u64 len, u64 node,
-                                        u64 flags) {
-  if (start & (PAGE_SIZE - 1))
-    return -EINVAL;
-  if (flags || node != 0)
-    return -EINVAL;
-  len = (len + PAGE_SIZE - 1) & ~(u64)(PAGE_SIZE - 1);
-  if (start + len < start)
-    return -EINVAL;
-  if (len && !lm_range_mapped(start, len))
-    return -ENOENT;
-  return 0;
-}
+/* mbind, set_mempolicy, get_mempolicy and set_mempolicy_home_node live in
+ * kernel/mm/mempolicy.c now: with more than one node they decide where pages
+ * come from, which is memory-manager work rather than a call this file can
+ * validate and wave through. */
 
 /* ── protection keys ─────────────────────────────────────────────── */
 
@@ -1263,16 +1054,16 @@ int linux_modern_syscall(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4,
 
   switch (nr) {
   case LM_mbind:
-    r = lm_mbind(a0, a1, a2, a3, a4, a5);
+    r = mempolicy_mbind(a0, a1, a2, a3, a4, a5);
     break;
   case LM_set_mempolicy:
-    r = lm_set_mempolicy(a0, a1, a2);
+    r = mempolicy_set(a0, a1, a2);
     break;
   case LM_get_mempolicy:
-    r = lm_get_mempolicy(a0, a1, a2, a3, a4);
+    r = mempolicy_get(a0, a1, a2, a3, a4);
     break;
   case LM_set_mempolicy_home_node:
-    r = lm_set_mempolicy_home_node(a0, a1, a2, a3);
+    r = mempolicy_home_node(a0, a1, a2, a3);
     break;
   case LM_pkey_alloc:
     r = lm_pkey_alloc(a0, a1);

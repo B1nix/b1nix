@@ -232,6 +232,17 @@ int pci_intel_stolen_decode(u16 ggc, u32 bdsm, u32 bgsm,
  * written because this kernel records no binding. */
 void pci_sysfs_publish_all(void);
 
+/* The kernel address a device's memory BAR is reachable at.
+ *
+ * Most of the time the direct map already covers it, because QEMU and every
+ * ordinary PC put the MMIO hole just under 4 GiB. That stops being true on a
+ * machine with a lot of RAM: the 64-bit window moves above it (a 72 GiB guest
+ * puts NVMe's BAR at 0x7000_00000000), and the direct map ends where RAM does.
+ * Reaching through it then faults on a page nothing ever mapped — which is
+ * exactly how the first >64 GiB boot died. Use this rather than
+ * vmm_direct_map_base() + bar. Returns 0 when the region cannot be mapped. */
+void *pci_map_mmio(u64 phys, usize size);
+
 /* M98 in-kernel self-test (BAR sizing, capability walk, bus master, MSI/MSI-X
  * programming readback, stolen memory). No-op outside b1nix.test=1. */
 void pci_selftest(void);

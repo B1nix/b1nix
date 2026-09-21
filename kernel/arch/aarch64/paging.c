@@ -10,12 +10,24 @@
 #include <b1nix/console.h>
 #include <b1nix/sched.h>
 #include <b1nix/errno.h>
+#include <b1nix/mempolicy.h>
 #include <b1nix/mm.h>
 #include <b1nix/userfaultfd.h>
 #include <b1nix/panic.h>
 #include <b1nix/user.h>
 #include <b1nix/module.h>
 #include <string.h>
+
+/* A fresh anonymous page, from the node the mapping's memory policy asks for
+ * (M128); see the same helper in the x86_64 port. */
+static u64 pf_alloc_anon_frame(struct vm_area *vma, u64 vaddr) {
+  int strict = 0;
+  int node = mempolicy_node_for(vma, vaddr, &strict);
+
+  if (node < 0)
+    return pmm_alloc_frame();
+  return pmm_alloc_frame_node(node, strict);
+}
 
 extern u8 __kernel_start[];
 extern u8 __kernel_end[];
@@ -689,7 +701,7 @@ static int fault_anon_user_page(u64 va) {
       return -1;
   }
 
-  u64 frame = pmm_alloc_frame();
+  u64 frame = pf_alloc_anon_frame(hit, va);
   if (!frame)
     return -1;
 
@@ -1046,7 +1058,7 @@ static int handle_page_fault_locked(u64 fault_addr, u64 error_code,
             *swap_entry = entry;
             return PF_NEEDS_FILE_FILL;
           }
-          u64 frame = pmm_alloc_frame();
+          u64 frame = pf_alloc_anon_frame(vma_for(va), va);
           if (!frame) return -1;
           l3[i3] = encode_leaf(frame, entry | VMM_PRESENT);
           tlb_flush_page(va);
@@ -1211,7 +1223,20 @@ u64 paging_user_phys(u64 pml4_phys, u64 vaddr) {
 }
 
 static void mprotect_page_in_l0(u64 *l0, u64 virtual_address, u64 flags) {
-  usize i0 = l0_index(virtual_address);
+  usize i0;
+
+  /* No top table, nothing to protect.
+   *
+   * get_current_l0() answers the kernel's own table when there is no current
+   * task, and phys_to_virt(0) — a null pointer — for a task whose address
+   * space has already been released: an exec or an exit that has torn the
+   * space down while another CPU is still in a syscall on that task. The
+   * dereference below then faults in EL1 at the index offset, which is what
+   * "unhandled synchronous exception, FAR 0x10" was on the blk lane. The
+   * x86_64 port's walkers have carried this check for the same reason. */
+  if (!l0)
+    return;
+  i0 = l0_index(virtual_address);
   if ((l0[i0] & 0x3ULL) != D_TABLE) return;
   u64 *l1 = table_from_entry(l0[i0]);
   usize i1 = l1_index(virtual_address);
@@ -2170,4 +2195,32 @@ u64 paging_reserve_kernel_va(usize size) {
   u64 va = mmio_next;
   mmio_next += len;
   return va;
+}
+
+/* ── transparent huge pages (M128): not on this architecture ─────────────
+ *
+ * aarch64 has block descriptors at level 2 that would serve, but every
+ * page-table walker in this file — the clone, the unmap paths, mprotect,
+ * teardown — assumes a leaf is a page, and a half-audited set of them is
+ * silent memory corruption rather than a slow machine. thp_init leaves the
+ * mode at "never" here, so nothing ever installs one; these exist so the
+ * generic callers need no #ifdef. */
+u64 paging_thp_bytes(u64 pml4_phys, u64 start, u64 end) {
+  (void)pml4_phys;
+  (void)start;
+  (void)end;
+  return 0;
+}
+
+int paging_thp_split_range(u64 pml4_phys, u64 start, u64 end, int partial_only) {
+  (void)pml4_phys;
+  (void)start;
+  (void)end;
+  (void)partial_only;
+  return 0;
+}
+
+int paging_thp_split_all(u64 pml4_phys) {
+  (void)pml4_phys;
+  return 0;
 }

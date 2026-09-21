@@ -8,7 +8,9 @@
 #include <b1nix/sched.h>
 #include <b1nix/errno.h>
 #include <b1nix/cgroup.h>
+#include <b1nix/mempolicy.h>
 #include <b1nix/mm.h>
+#include <b1nix/thp.h>
 #include <b1nix/userfaultfd.h>
 #include <b1nix/psi.h>
 #include <b1nix/rwlock.h>
@@ -19,6 +21,20 @@
 #include <b1nix/klog.h>
 #include <stdio.h>
 #include <string.h>
+
+/* A fresh anonymous page, from the node the mapping's memory policy asks for
+ * (M128). Without a policy, and on a machine with one node, this is the
+ * ordinary allocation with its per-CPU caches; with MPOL_BIND it is that node
+ * or nothing, which is what binding means. */
+static u64 pf_alloc_anon_frame(struct vm_area *vma, u64 vaddr) {
+  int strict = 0;
+  int node = mempolicy_node_for(vma, vaddr, &strict);
+
+  if (node < 0)
+    return pmm_alloc_frame();
+  return pmm_alloc_frame_node(node, strict);
+}
+
 
 /* F2 (M28 #7 prep): rwlock serialising page-table mutations across CPUs.
  * Today every kernel-mode entry holds the BKL so this is decorative; the
@@ -162,6 +178,164 @@ void paging_reload_cr3(void) {
  * survives with every switch flushing the TLB, the cause is a missing
  * cross-CPU shootdown somewhere and not the skip. Read once: this is the
  * hottest path in the scheduler. */
+/* ── 5-level paging (M128) ───────────────────────────────────────────────
+ *
+ * boot.S decides whether to run with CR4.LA57 (the CPU must have it and the
+ * command line must ask, with b1nix.la57) and leaves the answer here. When it
+ * is on, CR3 names a PML5 whose entries 0 and 511 both point at the PML4 that
+ * four-level paging would have used, so every walk below this layer is the
+ * one it always was and only the table CR3 names is different.
+ *
+ * An address space is still identified everywhere by its PML4 frame — 300-odd
+ * places pass that number around — so the PML5 that goes with it is kept
+ * beside it here, and looked up where CR3 is written. The lookup is a hash of
+ * the PML4 frame: one load on a context switch between processes, and nothing
+ * at all on a machine without LA57. */
+
+extern u32 la57_enabled; /* boot.S, .data */
+
+static u64 *alloc_page_table(void);
+static u64 table_to_phys(u64 *table);
+
+int paging_la57(void) { return la57_enabled != 0; }
+
+#define LA57_HASH_SLOTS 1024u
+static u64 la57_key[LA57_HASH_SLOTS]; /* PML4 frame, 0 = empty */
+static u64 la57_val[LA57_HASH_SLOTS]; /* the PML5 that names it */
+static spinlock_t la57_lock = SPINLOCK_INIT;
+
+static inline usize la57_slot_of(u64 pml4_phys) {
+  /* The frame number, mixed a little: page tables come off the buddy
+   * allocator in runs, so the low bits alone collide in clusters. */
+  u64 h = (pml4_phys >> 12) * 0x9E3779B97F4A7C15ULL;
+
+  return (usize)((h >> 40) & (LA57_HASH_SLOTS - 1));
+}
+
+static void la57_remember(u64 pml4_phys, u64 pml5_phys) {
+  u64 flags;
+  usize slot = la57_slot_of(pml4_phys);
+
+  spin_lock_irqsave(&la57_lock, &flags);
+  {
+    usize reuse = LA57_HASH_SLOTS; /* the first tombstone met, if any */
+
+    for (usize i = 0; i < LA57_HASH_SLOTS; i++) {
+      usize k = (slot + i) & (LA57_HASH_SLOTS - 1);
+      u64 key = la57_key[k];
+
+      /* A dead entry is reusable, but only after the probe has looked for a
+       * live one further along: taking it immediately would leave two slots
+       * claiming the same PML4. Address spaces are created and destroyed by
+       * the thousand, so without this the table fills with tombstones and the
+       * next process to start panics. */
+      if (key == (u64)-1) {
+        if (reuse == LA57_HASH_SLOTS)
+          reuse = k;
+        continue;
+      }
+      if (key == 0 || key == pml4_phys) {
+        if (key == 0 && reuse != LA57_HASH_SLOTS)
+          k = reuse;
+        la57_val[k] = pml5_phys;
+        __atomic_store_n(&la57_key[k], pml4_phys, __ATOMIC_RELEASE);
+        spin_unlock_irqrestore(&la57_lock, flags);
+        return;
+      }
+    }
+    if (reuse != LA57_HASH_SLOTS) {
+      la57_val[reuse] = pml5_phys;
+      __atomic_store_n(&la57_key[reuse], pml4_phys, __ATOMIC_RELEASE);
+      spin_unlock_irqrestore(&la57_lock, flags);
+      return;
+    }
+  }
+  spin_unlock_irqrestore(&la57_lock, flags);
+  panic("paging: no room to record a 5-level top table");
+}
+
+static u64 la57_lookup(u64 pml4_phys) {
+  usize slot = la57_slot_of(pml4_phys);
+
+  for (usize i = 0; i < LA57_HASH_SLOTS; i++) {
+    usize k = (slot + i) & (LA57_HASH_SLOTS - 1);
+    u64 key = __atomic_load_n(&la57_key[k], __ATOMIC_ACQUIRE);
+
+    if (key == pml4_phys)
+      return la57_val[k];
+    if (key == 0)
+      return 0; /* a tombstone (-1) is not the end of the chain */
+  }
+  return 0;
+}
+
+static void la57_forget(u64 pml4_phys) {
+  u64 flags;
+  usize slot = la57_slot_of(pml4_phys);
+
+  spin_lock_irqsave(&la57_lock, &flags);
+  for (usize i = 0; i < LA57_HASH_SLOTS; i++) {
+    usize k = (slot + i) & (LA57_HASH_SLOTS - 1);
+
+    if (la57_key[k] == pml4_phys) {
+      /* Tombstone rather than a hole: a hole would cut the probe chain and
+       * hide a later entry that hashed here. */
+      la57_val[k] = 0;
+      __atomic_store_n(&la57_key[k], (u64)-1, __ATOMIC_RELEASE);
+      break;
+    }
+    if (la57_key[k] == 0)
+      break;
+  }
+  spin_unlock_irqrestore(&la57_lock, flags);
+}
+
+/* Build the PML5 that will name this PML4. Its two entries are the whole
+ * table: [0] for the low canonical half, [511] for the high one, both the
+ * same PML4. Called where an address space is created — never from the switch
+ * path, which runs with interrupts masked and under the scheduler's locks,
+ * where an allocation can yield (that is a panic, and it is how this was
+ * found). */
+static void la57_create_top(u64 pml4_phys) {
+  u64 *pml5;
+
+  if (!la57_enabled || la57_lookup(pml4_phys))
+    return;
+  pml5 = alloc_page_table();
+  if (!pml5)
+    panic("paging: no memory for a 5-level top table");
+  pml5[0] = pml4_phys | VMM_PRESENT | VMM_WRITABLE | VMM_USER;
+  pml5[511] = pml4_phys | VMM_PRESENT | VMM_WRITABLE;
+  la57_remember(pml4_phys, table_to_phys(pml5));
+}
+
+/* What CR3 has to hold for this address space. A pure lookup: every space has
+ * its top table from the moment it exists. */
+static u64 cr3_for(u64 pml4_phys) {
+  u64 pml5_phys;
+
+  if (!la57_enabled)
+    return pml4_phys;
+  pml5_phys = la57_lookup(pml4_phys);
+  if (!pml5_phys)
+    panic("paging: an address space reached CR3 with no 5-level top table");
+  return pml5_phys;
+}
+
+/* The PML4 a CR3 value names, which is not the same thing under LA57. The
+ * callers that compare a live CR3 against an address space go through this. */
+u64 paging_cr3_to_pml4(u64 cr3) {
+  u64 top = cr3 & PAGE_ENTRY_ADDRESS_MASK;
+
+  if (!la57_enabled)
+    return top;
+  {
+    const u64 *pml5 = (const u64 *)(usize)(top + (direct_map_ready ? DIRECT_MAP_BASE : 0));
+
+    return pml5[0] & PAGE_ENTRY_ADDRESS_MASK;
+  }
+}
+
 static int cr3_skip_disabled = -1;
 
 void paging_switch_address_space(u64 pml4_phys) {
@@ -201,11 +375,17 @@ void paging_switch_address_space(u64 pml4_phys) {
      * write serialises, so the record is visible before the load completes. */
     pc->loaded_pml4_phys = target_phys;
     pc->loaded_addrspace_epoch = epoch;
-    __asm__ volatile("mov %0, %%cr3" : : "r"(target_phys) : "memory");
+    {
+      u64 cr3 = cr3_for(target_phys);
+
+      __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    }
   } else {
     /* Before per-CPU data exists (vmm_init on the BSP) there is nowhere to
      * record the load, so never skip. */
-    __asm__ volatile("mov %0, %%cr3" : : "r"(target_phys) : "memory");
+    u64 cr3 = cr3_for(target_phys);
+
+    __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
   }
 
   __asm__ volatile("pushq %0; popfq" : : "r"(rflags) : "memory", "cc");
@@ -307,14 +487,21 @@ static void split_huge_page_into(u64 *pd, usize index, u64 *pt) {
   u64 entry = pd[index];
   u64 base = entry & PAGE_ENTRY_ADDRESS_MASK;
   u64 flags = (entry & ~PAGE_ENTRY_ADDRESS_MASK) & ~HUGE_PAGE_FLAG;
-  u64 leaf_flags = flags & ~VMM_USER; /* see split_huge_page */
+  /* A transparent huge page's leaves keep every bit the block had, the user
+   * bit included; the identity window's lose it. See VMM_THP in <b1nix/mm.h>.
+   * The mark itself belongs to the block and does not survive it. */
+  int thp = (entry & VMM_THP) != 0;
+  u64 leaf_flags = thp ? (flags & ~VMM_THP) : (flags & ~VMM_USER);
 
+  flags &= ~VMM_THP;
   for (usize i = 0; i < 512; i++)
     pt[i] = (base + i * PAGE_SIZE) | leaf_flags;
   pd[index] = table_to_phys(pt) | flags;
   /* The 2 MiB entry other CPUs may have cached no longer describes this
    * range on its own — and the leaves lose the user bit. */
   addrspace_note_replaced(entry);
+  if (thp)
+    thp_count_split();
 }
 
 static u64 *split_huge_page(u64 *pd, usize index) {
@@ -329,7 +516,10 @@ static u64 *split_huge_page(u64 *pd, usize index) {
    * vmm_set_lazy) will explicitly add VMM_USER to the single leaf PTE it maps.
    * This prevents free_table() during process teardown from treating identity-mapped
    * physical memory frames as user allocations and wrongly freeing them to PMM. */
-  u64 leaf_flags = flags & ~VMM_USER;
+  int thp = (entry & VMM_THP) != 0;
+  u64 leaf_flags = thp ? (flags & ~VMM_THP) : (flags & ~VMM_USER);
+
+  flags &= ~VMM_THP;
 
   u64 *pt = alloc_page_table();
   for (usize i = 0; i < 512; i++) {
@@ -338,6 +528,8 @@ static u64 *split_huge_page(u64 *pd, usize index) {
 
   pd[index] = table_to_phys(pt) | flags;
   addrspace_note_replaced(entry); /* see split_huge_page_into */
+  if (thp)
+    thp_count_split();
   return pt;
 }
 
@@ -536,6 +728,330 @@ static u64 *ensure_child_table(u64 *parent, usize index) {
 }
 
 
+/* ── transparent huge pages: the mechanism (M128) ────────────────────────
+ *
+ * A transparent huge page is a 2 MiB directory entry carrying VMM_USER and
+ * VMM_THP over a buddy order-9 block. Every frame of the block has its own
+ * refcount of 1, which is what lets the block be split into 512 ordinary
+ * leaves at any time and then freed a page at a time like anything else.
+ *
+ * The rule that keeps the rest of the kernel correct: the fault path is the
+ * only thing that CREATES one, and anything else that meets one either breaks
+ * it up first (paging_thp_split_range, called with no lock held because it
+ * allocates) or handles the whole block. Nothing here ever frees a page table
+ * — a walker that is mid-descent without the lock, as vmm_set_lazy does, may
+ * still hold a pointer into one.
+ */
+
+/* The directory entry covering `va` in `pml4`, and where it lives, without
+ * allocating and without following anything that is not a table. Returns NULL
+ * when no directory describes the address. */
+static u64 *thp_pde_slot(u64 *pml4, u64 va) {
+  if (!pml4)
+    return 0;
+  u64 pml4e = pml4[pml4_index(va)];
+  if (!(pml4e & VMM_PRESENT))
+    return 0;
+  u64 *pdpt = reachable_table(pml4e);
+  if (!pdpt)
+    return 0;
+  u64 pdpte = pdpt[pdpt_index(va)];
+  if (!(pdpte & VMM_PRESENT) || (pdpte & HUGE_PAGE_FLAG))
+    return 0;
+  u64 *pd = reachable_table(pdpte);
+  if (!pd)
+    return 0;
+  return &pd[pd_index(va)];
+}
+
+/* The task whose pages these are, for the eviction ring, or NULL when the
+ * split is happening on somebody else's address space (a teardown, say).
+ * Leaving them unregistered is not a correctness problem — the brk heap's
+ * pages are unregistered too — it only means reclaim cannot take them until
+ * this space's own task splits or faults again. */
+static struct task *thp_space_owner(u64 pml4_phys) {
+  if (current_task &&
+      (pml4_phys == 0 || pml4_phys == current_task->pml4_phys))
+    return current_task;
+  return 0;
+}
+
+static u64 *thp_pml4_of(u64 pml4_phys) {
+  if (!pml4_phys)
+    return kernel_pml4_virt;
+  if (pml4_phys >= DIRECT_MAP_SIZE)
+    return 0;
+  return (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE);
+}
+
+u64 paging_thp_bytes(u64 pml4_phys, u64 start, u64 end) {
+  u64 *pml4 = thp_pml4_of(pml4_phys);
+  u64 bytes = 0;
+  u64 flags;
+
+  if (!pml4 || end <= start)
+    return 0;
+  vmm_read_acquire(&flags);
+  for (u64 va = start & ~(THP_SIZE - 1); va < end; va += THP_SIZE) {
+    u64 *slot = thp_pde_slot(pml4, va);
+
+    if (slot && (*slot & VMM_PRESENT) && (*slot & HUGE_PAGE_FLAG) &&
+        (*slot & VMM_THP))
+      bytes += THP_SIZE;
+  }
+  vmm_read_release(flags);
+  return bytes;
+}
+
+/* Break the one block covering `va`. Returns 1 when a block was split, 0 when
+ * there was none, -ENOMEM when the replacement table could not be allocated.
+ * No lock held on entry: the table is allocated first and committed second,
+ * because allocating under the page-table lock can reclaim and reclaim blocks
+ * with interrupts off (see split_huge_page_into). */
+static int thp_split_at(u64 pml4_phys, u64 va) {
+  u64 *pml4 = thp_pml4_of(pml4_phys);
+  u64 probe_flags, commit_flags;
+  u64 block = 0;
+  int split = 0;
+  /* Whose pages these are, for the eviction ring below: the task the address
+   * space belongs to, which is not always the one running (a fork splits the
+   * parent's, a cgroup's reclaim splits a sleeper's). */
+  struct task *owner = thp_space_owner(pml4_phys);
+
+  if (!pml4)
+    return 0;
+  va &= ~(THP_SIZE - 1);
+
+  vmm_read_acquire(&probe_flags);
+  {
+    u64 *slot = thp_pde_slot(pml4, va);
+
+    if (!slot || !(*slot & VMM_PRESENT) || !(*slot & HUGE_PAGE_FLAG) ||
+        !(*slot & VMM_THP)) {
+      vmm_read_release(probe_flags);
+      return 0;
+    }
+  }
+  vmm_read_release(probe_flags);
+
+  u64 *spare = alloc_page_table_try();
+  if (!spare)
+    return -ENOMEM;
+
+  vmm_write_acquire(&commit_flags);
+  {
+    u64 *slot = thp_pde_slot(pml4, va);
+    usize index;
+    u64 *pd;
+
+    if (slot && (*slot & VMM_PRESENT) && (*slot & HUGE_PAGE_FLAG) &&
+        (*slot & VMM_THP)) {
+      index = pd_index(va);
+      pd = slot - index;
+      block = *slot & PAGE_ENTRY_ADDRESS_MASK;
+      split_huge_page_into(pd, index, spare);
+      spare = 0;
+      for (u64 p = va; p < va + THP_SIZE; p += PAGE_SIZE)
+        invalidate_page(p);
+    }
+  }
+  vmm_write_release(commit_flags);
+
+  if (spare) {
+    /* Another CPU got there first. */
+    u64 frame = table_to_phys(spare);
+
+    pmm_note_page_table(frame, 0);
+    pmm_free_frame(frame);
+  } else {
+    split = 1;
+    /* The 512 pages are ordinary pages again, so they can be reclaimed again
+     * — but only if reclaim knows about them. A block is never in the
+     * eviction ring (there is nothing there to take one page of), so nothing
+     * of a mapping that is still a block can be reclaimed; registering the
+     * leaves here is what puts them back within reclaim's reach once
+     * something has split them.
+     *
+     * The other half of that — having reclaim SPLIT a block when it finds
+     * nothing else to take — is deliberately not here. Reclaim is reached
+     * from inside the allocator, splitting allocates and takes the
+     * page-table lock, and the two orders do not agree: it wedged the
+     * machine when tried. See docs/kernel/memory-and-scheduling.md. */
+    if (owner) {
+      extern void eviction_register_page(struct task *task, u64 vaddr,
+                                         u64 frame);
+
+      for (usize i = 0; i < THP_PAGES; i++)
+        eviction_register_page(owner, va + i * PAGE_SIZE,
+                               block + i * PAGE_SIZE);
+    }
+    {
+      extern void tlb_shootdown_current_mm(void);
+
+      if (irqs_are_enabled())
+        tlb_shootdown_current_mm();
+    }
+  }
+  return split;
+}
+
+int paging_thp_split_range(u64 pml4_phys, u64 start, u64 end, int partial_only) {
+  u64 *pml4 = thp_pml4_of(pml4_phys);
+
+  if (!pml4 || end <= start || thp_mode() == THP_MODE_NEVER)
+    return 0;
+  for (u64 va = start & ~(THP_SIZE - 1); va < end; va += THP_SIZE) {
+    if (partial_only && va >= start && va + THP_SIZE <= end)
+      continue; /* covered whole: the caller can release it as a block */
+    int rc = thp_split_at(pml4_phys, va);
+
+    if (rc < 0)
+      return rc;
+  }
+  return 0;
+}
+
+int paging_thp_split_all(u64 pml4_phys) {
+  u64 *pml4 = thp_pml4_of(pml4_phys);
+
+  if (!pml4 || thp_mode() == THP_MODE_NEVER)
+    return 0;
+  /* The user half only, and skipped whole levels at a time: an address space
+   * is mostly holes, and a fork must not walk 128 TiB of them. */
+  for (usize i = 0; i < 256; i++) {
+    u64 pml4e = pml4[i];
+
+    if (!(pml4e & VMM_PRESENT))
+      continue;
+    u64 *pdpt = reachable_table(pml4e);
+    if (!pdpt)
+      continue;
+    for (usize j = 0; j < 512; j++) {
+      u64 pdpte = pdpt[j];
+
+      if (!(pdpte & VMM_PRESENT) || (pdpte & HUGE_PAGE_FLAG))
+        continue;
+      u64 *pd = reachable_table(pdpte);
+      if (!pd)
+        continue;
+      for (usize k = 0; k < 512; k++) {
+        u64 pde = pd[k];
+
+        if (!(pde & VMM_PRESENT) || !(pde & HUGE_PAGE_FLAG) || !(pde & VMM_THP))
+          continue;
+        u64 va = ((u64)i << 39) | ((u64)j << 30) | ((u64)k << 21);
+        int rc = thp_split_at(pml4_phys, va);
+
+        if (rc < 0)
+          return rc;
+        /* The tables may have moved under the split; re-read this level. */
+        pd = reachable_table(pdpt[j]);
+        if (!pd)
+          break;
+      }
+    }
+  }
+  return 0;
+}
+
+/* Install a 2 MiB entry for the block containing `va`, or report that nothing
+ * was installed. Called from the anonymous fault path with no lock held.
+ *
+ * The block is only taken when the directory entry is ABSENT — there is then
+ * no page table to retire, and this code never has to free one out from under
+ * a lock-free walker. That is why an anonymous mmap leaves whole aligned
+ * blocks unmarked when the feature is on (see syscall_mmap).
+ *
+ * Returns 1 when the page is now mapped and the fault is served.
+ */
+static int thp_try_install(struct vm_area *vma, u64 va, u64 leaf_flags) {
+  u64 *pml4 = get_current_pml4();
+  u64 base = va & ~(THP_SIZE - 1);
+  u64 probe_flags, commit_flags;
+
+  if (!pml4 || !thp_vma_eligible(vma))
+    return 0;
+  if (base < vma->start || base + THP_SIZE > vma->end)
+    return 0;
+
+  /* Cheap refusal first: a directory that already describes this block means
+   * there are leaves (or a block) here and this is not ours to take. */
+  vmm_read_acquire(&probe_flags);
+  {
+    u64 *slot = thp_pde_slot(pml4, base);
+
+    if (slot && (*slot & VMM_PRESENT)) {
+      vmm_read_release(probe_flags);
+      return 0;
+    }
+  }
+  vmm_read_release(probe_flags);
+
+  /* A block commits all 512 pages for a mapping that may touch one, so it is
+   * only taken while the machine can spare them. pmm_alloc_block already
+   * refuses to reclaim on our behalf; this refuses to take the last of the
+   * memory it would have reclaimed for somebody else. */
+  if (pmm_free_frame_count() < THP_PAGES * 8) {
+    thp_count_fallback();
+    return 0;
+  }
+
+  /* From the node the mapping's policy names, and strictly where MPOL_BIND
+   * says so. A block that ignored the policy would put 512 pages on the wrong
+   * node in one go — the very thing mbind exists to prevent. */
+  int strict = 0;
+  int node = mempolicy_node_for(vma, base, &strict);
+  u64 block = pmm_alloc_block_node(9, node, node >= 0 ? strict : 0);
+
+  if (!block) {
+    thp_count_fallback();
+    return 0;
+  }
+
+  u64 entry = block | VMM_PRESENT | VMM_USER | HUGE_PAGE_FLAG | VMM_THP |
+              (leaf_flags & (VMM_WRITABLE | VMM_NO_EXECUTE | VMM_PKEY_MASK));
+  int installed = 0;
+
+  vmm_write_acquire(&commit_flags);
+  {
+    u64 *pdpt = ensure_child_table_try(pml4, pml4_index(base));
+    u64 *pd = pdpt ? ensure_child_table_try(pdpt, pdpt_index(base)) : 0;
+
+    /* Published with a compare-exchange, not a store, because the write lock
+     * is not the only writer here: ensure_child_table publishes a page table
+     * into this very slot without taking it (see the note there), so a plain
+     * store could overwrite a table another CPU has already made reachable
+     * and leak its frame. The loser of that race frees its block and the
+     * fault falls back to 4 KiB pages, which is always correct. */
+    u64 expected = pd ? __atomic_load_n(&pd[pd_index(base)], __ATOMIC_ACQUIRE) : VMM_PRESENT;
+
+    if (pd && !(expected & VMM_PRESENT)) {
+      __atomic_or_fetch(&pml4[pml4_index(base)], VMM_USER, __ATOMIC_SEQ_CST);
+      __atomic_or_fetch(&pdpt[pdpt_index(base)], VMM_USER, __ATOMIC_SEQ_CST);
+      if (__atomic_compare_exchange_n(&pd[pd_index(base)], &expected, entry, 0,
+                                      __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        for (u64 p = base; p < base + THP_SIZE; p += PAGE_SIZE)
+          invalidate_page(p);
+        installed = 1;
+      }
+    }
+  }
+  vmm_write_release(commit_flags);
+
+  if (!installed) {
+    for (usize i = 0; i < THP_PAGES; i++)
+      pmm_free_frame(block + i * PAGE_SIZE);
+    thp_count_fallback();
+    return 0;
+  }
+  thp_count_alloc();
+  /* The other 511 pages are the process's too; the fault hook charges one. */
+  cgroup_mem_charge_pages(THP_PAGES - 1);
+  if (vma_trace_faults_enabled())
+    vma_trace_record("pf-thp", base, base + THP_SIZE);
+  return 1;
+}
+
 void vmm_map_page_in_table(u64 *pml4, u64 virtual_address, u64 physical_address, u64 flags) {
   u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
   u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
@@ -618,7 +1134,22 @@ void vmm_init(void) {
   console_write("\n");
 
   /* Switch to new page table */
+  la57_create_top(phys_pml4);
   paging_switch_address_space(phys_pml4);
+
+  /* Say which paging mode the machine is actually running in. boot.S decided
+   * it (CPU support plus b1nix.la57) and the switch above has just installed
+   * the first five-level top table if it said yes. */
+  if (la57_enabled) {
+    u64 cr4;
+
+    __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
+    console_write("paging: 5-level (LA57) enabled, cr4=0x");
+    console_write_hex64(cr4);
+    console_write("\n");
+  } else {
+    console_write("paging: 4-level\n");
+  }
 
   /* Now that direct map is ready, we can use virtual addresses for the PML4 */
   direct_map_ready = 1;
@@ -855,9 +1386,33 @@ static void unmap_page_from_pml4(u64 *pml4, u64 virtual_address, u64 *defer) {
   }
 
   if ((pde & HUGE_PAGE_FLAG) != 0) {
+    /* Clearing the entry unmaps all 2 MiB of it, whatever the caller asked
+     * for, so a transparent huge page's frames have to go back here or the
+     * whole 512-frame block leaks. The kernel's identity window keeps the old
+     * behaviour: its frames are not the caller's to release.
+     *
+     * A range operation that covers only part of a block has already split it
+     * (paging_thp_split_range), so by the time this runs the block is either
+     * wholly inside the range or not being unmapped at all. */
     pd[pd_index(virtual_address)] = 0;
     addrspace_note_replaced(pde);
     invalidate_page(virtual_address);
+    if (pde & VMM_THP) {
+      u64 base = pde & PAGE_ENTRY_ADDRESS_MASK;
+      extern void eviction_unregister_page(u64 frame);
+
+      /* Freed inline, not through `defer`: that carries one frame and a block
+       * is 512. The caller that can do better — vmm_unmap_range_collect —
+       * handles a block of its own and never reaches here; what is left is
+       * address-space teardown, which already frees inline and flushes every
+       * CPU once at the end. */
+      for (usize i = 0; i < THP_PAGES; i++) {
+        u64 frame = base + i * PAGE_SIZE;
+
+        eviction_unregister_page(frame);
+        pmm_free_frame(frame);
+      }
+    }
     return;
   }
 
@@ -949,6 +1504,12 @@ void paging_unmap_range_from_space(u64 pml4_phys, u64 base, usize npages) {
                         : kernel_pml4_virt;
   u64 end = base + (u64)npages * PAGE_SIZE;
 
+  /* Before the lock, because splitting allocates. Only the blocks this range
+   * cuts in half: one it covers entirely is released as a block below, which
+   * costs no table at all — and address-space teardown, the busiest caller
+   * here, covers every block of every mapping entirely. */
+  (void)paging_thp_split_range(pml4_phys, base, end, 1);
+
   /* Skip the holes instead of walking them.
    *
    * A mapping is not the same thing as memory: a browser reserves address
@@ -987,6 +1548,17 @@ void paging_unmap_range_from_space(u64 pml4_phys, u64 base, usize npages) {
       continue;
     }
     if (pde & HUGE_PAGE_FLAG) {
+      /* Same care as vmm_unmap_range_collect: clearing the entry releases the
+       * whole block, so a range that covers only part of one must not reach
+       * unmap_page_from_pml4. The split pass at the top of this function
+       * handles that case; this is what happens when it could not. */
+      if ((pde & VMM_THP) &&
+          ((va & (THP_SIZE - 1)) != 0 ||
+           (va & ~(THP_SIZE - 1)) + THP_SIZE > end)) {
+        klog_warn("thp: leaving a block mapped, the unmap covers only part of it");
+        va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
+        continue;
+      }
       unmap_page_from_pml4(pml4, va, 0);
       va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
       continue;
@@ -1061,6 +1633,15 @@ void paging_mprotect_range(u64 start, u64 end, u64 flags) {
   u64 _vmflags;
   u64 *pml4 = get_current_pml4();
   int touched = 0;
+
+  /* Protection is a per-leaf property here — the loop below skips a 2 MiB
+   * entry entirely — so a transparent huge page in the range is broken up
+   * first rather than left with the protection mprotect was asked to remove.
+   * Every block, not only the partly covered ones: a mapping whose protection
+   * changes is no longer the untouched anonymous run the block was taken for.
+   */
+  (void)paging_thp_split_range(current_task ? current_task->pml4_phys : 0,
+                               start, end, 0);
 
   /* The lock is taken per page table, not for the whole range.
    *
@@ -1553,6 +2134,11 @@ usize vmm_unmap_range_collect(u64 base, usize npages, u64 *frames_out) {
   u64 end = base + (u64)npages * PAGE_SIZE;
   u64 *pml4 = get_current_pml4();
 
+  /* See paging_unmap_range_from_space: split what the range only partly
+   * covers, before the lock, where allocating is allowed. */
+  (void)paging_thp_split_range(current_task ? current_task->pml4_phys : 0,
+                               base, end, 1);
+
   vmm_write_acquire(&_vmflags);
   for (u64 va = base; va < end;) {
     /* One walk per table, not per page, and no walk at all through the holes.
@@ -1587,7 +2173,41 @@ usize vmm_unmap_range_collect(u64 base, usize npages, u64 *frames_out) {
       continue;
     }
     if (pde & HUGE_PAGE_FLAG) {
-      unmap_page_from_pml4(pml4, va, 0);
+      /* A whole transparent huge page. Its 512 frames are reported like any
+       * other, so the caller frees them only after its flush, and there is
+       * room for them because a range that covers a block whole asked about
+       * at least 512 pages.
+       *
+       * Covered whole is checked rather than assumed. The split pass above
+       * should have broken up anything this range only cuts in half, but it
+       * can fail for want of a page table — and freeing 512 frames for a
+       * request that named half of them would hand live memory back. A block
+       * that is still here and not wholly inside the range is left alone: an
+       * unmap that leaks is recoverable, one that frees a page somebody is
+       * still using is not. */
+      if ((pde & VMM_THP) &&
+          ((va & (THP_SIZE - 1)) != 0 ||
+           (va & ~(THP_SIZE - 1)) + THP_SIZE > end)) {
+        klog_warn("thp: leaving a block mapped, the unmap covers only part of it");
+        va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
+        continue;
+      }
+      if (pde & VMM_THP) {
+        u64 blk = pde & PAGE_ENTRY_ADDRESS_MASK;
+        extern void eviction_unregister_page(u64 frame);
+
+        pd[pd_index(va)] = 0;
+        for (usize i = 0; i < THP_PAGES; i++) {
+          eviction_unregister_page(blk + i * PAGE_SIZE);
+          frames_out[nframes++] = blk + i * PAGE_SIZE;
+        }
+        any_present = 1;
+        for (u64 p = va & ~(THP_SIZE - 1); p < (va & ~(THP_SIZE - 1)) + THP_SIZE;
+             p += PAGE_SIZE)
+          invalidate_page(p);
+      } else {
+        unmap_page_from_pml4(pml4, va, 0);
+      }
       va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
       continue;
     }
@@ -1671,6 +2291,11 @@ static unsigned move_leftovers_reported;
 void paging_move_range(u64 old_start, u64 new_start, u64 len) {
   extern void tlb_shootdown_current_mm(void);
   u64 flags;
+
+  /* The move copies leaf entries; a 2 MiB entry is not one, and the
+   * destination's alignment is not the source's. Break them up first. */
+  (void)paging_thp_split_range(current_task ? current_task->pml4_phys : 0,
+                               old_start, old_start + len, 0);
 
   /* Recorded after the destination has been inspected, not before: an entry
    * for the move itself would otherwise be the newest edit covering the very
@@ -2066,6 +2691,7 @@ static int vmm_handle_page_fault_inner(u64 fault_addr, u64 error_code) {
     /* Cheap test first, under the read lock. An ordinary copy-on-write fault
      * arrives here too, and it must not pay for a page-table allocation. */
     int on_huge = 0;
+    int on_thp = 0;
     int leaf_seen = 0;
     u64 leaf_val = 0;
     u64 probe_flags;
@@ -2087,6 +2713,8 @@ static int vmm_handle_page_fault_inner(u64 fault_addr, u64 error_code) {
 
           on_huge = (pde & VMM_PRESENT) && (pde & HUGE_PAGE_FLAG) &&
                     !(pde & VMM_USER);
+          on_thp = (pde & VMM_PRESENT) && (pde & HUGE_PAGE_FLAG) &&
+                   (pde & VMM_THP);
           if ((pde & VMM_PRESENT) && !(pde & HUGE_PAGE_FLAG)) {
             leaf_seen = 1;
             leaf_val = table_from_entry(pde)[pt_index(page_aligned)];
@@ -2095,6 +2723,21 @@ static int vmm_handle_page_fault_inner(u64 fault_addr, u64 error_code) {
       }
     }
     vmm_read_release(probe_flags);
+
+    /* A refused access to a transparent huge page. Whatever the reason — a
+     * write to a mapping mprotect made read-only, a protection key, a
+     * copy-on-write break this path knows nothing about — the answer is the
+     * same: break the block into its 512 leaves and let the fault happen
+     * again against a page table the rest of this handler understands. Doing
+     * it here rather than letting the stale-translation retry below spin on
+     * it is the difference between one extra fault and 256 of them. */
+    if (on_thp) {
+      if (thp_split_at(current_task ? current_task->pml4_phys : 0,
+                       page_aligned) > 0) {
+        fault_note(0, 0, "split a transparent huge page; retrying the access");
+        return 0;
+      }
+    }
 
     int covered = 0;
     int found_vma = 0;
@@ -2325,6 +2968,14 @@ static int vmm_handle_page_fault_inner(u64 fault_addr, u64 error_code) {
         anon_exec_bits |= VMM_PKEY_BITS(kv->pkey);
     }
 
+    /* A 2 MiB entry, when the machine allows them, the mapping asked for one,
+     * and nothing at all describes the block yet. Tried before the zero page
+     * below, because the first thing that installs a leaf here ends any
+     * chance of the block. */
+    if (thp_try_install(anon_vma, page_aligned,
+                        anon_user_flags | anon_exec_bits))
+      return 0;
+
     u64 zero_pg = (error_code & PF_WRITE) ? 0 : pmm_zero_page();
     if (zero_pg) {
       u64 cflags;
@@ -2372,10 +3023,10 @@ static int vmm_handle_page_fault_inner(u64 fault_addr, u64 error_code) {
       return 0;
     }
     // Prepare a zeroed frame OUTSIDE the lock (alloc may run reclaim/swap).
-    u64 frame = pmm_alloc_frame();
+    u64 frame = pf_alloc_anon_frame(anon_vma, page_aligned);
     if (!frame) {
       eviction_evict_page();
-      frame = pmm_alloc_frame();
+      frame = pf_alloc_anon_frame(anon_vma, page_aligned);
       if (!frame) {
         /* True OOM while growing a userspace mapping. Do NOT panic the whole
          * kernel for one greedy process — return failure so the exception
@@ -2523,10 +3174,10 @@ static int vmm_handle_page_fault_inner(u64 fault_addr, u64 error_code) {
        * evict a page mapped read-only in many address spaces). */
       return 0;
     }
-    u64 frame = pmm_alloc_frame();
+    u64 frame = pf_alloc_anon_frame(va, page_aligned);
     if (!frame) {
       eviction_evict_page();
-      frame = pmm_alloc_frame();
+      frame = pf_alloc_anon_frame(va, page_aligned);
       if (!frame) {
         console_write("pf: OOM during lazy allocation, swap failed\n");
         return -1;
@@ -3103,6 +3754,9 @@ u64 paging_create_address_space(void) {
   u64 *pml4 = alloc_page_table();
   u64 pml4_phys = table_to_phys(pml4);
 
+  /* Before the space can ever be loaded: see la57_create_top. */
+  la57_create_top(pml4_phys);
+
   u64 _vmflags;
   vmm_read_acquire(&_vmflags);
   spaces_add(pml4_phys);
@@ -3217,6 +3871,18 @@ static int clone_table(u64 *src_table, u64 *dst_table, int level) {
 u64 paging_clone_address_space(u64 src_pml4_phys) {
   u64 real_src_phys = src_pml4_phys ? src_pml4_phys : kernel_pml4_phys;
   u64 *src_pml4 = (u64 *)(usize)(real_src_phys + DIRECT_MAP_BASE);
+
+  /* clone_table copies a 2 MiB entry verbatim, which would hand both address
+   * spaces a writable block that neither of them refcounts. Rather than teach
+   * the clone a second copy-on-write representation — a huge COW entry, and a
+   * fault path to break it — a fork breaks the parent's blocks into their 512
+   * leaves first, and the ordinary per-page copy-on-write takes it from there.
+   * The child re-forms its own blocks on its own faults.
+   *
+   * Before the lock and before the page-table walk, because splitting
+   * allocates. */
+  (void)paging_thp_split_all(real_src_phys);
+
   spaces_reserve();
   u64 *dst_pml4 = alloc_page_table_try();
   u64 dst_pml4_phys;
@@ -3226,6 +3892,8 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
     return 0; /* out of memory: the caller reports ENOMEM */
   }
   dst_pml4_phys = table_to_phys(dst_pml4);
+  /* Outside the lock below, where allocating is still allowed. */
+  la57_create_top(dst_pml4_phys);
 
   /* M28 #7 T4: serialize page-table reads against concurrent vmm_map_page
    * /vmm_unmap_page writes. Without BKL the syscall path lets two CPUs run
@@ -3260,8 +3928,11 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
     dst_pml4[i] = kernel_pml4_virt[i];
   }
 
-  if (real_src_phys == read_cr3()) {
-    write_cr3(real_src_phys);
+  /* Through the helper: with LA57 the live CR3 names a PML5, not this PML4,
+   * and a plain comparison would silently skip the reload that drops the
+   * parent's now-COW writable entries. */
+  if (real_src_phys == paging_cr3_to_pml4(read_cr3())) {
+    write_cr3(read_cr3());
   }
 
   vmm_write_release(_vmflags);
@@ -3355,7 +4026,19 @@ void paging_free_swap_slots(u64 pml4_phys) {
 int paging_user_writable(u64 pml4_phys, u64 vaddr) {
   u64 pte = paging_user_pte(pml4_phys, vaddr);
 
-  return (pte & VMM_PRESENT) && (pte & VMM_WRITABLE);
+  if (pte & VMM_PRESENT)
+    return (pte & VMM_WRITABLE) != 0;
+  /* paging_user_pte answers for a 4 KiB leaf only, and reports a transparent
+   * huge page as no mapping at all. A userfaultfd write-protect check that
+   * believed that would refuse a write to a page that is perfectly writable. */
+  {
+    u64 *pml4 = thp_pml4_of(pml4_phys);
+    u64 *slot = pml4 ? thp_pde_slot(pml4, vaddr) : 0;
+
+    if (slot && (*slot & VMM_PRESENT) && (*slot & VMM_THP))
+      return (*slot & VMM_WRITABLE) != 0;
+  }
+  return 0;
 }
 
 int paging_set_writable_in_space(u64 pml4_phys, u64 vaddr, int writable) {
@@ -3537,6 +4220,15 @@ u64 paging_user_resident(u64 pml4_phys, u64 start, u64 end) {
     u64 *pd = table_from_entry(pdpte);
     u64 pde = pd[pd_index(va)];
     if (!(pde & VMM_PRESENT) || (pde & HUGE_PAGE_FLAG)) {
+      /* A transparent huge page IS resident, all 512 pages of it, and an RSS
+       * that says otherwise is what would make a process using them look like
+       * it had given its memory back. Only the part of the block the caller
+       * asked about is counted. */
+      if ((pde & VMM_PRESENT) && (pde & VMM_THP)) {
+        u64 stop = next_pd < end ? next_pd : end;
+
+        count += (stop - va) / PAGE_SIZE;
+      }
       va = next_pd;
       continue;
     }
@@ -3708,6 +4400,18 @@ static void free_table(u64 *table, int level) {
   }
   for (usize i = 0; i < 512; i++) {
     u64 entry = table[i];
+    /* A transparent huge page whose mapping was never unmapped — the brk
+     * heap's blocks, say, which no VMA covers. Skipping it here (which is
+     * what a huge entry at a non-leaf level used to get) leaks the whole
+     * 512-frame block for the lifetime of the machine. */
+    if ((entry & VMM_PRESENT) && (entry & HUGE_PAGE_FLAG) && (entry & VMM_THP)) {
+      u64 base = entry & PAGE_ENTRY_ADDRESS_MASK;
+
+      table[i] = 0;
+      for (usize f = 0; f < THP_PAGES; f++)
+        pmm_free_frame(base + f * PAGE_SIZE);
+      continue;
+    }
     if ((entry & VMM_PRESENT) && !(entry & HUGE_PAGE_FLAG)) {
       u64 child_phys = entry & PAGE_ENTRY_ADDRESS_MASK;
 
@@ -3761,6 +4465,18 @@ void paging_free_address_space(u64 pml4_phys) {
       return; /* another thread is already tearing this space down */
     spaces_remove(pml4_phys);
     arch_pkeys_mm_release(pml4_phys);
+    /* The five-level top table that named this PML4, if there was one. It
+     * holds nothing but the two entries pointing here, so it is released with
+     * the space rather than walked (M128). */
+    if (la57_enabled) {
+      u64 pml5_phys = la57_lookup(pml4_phys);
+
+      la57_forget(pml4_phys);
+      if (pml5_phys) {
+        pmm_note_page_table(pml5_phys, 0);
+        pmm_free_frame(pml5_phys);
+      }
+    }
 
     /* This space is going away and its PML4 frame is about to go back to the
      * allocator. Any CPU still recording it as "loaded" must be made to write
