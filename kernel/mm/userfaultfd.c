@@ -247,11 +247,13 @@ static int uffd_pop(struct uffd_ctx *c, struct uffd_msg *out) {
  * wake is broadcast to every waiter on the context and only one of them is
  * usually the one whose page was filled. */
 static int uffd_page_present(u64 pml4, u64 addr, int for_write) {
-  u64 pte = paging_user_pte(pml4, addr);
-
-  if (!(pte & VMM_PRESENT))
+  if (!paging_user_frame(pml4, addr))
     return 0;
-  if (for_write && !(pte & VMM_WRITABLE))
+  /* For a write, the page must also be writable again -- which is what lifting
+   * a write-protection means, and what the waiting store is waiting for. The
+   * question goes to the arch: the bit that carries the answer is not the same
+   * one on both. */
+  if (for_write && !paging_user_writable(pml4, addr))
     return 0;
   return 1;
 }
@@ -469,22 +471,15 @@ static int uffd_install(struct uffd_ctx *c, u64 dst, const void *src,
   return 0;
 }
 
-/* Change the writability of a range already mapped in the watched space. */
+/* Change the writability of a range already mapped in the watched space.
+ *
+ * Through the arch helper, not by editing the leaf here: "writable" is one bit
+ * on x86_64 and a two-bit AP field on aarch64, and a caller that clears bit 1
+ * of an aarch64 descriptor has cleared the bit that says it is a page. */
 static int uffd_writeprotect(struct uffd_ctx *c, u64 start, u64 end, int on) {
   for (u64 a = start; a < end; a += PAGE_SIZE) {
-    u64 pte = paging_user_pte(c->pml4_phys, a);
-
-    if (!(pte & VMM_PRESENT))
-      continue;
-    u64 frame = pte & UFFD_PTE_ADDR_MASK;
-    u64 pflags = pte & ~UFFD_PTE_ADDR_MASK;
-
-    if (on)
-      pflags &= ~(u64)VMM_WRITABLE;
-    else
-      pflags |= VMM_WRITABLE;
-    paging_set_page_in_space(c->pml4_phys, a, frame, pflags);
-    tlb_shootdown_page(a);
+    if (paging_set_writable_in_space(c->pml4_phys, a, !on))
+      tlb_shootdown_page(a);
   }
   return 0;
 }

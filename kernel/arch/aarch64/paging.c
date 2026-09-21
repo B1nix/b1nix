@@ -11,6 +11,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
+#include <b1nix/userfaultfd.h>
 #include <b1nix/panic.h>
 #include <b1nix/user.h>
 #include <b1nix/module.h>
@@ -72,6 +73,12 @@ extern u8 __kernel_end[];
 #define AP_EL1_RW     (0ULL << 6)
 #define AP_EL1_EL0_RW (1ULL << 6)
 #define AP_EL1_RO     (2ULL << 6)
+/* The AP field itself: two bits, and both have to be replaced together. */
+#define AP_MASK       (3ULL << 6)
+
+/* Every user page this port installs is offered to the eviction ring; see the
+ * call in fault_anon_user_page. */
+extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
 #define AP_EL1_EL0_RO (3ULL << 6)
 #define SH_INNER (3ULL << 8)
 
@@ -1076,6 +1083,26 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   u64 swap_entry = 0;
   u64 f;
   int rc;
+  int major = 0;
+
+  /* M126: userfaultfd. A registered range's faults belong to a monitor in
+   * userspace, and it has to be asked BEFORE the handler services the page --
+   * a fresh anonymous read is otherwise answered from the zero page and the
+   * monitor never hears about the access it exists to see. Asked with no VM
+   * lock held, because servicing means sleeping until the monitor installs the
+   * page and the monitor needs those locks. (The x86_64 copy of this sits in
+   * the same place, for the same reasons.) */
+  if (current_task && fault_addr < USER_SPACE_LIMIT) {
+    /* The shared VM code is handed an x86-shaped error_code (see the
+     * translation in kernel/arch/aarch64/interrupts.c): bit 0 present, bit 1
+     * write, bit 2 from userspace. */
+    int is_write = (error_code & 2) != 0;
+    int from_user = (error_code & 4) != 0;
+
+    if (from_user &&
+        uffd_handle_fault(fault_addr, is_write, (error_code & 1) != 0))
+      return 0;
+  }
 
   vmm_write_acquire(&f);
   rc = handle_page_fault_locked(fault_addr, error_code, &swap_l3, &swap_i3,
@@ -1122,14 +1149,42 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     }
   }
 
-  if (rc == PF_NEEDS_SWAP_IN)
-    return swap_in_fault(swap_l3, swap_i3, fault_addr & ~(PAGE_SIZE - 1),
-                         swap_entry);
-  if (rc == PF_NEEDS_FILE_CB)
-    return file_cb_fault(fault_addr & ~(PAGE_SIZE - 1));
-  if (rc == PF_NEEDS_FILE_FILL)
-    return file_fill_fault(swap_l3, swap_i3, fault_addr & ~(PAGE_SIZE - 1),
-                           swap_entry, (error_code & 0xc) != 0);
+  if (rc == PF_NEEDS_SWAP_IN) {
+    /* A page that has to come back from swap is a MAJOR fault, which is the
+     * distinction perf's two page-fault counters are about. */
+    major = 1;
+    rc = swap_in_fault(swap_l3, swap_i3, fault_addr & ~(PAGE_SIZE - 1),
+                       swap_entry);
+  } else if (rc == PF_NEEDS_FILE_CB) {
+    major = 1;
+    rc = file_cb_fault(fault_addr & ~(PAGE_SIZE - 1));
+  } else if (rc == PF_NEEDS_FILE_FILL) {
+    major = 1;
+    rc = file_fill_fault(swap_l3, swap_i3, fault_addr & ~(PAGE_SIZE - 1),
+                         swap_entry, (error_code & 0xc) != 0);
+  }
+
+  /* Every serviced user fault, counted against the task that took it: this is
+   * what PERF_COUNT_SW_PAGE_FAULTS* reads. A fault the handler refused is a
+   * signal, not a fault the task took. */
+  if (rc == 0 && current_task && fault_addr < USER_SPACE_LIMIT) {
+    task_count_fault(current_task, major);
+
+    /* And the page joins the eviction ring, which is what makes it a
+     * candidate for reclaim -- machine-wide and for the cgroup that owns it.
+     * This port never did it, so on aarch64 the ring held only pages that had
+     * already been swapped once, and a cgroup over its memory.max had nothing
+     * to give back and was killed instead.
+     *
+     * HERE and not where the page is installed: the install runs under the VM
+     * write lock, the ring's own lock is taken inside it, and the eviction
+     * scan takes them in the other order. */
+    u64 va = fault_addr & ~(u64)(PAGE_SIZE - 1);
+    u64 frame = paging_user_frame(current_task->pml4_phys, va);
+
+    if (frame)
+      eviction_register_page(current_task, va, frame);
+  }
   return rc;
 }
 
@@ -1581,8 +1636,6 @@ int paging_mark_swapped(u64 pml4_phys, u64 vaddr, u64 slot) {
 /* Bring every swapped-out page of an address space back into memory. fork(2)
  * and execve(2) call this because both walk the page tables directly and
  * cannot fault a page in on the caller's behalf. */
-extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
-
 static void swap_in_subtree(u64 *table, int level, u64 base) {
   u64 step = 1ULL << (12 + (3 - level) * 9);
   for (usize i = 0; i < 512; i++) {
@@ -1619,13 +1672,96 @@ void paging_swap_in_all_swapped(u64 pml4_phys) {
 
 /* Slots are released by the generic swap code as it walks the tables; x86_64
  * leaves this a no-op for the same reason. */
-void paging_free_swap_slots(u64 space) { (void)space; }
+/* Release every swap slot an address space still holds.
+ *
+ * x86_64 frees slots as pages are unmapped and leaves this a no-op. This port
+ * frees them in vmm_unmap_range_collect and NOWHERE ELSE, so a process that
+ * simply exits -- which unmaps nothing, it drops the whole space -- left every
+ * page it had in swap allocated for ever. Nothing noticed while nothing on
+ * aarch64 was ever evicted; the moment the eviction ring started holding this
+ * port's pages, one run filled all 512 disk slots and all 16384 compressed
+ * entries, and swapoff could never succeed again.
+ *
+ * Walked with the VM write lock held and the slot freed as each leaf is
+ * cleared, which is the same shape as the unmap path. */
+static void free_swap_slots_subtree(u64 *table, int level) {
+  extern void swap_free_slot_index(u32 slot);
+
+  for (usize i = 0; i < 512; i++) {
+    u64 entry = table[i];
+
+    if (!entry)
+      continue;
+    if (level < 3) {
+      if ((entry & 0x3ULL) == D_TABLE)
+        free_swap_slots_subtree(table_from_entry(entry), level + 1);
+      continue;
+    }
+    if ((entry & 0x3ULL) != D_PAGE && (entry & VMM_SWAPPED)) {
+      swap_free_slot_index((u32)((entry & ADDR_MASK) >> 12));
+      table[i] = 0;
+    }
+  }
+}
+
+void paging_free_swap_slots(u64 space) {
+  if (!space)
+    return;
+
+  u64 f;
+
+  vmm_write_acquire(&f);
+  free_swap_slots_subtree(phys_to_virt(space), 0);
+  vmm_write_release(f);
+}
 
 /* Reference bit. AArch64 without FEAT_HAFDBS never sets the Access Flag in
  * hardware — instead, touching a page whose AF is clear raises an Access Flag
  * fault, which vmm_handle_page_fault answers by setting the bit. That gives the
  * eviction LRU exactly the "was this page touched since I last asked" signal
  * x86_64 gets from its hardware A bit. */
+int paging_user_writable(u64 space, u64 vaddr) {
+  u64 *l3 = leaf_table_for(space, vaddr);
+
+  if (!l3)
+    return 0;
+
+  u64 entry = l3[l3_index(vaddr)];
+
+  if ((entry & 0x3ULL) != D_PAGE)
+    return 0;
+  /* Read-only is AP = 2 (kernel) or 3 (user); both have bit 7 set. */
+  return (entry & (2ULL << 6)) == 0;
+}
+
+int paging_set_writable_in_space(u64 space, u64 vaddr, int writable) {
+  u64 f;
+  int changed = 0;
+
+  vmm_write_acquire(&f);
+  {
+    u64 *l3 = leaf_table_for(space, vaddr);
+
+    if (l3) {
+      usize i3 = l3_index(vaddr);
+      u64 entry = l3[i3];
+
+      if ((entry & 0x3ULL) == D_PAGE) {
+        /* AP is a two-bit field, and which read-write encoding applies depends
+         * on whether the page belongs to userspace. */
+        u64 rw = (entry & SW_USER) ? AP_EL1_EL0_RW : AP_EL1_RW;
+        u64 ro = (entry & SW_USER) ? AP_EL1_EL0_RO : AP_EL1_RO;
+
+        l3[i3] = (entry & ~AP_MASK) | (writable ? rw : ro);
+        tlb_flush_page(vaddr);
+        changed = 1;
+      }
+    }
+  }
+  vmm_write_release(f);
+  return changed;
+}
+
 int paging_test_and_clear_accessed(u64 space, u64 vaddr) {
   u64 *l3 = leaf_table_for(space, vaddr);
   if (!l3)

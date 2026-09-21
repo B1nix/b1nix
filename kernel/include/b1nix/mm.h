@@ -326,6 +326,18 @@ void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address);
  * frame reference is the caller's to manage). */
 void paging_set_page_in_space(u64 pml4_phys, u64 virtual_address,
                               u64 physical_address, u64 flags);
+/* Make an existing mapping writable, or not. The page must already be there;
+ * everything else about it is kept. Returns 1 if the mapping changed, 0 if
+ * there was nothing mapped at that address.
+ *
+ * Its own call rather than a read-modify-write of the leaf by the caller,
+ * because "writable" is a single bit on x86_64 and a two-bit AP field on
+ * aarch64 -- a caller that clears bit 1 of an aarch64 descriptor has cleared
+ * the bit that says it is a page. */
+int paging_set_writable_in_space(u64 pml4_phys, u64 virtual_address,
+                                 int writable);
+/* Is the page mapped there writable? 0 when nothing is mapped. */
+int paging_user_writable(u64 pml4_phys, u64 virtual_address);
 /* Move a range's leaf page-table entries to another address in the current
  * address space, leaving the pages themselves where they are. The destination
  * must already be mapped (lazily is enough) so no table has to be allocated. */

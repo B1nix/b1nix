@@ -3352,6 +3352,50 @@ void paging_free_swap_slots(u64 pml4_phys) {
   (void)pml4_phys;
 }
 
+int paging_user_writable(u64 pml4_phys, u64 vaddr) {
+  u64 pte = paging_user_pte(pml4_phys, vaddr);
+
+  return (pte & VMM_PRESENT) && (pte & VMM_WRITABLE);
+}
+
+int paging_set_writable_in_space(u64 pml4_phys, u64 vaddr, int writable) {
+  u64 flags;
+  int changed = 0;
+
+  vmm_write_acquire(&flags);
+  {
+    u64 *pml4 = (u64 *)(usize)(pml4_phys ? (pml4_phys + DIRECT_MAP_BASE)
+                                         : (u64)(usize)kernel_pml4_virt);
+    u64 pml4e = pml4[pml4_index(vaddr)];
+
+    if (pml4e & VMM_PRESENT) {
+      u64 *pdpt = table_from_entry(pml4e);
+      u64 pdpte = pdpt[pdpt_index(vaddr)];
+
+      if ((pdpte & VMM_PRESENT) && !(pdpte & HUGE_PAGE_FLAG)) {
+        u64 *pd = table_from_entry(pdpte);
+        u64 pde = pd[pd_index(vaddr)];
+
+        if ((pde & VMM_PRESENT) && !(pde & HUGE_PAGE_FLAG)) {
+          u64 *pt = table_from_entry(pde);
+          u64 pte = pt[pt_index(vaddr)];
+
+          if (pte & VMM_PRESENT) {
+            pt[pt_index(vaddr)] =
+                writable ? (pte | VMM_WRITABLE) : (pte & ~(u64)VMM_WRITABLE);
+            invalidate_page(vaddr);
+            changed = 1;
+          }
+        }
+      }
+    }
+  }
+  vmm_write_release(flags);
+  if (changed)
+    tlb_shootdown_page(vaddr);
+  return changed;
+}
+
 int paging_test_and_clear_accessed(u64 pml4_phys, u64 vaddr) {
   u64 *pml4 = (u64 *)(usize)(pml4_phys ? (pml4_phys + DIRECT_MAP_BASE) : (u64)(usize)kernel_pml4_virt);
   u64 pml4e = pml4[pml4_index(vaddr)];

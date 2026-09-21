@@ -3139,9 +3139,18 @@ check_output "$POSIX_LOG" "M126-SMOKE: ok disable-stops" "PERF_EVENT_IOC_DISABLE
 check_output "$POSIX_LOG" "M126-SMOKE: ok page-faults" "PERF_COUNT_SW_PAGE_FAULTS counts the faults of touching 256 fresh pages"
 check_output "$POSIX_LOG" "M126-SMOKE: ok context-switches" "PERF_COUNT_SW_CONTEXT_SWITCHES counts twenty sleeps"
 check_output "$POSIX_LOG" "M126-SMOKE: ok read-format" "read(2) returns value, time_enabled, time_running and id, and IOC_ID agrees"
-check_output "$POSIX_LOG" "M126-SMOKE: ok hw-counters" "the CPU's own counters move with real work: 120 ms of a tight loop retires millions of instructions and burns millions of cycles"
-check_output "$POSIX_LOG" "M126-SMOKE: ok hw-per-task" "a hardware counter follows its task: a child blocked on a pipe is not credited with the parent's 120 ms of work"
-check_output "$POSIX_LOG" "M126-SMOKE: ok hw-raw-cache" "PERF_TYPE_RAW and PERF_TYPE_HW_CACHE reach the same branch counter and agree within a factor of four"
+# The hardware counters exist only where the CPU has an architectural PMU: a
+# KVM guest on x86_64 has one, a TCG guest and this kernel's aarch64 port (no
+# PMUv3 driver) have none, and the test says so rather than inventing numbers.
+# Graded strictly where the counters are there, and the skip is checked for
+# where they are not -- a silent absence would look the same as a pass.
+if grep -qa "M126-SMOKE: skip hw-counters" "$POSIX_LOG" 2>/dev/null; then
+	check_output "$POSIX_LOG" "M126-SMOKE: skip hw-counters" "this CPU has no architectural PMU, and the hardware counters say so instead of reporting zeroes"
+else
+	check_output "$POSIX_LOG" "M126-SMOKE: ok hw-counters" "the CPU's own counters move with real work: 120 ms of a tight loop retires millions of instructions and burns millions of cycles"
+	check_output "$POSIX_LOG" "M126-SMOKE: ok hw-per-task" "a hardware counter follows its task: a child blocked on a pipe is not credited with the parent's 120 ms of work"
+	check_output "$POSIX_LOG" "M126-SMOKE: ok hw-raw-cache" "PERF_TYPE_RAW and PERF_TYPE_HW_CACHE reach the same branch counter and agree within a factor of four"
+fi
 check_output "$POSIX_LOG" "M126-SMOKE: ok refuses-unknown-hw" "a hardware event with no architectural counter behind it is EOPNOTSUPP rather than answered from another event"
 check_output "$POSIX_LOG" "M126-SMOKE: ok refuses-unknown-sample-type" "a sample_type with no field behind it is refused at open"
 check_output "$POSIX_LOG" "M126-SMOKE: ok refuses-all-all" "pid=-1 with cpu=-1 is EINVAL, as on Linux"
