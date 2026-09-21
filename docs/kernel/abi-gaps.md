@@ -27,7 +27,8 @@ a full Plasma session is what M124 used as its own proof.
 | Gap | What it breaks | Milestone | Observed |
 |---|---|---|---|
 | cgroup v2 controllers (memory, cpu, io, pids), PSI | systemd slices, `MemoryMax`/`CPUWeight`, `systemd-oomd`, `systemctl status` accounting, container limits under podman | M127 | systemd runs as PID 1 (M112) but the resource-control half of its model has nothing behind it |
-| io_uring: SQPOLL, IOPOLL, provided-buffer rings, multishot, `SENDMSG`/`RECVMSG`, `URING_CMD`, the filesystem opcodes | A program that needs one of these; the ring itself works (M125) and each absence is refused at setup or reported by `IORING_REGISTER_PROBE` | — | liburing's suite in the Debian lane names them |
+| io_uring: the four xattr opcodes, `URING_CMD`, the futex opcodes, `RECV_ZC`, `EPOLL_WAIT`, `READV_FIXED`/`WRITEV_FIXED`, personalities, registered ring descriptors, NAPI, ring resizing; `SEND_ZC` copies; `IOSQE_IO_DRAIN` does not order | A program that needs one of these; everything else works (M125) and each absence is refused at setup or reported by `IORING_REGISTER_PROBE` | — | liburing's suite in the Debian lane names them |
+| perf: PMU hardware counters, tracepoints, eBPF on an event, counters that follow `fork` | `perf record -e cycles`, `perf stat` on a hardware event; the software counters and timer sampling work (M126) and each absence is `EOPNOTSUPP` at open | — | `m126_smoke` in the posix lane |
 | `perf_event_open`, eBPF, kprobes | `perf record`/`perf top`, `bpftrace`, anything in Debian that profiles | M126 | — |
 | `userfaultfd`, `fanotify` | CRIU, live migration, file-access monitoring | M126 | — |
 | Suspend (s2idle, S3), cpufreq, cpuidle | `systemctl suspend`, battery life, a laptop that can be closed | M129 | — |

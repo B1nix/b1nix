@@ -4324,6 +4324,69 @@ int scheduler_adopt_owner_context(usize owner_pid) {
   return 0;
 }
 
+/* The inverse of scheduler_adopt_owner_context: hand the owner's address space
+ * and descriptor table back and become a plain kernel thread again.
+ *
+ * This is NOT optional for the io_uring submission thread, and the reason is
+ * the one b1nix's teardown is built around: whoever drops the LAST reference
+ * tears the thing down. A thread that keeps the owner's pml4 and vma_list past
+ * the owner's exit either (a) stops the reaper freeing them, in which case they
+ * are freed here, or (b) races it, in which case the reaper walks a vma_list
+ * this thread is still using. The second is what a lingering SQPOLL thread did:
+ * `user_address_space_cleanup` on the exiting process unmapped through a list
+ * that had already been half torn down, and panicked on a misaligned address.
+ *
+ * So the borrow is given back explicitly, through the same primitives the reap
+ * path uses, while this thread is still the one running. */
+void scheduler_release_owner_context(void) {
+  struct task *t = current_task;
+  struct vfs_handle **tbl;
+  int *fl = 0;
+  usize cap = 0;
+  u64 last;
+
+  if (!t || !t->pml4_phys)
+    return;
+
+  tbl = fdtable_release(t, &fl, &cap);
+  if (tbl) {
+    for (usize i = 0; i < cap; i++)
+      if (tbl[i])
+        vfs_close_handle(tbl[i], (int)t->id);
+    kfree(tbl);
+    kfree(fl);
+  }
+
+  last = mm_release_user(t);
+  if (last) {
+    /* Nobody else is left: this thread owns the teardown. */
+    t->pml4_phys = last;
+    paging_switch_address_space(0);
+    user_address_space_cleanup(t);
+    paging_free_address_space(last);
+    t->pml4_phys = 0;
+  }
+  t->vma_list = 0;
+  t->user_brk = 0;
+  t->heap_start = 0;
+  paging_switch_address_space(0);
+}
+
+/* Is the task this thread borrowed from still running in the address space it
+ * was borrowed from? A DEAD or REAPING owner is one whose teardown is about to
+ * start, and the borrow has to end before it does. */
+int scheduler_owner_context_alive(usize owner_pid) {
+  struct task *t = current_task;
+  struct task *o = scheduler_task_by_pid(owner_pid);
+
+  if (!t || !o || o == t)
+    return 0;
+  if (o->state == TASK_UNUSED || o->state == TASK_DEAD ||
+      o->state == TASK_REAPING)
+    return 0;
+  return o->pml4_phys != 0 && o->pml4_phys == t->pml4_phys;
+}
+
 int g_has_any_thread = 0;
 
 /* CLONE_VFORK: the parent must not run until the child has execve()d or

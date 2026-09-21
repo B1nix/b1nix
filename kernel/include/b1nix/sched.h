@@ -546,6 +546,11 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg);
  * thread is the one user; see kernel/sched/scheduler.c for why this is safe
  * against the owner exiting. Returns 0, or -1 when there is nothing to adopt. */
 int scheduler_adopt_owner_context(usize owner_pid);
+/* Give that context back before the owner's teardown starts, and say whether
+ * the owner is still there to borrow from. A thread that adopted a context must
+ * call the first before it exits. */
+void scheduler_release_owner_context(void);
+int scheduler_owner_context_alive(usize owner_pid);
 /* Like kthread_create, but marks the task ap_runnable so Application Processors
  * may run it (used for userspace processes, which enter ring 3 and release the
  * BKL). See struct task::ap_runnable. */

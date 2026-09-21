@@ -859,6 +859,12 @@ isize syscall_splice(int fd_in, u64 *user_off_in, int fd_out,
 int syscall_fallocate(int fd, int mode, u64 offset, u64 len) {
   if (len == 0)
     return -EINVAL;
+  /* offset + len must not wrap, and must stay inside what a file offset can
+   * hold. IORING_OP_FALLOCATE lets a caller put any two 64-bit words here, and
+   * a wrapped end would be handed to ftruncate as a length that means nothing. */
+  if (offset > 0x7fffffffffffffffull || len > 0x7fffffffffffffffull ||
+      offset + len > 0x7fffffffffffffffull)
+    return -EINVAL;
   /* Only plain allocate (0) and KEEP_SIZE are representable; the rest need
    * driver support b1nix lacks. */
   if (mode & ~FALLOC_FL_KEEP_SIZE)

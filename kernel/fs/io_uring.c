@@ -1184,9 +1184,21 @@ static int iou_tmp_fd(struct vfs_handle *h) {
   return fd;
 }
 
+/* Give the lent descriptor back.
+ *
+ * scheduler_fd_close() only clears the slot: it does NOT drop the reference the
+ * table was holding — vfs_close() is what pairs a descriptor with its release,
+ * through scheduler_fd_take. Clearing the slot alone leaked one handle per
+ * lend, which under liburing's suite is thousands of inodes and pages that
+ * nothing ever frees, and the machine then falls over somewhere else entirely. */
 static void iou_tmp_fd_put(int fd) {
-  if (fd >= 0)
-    scheduler_fd_close(fd);
+  struct vfs_handle *h;
+
+  if (fd < 0)
+    return;
+  h = scheduler_fd_take(fd);
+  if (h)
+    vfs_handle_release(h);
 }
 
 /* Install a handle in the registered-file set. `file_index` is sqe->file_index:
@@ -1231,19 +1243,26 @@ static i32 iou_install_direct(struct io_ring_ctx *ctx, struct vfs_handle *h,
 }
 
 /* An opcode that produced an ordinary descriptor was asked for a direct one
- * instead: take the handle out of the descriptor and put it in a slot. */
+ * instead: take the handle out of the descriptor table — with the reference the
+ * table was holding, so nothing is retained and nothing is leaked — and put it
+ * in a registered-file slot. */
 static i32 iou_fd_to_direct(struct io_ring_ctx *ctx, int fd, u32 file_index) {
-  struct vfs_handle *h = scheduler_fd_get_retain(fd);
+  struct vfs_handle *h = scheduler_fd_take(fd);
   i32 rc;
 
-  if (!h) {
-    scheduler_fd_close(fd);
+  if (!h)
     return -EBADF;
-  }
   rc = iou_install_direct(ctx, h, file_index);
   if (rc < 0)
-    vfs_handle_release(h);
-  scheduler_fd_close(fd);
+    /* vfs_close_handle, not vfs_handle_release: this reference is the one the
+     * descriptor table was holding, and giving it back is a close — the flush,
+     * the POSIX locks and the inode's own bookkeeping all hang off it. A plain
+     * refcount decrement leaves the file half open for ever. */
+    /* vfs_close_handle, not vfs_handle_release: this reference is the one the
+     * descriptor table was holding, and giving it back is a close — the flush,
+     * the POSIX locks and the inode's own bookkeeping all hang off it. A plain
+     * refcount decrement leaves the file half open for ever. */
+    vfs_close_handle(h, current_task ? (int)task_tgid(current_task) : 0);
   return rc;
 }
 
@@ -1388,12 +1407,12 @@ static i32 iou_perform_op(struct iou_req *req) {
 
       if (copy &&
           syscall_copyout((void *)(usize)sqe->addr, addrbuf, copy) < 0) {
-        scheduler_fd_close(fd);
+        vfs_close(fd);
         return -EFAULT;
       }
       if (syscall_copyout((void *)(usize)sqe->addr2, &reported,
                           sizeof(reported)) < 0) {
-        scheduler_fd_close(fd);
+        vfs_close(fd);
         return -EFAULT;
       }
     }
@@ -1477,9 +1496,14 @@ static i32 iou_perform_op(struct iou_req *req) {
      * frees the request that is executing. Linux answers EBADF for the same
      * reason. */
     victim = scheduler_fd_get(sqe->fd);
-    if (victim && victim->private_data == ctx)
+    if (!victim)
       return -EBADF;
-    return (i32)scheduler_fd_close(sqe->fd);
+    if (victim->private_data == ctx)
+      return -EBADF;
+    /* vfs_close, not scheduler_fd_close: close(2) releases the handle, and
+     * clearing the slot on its own would leave the file open for ever. */
+    vfs_close(sqe->fd);
+    return 0;
   }
 
   case IORING_OP_ASYNC_CANCEL: {
@@ -2001,7 +2025,7 @@ static i32 iou_perform_op(struct iou_req *req) {
       i32 b;
 
       if (a < 0) {
-        scheduler_fd_close(fds[1]);
+        vfs_close(fds[1]);
         return a;
       }
       b = iou_fd_to_direct(ctx, fds[1],
@@ -2020,8 +2044,8 @@ static i32 iou_perform_op(struct iou_req *req) {
     }
     if (sqe->addr &&
         syscall_copyout((void *)(usize)sqe->addr, fds, sizeof(fds)) < 0) {
-      scheduler_fd_close(fds[0]);
-      scheduler_fd_close(fds[1]);
+      vfs_close(fds[0]);
+      vfs_close(fds[1]);
       return -EFAULT;
     }
     return 0;
@@ -3117,6 +3141,15 @@ static void iou_sq_thread(void *arg) {
   while (!__atomic_load_n(&ctx->sq_stop, __ATOMIC_ACQUIRE)) {
     int did = 0;
 
+    /* Stop the moment the owner does. This thread is running in the owner's
+     * address space, and the reaper is about to tear it down; a submission
+     * thread that carried on would be the other party in that race. Checked
+     * every iteration, and the iteration is bounded by a 20 ms sleep, so the
+     * window is short and the owner's reap cannot start inside it — a DEAD or
+     * REAPING owner is already refused here. */
+    if (!scheduler_owner_context_alive(ctx->owner_tgid))
+      break;
+
     if (__atomic_load_n(&ctx->enabled, __ATOMIC_ACQUIRE)) {
       if (iou_sq_pending(ctx)) {
         u32 tail = __atomic_load_n(&ctx->hdr->sq_tail, __ATOMIC_ACQUIRE);
@@ -3168,6 +3201,10 @@ static void iou_sq_thread(void *arg) {
   }
 
   iou_sq_need_wakeup(ctx, 0);
+  /* Hand the owner's address space and descriptor table back before this task
+   * ends: see scheduler_release_owner_context for why it cannot be left to the
+   * thread's own teardown. */
+  scheduler_release_owner_context();
   __atomic_store_n(&ctx->sq_alive, 0, __ATOMIC_RELEASE);
   iou_ctx_put(ctx);
 }
@@ -3455,7 +3492,7 @@ static isize iou_setup(u32 entries, u64 uparams) {
     ctx->sq_tid = kthread_create("io_uring-sq", iou_sq_thread, ctx);
     if (ctx->sq_tid < 0) {
       iou_ctx_put(ctx);
-      scheduler_fd_close(fd);
+      vfs_close(fd);
       return -EAGAIN;
     }
     /* The thread adopts the owner's address space before it does anything; if
@@ -3466,7 +3503,7 @@ static isize iou_setup(u32 entries, u64 uparams) {
            !__atomic_load_n(&ctx->sq_stop, __ATOMIC_ACQUIRE))
       scheduler_yield();
     if (!__atomic_load_n(&ctx->sq_alive, __ATOMIC_ACQUIRE)) {
-      scheduler_fd_close(fd);
+      vfs_close(fd);
       return -EOWNERDEAD;
     }
   }
@@ -3494,7 +3531,7 @@ static isize iou_setup(u32 entries, u64 uparams) {
   p.cq_off.user_addr = 0;
 
   if (syscall_copyout((void *)(usize)uparams, &p, sizeof(p)) < 0) {
-    scheduler_fd_close(fd);
+    vfs_close(fd);
     return -EFAULT;
   }
   iou_trace("setup", entries, p.flags, fd);

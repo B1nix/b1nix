@@ -1,7 +1,7 @@
 # Processes and system calls
 
 Milestones M4, M12–M13, M18–M20, M30, M35–M36, M40, M46, M48, M56, M73–M74,
-M80, M92, M124 and M125.
+M80, M92, M124, M125 and M126.
 
 ## The Linux ABI
 
@@ -191,20 +191,126 @@ it is 217 static programs and about 180 MiB of image:
 status verbatim — 0 passed, 77 skipped, anything else failed. `b1nix.liburing=`
 runs a named subset and `b1nix.liburing-part=N/M` runs a share of the list,
 which is how the tail of it is measured in a guest the head has not worn out.
-As of this milestone: **89 pass, 48 skip, 72 fail, 8 hang**. Almost every
-failure is a test for something refused at setup — SQPOLL, IOPOLL, SQE128,
-DEFER_TASKRUN — which those tests treat as a failure rather than a skip; the
-rest are opcodes that are not implemented, the syzkaller reproducers (they
-`mmap` at a hint below 4 GiB, which this kernel relocates), and the socket
-tests that need an ephemeral TCP bind. `fio --ioengine=io_uring` is the second
-consumer, run by stage 15 with `FIO=1 make debian-image`, plain and with
-`registerfiles=1 fixedbufs=1`.
+As of this milestone, measured in six parts at 4 GiB against the same harness
+on the branch point:
+
+| | before | after | after, on a boot that did not hit the defect below |
+|---|---|---|---|
+| pass | 89 | **106** | **116** |
+| fail | 73 | 45 | 57 |
+| skip | 48 | 28 | 31 |
+| timeout | 7 | 13 | 13 |
+| tests that ran | 217 | 192 | 217 |
+
+Seventeen tests stopped skipping because the feature they probe for now exists.
+The middle column is this tree measured as it stands: two of the six boots end
+in the panic described below and lose the tests after it. The right-hand column
+is an intermediate build of the same feature set whose boots happened not to
+trip it, and is what the features are worth once the defect is fixed.
+
+The timeouts went **up**, and that is worth saying plainly rather than hiding in
+the total: `socket`, `send_recv`, `send_recvmsg`, `sendmsg_iov_clean` and
+`recv-bundle-short-ooo` used to stop at a refused `IORING_OP_SOCKET` or a
+refused setup flag and now get past it, only to reach a UDP `bind(port = 0)`
+that this kernel does not answer with an ephemeral port — the same gap
+`accept.t` names with `t_bind_ephemeral_port: Assertion 'addr->sin_port != 0'`,
+and a networking one, not an io_uring one. The remaining failures are the
+opcodes still absent, the syzkaller reproducers (they `mmap` at a hint below
+4 GiB, which this kernel relocates), and tests for `IOSQE_IO_DRAIN` ordering.
+`fio --ioengine=io_uring` is the second consumer, run by stage 15 with
+`FIO=1 make debian-image`, plain and with `registerfiles=1 fixedbufs=1`.
+
+**One defect liburing found is open, and it is worth the space.** Run the two
+syzkaller reproducers `232c93d07b74` and `a0908ae19763` in one boot together
+with the rest of their part of the suite, and the machine panics later — inside
+`__ext4_new_inode`, with the heap allocator's poison in a register, or inside
+`ext4_writepages` at the harness's closing `sync`. It needs **both**
+reproducers; either one alone is clean, at 4 GiB and at 8 GiB alike, so it is
+not simple exhaustion. It disappears if `IORING_OP_OPENAT` is refused — because
+the reproducers then create no files at all — which places the trigger at file
+creation under the process and memory churn two fork bombs make, and the defect
+in the create path's error handling rather than in io_uring. It is recorded here
+because io_uring is what made it reachable: before this milestone nothing could
+ask the kernel to create a file from a fuzzed SQE. Not root-caused.
 
 Two defects liburing found were not in io_uring at all and are fixed here: a
 `fsync(2)` on an unlinked file on an imported filesystem answered `EINVAL`
 (`lkpifs_fsync` now syncs through the superblock when the name is gone), and a
 static `ET_EXEC` faults in its own image before `main()`, which is why the
 suite is built `-static-pie`.
+
+## Observability: perf_event_open (M126)
+
+`kernel/perf/perf_event.c`. The ABI is Linux's, vendored into
+`kernel/include/b1nix/perf_event_abi.h` for the same reason io_uring's is: the
+distribution's own `perf` is compiled against `struct perf_event_attr`, the
+sample-record layout and the mmap'd control page, and a field in the wrong
+place is a class of bug no test names. The only edits to the header are the
+three host includes and the ioctl numbers, which are spelled out because this
+kernel has no `_IO`/`_IOW` macros.
+
+The descriptor is a node handle over an anonymous `VFS_DEVICE` inode, as
+io_uring's ring is. `read(2)` gives the count in whichever `PERF_FORMAT_*`
+shape was asked for, `ioctl(2)` carries ENABLE/DISABLE/RESET/REFRESH/PERIOD/ID,
+`poll(2)` reports the ring buffer readable, and `mmap(2)` maps one control page
+plus a power of two of data pages — the length is what says how big, so the
+buffer is allocated on the first mapping and not at open.
+
+**What is counted is what this kernel already keeps**, and nothing is invented:
+
+| counter | read from |
+|---|---|
+| `SW_TASK_CLOCK` | the task's own CPU time (M86 accounting) |
+| `SW_CPU_CLOCK` | wall time while the counter is enabled |
+| `SW_PAGE_FAULTS`, `_MIN`, `_MAJ` | a per-task pair counted in `vmm_handle_page_fault`; major means the page came from swap or a file |
+| `SW_CONTEXT_SWITCHES` | the scheduler's `nvcsw + nivcsw` |
+| `SW_DUMMY` | nothing, by definition — `perf` opens one only to get a ring buffer |
+
+`PERF_TYPE_HARDWARE`, `HW_CACHE`, `RAW` and `TRACEPOINT` are **`EOPNOTSUPP` at
+open**. There is no PMU driver here — nothing programs `IA32_PERFEVTSELx` and
+there is no counter-overflow NMI — and a counter that read zero for ever would
+be worse than an honest refusal. A `sample_type` bit whose field this does not
+write, `PERF_FORMAT_GROUP`, `attr.inherit` and `attr.precise_ip` are refused for
+the same reason: each would otherwise be a wrong number rather than none.
+
+**A sample is taken from the timer tick**, on the CPU that took it, with the
+register file of whatever it interrupted — there is no counter-overflow
+interrupt to hang sampling off, so the tick *is* the sampling clock.
+`attr.freq` asks for N samples a second and gets one every
+`SCHED_TICKS_PER_SEC / N` ticks; an `attr.sample_period` on a clock counter is
+charged the tick's worth of nanoseconds, and a period on an event counter is
+refused rather than approximated. The period written into every
+`PERF_RECORD_SAMPLE` says what that sample is worth, so the profile is
+statistically what `perf record` produces, at the resolution the timer gives.
+
+The user call chain is walked from the frame pointer **without faulting**: each
+link is resolved through the page tables with `paging_user_frame` and a page
+that is not resident simply ends the chain. A sample is taken in interrupt
+context, so nothing on that path allocates, sleeps, or takes a lock another path
+holds while it sleeps.
+
+The buffer also carries `PERF_RECORD_COMM` and a `PERF_RECORD_MMAP2` per
+file-backed mapping, written when the buffer is first mapped, and
+`PERF_RECORD_EXIT` when a watched task goes — without them a sampled address is
+a number with nothing to resolve it against. Every non-`SAMPLE` record carries
+the `sample_id_all` trailer, whose field order is the ABI's and is parsed from
+the *end* of the record: one field too many or too few makes every record after
+it nonsense.
+
+`/proc/sys/kernel/perf_event_paranoid` is real and enforced: 2 (the Linux
+default) lets an unprivileged caller profile only tasks of its own thread group,
+1 and 0 relax that, and anything machine-wide needs `CAP_SYS_ADMIN`.
+
+What is **not** there: PMU hardware counters, tracepoints, eBPF programs
+attached to an event, `PERF_EVENT_IOC_SET_OUTPUT` (redirecting one event's
+records into another's buffer), `rdpmc` from userspace (`cap_user_rdpmc` stays
+clear, so `perf` uses `read(2)`), and counters that follow `fork`. The
+distribution's `perf record` has not been run against this.
+
+`tests/programs/bin/smoke/m126_smoke.c` proves each counter by making the thing
+it counts happen — 120 ms of spinning against the task clock, 256 fresh pages
+against the fault counter, twenty sleeps against the switch counter — and then
+maps a ring, samples 300 ms at 200 Hz and walks the records it finds.
 
 ## The vDSO
 
