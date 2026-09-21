@@ -8,9 +8,16 @@
  */
 
 #include <b1nix/blk.h>
+#include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/lapic.h>
+#include <b1nix/cpufreq.h>
+#include <b1nix/acpi_power.h>
+#include <b1nix/cpuidle.h>
+#include <b1nix/suspend.h>
 #include <b1nix/mm.h>
+#include <b1nix/thp.h>
+#include <b1nix/numa.h>
 #include <b1nix/module.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/netdev.h>
@@ -821,6 +828,54 @@ static int sysfs_char_lookup(struct vfs_node *dir, const char *name) {
   return sysfs_child(dir, name) ? 0 : -1;
 }
 
+/* ── /sys/class/rtc/rtc0 (M129) ──────────────────────────────────────────
+ *
+ * util-linux's rtcwake refuses to suspend unless the clock it is about to
+ * arm is marked as a wakeup device: it opens
+ * /sys/class/rtc/rtc0/device/power/wakeup and expects to read "enabled".
+ * That file is the device-power-management surface Linux gives every device;
+ * this kernel has no such model, and one file that tells the truth about the
+ * one device that really can wake it is worth more than a model that does
+ * not exist. `name` is there because rtcwake and hwclock print it. */
+
+static int g_rtc_wakeup(char *b, usize c) {
+  /* The RTC alarm is registered with the suspend path and really does end a
+   * freeze — see kernel/dev/rtc_dev.c. */
+  return snprintf(b, c, "enabled\n");
+}
+
+static int g_rtc_name(char *b, usize c) {
+#if defined(__x86_64__)
+  return snprintf(b, c, "rtc_cmos\n");
+#else
+  return snprintf(b, c, "pl031\n");
+#endif
+}
+
+static void sysfs_build_rtc(struct vfs_node *classp) {
+  struct vfs_node *rtc_class, *rtc0, *dev, *power;
+
+  if (!classp)
+    return;
+  rtc_class = sysfs_mkchild(classp, "rtc", VFS_DIRECTORY, 0);
+  if (!rtc_class)
+    return;
+  rtc0 = sysfs_mkchild(rtc_class, "rtc0", VFS_DIRECTORY, 0);
+  if (!rtc0)
+    return;
+  sysfs_mkchild(rtc0, "name", VFS_DEVICE, g_rtc_name);
+  /* Linux reaches the device through a symlink; a directory of the same name
+   * is what a reader of `device/power/wakeup` actually needs, and this sysfs
+   * has no symlinks. */
+  dev = sysfs_mkchild(rtc0, "device", VFS_DIRECTORY, 0);
+  if (!dev)
+    return;
+  power = sysfs_mkchild(dev, "power", VFS_DIRECTORY, 0);
+  if (!power)
+    return;
+  sysfs_mkchild(power, "wakeup", VFS_DEVICE, g_rtc_wakeup);
+}
+
 static void sysfs_build_block(struct vfs_node *root) {
   struct vfs_node *block = sysfs_mkchild(root, "block", VFS_DIRECTORY, 0);
   struct vfs_node *devp = sysfs_mkchild(root, "dev", VFS_DIRECTORY, 0);
@@ -837,6 +892,8 @@ static void sysfs_build_block(struct vfs_node *root) {
   g_sysfs_block = block;
   g_sysfs_devblock = devblock;
   g_sysfs_classblock = classblock;
+  /* The one device in this machine that can end a suspend says so here. */
+  sysfs_build_rtc(classp);
   /* A remount starts from an empty tree, so nothing may be remembered from the
    * previous one. */
   memset(g_sysfs_blkent, 0, sizeof(g_sysfs_blkent));
@@ -917,7 +974,12 @@ static int g_kversion(char *b, usize c) {
  * the CPU's own nominal maximum when CPUID publishes one. A CPU whose clock was
  * never measured gets no cpufreq directory at all rather than a made-up number. */
 static int g_cpu_cur_freq(char *b, usize c) {
-  return snprintf(b, c, "%lu\n", (unsigned long)arch_cpu_khz());
+  /* What the processor says it is running at, where it will say (M129); the
+   * measured clock otherwise. */
+  u32 khz = cpufreq_cur_khz();
+
+  return snprintf(b, c, "%lu\n",
+                  (unsigned long)(khz ? khz : arch_cpu_khz()));
 }
 
 static int g_cpu_max_freq(char *b, usize c) {
@@ -931,8 +993,45 @@ static int g_cpu_min_freq(char *b, usize c) {
 }
 
 static int g_cpu_governor(char *b, usize c) {
-  /* No frequency scaling: the clock is whatever the hardware runs at. */
-  return snprintf(b, c, "performance\n");
+  /* The governor in force. Without a scaling driver the clock is whatever the
+   * hardware runs at, and "performance" is the truthful name for that. */
+  const char *g = cpufreq_governor();
+
+  return snprintf(b, c, "%s\n", (g && g[0] && strcmp(g, "none")) ? g
+                                                                  : "performance");
+}
+
+static int g_cpu_driver(char *b, usize c) {
+  return snprintf(b, c, "%s\n", cpufreq_driver_name());
+}
+
+static int g_cpu_governors(char *b, usize c) {
+  /* Only what can really be asked for: a list naming governors nothing
+   * implements is how a tuning daemon comes to believe it has set one. */
+  if (strcmp(cpufreq_driver_name(), "none") == 0)
+    return snprintf(b, c, "performance\n");
+  return snprintf(b, c, "performance powersave\n");
+}
+
+/* Writing scaling_governor asks the processor for it. A driver that is not
+ * there refuses, rather than accepting the write and changing nothing. */
+static isize sysfs_governor_write(struct vfs_node *node, u64 offset,
+                                  const char *buffer, usize size, int flags) {
+  char name[32];
+  usize n = size < sizeof(name) - 1 ? size : sizeof(name) - 1;
+
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (!buffer || !size)
+    return -EINVAL;
+  memcpy(name, buffer, n);
+  name[n] = 0;
+  while (n && (name[n - 1] == '\n' || name[n - 1] == ' '))
+    name[--n] = 0;
+  if (cpufreq_set_governor(name) != 0)
+    return -EINVAL;
+  return (isize)size;
 }
 
 static int g_cpu_range(char *b, usize c) {
@@ -940,6 +1039,253 @@ static int g_cpu_range(char *b, usize c) {
   if (n == 1)
     return snprintf(b, c, "0\n");
   return snprintf(b, c, "0-%d\n", n - 1);
+}
+
+/* ── /sys/devices/system/node (M128) ─────────────────────────────────────
+ *
+ * What `numactl --hardware`, `lscpu` and libnuma read: which nodes exist,
+ * which CPUs sit on each, how much memory each has and how far apart they
+ * are. A machine with one node still publishes node0 — that is what Linux
+ * does, and a tool that finds the directory missing concludes the kernel has
+ * no NUMA support at all rather than that it has one node. */
+
+static int node_range_str(char *b, usize c, u64 mask) {
+  usize used = 0;
+  int first = 1;
+
+  for (int i = 0; i < 64;) {
+    if (!(mask & (1ULL << i))) {
+      i++;
+      continue;
+    }
+    int start = i;
+
+    while (i < 64 && (mask & (1ULL << i)))
+      i++;
+    if (used < c)
+      used += (usize)snprintf(b + used, c - used, "%s%d", first ? "" : ",",
+                              start);
+    if (i - 1 > start && used < c)
+      used += (usize)snprintf(b + used, c - used, "-%d", i - 1);
+    first = 0;
+  }
+  if (used < c)
+    used += (usize)snprintf(b + used, c - used, "\n");
+  return (int)used;
+}
+
+static int node_meminfo(int node, char *b, usize c) {
+  u64 total_kb = numa_node_bytes(node) / 1024;
+  u64 free_kb = (u64)pmm_node_free_frames(node) * PAGE_SIZE / 1024;
+
+  /* A node whose size the firmware never stated is the whole machine's. */
+  if (!total_kb)
+    total_kb = pmm_total_usable_memory() / 1024;
+  return snprintf(b, c,
+                  "Node %d MemTotal:       %lu kB\n"
+                  "Node %d MemFree:        %lu kB\n"
+                  "Node %d MemUsed:        %lu kB\n",
+                  node, (unsigned long)total_kb, node, (unsigned long)free_kb,
+                  node,
+                  (unsigned long)(total_kb > free_kb ? total_kb - free_kb : 0));
+}
+
+static int node_distance_str(int node, char *b, usize c) {
+  usize used = 0;
+
+  for (int i = 0; i < numa_node_count(); i++)
+    if (used < c)
+      used += (usize)snprintf(b + used, c - used, "%s%d", i ? " " : "",
+                              numa_distance(node, i));
+  if (used < c)
+    used += (usize)snprintf(b + used, c - used, "\n");
+  return (int)used;
+}
+
+#define NODE_ATTRS(n)                                                        \
+  static int g_node##n##_cpulist(char *b, usize c) {                         \
+    return node_range_str(b, c, numa_cpumask(n));                            \
+  }                                                                          \
+  static int g_node##n##_cpumap(char *b, usize c) {                          \
+    return snprintf(b, c, "%08lx\n", (unsigned long)numa_cpumask(n));        \
+  }                                                                          \
+  static int g_node##n##_meminfo(char *b, usize c) {                         \
+    return node_meminfo(n, b, c);                                            \
+  }                                                                          \
+  static int g_node##n##_distance(char *b, usize c) {                        \
+    return node_distance_str(n, b, c);                                       \
+  }
+
+NODE_ATTRS(0)
+NODE_ATTRS(1)
+NODE_ATTRS(2)
+NODE_ATTRS(3)
+NODE_ATTRS(4)
+NODE_ATTRS(5)
+NODE_ATTRS(6)
+NODE_ATTRS(7)
+
+struct node_attr_set {
+  int (*cpulist)(char *, usize);
+  int (*cpumap)(char *, usize);
+  int (*meminfo)(char *, usize);
+  int (*distance)(char *, usize);
+};
+
+#define NODE_SET(n)                                                          \
+  { g_node##n##_cpulist, g_node##n##_cpumap, g_node##n##_meminfo,            \
+    g_node##n##_distance }
+
+static const struct node_attr_set g_node_attrs[NUMA_MAX_NODES] = {
+    NODE_SET(0), NODE_SET(1), NODE_SET(2), NODE_SET(3),
+    NODE_SET(4), NODE_SET(5), NODE_SET(6), NODE_SET(7),
+};
+
+static int g_node_online(char *b, usize c) {
+  int n = numa_node_count();
+
+  return node_range_str(b, c, n >= 64 ? ~0ULL : ((1ULL << n) - 1));
+}
+
+static int g_node_has_cpu(char *b, usize c) {
+  u64 mask = 0;
+
+  for (int i = 0; i < numa_node_count(); i++)
+    if (numa_cpumask(i))
+      mask |= 1ULL << i;
+  return node_range_str(b, c, mask);
+}
+
+static void sysfs_build_nodes(struct vfs_node *sys) {
+  struct vfs_node *nd = sysfs_mkchild(sys, "node", VFS_DIRECTORY, 0);
+  int n = numa_node_count();
+
+  if (!nd)
+    return;
+  sysfs_mkchild(nd, "online", VFS_DEVICE, g_node_online);
+  sysfs_mkchild(nd, "possible", VFS_DEVICE, g_node_online);
+  sysfs_mkchild(nd, "has_memory", VFS_DEVICE, g_node_online);
+  sysfs_mkchild(nd, "has_normal_memory", VFS_DEVICE, g_node_online);
+  sysfs_mkchild(nd, "has_cpu", VFS_DEVICE, g_node_has_cpu);
+  for (int i = 0; i < n && i < NUMA_MAX_NODES; i++) {
+    char name[16];
+    struct vfs_node *one;
+
+    snprintf(name, sizeof(name), "node%d", i);
+    one = sysfs_mkchild(nd, name, VFS_DIRECTORY, 0);
+    if (!one)
+      continue;
+    sysfs_mkchild(one, "cpulist", VFS_DEVICE, g_node_attrs[i].cpulist);
+    sysfs_mkchild(one, "cpumap", VFS_DEVICE, g_node_attrs[i].cpumap);
+    sysfs_mkchild(one, "meminfo", VFS_DEVICE, g_node_attrs[i].meminfo);
+    sysfs_mkchild(one, "distance", VFS_DEVICE, g_node_attrs[i].distance);
+  }
+}
+
+/* ── /sys/devices/system/cpu/cpuN/cpuidle (M129) ─────────────────────────
+ *
+ * One directory per idle state, with the counters powertop and every
+ * monitoring agent read. They are per CPU, so the attribute functions are
+ * generated per (cpu, state) pair the same way the node attributes are. */
+
+#define CPUIDLE_SYSFS_CPUS   8
+#define CPUIDLE_SYSFS_STATES 4
+
+static int cpuidle_attr(int cpu, int state, int which, char *b, usize c) {
+  switch (which) {
+  case 0:
+    return snprintf(b, c, "%s\n", cpuidle_state_name(state));
+  case 1:
+    return snprintf(b, c, "%s\n", cpuidle_state_desc(state));
+  case 2:
+    return snprintf(b, c, "%lu\n",
+                    (unsigned long)cpuidle_state_usage(cpu, state));
+  case 3:
+    return snprintf(b, c, "%lu\n",
+                    (unsigned long)cpuidle_state_time_us(cpu, state));
+  default:
+    return snprintf(b, c, "%lu\n",
+                    (unsigned long)cpuidle_state_latency_us(state));
+  }
+}
+
+#define CPUIDLE_ONE(cpu, st)                                                 \
+  static int g_ci##cpu##_##st##_name(char *b, usize c) {                     \
+    return cpuidle_attr(cpu, st, 0, b, c);                                   \
+  }                                                                          \
+  static int g_ci##cpu##_##st##_desc(char *b, usize c) {                     \
+    return cpuidle_attr(cpu, st, 1, b, c);                                   \
+  }                                                                          \
+  static int g_ci##cpu##_##st##_usage(char *b, usize c) {                    \
+    return cpuidle_attr(cpu, st, 2, b, c);                                   \
+  }                                                                          \
+  static int g_ci##cpu##_##st##_time(char *b, usize c) {                     \
+    return cpuidle_attr(cpu, st, 3, b, c);                                   \
+  }                                                                          \
+  static int g_ci##cpu##_##st##_lat(char *b, usize c) {                      \
+    return cpuidle_attr(cpu, st, 4, b, c);                                   \
+  }
+
+#define CPUIDLE_CPU(cpu)                                                     \
+  CPUIDLE_ONE(cpu, 0)                                                        \
+  CPUIDLE_ONE(cpu, 1)                                                        \
+  CPUIDLE_ONE(cpu, 2)                                                        \
+  CPUIDLE_ONE(cpu, 3)
+
+CPUIDLE_CPU(0)
+CPUIDLE_CPU(1)
+CPUIDLE_CPU(2)
+CPUIDLE_CPU(3)
+CPUIDLE_CPU(4)
+CPUIDLE_CPU(5)
+CPUIDLE_CPU(6)
+CPUIDLE_CPU(7)
+
+struct cpuidle_attr_set {
+  int (*name)(char *, usize);
+  int (*desc)(char *, usize);
+  int (*usage)(char *, usize);
+  int (*time)(char *, usize);
+  int (*lat)(char *, usize);
+};
+
+#define CPUIDLE_SET(cpu, st)                                                 \
+  { g_ci##cpu##_##st##_name, g_ci##cpu##_##st##_desc,                        \
+    g_ci##cpu##_##st##_usage, g_ci##cpu##_##st##_time, g_ci##cpu##_##st##_lat }
+
+#define CPUIDLE_ROW(cpu)                                                     \
+  { CPUIDLE_SET(cpu, 0), CPUIDLE_SET(cpu, 1), CPUIDLE_SET(cpu, 2),           \
+    CPUIDLE_SET(cpu, 3) }
+
+static const struct cpuidle_attr_set
+    g_cpuidle_attrs[CPUIDLE_SYSFS_CPUS][CPUIDLE_SYSFS_STATES] = {
+        CPUIDLE_ROW(0), CPUIDLE_ROW(1), CPUIDLE_ROW(2), CPUIDLE_ROW(3),
+        CPUIDLE_ROW(4), CPUIDLE_ROW(5), CPUIDLE_ROW(6), CPUIDLE_ROW(7),
+};
+
+static void sysfs_build_cpuidle(struct vfs_node *cpu_dir, int cpu) {
+  struct vfs_node *ci;
+  int n = cpuidle_state_count();
+
+  if (cpu < 0 || cpu >= CPUIDLE_SYSFS_CPUS || n <= 0)
+    return;
+  ci = sysfs_mkchild(cpu_dir, "cpuidle", VFS_DIRECTORY, 0);
+  if (!ci)
+    return;
+  for (int st = 0; st < n && st < CPUIDLE_SYSFS_STATES; st++) {
+    char name[16];
+    struct vfs_node *sd;
+
+    snprintf(name, sizeof(name), "state%d", st);
+    sd = sysfs_mkchild(ci, name, VFS_DIRECTORY, 0);
+    if (!sd)
+      continue;
+    sysfs_mkchild(sd, "name", VFS_DEVICE, g_cpuidle_attrs[cpu][st].name);
+    sysfs_mkchild(sd, "desc", VFS_DEVICE, g_cpuidle_attrs[cpu][st].desc);
+    sysfs_mkchild(sd, "usage", VFS_DEVICE, g_cpuidle_attrs[cpu][st].usage);
+    sysfs_mkchild(sd, "time", VFS_DEVICE, g_cpuidle_attrs[cpu][st].time);
+    sysfs_mkchild(sd, "latency", VFS_DEVICE, g_cpuidle_attrs[cpu][st].lat);
+  }
 }
 
 static int g_memtotal(char *b, usize c) {
@@ -994,6 +1340,182 @@ static void sysfs_build_net(struct vfs_node *root) {
   sysfs_mkstr(eth, "flags", "0x1003\n"); /* IFF_UP|IFF_BROADCAST|IFF_MULTICAST */
 }
 
+/* /sys/kernel/mm/transparent_hugepage/enabled (M128).
+ *
+ * Linux's format exactly: the three modes with the live one in brackets, so
+ * anything that greps for "[never]" or writes "madvise" behaves as it would
+ * there. Writable, because a program that wants huge pages for a run should
+ * not need a reboot to get them. */
+static int sysfs_thp_enabled(char *buf, usize cap) {
+  int m = thp_mode();
+
+  return snprintf(buf, cap, "%s %s %s\n",
+                  m == THP_MODE_ALWAYS ? "[always]" : "always",
+                  m == THP_MODE_MADVISE ? "[madvise]" : "madvise",
+                  m == THP_MODE_NEVER ? "[never]" : "never");
+}
+
+static isize sysfs_thp_enabled_write(struct vfs_node *node, u64 offset,
+                                     const char *buffer, usize size,
+                                     int flags) {
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (!buffer || size == 0)
+    return -EINVAL;
+  if (size >= 6 && memcmp(buffer, "always", 6) == 0)
+    thp_set_mode(THP_MODE_ALWAYS);
+  else if (size >= 7 && memcmp(buffer, "madvise", 7) == 0)
+    thp_set_mode(THP_MODE_MADVISE);
+  else if (size >= 5 && memcmp(buffer, "never", 5) == 0)
+    thp_set_mode(THP_MODE_NEVER);
+  else
+    return -EINVAL;
+  return (isize)size;
+}
+
+/* The three numbers that say whether the feature is doing anything: blocks
+ * installed, faults that wanted one and could not have it, and blocks broken
+ * back into leaves. */
+static int sysfs_thp_stats(char *buf, usize cap) {
+  return snprintf(buf, cap,
+                  "thp_fault_alloc %lu\nthp_fault_fallback %lu\n"
+                  "thp_split_page %lu\n",
+                  (unsigned long)thp_stat_alloc(),
+                  (unsigned long)thp_stat_fallback(),
+                  (unsigned long)thp_stat_split());
+}
+
+/* ── /sys/class/power_supply and /sys/class/thermal (M134) ───────────────
+ *
+ * Built only for what the firmware really declares. Every read re-evaluates
+ * the firmware method behind it, because that is the only way a battery's
+ * charge is ever current; a method that refuses returns the error rather
+ * than a number, and the file reads as an error too.
+ */
+#define PS_BAT_RENDER(i, which, fn)                                          \
+  static int fn(char *b, usize c) {                                          \
+    return acpi_power_battery_attr(i, which, b, c);                          \
+  }
+
+#define PS_BAT_SET(i)                                                        \
+  PS_BAT_RENDER(i, ACPI_BAT_TYPE, g_bat##i##_type)                           \
+  PS_BAT_RENDER(i, ACPI_BAT_PRESENT, g_bat##i##_present)                     \
+  PS_BAT_RENDER(i, ACPI_BAT_STATUS, g_bat##i##_status)                       \
+  PS_BAT_RENDER(i, ACPI_BAT_CAPACITY, g_bat##i##_capacity)                   \
+  PS_BAT_RENDER(i, ACPI_BAT_NOW, g_bat##i##_now)                             \
+  PS_BAT_RENDER(i, ACPI_BAT_FULL, g_bat##i##_full)
+
+PS_BAT_SET(0)
+PS_BAT_SET(1)
+
+struct ps_bat_ops {
+  sysfs_render type, present, status, capacity, now, full;
+};
+
+static const struct ps_bat_ops g_ps_bat[ACPI_PS_MAX_BATTERY] = {
+    { g_bat0_type, g_bat0_present, g_bat0_status, g_bat0_capacity, g_bat0_now,
+      g_bat0_full },
+    { g_bat1_type, g_bat1_present, g_bat1_status, g_bat1_capacity, g_bat1_now,
+      g_bat1_full },
+};
+
+static int g_ac0_online(char *b, usize c) { return acpi_power_ac_attr(0, b, c); }
+static int g_ac0_type(char *b, usize c) { return snprintf(b, c, "Mains\n"); }
+
+#define PS_TZ_SET(i)                                                         \
+  static int g_tz##i##_type(char *b, usize c) {                              \
+    return acpi_power_thermal_attr(i, ACPI_TZ_TYPE, b, c);                   \
+  }                                                                          \
+  static int g_tz##i##_temp(char *b, usize c) {                              \
+    return acpi_power_thermal_attr(i, ACPI_TZ_TEMP, b, c);                   \
+  }
+
+PS_TZ_SET(0)
+PS_TZ_SET(1)
+PS_TZ_SET(2)
+PS_TZ_SET(3)
+
+struct ps_tz_ops { sysfs_render type, temp; };
+
+static const struct ps_tz_ops g_ps_tz[ACPI_PS_MAX_THERMAL] = {
+    { g_tz0_type, g_tz0_temp }, { g_tz1_type, g_tz1_temp },
+    { g_tz2_type, g_tz2_temp }, { g_tz3_type, g_tz3_temp },
+};
+
+/* /sys/class already exists by the time this runs; find it rather than
+ * attaching a second directory of the same name. */
+static struct vfs_node *sysfs_class_dir(struct vfs_node *root) {
+  for (struct vfs_node *c = root->first_child; c; c = c->next_sibling)
+    if (strcmp(c->name, "class") == 0)
+      return c;
+  return sysfs_mkchild(root, "class", VFS_DIRECTORY, 0);
+}
+
+static void sysfs_build_acpi_power(struct vfs_node *root) {
+  int nbat = acpi_power_battery_count();
+  int nac = acpi_power_ac_count();
+  int ntz = acpi_power_thermal_count();
+  struct vfs_node *classp;
+
+  if (nbat <= 0 && nac <= 0 && ntz <= 0)
+    return;          /* no battery, no adapter, no zone: publish nothing */
+  classp = sysfs_class_dir(root);
+  if (!classp)
+    return;
+
+  if (nbat > 0 || nac > 0) {
+    struct vfs_node *psd = sysfs_mkchild(classp, "power_supply",
+                                         VFS_DIRECTORY, 0);
+    if (psd) {
+      for (int i = 0; i < nbat && i < ACPI_PS_MAX_BATTERY; i++) {
+        char name[8];
+        struct vfs_node *d;
+        snprintf(name, sizeof(name), "BAT%d", i);
+        d = sysfs_mkchild(psd, name, VFS_DIRECTORY, 0);
+        if (!d)
+          continue;
+        sysfs_mkchild(d, "type", VFS_DEVICE, g_ps_bat[i].type);
+        sysfs_mkchild(d, "present", VFS_DEVICE, g_ps_bat[i].present);
+        sysfs_mkchild(d, "status", VFS_DEVICE, g_ps_bat[i].status);
+        sysfs_mkchild(d, "capacity", VFS_DEVICE, g_ps_bat[i].capacity);
+        /* Linux names these after the unit the firmware chose, and a reader
+         * that divides one by the other has to be told which it got. */
+        if (acpi_power_battery_in_energy_units(i)) {
+          sysfs_mkchild(d, "energy_now", VFS_DEVICE, g_ps_bat[i].now);
+          sysfs_mkchild(d, "energy_full", VFS_DEVICE, g_ps_bat[i].full);
+        } else {
+          sysfs_mkchild(d, "charge_now", VFS_DEVICE, g_ps_bat[i].now);
+          sysfs_mkchild(d, "charge_full", VFS_DEVICE, g_ps_bat[i].full);
+        }
+      }
+      if (nac > 0) {
+        struct vfs_node *d = sysfs_mkchild(psd, "AC0", VFS_DIRECTORY, 0);
+        if (d) {
+          sysfs_mkchild(d, "type", VFS_DEVICE, g_ac0_type);
+          sysfs_mkchild(d, "online", VFS_DEVICE, g_ac0_online);
+        }
+      }
+    }
+  }
+
+  if (ntz > 0) {
+    struct vfs_node *td = sysfs_mkchild(classp, "thermal", VFS_DIRECTORY, 0);
+    if (td) {
+      for (int i = 0; i < ntz && i < ACPI_PS_MAX_THERMAL; i++) {
+        char name[20];
+        struct vfs_node *d;
+        snprintf(name, sizeof(name), "thermal_zone%d", i);
+        d = sysfs_mkchild(td, name, VFS_DIRECTORY, 0);
+        if (!d)
+          continue;
+        sysfs_mkchild(d, "type", VFS_DEVICE, g_ps_tz[i].type);
+        sysfs_mkchild(d, "temp", VFS_DEVICE, g_ps_tz[i].temp);
+      }
+    }
+  }
+}
+
 static struct vfs_fs sysfs_fs;
 
 /* Writable /sys/kernel/mm/drop_caches — mirrors Linux /proc/sys/vm/drop_caches.
@@ -1009,6 +1531,42 @@ static isize sysfs_drop_caches_write(struct vfs_node *node, u64 offset,
   (void)flags;
   page_cache_evict((usize)-1); /* evict everything reclaimable */
   return (isize)size;          /* consume the whole write */
+}
+
+/* ── /sys/power/state (M129) ─────────────────────────────────────────────
+ *
+ * The one file every suspend tool writes to, from `systemctl suspend` down to
+ * `echo freeze > /sys/power/state`. Reading it lists the states this machine
+ * really has — which is why it is rendered from suspend_states() rather than
+ * written out here: a kernel that advertises `mem` and cannot come back from
+ * it has told the tool to hang the machine.
+ *
+ * A write blocks for as long as the machine is suspended and returns when it
+ * has resumed, which is exactly the contract userspace already expects. */
+static int g_power_state(char *b, usize c) {
+  return snprintf(b, c, "%s\n", suspend_states());
+}
+
+static isize sysfs_power_state_write(struct vfs_node *node, u64 offset,
+                                     const char *buffer, usize size,
+                                     int flags) {
+  char name[32];
+  usize n = size < sizeof(name) - 1 ? size : sizeof(name) - 1;
+  int rc;
+
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (!buffer || !size)
+    return -EINVAL;
+  memcpy(name, buffer, n);
+  name[n] = 0;
+  while (n && (name[n - 1] == '\n' || name[n - 1] == ' ' || name[n - 1] == '\t'))
+    name[--n] = 0;
+  rc = suspend_enter(name);
+  if (rc < 0)
+    return rc;
+  return (isize)size;
 }
 
 /* SYSFS_MAGIC. statfs on a synthetic filesystem used to report ENOSYS, which
@@ -1045,6 +1603,23 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
     dc->inode->mode = 0644;
     dc->inode->write_cb = sysfs_drop_caches_write;
   }
+  /* /sys/kernel/mm/transparent_hugepage — the state of M128's huge pages. */
+  if (km) {
+    struct vfs_node *th =
+        sysfs_mkchild(km, "transparent_hugepage", VFS_DIRECTORY, 0);
+
+    if (th) {
+      struct vfs_node *en =
+          sysfs_mkchild(th, "enabled", VFS_DEVICE, sysfs_thp_enabled);
+
+      if (en) {
+        en->inode->mode = 0644;
+        en->inode->write_cb = sysfs_thp_enabled_write;
+      }
+      sysfs_mkstr(th, "hpage_pmd_size", "%lu\n", (unsigned long)THP_SIZE);
+      sysfs_mkchild(th, "stats", VFS_DEVICE, sysfs_thp_stats);
+    }
+  }
   sysfs_mkchild(kern, "ostype", VFS_DEVICE, g_ostype);
   sysfs_mkchild(kern, "osrelease", VFS_DEVICE, g_osrelease);
   sysfs_mkchild(kern, "module_region", VFS_DEVICE, g_module_region);
@@ -1060,6 +1635,18 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
   if (fsd)
     sysfs_mkchild(fsd, "cgroup", VFS_DIRECTORY, 0);
 
+  /* /sys/power/state — the suspend surface (M129). */
+  {
+    struct vfs_node *pw = sysfs_mkchild(root, "power", VFS_DIRECTORY, 0);
+    struct vfs_node *st =
+        pw ? sysfs_mkchild(pw, "state", VFS_DEVICE, g_power_state) : 0;
+
+    if (st && st->inode) {
+      st->inode->mode = 0644;
+      st->inode->write_cb = sysfs_power_state_write;
+    }
+  }
+
   struct vfs_node *dev = sysfs_mkchild(root, "devices", VFS_DIRECTORY, 0);
   struct vfs_node *sys = sysfs_mkchild(dev, "system", VFS_DIRECTORY, 0);
   struct vfs_node *cpu = sysfs_mkchild(sys, "cpu", VFS_DIRECTORY, 0);
@@ -1070,14 +1657,19 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
   /* Per-CPU clock under /sys/devices/system/cpu/cpuN/cpufreq. Crash
    * reporters and monitoring tools read these; they exist only once the clock
    * has actually been measured. */
-  if (arch_cpu_khz()) {
+  {
     int ncpu = (g_max_cpus > 0) ? g_max_cpus : 1;
+
     for (int i = 0; i < ncpu; i++) {
       char name[16];
       snprintf(name, sizeof(name), "cpu%d", i);
       struct vfs_node *cn = sysfs_mkchild(cpu, name, VFS_DIRECTORY, 0);
       if (!cn)
         continue;
+      /* The idle states this CPU really has, and their counters (M129). */
+      sysfs_build_cpuidle(cn, i);
+      if (!arch_cpu_khz())
+        continue; /* a clock that was never measured gets no cpufreq */
       struct vfs_node *cf = sysfs_mkchild(cn, "cpufreq", VFS_DIRECTORY, 0);
       if (!cf)
         continue;
@@ -1087,15 +1679,27 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
       sysfs_mkchild(cf, "cpuinfo_cur_freq", VFS_DEVICE, g_cpu_cur_freq);
       sysfs_mkchild(cf, "cpuinfo_max_freq", VFS_DEVICE, g_cpu_max_freq);
       sysfs_mkchild(cf, "cpuinfo_min_freq", VFS_DEVICE, g_cpu_min_freq);
-      sysfs_mkchild(cf, "scaling_governor", VFS_DEVICE, g_cpu_governor);
+      {
+        struct vfs_node *gov =
+            sysfs_mkchild(cf, "scaling_governor", VFS_DEVICE, g_cpu_governor);
+
+        if (gov && gov->inode)
+          gov->inode->write_cb = sysfs_governor_write;
+      }
+      sysfs_mkchild(cf, "scaling_driver", VFS_DEVICE, g_cpu_driver);
+      sysfs_mkchild(cf, "scaling_available_governors", VFS_DEVICE,
+                    g_cpu_governors);
     }
   }
+
+  sysfs_build_nodes(sys);
 
   struct vfs_node *mem = sysfs_mkchild(root, "memory", VFS_DIRECTORY, 0);
   sysfs_mkchild(mem, "total_kb", VFS_DEVICE, g_memtotal);
 
   sysfs_build_block(root);
   sysfs_build_net(root);
+  sysfs_build_acpi_power(root);
   /* M96: /sys/module/<name>/ — refcnt, initstate and a parameters directory —
    * for whatever is loaded now; later loads and unloads maintain the tree
    * themselves. */

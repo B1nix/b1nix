@@ -15,7 +15,11 @@
 #include <b1nix/ftrace.h>
 #include <b1nix/gdbstub.h>
 #include <b1nix/initramfs.h>
+#include <b1nix/cpufreq.h>
+#include <b1nix/cpuidle.h>
 #include <b1nix/mm.h>
+#include <b1nix/thp.h>
+#include <b1nix/numa.h>
 #include <b1nix/perf_event.h>
 #include <b1nix/net.h>
 #include <b1nix/netproto.h>
@@ -60,6 +64,7 @@
 #include <b1nix/nbd.h>
 #include <b1nix/vt.h>
 #include <b1nix/rtc.h>
+#include <b1nix/suspend.h>
 #include <b1nix/kmsg.h>
 #include <b1nix/watchdog.h>
 #include <b1nix/i2c.h>
@@ -75,6 +80,8 @@
 #include <b1nix/lapic.h>
 #include <b1nix/video.h>
 #include <b1nix/acpi.h>
+#include <b1nix/aml.h>
+#include <b1nix/acpi_power.h>
 #include <b1nix/ioapic.h>
 #include <b1nix/ramdisk.h>
 #include <b1nix/sound.h>
@@ -638,6 +645,18 @@ void kernel_main(usize arg0, usize arg1)
 	 * before LAPIC bring-up: smp_boot_aps prefers the MADT CPU list to the
 	 * CPUID guess. Silently no-ops on platforms without ACPI. */
 	acpi_init();
+	/* The memory topology, from the same tables: which physical ranges belong
+	 * to which node and how far apart the nodes are. After acpi_init because
+	 * it reads SRAT and SLIT through it, and the allocator re-links its free
+	 * blocks per node once it knows (M128). */
+	numa_init();
+	pmm_numa_reseed();
+	/* Transparent huge pages: read b1nix.thp. Off unless the command line
+	 * asks (M128) — see kernel/mm/thp.c for why it is opt-in. */
+	thp_init();
+	/* How this machine parks a CPU: MWAIT into a real C-state where the
+	 * processor has one, HLT where it does not (M129). Before the first idle,
+	 * which on the BSP is a long way off, and before the APs start. */
 	lapic_init();
 	/* The TSC is calibrated by lapic_init; hand the monotonic clock over to it
 	 * so log timestamps and /proc/uptime gain microsecond resolution. */
@@ -653,6 +672,21 @@ void kernel_main(usize arg0, usize arg1)
 		k_warn("timer", "LAPIC calibration unavailable, keeping PIT IRQ0 active");
 	}
 #endif
+
+	/* The other half of ACPI: the DSDT and the SSDTs are a compiled
+	 * program, not a table of structs, so a battery's charge or a thermal
+	 * zone's temperature cannot be read without running it (M134). Building
+	 * the namespace needs the heap and the direct map, both of which are up,
+	 * and runs nothing -- methods are evaluated on demand. No-ops on a
+	 * machine without ACPI, which is every board on the other arch. */
+	aml_init();
+	acpi_power_init();
+
+	/* How this machine parks a CPU, and how fast it may run — both arches
+	 * reach here, and both publish what they found under
+	 * /sys/devices/system/cpu (M129). */
+	cpuidle_init();
+	cpufreq_init();
 
 	/* Every PCI function, one stamped line each, before any driver claims
 	 * one. pci_init() existed and had no caller, so hardware b1nix has no
@@ -1079,6 +1113,7 @@ void kernel_main(usize arg0, usize arg1)
 	BOOTMARK(31);	/* magenta: device init survived, VTs up */
 	kmsg_init();            /* M107 /dev/kmsg record ring */
 	rtc_dev_init();         /* M107 /dev/rtc0 */
+	suspend_init();         /* M129 s2idle + the RTC alarm wake source */
 	watchdog_init();        /* M107 /dev/watchdog */
 	i2c_init();             /* M107 SMBus host controller, if one exists */
 	blk_create_dev_nodes(); /* /dev/<blkdev> nodes for blkid/fdisk/loopN */
@@ -2140,11 +2175,7 @@ void kernel_main(usize arg0, usize arg1)
 			extern u64 g_idle_halts;
 
 			g_idle_halts++;
-#if defined(__x86_64__)
-			__asm__ volatile("sti; hlt" : : : "memory");
-#elif defined(__aarch64__)
-			__asm__ volatile("msr daifclr, #2; wfi" : : : "memory");
-#endif
+			cpuidle_enter();
 		}
 	}
 }

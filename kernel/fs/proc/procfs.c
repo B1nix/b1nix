@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/ktime.h>
+#include <b1nix/rtc.h>
 #include <b1nix/console.h>
 #include <b1nix/perf_event.h>
 /* procfs — synthetic /proc filesystem (M34).
@@ -33,12 +34,15 @@
 #include <b1nix/kmsg.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
+#include <b1nix/thp.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/module.h>
 #include <b1nix/namespace.h>
 #include <b1nix/user_namespace.h>
 #include <b1nix/ptrace.h>
 #include <b1nix/resource_caps.h>
+#include <b1nix/acpi_power.h>
+#include <b1nix/aml.h>
 #include <b1nix/sched.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
@@ -1643,22 +1647,233 @@ static int r_cmdline(usize pid, struct sbuf *s) {
   return 0;
 }
 
-#if defined(__aarch64__)
 /* /proc/interrupts: INTID and how many times it was taken, lines that have
  * fired only. Linux prints a column per CPU and the controller's name; one
- * total is what telling "the interrupt arrives" from "it does not" needs. */
+ * total is what telling "the interrupt arrives" from "it does not" needs.
+ *
+ * The per-line counters are the aarch64 GIC's; x86_64 keeps none per line yet
+ * and prints only the row below, which is the one a reader of this file on
+ * this kernel is usually after. */
 static int r_interrupts(usize pid, struct sbuf *s) {
-  extern u64 arch_irq_count(u32 irq);
-  extern u32 arch_irq_lines(void);
   (void)pid;
-  for (u32 i = 0; i < arch_irq_lines(); i++) {
-    u64 n = arch_irq_count(i);
+#if defined(__aarch64__)
+  {
+    extern u64 arch_irq_count(u32 irq);
+    extern u32 arch_irq_lines(void);
+
+    for (u32 i = 0; i < arch_irq_lines(); i++) {
+      u64 n = arch_irq_count(i);
+      if (n)
+        sb_addf(s, "%4u: %10lu\n", i, (unsigned long)n);
+    }
+  }
+#endif
+  /* The RTC alarm, named rather than numbered: it is IRQ 8 on x86_64 and a
+   * GIC SPI on aarch64, and what a reader wants to know is whether the alarm
+   * that was armed actually interrupted anything (M129). */
+  {
+    u64 n = rtc_wake_irq_count();
+
     if (n)
-      sb_addf(s, "%4u: %10lu\n", i, (unsigned long)n);
+      sb_addf(s, " RTC: %10lu   RTC alarm\n", (unsigned long)n);
+  }
+  /* The local timer is not a line — it is delivered by the CPU's own timer,
+   * per CPU — so Linux gives it a named row, and so does this. A reader that
+   * wants to know whether the machine is ticking while it idles has nowhere
+   * else to look. */
+  {
+    extern u64 arch_local_timer_count(void);
+
+    sb_addf(s, " LOC: %10lu   Local timer interrupts\n",
+            (unsigned long)arch_local_timer_count());
   }
   return 0;
 }
-#endif
+
+/* /proc/b1nix-tick — how this kernel's timer behaves right now.
+ *
+ * `hz` is the scheduler tick, `dynticks_cap` the longest idle interval it
+ * will program in ticks (0 when the beat is fixed), and `local_timer` the
+ * count /proc/interrupts calls LOC. A test that wants to know whether an
+ * idle second cost what it should has to know what to expect, and reading
+ * the command line to guess is how a check comes to pass on a kernel that
+ * changed its default (M129). */
+static int r_b1nix_tick(usize pid, struct sbuf *s) {
+  extern u64 arch_local_timer_count(void);
+  (void)pid;
+  sb_addf(s, "hz %lu\n", (unsigned long)sched_tick_hz());
+  sb_addf(s, "dynticks_cap %lu\n", (unsigned long)arch_dynticks_cap());
+  sb_addf(s, "local_timer %lu\n", (unsigned long)arch_local_timer_count());
+  return 0;
+}
+
+/* ── /proc/b1nix-acpi — what the AML interpreter built (M134) ──────────
+ *
+ * The namespace is the interpreter's own work: nothing else in the kernel
+ * can produce it, and a parser that went wrong produces a visibly wrong one
+ * (too few objects, a missing \_SB_, a path that stops mid-device). So this
+ * is both the debugging surface a human wants when a machine's firmware does
+ * something strange, and what the M134 smoke test grades.
+ */
+struct acpi_walk_sink {
+  struct sbuf *s;
+  u32 printed;
+};
+
+static void acpi_walk_line(void *ctx, const char *path, int type) {
+  struct acpi_walk_sink *w = (struct acpi_walk_sink *)ctx;
+  /* A laptop's DSDT has thousands of objects; the count above is the whole
+   * truth, the listing is a sample large enough to find anything by name. */
+  if (w->printed >= 4096)
+    return;
+  sb_addf(w->s, "%s %s\n", path, aml_type_name(type));
+  w->printed++;
+}
+
+static int r_b1nix_acpi(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "ready %d\n", aml_ready());
+  sb_addf(s, "tables %d\n", aml_table_count());
+  for (int i = 0; i < aml_table_count(); i++)
+    sb_addf(s, "table %s %u\n", aml_table_sig(i),
+            (unsigned)aml_table_length(i));
+  sb_addf(s, "objects %u\n", (unsigned)aml_object_count());
+  sb_addf(s, "methods %u\n", (unsigned)aml_type_count(AML_T_METHOD));
+  sb_addf(s, "devices %u\n", (unsigned)aml_type_count(AML_T_DEVICE));
+  sb_addf(s, "regions %u\n", (unsigned)aml_type_count(AML_T_REGION));
+  sb_addf(s, "fields %u\n", (unsigned)aml_type_count(AML_T_FIELD));
+  sb_addf(s, "packages %u\n", (unsigned)aml_type_count(AML_T_PACKAGE));
+  sb_addf(s, "thermalzones %u\n", (unsigned)aml_type_count(AML_T_THERMAL));
+  /* What the consumers actually published. A zone the firmware declares but
+   * gives no _TMP is a zone with no temperature, and does not appear in
+   * /sys -- so these are the numbers /sys must agree with. */
+  sb_addf(s, "batteries %d\n", acpi_power_battery_count());
+  sb_addf(s, "acadapters %d\n", acpi_power_ac_count());
+  sb_addf(s, "zones_published %d\n", acpi_power_thermal_count());
+  for (int i = 0; i < acpi_power_battery_count(); i++)
+    sb_addf(s, "battery %s\n", acpi_power_battery_path(i));
+  for (int i = 0; i < acpi_power_ac_count(); i++)
+    sb_addf(s, "acadapter %s\n", acpi_power_ac_path(i));
+  for (int i = 0; i < acpi_power_thermal_count(); i++)
+    sb_addf(s, "zone %s\n", acpi_power_thermal_path(i));
+  sb_addf(s, "skipped %u\n", (unsigned)aml_skipped_terms());
+  u32 refused = aml_refused_spaces();
+  sb_puts(s, "refused");
+  if (!refused)
+    sb_puts(s, " none");
+  else
+    for (int i = 0; i < 16; i++)
+      if (refused & (1u << i))
+        sb_addf(s, " %s", aml_region_space_name((u8)i));
+  sb_puts(s, "\n");
+  struct acpi_walk_sink w = { s, 0 };
+  aml_walk(acpi_walk_line, &w);
+  return 0;
+}
+
+/* ── /proc/b1nix-acpi-eval — run one method or read one object ────────
+ *
+ * Write "<path> [arg ...]" (each argument decimal, or 0x-prefixed hex), then
+ * read the answer back. Root-only, because evaluating AML writes whatever
+ * operation-region address the firmware tells it to.
+ */
+static char   g_amlq_path[160];
+static int    g_amlq_nargs;
+static u64    g_amlq_args[7];
+static int    g_amlq_status = AML_ENOENT;
+static int    g_amlq_valid;
+static struct aml_result g_amlq_res;
+
+static int amlq_write(usize pid, const char *buf, usize len) {
+  (void)pid;
+  usize i = 0;
+  usize n = 0;
+  while (i < len && (buf[i] == ' ' || buf[i] == '\t'))
+    i++;
+  while (i < len && buf[i] != ' ' && buf[i] != '\n' && buf[i] != '\t' &&
+         n + 1 < sizeof(g_amlq_path))
+    g_amlq_path[n++] = buf[i++];
+  g_amlq_path[n] = '\0';
+  g_amlq_nargs = 0;
+  while (i < len && g_amlq_nargs < 7) {
+    while (i < len && (buf[i] == ' ' || buf[i] == '\t'))
+      i++;
+    if (i >= len || buf[i] == '\n')
+      break;
+    u64 v = 0;
+    int base = 10;
+    if (i + 1 < len && buf[i] == '0' && (buf[i + 1] == 'x' || buf[i + 1] == 'X')) {
+      base = 16;
+      i += 2;
+    }
+    int digits = 0;
+    while (i < len) {
+      char ch = buf[i];
+      u64 d;
+      if (ch >= '0' && ch <= '9') d = (u64)(ch - '0');
+      else if (base == 16 && ch >= 'a' && ch <= 'f') d = (u64)(ch - 'a' + 10);
+      else if (base == 16 && ch >= 'A' && ch <= 'F') d = (u64)(ch - 'A' + 10);
+      else break;
+      v = v * (u64)base + d;
+      digits++;
+      i++;
+    }
+    if (!digits)
+      break;
+    g_amlq_args[g_amlq_nargs++] = v;
+  }
+  if (!g_amlq_path[0])
+    return -EINVAL;
+  g_amlq_status = aml_evaluate(g_amlq_path, g_amlq_args, g_amlq_nargs,
+                               &g_amlq_res);
+  g_amlq_valid = 1;
+  /* A refused evaluation is reported through the file, not as a write
+   * error: the caller asked a question and the answer is "no, because". */
+  return (int)len;
+}
+
+static int r_b1nix_acpi_eval(usize pid, struct sbuf *s) {
+  (void)pid;
+  if (!g_amlq_valid) {
+    sb_puts(s, "status no-query\n");
+    return 0;
+  }
+  sb_addf(s, "path %s\n", g_amlq_path);
+  sb_addf(s, "args %d\n", g_amlq_nargs);
+  sb_addf(s, "status %s\n", aml_error_name(g_amlq_status));
+  if (g_amlq_status != AML_OK)
+    return 0;
+  sb_addf(s, "type %s\n", aml_type_name(g_amlq_res.type));
+  switch (g_amlq_res.type) {
+  case AML_T_INTEGER:
+    sb_addf(s, "integer 0x%llx\n", (unsigned long long)g_amlq_res.integer);
+    break;
+  case AML_T_STRING:
+  case AML_T_BUFFER:
+    sb_addf(s, "length %u\n", (unsigned)g_amlq_res.length);
+    sb_puts(s, "bytes");
+    for (u32 i = 0; i < g_amlq_res.bytes_copied; i++)
+      sb_addf(s, " %02x", (unsigned)g_amlq_res.bytes[i]);
+    sb_puts(s, "\n");
+    if (g_amlq_res.type == AML_T_STRING) {
+      sb_puts(s, "text ");
+      for (u32 i = 0; i < g_amlq_res.bytes_copied; i++)
+        sb_putc(s, (char)g_amlq_res.bytes[i]);
+      sb_puts(s, "\n");
+    }
+    break;
+  case AML_T_PACKAGE:
+    sb_addf(s, "count %u\n", (unsigned)g_amlq_res.length);
+    for (u32 i = 0; i < g_amlq_res.elems; i++)
+      sb_addf(s, "elem %u %s 0x%llx\n", (unsigned)i,
+              aml_type_name(g_amlq_res.elem_type[i]),
+              (unsigned long long)g_amlq_res.elem_int[i]);
+    break;
+  default:
+    break;
+  }
+  return 0;
+}
 
 static int r_kallsyms(usize pid, struct sbuf *s) {
   (void)pid;
@@ -2158,14 +2373,16 @@ struct procfs_map_ent {
   unsigned long ino;
   unsigned long dev;  /* st_dev of the backing filesystem (0 = anonymous) */
   const char *name; /* 0 = anonymous */
+  int thp;          /* the mapping's MADV_HUGEPAGE advice: -1, 0 or 1 */
 };
 
 static void procfs_maps_add(struct procfs_map_ent *m, usize *n, usize max,
                             u64 start, u64 end, int prot, int shared,
                             u64 offset, unsigned long ino, unsigned long dev,
-                            const char *name) {
+                            const char *name, int thp) {
   if (*n >= max || end <= start)
     return;
+  m[*n].thp = thp;
   m[*n].start = start;
   m[*n].end = end;
   m[*n].prot = prot;
@@ -2177,7 +2394,54 @@ static void procfs_maps_add(struct procfs_map_ent *m, usize *n, usize max,
   (*n)++;
 }
 
-static int r_pid_maps_walked(usize pid, struct sbuf *s) {
+/* The per-mapping block /proc/<pid>/smaps prints under each maps line.
+ *
+ * Only fields this kernel can answer honestly. Rss comes from the page tables
+ * (a transparent huge page counts as its 512 pages, see paging_user_resident)
+ * and AnonHugePages from the directory entries themselves — which is the only
+ * way to prove a mapping really is 2 MiB-backed rather than merely advised. */
+static void procfs_smaps_block(struct sbuf *s, u64 pml4_phys,
+                               const struct procfs_map_ent *e) {
+  u64 size_kb = (e->end - e->start) / 1024;
+  u64 rss_kb = paging_user_resident(pml4_phys, e->start, e->end) * 4;
+  u64 anon_huge_kb = paging_thp_bytes(pml4_phys, e->start, e->end) / 1024;
+  int anon = (e->ino == 0 && e->dev == 0);
+  u64 anon_kb = anon ? rss_kb : 0;
+
+  sb_addf(s, "Size:           %8lu kB\n", (unsigned long)size_kb);
+  sb_addf(s, "KernelPageSize: %8lu kB\n", 4ul);
+  sb_addf(s, "MMUPageSize:    %8lu kB\n", 4ul);
+  sb_addf(s, "Rss:            %8lu kB\n", (unsigned long)rss_kb);
+  sb_addf(s, "Pss:            %8lu kB\n", (unsigned long)rss_kb);
+  sb_addf(s, "Shared_Clean:   %8lu kB\n",
+          (unsigned long)(e->shared ? rss_kb : 0));
+  sb_addf(s, "Shared_Dirty:   %8lu kB\n", 0ul);
+  sb_addf(s, "Private_Clean:  %8lu kB\n",
+          (unsigned long)(e->shared ? 0 : (rss_kb - anon_kb)));
+  sb_addf(s, "Private_Dirty:  %8lu kB\n", (unsigned long)anon_kb);
+  sb_addf(s, "Referenced:     %8lu kB\n", (unsigned long)rss_kb);
+  sb_addf(s, "Anonymous:      %8lu kB\n", (unsigned long)anon_kb);
+  sb_addf(s, "LazyFree:       %8lu kB\n", 0ul);
+  sb_addf(s, "AnonHugePages:  %8lu kB\n", (unsigned long)anon_huge_kb);
+  sb_addf(s, "ShmemPmdMapped: %8lu kB\n", 0ul);
+  sb_addf(s, "FilePmdMapped:  %8lu kB\n", 0ul);
+  sb_addf(s, "Shared_Hugetlb: %8lu kB\n", 0ul);
+  sb_addf(s, "Private_Hugetlb:%8lu kB\n", 0ul);
+  sb_addf(s, "Swap:           %8lu kB\n", 0ul);
+  sb_addf(s, "SwapPss:        %8lu kB\n", 0ul);
+  sb_addf(s, "Locked:         %8lu kB\n", 0ul);
+  sb_addf(s, "THPeligible:    %d\n",
+          (thp_mode() != THP_MODE_NEVER && anon && !e->shared && e->thp >= 0 &&
+           (e->end - e->start) >= THP_SIZE)
+              ? 1
+              : 0);
+  sb_addf(s, "VmFlags:%s%s%s%s%s%s\n", (e->prot & 0x1) ? " rd" : "",
+          (e->prot & 0x2) ? " wr" : "", (e->prot & 0x4) ? " ex" : "",
+          e->shared ? " sh" : " mr", e->thp > 0 ? " hg" : "",
+          e->thp < 0 ? " nh" : "");
+}
+
+static int r_pid_maps_walked(usize pid, struct sbuf *s, int smaps) {
   struct task *t = scheduler_task_by_pid(pid);
   if (!t)
     return 0;
@@ -2216,7 +2480,7 @@ static int r_pid_maps_walked(usize pid, struct sbuf *s) {
     procfs_maps_add(m, &n, cap, v->start, v->end, (int)v->prot,
                     (v->flags & 0x1) != 0, v->offset,
                     (v->node && v->node->inode) ? v->node->inode->ino : 0,
-                    v->node ? vfs_node_dev(v->node) : 0, name);
+                    v->node ? vfs_node_dev(v->node) : 0, name, (int)v->thp);
   }
 
   /* Name the mappings that belong to the loaded image. The executable's and
@@ -2332,6 +2596,12 @@ static int r_pid_maps_walked(usize pid, struct sbuf *s) {
             (unsigned long)m[i].end, perms, (unsigned long)m[i].offset,
             (m[i].dev >> 8) & 0xfful, m[i].dev & 0xfful, m[i].ino,
             m[i].name ? m[i].name : "");
+    if (smaps) {
+      struct procfs_map_ent e = m[i];
+
+      e.start = start;
+      procfs_smaps_block(s, t->pml4_phys, &e);
+    }
     prev_end = m[i].end;
   }
   kfree(m);
@@ -2343,7 +2613,16 @@ static int r_pid_maps_walked(usize pid, struct sbuf *s) {
  * whole read is one counted walk, so nothing it points at is freed under it. */
 static int r_pid_maps(usize pid, struct sbuf *s) {
   vma_walker_enter();
-  int rc = r_pid_maps_walked(pid, s);
+  int rc = r_pid_maps_walked(pid, s, 0);
+  vma_walker_exit();
+  return rc;
+}
+
+/* The same walk with the per-mapping detail Linux's smaps carries. Kept as one
+ * renderer so the two files can never disagree about where a mapping is. */
+static int r_pid_smaps(usize pid, struct sbuf *s) {
+  vma_walker_enter();
+  int rc = r_pid_maps_walked(pid, s, 1);
   vma_walker_exit();
   return rc;
 }
@@ -3102,6 +3381,7 @@ static void procfs_make_tiddir(struct vfs_node *taskdir, usize tid) {
   procfs_mkchild(d, "stat", VFS_DEVICE, r_pid_stat, tid);
   procfs_mkchild(d, "comm", VFS_DEVICE, r_pid_comm, tid);
   procfs_mkchild(d, "maps", VFS_DEVICE, r_pid_maps, tid);
+  procfs_mkchild(d, "smaps", VFS_DEVICE, r_pid_smaps, tid);
   procfs_mkchild(d, "statm", VFS_DEVICE, r_pid_statm, tid);
 }
 
@@ -3405,6 +3685,7 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   procfs_mkchild(d, "comm", VFS_DEVICE, r_pid_comm, pid);
   procfs_mkchild(d, "stat", VFS_DEVICE, r_pid_stat, pid);
   procfs_mkchild(d, "maps", VFS_DEVICE, r_pid_maps, pid);
+  procfs_mkchild(d, "smaps", VFS_DEVICE, r_pid_smaps, pid);
   {
     struct vfs_node *mi = procfs_mkchild(d, "mountinfo", VFS_DEVICE, r_mountinfo, pid);
     if (mi)
@@ -3996,9 +4277,17 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
     }
   }
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
-#if defined(__aarch64__)
   procfs_mkchild(root, "interrupts", VFS_DEVICE, r_interrupts, 0);
-#endif
+  procfs_mkchild(root, "b1nix-tick", VFS_DEVICE, r_b1nix_tick, 0);
+  procfs_mkchild(root, "b1nix-acpi", VFS_DEVICE, r_b1nix_acpi, 0);
+  {
+    /* Writing here makes the kernel execute firmware bytecode, which can
+     * touch any I/O port or physical address the DSDT names. Root only. */
+    struct vfs_node *q = procfs_mkchild_writable(root, "b1nix-acpi-eval",
+                                                 r_b1nix_acpi_eval, amlq_write);
+    if (q && q->inode)
+      q->inode->mode = 0600;
+  }
   procfs_mkchild(root, "b1nix-prof", VFS_DEVICE, r_b1nix_prof, 0);
   procfs_mkchild(root, "b1nix-kprof", VFS_DEVICE, r_b1nix_kprof, 0);
   procfs_mkchild(root, "b1nix-tasks", VFS_DEVICE, r_b1nix_tasks, 0);
