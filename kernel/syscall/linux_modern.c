@@ -11,6 +11,7 @@
  */
 #include <b1nix/errno.h>
 #include <b1nix/io_uring.h>
+#include <b1nix/perf_event.h>
 #include <b1nix/ktime.h>
 #include <b1nix/landlock.h>
 #include <b1nix/mm.h>
@@ -1338,6 +1339,8 @@ int linux_modern_syscall(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4,
     break;
   default:
     if (io_uring_syscall(nr, a0, a1, a2, a3, a4, a5, ret))
+      return 1;
+    if (perf_event_syscall(nr, a0, a1, a2, a3, a4, ret))
       return 1;
     if (landlock_syscall(nr, a0, a1, a2, a3, ret))
       return 1;

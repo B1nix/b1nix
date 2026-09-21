@@ -8,6 +8,7 @@
 #include <b1nix/panic.h>
 #include <b1nix/panic_screen.h>
 #include <b1nix/sched.h>
+#include <b1nix/perf_event.h>
 #include <b1nix/irq.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/mm.h>
@@ -617,6 +618,10 @@ static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 
 			kprof_tick(frame->elr, in_user, in_idle,
 			           pc ? (int)pc->cpu_id : 0);
+			/* M126: the same tick is perf's sampling clock. x29 is
+			 * the frame pointer on aarch64. */
+			perf_event_tick_sample(frame->elr, frame->x29, in_user,
+			                       pc ? (int)pc->cpu_id : 0);
 		}
 
 		/* Only the boot CPU runs the housekeeping half of the tick: the

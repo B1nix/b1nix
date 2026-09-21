@@ -19,6 +19,7 @@ void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/mm.h>
 #include <b1nix/serial.h>
 #include <b1nix/panic.h>
+#include <b1nix/perf_event.h>
 #include <b1nix/ptrace.h>
 #include <b1nix/rseq.h>
 #include <b1nix/sched.h>
@@ -725,6 +726,9 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
                      (struct task *)pcpu->cur_task == (struct task *)pcpu->idle_task);
 
       kprof_tick(frame->rip, in_user, in_idle, pcpu ? (int)pcpu->cpu_id : 0);
+      /* M126: the same tick is perf's sampling clock. */
+      perf_event_tick_sample(frame->rip, frame->rbp, in_user,
+                             pcpu ? (int)pcpu->cpu_id : 0);
     }
     if (is_bsp) {
       timer_ticks++;

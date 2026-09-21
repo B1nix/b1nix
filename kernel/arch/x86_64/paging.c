@@ -3,6 +3,7 @@
 #include <b1nix/bootinfo.h>
 
 #include <b1nix/user.h>
+#include <b1nix/lapic.h>
 #include <b1nix/lockdep.h>
 #include <b1nix/sched.h>
 #include <b1nix/errno.h>
@@ -1955,7 +1956,22 @@ static inline void pf_note_class(int cls)
 /* A page of a mapping whose file hands out its own frames (mmap_fault_cb):
  * memfd_secret's pages are in no page cache and have no kernel address to
  * copy from, so the file names the frame and it is mapped as it is. */
+/* Set while the fault in progress had to fetch the page from somewhere — a
+ * swap slot or a file — which is what makes a fault MAJOR rather than minor.
+ * One slot per CPU: the fault is serviced on the CPU that took it, and the
+ * flag is cleared and read by the same call on that CPU. */
+static int g_fault_was_major[MAX_CPUS];
+
+static int *fault_major_slot(void) {
+  u32 c = get_percpu() ? get_percpu()->cpu_id : 0;
+
+  if (c >= MAX_CPUS)
+    c = 0;
+  return &g_fault_was_major[c];
+}
+
 static int fault_from_file_cb(struct vm_area *vma, u64 page_aligned) {
+  *fault_major_slot() = 1;
   if (vma->prot == PROT_NONE)
     return -1;
   u64 file_page =
@@ -1983,7 +1999,8 @@ static int fault_from_file_cb(struct vm_area *vma, u64 page_aligned) {
   return rc < 0 ? -1 : 0;
 }
 
-int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
+/* The fault handler proper; vmm_handle_page_fault below wraps it to count. */
+static int vmm_handle_page_fault_inner(u64 fault_addr, u64 error_code) {
 
   u64 page_aligned = fault_addr & ~(PAGE_SIZE - 1);
 
@@ -2838,6 +2855,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   // (see pf_note_class above)
   // encoded in the PTE's address field — read it directly, no reverse-map scan.
   if (!(pte & VMM_PRESENT) && (pte & VMM_SWAPPED)) {
+    *fault_major_slot() = 1; /* the page has to come back from swap */
     pf_note_class(PF_CLASS_SWAP);
     // swap_in allocates a frame and does blocking disk I/O — outside the lock.
     u64 new_frame = 0;
@@ -3037,6 +3055,22 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 
   return -1; // Unhandled
 }
+
+/* Every page fault, counted against the task that took it.
+ *
+ * perf's PERF_COUNT_SW_PAGE_FAULTS* counters read these, so the count has to be
+ * of faults really serviced: a fault the handler refused is a signal, not a
+ * fault the task took. */
+int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
+  int rc;
+
+  *fault_major_slot() = 0;
+  rc = vmm_handle_page_fault_inner(fault_addr, error_code);
+  if (rc == 0 && (error_code & PF_USER) && current_task)
+    task_count_fault(current_task, *fault_major_slot());
+  return rc;
+}
+
 
 static void spaces_reserve(void);
 static void spaces_unreserve(void);

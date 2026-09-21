@@ -366,6 +366,7 @@ BINARIES += $(BUILD)/bin/m123_smoke
 BINARIES += $(BUILD)/bin/m124_smoke
 # M125: io_uring.
 BINARIES += $(BUILD)/bin/m125_smoke
+BINARIES += $(BUILD)/bin/m126_smoke
 # M127: cgroup v2 resource control, the OOM killer and PSI.
 BINARIES += $(BUILD)/bin/m127_smoke
 # M127: compressed swap (zram), cgroup-targeted reclaim, memory.swap.current.

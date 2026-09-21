@@ -11,6 +11,7 @@
 #include <b1nix/namespace.h>
 #include <b1nix/user_namespace.h>
 #include <b1nix/panic.h>
+#include <b1nix/perf_event.h>
 #include <b1nix/posix.h>
 #include <b1nix/runqueue.h>
 #include <b1nix/ptrace.h>
@@ -665,6 +666,11 @@ static u64   g_min_pass = 0;
  * watchdog task dump to name the user function a wedged thread group spins
  * in. */
 static u64   g_task_user_rip[TASK_SLOTS];
+/* Page faults this task has taken, minor and major, for getrusage and for
+ * perf's PERF_COUNT_SW_PAGE_FAULTS* counters. A parallel array rather than a
+ * field of struct task, like everything else counted per task here. */
+static u64   g_task_minflt[TASK_SLOTS];
+static u64   g_task_majflt[TASK_SLOTS];
 /* Scratch: which address the dump above decided to show for the current
  * thread — the sampled one or the syscall entry — so the mapping lookup that
  * follows describes the address actually printed. */
@@ -1391,6 +1397,8 @@ static struct task *find_unused_task(int user) {
       g_task_stime_ns[i] = 0;
       g_task_cutime_ns[i] = 0;
       g_task_cstime_ns[i] = 0;
+      g_task_minflt[i] = 0;
+      g_task_majflt[i] = 0;
       g_task_start_tick[i] = scheduler_ticks;
       g_task_pidfs_ino[i] = g_pidfs_ino_next++;
       g_task_nvcsw[i] = 0;
@@ -1453,6 +1461,8 @@ static struct task *find_unused_task(int user) {
   g_task_stime_ns[i] = 0;
   g_task_cutime_ns[i] = 0;
   g_task_cstime_ns[i] = 0;
+  g_task_minflt[i] = 0;
+  g_task_majflt[i] = 0;
   g_task_start_tick[i] = scheduler_ticks;
   g_task_pidfs_ino[i] = g_pidfs_ino_next++;
   g_task_nvcsw[i] = 0;
@@ -3473,6 +3483,30 @@ usize task_tgid(const struct task *t) {
  * task dump name the exact user function a wedged thread group is spinning
  * in, and lets the kernel tell a CPU-bound but progressing thread group from
  * one stuck in the same user address forever. */
+/* One page fault, credited to the task that took it. `major` means the page
+ * had to come from somewhere — a swap slot or a file — rather than only
+ * needing a page-table entry. */
+void task_count_fault(struct task *t, int major) {
+  if (!t)
+    return;
+  usize i = task_index(t);
+
+  if (major)
+    __atomic_add_fetch(&g_task_majflt[i], 1, __ATOMIC_RELAXED);
+  else
+    __atomic_add_fetch(&g_task_minflt[i], 1, __ATOMIC_RELAXED);
+}
+
+u64 task_minflt(const struct task *t) {
+  if (!t) return 0;
+  return __atomic_load_n(&g_task_minflt[task_index(t)], __ATOMIC_RELAXED);
+}
+
+u64 task_majflt(const struct task *t) {
+  if (!t) return 0;
+  return __atomic_load_n(&g_task_majflt[task_index(t)], __ATOMIC_RELAXED);
+}
+
 u64 task_user_rip(const struct task *t) {
   if (!t) return 0;
   return g_task_user_rip[task_index(t)];
@@ -7725,6 +7759,9 @@ static void acct_release_to_group(struct task *t) {
 }
 
 void scheduler_exit_current(int exit_code) {
+  /* M126: tell any perf ring watching this task that it is going, so a
+   * `perf report` can close its map of the process. */
+  perf_event_task_exit(current_task);
   /* A vfork parent waiting on this task must be released before teardown. */
   scheduler_vfork_release();
   if (current_task == 0) {

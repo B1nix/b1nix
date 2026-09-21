@@ -590,6 +590,7 @@ KERNEL_SOURCES := \
 	kernel/mm/psi.c \
 	kernel/mm/eviction.c \
 	kernel/sched/scheduler.c \
+	kernel/perf/perf_event.c \
 	kernel/syscall/syscall.c \
 	kernel/syscall/linux_abi.c \
 	kernel/syscall/linux_modern.c \

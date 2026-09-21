@@ -3129,6 +3129,28 @@ check_output "$POSIX_LOG" "M125-SMOKE: ok no-sqarray" "IORING_SETUP_NO_SQARRAY i
 check_output "$POSIX_LOG" "M125-SMOKE: ok defer-taskrun" "IORING_SETUP_DEFER_TASKRUN completes its work"
 check_output "$POSIX_LOG" "M125-SMOKE: ok defer-taskrun-needs-single-issuer" "DEFER_TASKRUN without SINGLE_ISSUER is EINVAL, as on Linux"
 check_output "$POSIX_LOG" "M125-SMOKE: done" "M125 suite completes"
+
+# ── M126: perf_event_open ─────────────────────────────────────────────────
+check_output "$POSIX_LOG" "M126-SMOKE: start" "the perf_event_open smoke starts"
+check_output "$POSIX_LOG" "M126-SMOKE: ok open" "perf_event_open returns a descriptor for a software task-clock counter"
+check_output "$POSIX_LOG" "M126-SMOKE: ok counter-disabled-does-not-count" "a counter that has not been enabled does not move"
+check_output "$POSIX_LOG" "M126-SMOKE: ok task-clock" "PERF_COUNT_SW_TASK_CLOCK counts the CPU time the task really burned"
+check_output "$POSIX_LOG" "M126-SMOKE: ok disable-stops" "PERF_EVENT_IOC_DISABLE stops the counter"
+check_output "$POSIX_LOG" "M126-SMOKE: ok page-faults" "PERF_COUNT_SW_PAGE_FAULTS counts the faults of touching 256 fresh pages"
+check_output "$POSIX_LOG" "M126-SMOKE: ok context-switches" "PERF_COUNT_SW_CONTEXT_SWITCHES counts twenty sleeps"
+check_output "$POSIX_LOG" "M126-SMOKE: ok read-format" "read(2) returns value, time_enabled, time_running and id, and IOC_ID agrees"
+check_output "$POSIX_LOG" "M126-SMOKE: ok refuses-hardware" "a PMU counter is refused with EOPNOTSUPP rather than answered with zero"
+check_output "$POSIX_LOG" "M126-SMOKE: ok refuses-unknown-sample-type" "a sample_type with no field behind it is refused at open"
+check_output "$POSIX_LOG" "M126-SMOKE: ok refuses-all-all" "pid=-1 with cpu=-1 is EINVAL, as on Linux"
+check_output "$POSIX_LOG" "M126-SMOKE: ok refuses-missing-pid" "a counter on a pid that does not exist is refused"
+check_output "$POSIX_LOG" "M126-SMOKE: ok sampling-open" "the mmapped control page describes the ring buffer it was given"
+check_output "$POSIX_LOG" "M126-SMOKE: ok sampling-process-records" "the buffer carries the COMM and MMAP records a profile resolves against"
+check_output "$POSIX_LOG" "M126-SMOKE: ok sampling" "300 ms of spinning at 200 Hz produces real samples"
+check_output "$POSIX_LOG" "M126-SMOKE: ok sampling-ip" "every sample carries an instruction pointer"
+check_output "$POSIX_LOG" "M126-SMOKE: ok sampling-callchain" "the call chains start in the sampled user program"
+check_output "$POSIX_LOG" "M126-SMOKE: ok sampling-poll" "poll(2) reports the ring buffer readable once records are waiting"
+check_output "$POSIX_LOG" "M126-SMOKE: ok refresh" "PERF_EVENT_IOC_REFRESH(3) delivers exactly three samples and stops"
+check_output "$POSIX_LOG" "M126-SMOKE: done" "M126 suite completes"
 # Protection keys. The lanes above run on the host's CPU; one without PKU must
 # answer as Linux does there. The pku lane (TCG -cpu max) has the hardware.
 if grep -qa "M124-SMOKE: ok pkey-cpuinfo" "$POSIX_LOG" 2>/dev/null; then

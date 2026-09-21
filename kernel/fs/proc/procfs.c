@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/ktime.h>
 #include <b1nix/console.h>
+#include <b1nix/perf_event.h>
 /* procfs — synthetic /proc filesystem (M34).
  *
  * Exposes kernel and per-process state as read-on-demand pseudo-files. Unlike
@@ -1135,6 +1136,33 @@ static int w_sys_shmmax(usize pid, const char *buf, usize len) {
   u64 v;
   if (sysctl_parse_u64(buf, len, &v) < 0 || resource_caps_set_shmmax(v) < 0)
     return -EINVAL;
+  return (int)len;
+}
+
+/* /proc/sys/kernel/perf_event_paranoid — what an unprivileged process may
+ * profile. 2 (the Linux default) is its own tasks and nothing else; `perf`
+ * reads this before it decides whether to try a system-wide event. */
+static int r_sys_perf_paranoid(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "%d\n", perf_event_paranoid_get());
+  return 0;
+}
+
+static int w_sys_perf_paranoid(usize pid, const char *buf, usize len) {
+  (void)pid;
+  u64 v;
+
+  /* -1 through 2 are the values Linux defines; anything else is a caller who
+   * means something this kernel would not honour. */
+  if (len && buf[0] == '-') {
+    if (len < 2 || buf[1] != '1')
+      return -EINVAL;
+    perf_event_paranoid_set(-1);
+    return (int)len;
+  }
+  if (sysctl_parse_u64(buf, len, &v) < 0 || v > 2)
+    return -EINVAL;
+  perf_event_paranoid_set((int)v);
   return (int)len;
 }
 
@@ -4013,6 +4041,8 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
       procfs_mkchild(kern, "overflowgid", VFS_DEVICE, r_sys_overflowgid, 0);
       procfs_mkchild(kern, "cap_last_cap", VFS_DEVICE, r_sys_cap_last_cap, 0);
       procfs_mkchild(kern, "threads-max", VFS_DEVICE, r_sys_threads_max, 0);
+      procfs_mkchild_writable(kern, "perf_event_paranoid",
+                              r_sys_perf_paranoid, w_sys_perf_paranoid);
 #ifdef __aarch64__
       procfs_mkchild_writable(kern, "touch", r_sys_touch, w_sys_touch);
 #endif

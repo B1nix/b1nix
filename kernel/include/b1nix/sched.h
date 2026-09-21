@@ -461,6 +461,11 @@ void sched_acct_on_switch(struct task *prev);
 /* Last userspace RIP at the moment the LAPIC timer tick preempted this task
  * (0 for kernel tasks / never-preempted). Watchdog diagnostic: names the user
  * function a wedged thread group is spinning in. */
+/* Page faults taken by this task, minor and major. Counted in
+ * vmm_handle_page_fault; read by perf's software counters. */
+void task_count_fault(struct task *t, int major);
+u64  task_minflt(const struct task *t);
+u64  task_majflt(const struct task *t);
 u64  task_user_rip(const struct task *t);
 void task_set_user_rip(struct task *t, u64 rip);
 

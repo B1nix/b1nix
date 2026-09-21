@@ -1144,10 +1144,14 @@ static int iou_path_at(int dirfd, u64 user_path, char *out, usize outsz) {
       0)
     return -EFAULT;
   if (kpath[0] == '/' || dirfd == AT_FDCWD) {
+    /* Through vfs_resolve_path, not copied: a relative path is relative to the
+     * CALLER's working directory, and the vfs_* entry points below take an
+     * absolute one. Handing them the relative path made IORING_OP_SYMLINKAT
+     * create its link in the root directory instead of the one the program was
+     * standing in, and liburing's symlink test then could not read it back. */
     if (strlen(kpath) >= outsz)
       return -ENAMETOOLONG;
-    strncpy(out, kpath, outsz - 1);
-    out[outsz - 1] = 0;
+    vfs_resolve_path(kpath, out);
     return 0;
   }
   if (vfs_fd_abspath(dirfd, dirbuf, sizeof(dirbuf)) < 0)
@@ -1722,6 +1726,13 @@ static i32 iou_perform_op(struct iou_req *req) {
 
     if (!h)
       return -EBADF;
+    /* Every field this opcode does not read must be zero. Linux checks the
+     * whole SQE, and liburing's truncate test sets `addr` and `len` on purpose
+     * and requires EINVAL for it: a caller that filled them in meant a
+     * different operation. */
+    if (sqe->rw_flags || sqe->addr || sqe->len || sqe->buf_index ||
+        sqe->splice_fd_in || sqe->addr3)
+      return -EINVAL;
     tfd = iou_tmp_fd(h);
     if (tfd < 0)
       return (i32)tfd;
