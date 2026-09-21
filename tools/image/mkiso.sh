@@ -126,7 +126,7 @@ fi
 rm -f "$STAMP"
 
 # ── stage the ISO root ─────────────────────────────────────────────────────
-mkdir -p "$STAGE/tools/image/limine" "$STAGE/EFI/BOOT"
+mkdir -p "$STAGE/boot/limine" "$STAGE/EFI/BOOT"
 # Without DWARF. The boot loader reads the kernel off the emulated CD at about
 # 15 MB/s, and three quarters of the ELF is debug info nothing at boot uses:
 # backtraces and kprof symbolise through the embedded kallsyms. 52 MB took 3 s
@@ -135,12 +135,17 @@ OBJCOPY="${OBJCOPY:-$(command -v llvm-objcopy || command -v objcopy)}"
 [ -n "$OBJCOPY" ] || { echo "mkiso: llvm-objcopy or objcopy is required" >&2; exit 1; }
 "$OBJCOPY" --strip-debug "$KERNEL" "$STAGE/boot/kernel.elf"
 
-# Limine's own boot files. limine-bios.sys must live next to limine.conf in one
-# of the directories Limine scans (we use /tools/image/limine); the two *-cd.bin El
-# Torito images are referenced by path from the xorriso command line.
+# Limine's own boot files. limine-bios.sys and limine.conf must both live in
+# one of the directories Limine SCANS -- /, /boot, /limine, /boot/limine,
+# /EFI/BOOT -- and nowhere else will do: a config staged outside that list is
+# never found, so the ISO boots whatever stale config an earlier build left in
+# a directory that IS scanned, or nothing at all. /boot/limine is the
+# conventional one. The two *-cd.bin El Torito images are referenced by
+# explicit path from the xorriso command line, so they only have to be
+# somewhere.
 cp -f "$LIMINE_DATADIR/limine-bios.sys" \
       "$LIMINE_DATADIR/limine-bios-cd.bin" \
-      "$LIMINE_DATADIR/limine-uefi-cd.bin" "$STAGE/tools/image/limine/"
+      "$LIMINE_DATADIR/limine-uefi-cd.bin" "$STAGE/boot/limine/"
 for efi in BOOTX64.EFI BOOTIA32.EFI BOOTAA64.EFI BOOTRISCV64.EFI; do
   [ -f "$LIMINE_DATADIR/$efi" ] && cp -f "$LIMINE_DATADIR/$efi" "$STAGE/EFI/BOOT/$efi"
 done
@@ -183,14 +188,14 @@ MODULE_BLOCK="${MODULE_BLOCK%
     gsub(/@CMDLINE@/, cmdline, line)
     print line
   }
-' "$ROOT_DIR/tools/image/limine/limine.conf.in" > "$STAGE/tools/image/limine/limine.conf"
+' "$ROOT_DIR/tools/image/limine/limine.conf.in" > "$STAGE/boot/limine/limine.conf"
 
 # ── build the hybrid BIOS+UEFI ISO ─────────────────────────────────────────
 xorriso -as mkisofs -R -r -J \
-  -b tools/image/limine/limine-bios-cd.bin \
+  -b boot/limine/limine-bios-cd.bin \
   -no-emul-boot -boot-load-size 4 -boot-info-table \
   -hfsplus -apm-block-size 2048 \
-  --efi-boot tools/image/limine/limine-uefi-cd.bin \
+  --efi-boot boot/limine/limine-uefi-cd.bin \
   -efi-boot-part --efi-boot-image --protective-msdos-label \
   "$STAGE" -o "$OUT" >/dev/null 2>&1
 
