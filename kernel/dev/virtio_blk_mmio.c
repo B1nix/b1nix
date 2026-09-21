@@ -130,11 +130,30 @@ struct virtio_blk_dma_req {
   volatile u8 status;
 } __attribute__((packed));
 
+/* A request that timed out is still the DEVICE's: it owns the descriptors and
+ * the DMA buffer until it completes them, which it may do minutes later (a
+ * loaded TCG host does exactly that). Remember those, so the late completion
+ * is recognised for what it is and its buffer released. */
+#define VBLK_MAX_ABANDONED 16
+
+struct vblk_abandoned {
+  struct virtio_blk_dma_req *dma;
+  u16 head;
+  u8 used;
+};
+
 struct vblk_mmio_instance {
   volatile struct virtio_mmio_regs *regs;
   struct virtqueue vq;
   struct block_device blk;
   volatile int busy;
+  /* Descriptors are handed out from a rolling cursor, never from 0 again:
+   * restarting at 0 after a timeout handed the device descriptors it was
+   * still reading, and its late completion then landed on the next request's
+   * status byte — after which every request "failed" with whatever the ring
+   * happened to hold. */
+  u16 desc_next;
+  struct vblk_abandoned abandoned[VBLK_MAX_ABANDONED];
   u8 irq;
   /* 0 when the device stated no limit — then one request carries the range. */
   u32 max_discard_sectors;
@@ -170,12 +189,15 @@ static void vblk_unlock(struct vblk_mmio_instance *inst) {
  * handed to us (block-cache entry, kheap struct) is only virtually
  * contiguous, so describe it to the device one physical page at a time. */
 static int vblk_add_region(struct virtqueue *vq, u16 *next_desc, u16 *prev,
-                           u64 vaddr, u32 len, u16 write_flag) {
+                           u64 vaddr, u32 len, u16 write_flag, u16 *ndesc) {
   u32 rem = len;
   while (rem > 0) {
-    if (*next_desc >= vq->queue_size)
+    /* The cursor wraps; what bounds a request is how many descriptors it has
+     * taken, not where in the ring it started. */
+    if (++*ndesc > vq->queue_size)
       return -1;
-    u16 idx = (*next_desc)++;
+    u16 idx = *next_desc;
+    *next_desc = (u16)((idx + 1u) % vq->queue_size);
     u64 phys = vmm_virt_to_phys((void *)(usize)vaddr);
     u32 chunk = (u32)(4096 - (vaddr & 4095));
     if (chunk > rem)
@@ -193,6 +215,54 @@ static int vblk_add_region(struct virtqueue *vq, u16 *next_desc, u16 *prev,
     rem -= chunk;
   }
   return 0;
+}
+
+/* Hand a timed-out request over to the device for as long as it wants it. */
+static void vblk_abandon(struct vblk_mmio_instance *inst, u16 head,
+                         struct virtio_blk_dma_req *dma) {
+  for (int i = 0; i < VBLK_MAX_ABANDONED; i++) {
+    if (!inst->abandoned[i].used) {
+      inst->abandoned[i].dma = dma;
+      inst->abandoned[i].head = head;
+      inst->abandoned[i].used = 1;
+      return;
+    }
+  }
+  /* Table full: the buffer stays allocated for the life of the machine. The
+   * device still owns it, so freeing it is not an option. */
+}
+
+static void vblk_release_abandoned(struct vblk_mmio_instance *inst, u16 head) {
+  for (int i = 0; i < VBLK_MAX_ABANDONED; i++) {
+    if (inst->abandoned[i].used && inst->abandoned[i].head == head) {
+      kfree(inst->abandoned[i].dma);
+      inst->abandoned[i].dma = 0;
+      inst->abandoned[i].used = 0;
+      return;
+    }
+  }
+}
+
+/* Consume every completion the device has published, and say whether the one
+ * we are waiting for was among them. Matching by the used element's id is
+ * what makes a late completion harmless: it belongs to an abandoned request,
+ * so its buffer is freed and the entry dropped instead of being read as the
+ * answer to the request in flight. */
+static int vblk_reap_used(struct vblk_mmio_instance *inst, u16 head) {
+  struct virtqueue *vq = &inst->vq;
+  int mine = 0;
+
+  while (vq->used->idx != vq->last_used_idx) {
+    __sync_synchronize();
+    u32 id = vq->used->ring[vq->last_used_idx % vq->queue_size].id;
+
+    vq->last_used_idx++;
+    if ((u16)id == head)
+      mine = 1;
+    else
+      vblk_release_abandoned(inst, (u16)id);
+  }
+  return mine;
 }
 
 static int do_vblk_req(struct vblk_mmio_instance *inst, u64 lba, u32 count,
@@ -228,22 +298,25 @@ static int do_vblk_req(struct vblk_mmio_instance *inst, u64 lba, u32 count,
     data_flags = 0;
   }
 
-  u16 next_desc = 0;
+  u16 head = inst->desc_next;
+  u16 next_desc = head;
   u16 prev = 0xFFFF;
+  u16 ndesc = 0;
   if (vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)&dma->req,
-                      sizeof(struct virtio_blk_req), 0) < 0 ||
+                      sizeof(struct virtio_blk_req), 0, &ndesc) < 0 ||
       (has_data &&
        vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)data,
-                       data_len, data_flags) < 0) ||
+                       data_len, data_flags, &ndesc) < 0) ||
       vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)&dma->status,
-                      1, VRING_DESC_F_WRITE) < 0) {
+                      1, VRING_DESC_F_WRITE, &ndesc) < 0) {
     vblk_unlock(inst);
     kfree(dma);
     return -1;
   }
+  inst->desc_next = next_desc;
 
   u16 avail_idx = inst->vq.avail->idx % inst->vq.queue_size;
-  inst->vq.avail->ring[avail_idx] = 0;
+  inst->vq.avail->ring[avail_idx] = head;
 
   __sync_synchronize();
   inst->vq.avail->idx++;
@@ -268,7 +341,7 @@ static int do_vblk_req(struct vblk_mmio_instance *inst, u64 lba, u32 count,
   u64 wait_start;
   __asm__ volatile("mrs %0, cntvct_el0" : "=r"(wait_start));
   int timed_out = 0;
-  while (inst->vq.used->idx == inst->vq.last_used_idx) {
+  while (!vblk_reap_used(inst, head)) {
     u64 now;
     __asm__ volatile("mrs %0, cntvct_el0" : "=r"(now));
     if (now - wait_start > wait_budget) { timed_out = 1; break; }
@@ -301,11 +374,11 @@ static int do_vblk_req(struct vblk_mmio_instance *inst, u64 lba, u32 count,
   }
 
   if (timed_out) {
-    /* The device still OWNS the descriptors and the DMA buffer: advancing
-     * last_used_idx would desynchronise every later request against the used
-     * ring, and freeing `dma` would hand the device a block the heap has
-     * already reused. Leave both alone — deliberately leaking one small
-     * request — and report the failure instead of corrupting the queue. */
+    /* The device still OWNS the descriptors and the DMA buffer, so neither is
+     * touched here: the cursor has already moved past those descriptors, and
+     * the buffer is handed to the abandoned table, which frees it when the
+     * completion finally arrives. */
+    vblk_abandon(inst, head, dma);
     console_write("virtio-blk-mmio: request timed out, lba=0x");
     console_write_hex64(lba);
     console_write("\n");
@@ -314,12 +387,13 @@ static int do_vblk_req(struct vblk_mmio_instance *inst, u64 lba, u32 count,
   }
 
   __sync_synchronize();
-  inst->vq.last_used_idx++;
-
-  int ret = (dma->status == 0) ? (int)count : -1;
+  /* Read the status byte once: it is device memory, and reporting a second
+   * read of it printed a status the decision was never made on. */
+  u8 status = dma->status;
+  int ret = (status == 0) ? (int)count : -1;
   if (ret < 0) {
     console_write("virtio-blk-mmio: request failed status=0x");
-    console_write_hex64(dma->status);
+    console_write_hex64(status);
     console_write(" lba=0x");
     console_write_hex64(lba);
     console_write("\n");

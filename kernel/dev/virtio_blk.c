@@ -171,7 +171,7 @@ static u64 vblk_spin_ns(int is_read) {
     char buf[32];
     u64 r = 1000000ull, w = 15000ull;
 
-    if (bootinfo_get_kv("b1nix.vblk-spin-us", buf, sizeof(buf)) == 0) {
+    if (bootinfo_get_kv("b1nix.vblk-spin-us", buf, sizeof(buf))) {
       const char *p = buf;
       u64 v = 0;
 

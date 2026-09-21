@@ -12,6 +12,7 @@
 #include <b1nix/posix.h>
 #include <b1nix/arch.h>
 #include <string.h>
+#include <b1nix/ktime.h>
 
 /* TCP protocol number in IPv4 */
 #define IP_PROTO_TCP 6
@@ -2873,10 +2874,22 @@ void tcp_robustness_smoke(void) {
   struct ipv4_addr peer_ip;
   u16 peer_port = 0;
   struct tcp_conn *acc = 0;
-  for (int i = 0; i < 100 && !acc; i++) {
-    acc = tcp_accept(port, &peer_ip, &peer_port);
-    if (!acc)
-      net_poll();
+  /* Bounded by time, not by a count of polls.
+   *
+   * A hundred net_poll() calls is a different amount of patience on every
+   * machine: under TCG, with two builds running on the host, the loopback
+   * handshake had not completed by the hundredth and this self-test reported
+   * FAIL accept — and then returned, so every marker after it was missing
+   * rather than wrong. Half a second is long enough for a loopback handshake
+   * anywhere and still bounded. */
+  {
+    u64 give_up = ktime_monotonic_ns() + 500ull * 1000ull * 1000ull;
+
+    while (!acc && ktime_monotonic_ns() < give_up) {
+      acc = tcp_accept(port, &peer_ip, &peer_port);
+      if (!acc)
+        net_poll();
+    }
   }
   if (!acc) {
     k_info(NULL, "M84-TCP: FAIL accept");
