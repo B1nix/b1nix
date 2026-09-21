@@ -726,7 +726,14 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
                      (struct task *)pcpu->cur_task == (struct task *)pcpu->idle_task);
 
       kprof_tick(frame->rip, in_user, in_idle, pcpu ? (int)pcpu->cpu_id : 0);
-      /* M126: the same tick is perf's sampling clock. */
+      /* M126: the same tick is perf's sampling clock, and the moment this CPU
+       * reads its hardware counters and credits them to whatever has been
+       * running since the last tick. */
+      {
+        struct task *cur = pcpu ? (struct task *)pcpu->cur_task : 0;
+
+        perf_pmu_tick(cur ? cur->id : 0);
+      }
       perf_event_tick_sample(frame->rip, frame->rbp, in_user,
                              pcpu ? (int)pcpu->cpu_id : 0);
     }

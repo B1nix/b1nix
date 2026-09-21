@@ -367,6 +367,10 @@ BINARIES += $(BUILD)/bin/m124_smoke
 # M125: io_uring.
 BINARIES += $(BUILD)/bin/m125_smoke
 BINARIES += $(BUILD)/bin/m126_smoke
+# M126: userfaultfd — page faults handled by a program.
+BINARIES += $(BUILD)/bin/m126_uffd_smoke
+# M126: fanotify — watching a mount, and refusing an open.
+BINARIES += $(BUILD)/bin/m126_fanotify_smoke
 # M127: cgroup v2 resource control, the OOM killer and PSI.
 BINARIES += $(BUILD)/bin/m127_smoke
 # M127: compressed swap (zram), cgroup-targeted reclaim, memory.swap.current.

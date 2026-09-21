@@ -235,6 +235,8 @@ run_test /bin/m123_smoke posix
 run_test /bin/m124_smoke posix
 run_test /bin/m125_smoke posix
 run_test /bin/m126_smoke posix
+run_test /bin/m126_uffd_smoke posix
+run_test /bin/m126_fanotify_smoke posix
 # M127: cgroup v2 resource control. It moves processes between cgroups, kills
 # inside one, and loads every CPU on the machine for a few seconds -- so it runs
 # in the sequential group, where nothing else is measuring anything.

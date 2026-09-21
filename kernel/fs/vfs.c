@@ -23,6 +23,7 @@
 #include <b1nix/filelock.h>
 #include <b1nix/initramfs.h>
 #include <b1nix/input.h>
+#include <b1nix/fanotify.h>
 #include <b1nix/inotify.h>
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
@@ -3893,6 +3894,23 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode);
 int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
   int rc = vfs_open_flags_mode_inner(path, flags, mode);
 
+  /* M126: an open is the event fanotify exists for, and the one place a
+   * monitor may still say no. The file IS open by now -- the descriptor is
+   * ours, not the caller's, until we return it -- so a refusal closes it
+   * again and the caller sees EPERM, exactly as Linux's FAN_OPEN_PERM does. */
+  if (rc >= 0 && fanotify_active()) {
+    struct vfs_handle *oh = scheduler_fd_get(rc);
+    struct vfs_node *onode = oh ? oh->node : 0;
+
+    if (onode) {
+      if (fanotify_permission(onode, IN_OPEN) != 0) {
+        vfs_close(rc);
+        return -EPERM;
+      }
+      fanotify_notify(onode, IN_OPEN);
+    }
+  }
+
   /*
    * A refused open of a graphics node, with the flags that were asked for.
    *
@@ -4892,8 +4910,10 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
   /* M73 inotify: report a successful write as IN_MODIFY. Called after the inode
    * lock is dropped so the notify path (its own leaf spinlocks) never nests
    * under the inode lock. */
-  if (res > 0)
+  if (res > 0) {
     vfs_inotify_notify(node, IN_MODIFY, 0);
+    fanotify_notify(node, IN_MODIFY);
+  }
   vfs_node_put(node);
   return res;
 }
@@ -5058,7 +5078,19 @@ isize vfs_handle_write(struct vfs_handle *h, const void *buf, usize size) {
 isize vfs_handle_read(struct vfs_handle *h, void *buf, usize size) {
   if (!h || !h->ops || !h->ops->read)
     return -EBADF;
-  return h->ops->read(h, (char *)buf, size);
+
+  isize res = h->ops->read(h, (char *)buf, size);
+
+  /* M126: a read of a watched file is FAN_ACCESS. Gated on a monitor existing
+   * at all, because this is every read the machine does. inotify's IN_ACCESS
+   * is reported from the same place, which it never was before -- a watch that
+   * asked for it simply never fired. */
+  if (res > 0 && h->kind == VFS_HANDLE_NODE && h->node && !h->no_notify &&
+      (fanotify_active() || vfs_inotify_watching())) {
+    vfs_inotify_notify(h->node, IN_ACCESS, 0);
+    fanotify_notify(h->node, IN_ACCESS);
+  }
+  return res;
 }
 
 isize vfs_write(int fd, const char *buf, usize size) {
@@ -5082,6 +5114,18 @@ int vfs_poll(int fd, struct b1nix_pollfd *pfd) {
 void vfs_close_handle(struct vfs_handle *h, int owner_pid) {
   if (!h)
     return;
+
+  /* M126: the close of a watched file, split the way the ABI splits it -- a
+   * descriptor that could write is FAN_CLOSE_WRITE, everything else is
+   * FAN_CLOSE_NOWRITE. Both were missing from inotify too. */
+  if (h->kind == VFS_HANDLE_NODE && h->node && !h->no_notify &&
+      (fanotify_active() || vfs_inotify_watching())) {
+    int writable = (h->flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR)) != 0;
+    u32 ev = writable ? IN_CLOSE_WRITE : IN_CLOSE_NOWRITE;
+
+    vfs_inotify_notify(h->node, ev, 0);
+    fanotify_notify(h->node, ev);
+  }
 
   if (h->kind == VFS_HANDLE_NODE && h->node && h->node->inode) {
     filelock_release_all_by_pid_inode(owner_pid, h->node->inode);

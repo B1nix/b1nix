@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <linux/perf_event.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -224,15 +226,202 @@ static void check_read_format(void) {
   close(fd);
 }
 
+/* ---- the hardware counters --------------------------------------------- */
+
+/* Is there a PMU at all? A TCG guest has none, and on such a machine every
+ * hardware event is refused -- which is the honest answer, not a failure. The
+ * checks below say so once and skip rather than pretending. */
+static int hw_present(void) {
+  struct perf_event_attr a;
+  int fd;
+
+  attr_init(&a, PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS);
+  fd = perf_open(&a, 0, -1, -1, 0);
+  if (fd < 0)
+    return 0;
+  close(fd);
+  return 1;
+}
+
+static void skip(const char *what, const char *why) {
+  printf("M126-SMOKE: skip %s — %s\n", what, why);
+  fflush(stdout);
+}
+
+/* Instructions and cycles, counted by the CPU itself while a known amount of
+ * work happens. The assertion is not "greater than zero": a loop that really
+ * ran 20 million iterations cannot have retired only a handful of
+ * instructions, and cycles must outnumber... nothing in particular, but they
+ * must be there, and the ratio must be sane rather than absurd. */
+static void check_hw_counters(void) {
+  struct perf_event_attr a;
+  int insn_fd, cyc_fd;
+  unsigned long long insns, cycles;
+
+  if (!hw_present()) {
+    skip("hw-counters", "this CPU has no architectural PMU (a TCG guest)");
+    return;
+  }
+
+  attr_init(&a, PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS);
+  insn_fd = perf_open(&a, 0, -1, -1, 0);
+  attr_init(&a, PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES);
+  cyc_fd = perf_open(&a, 0, -1, -1, 0);
+  if (insn_fd < 0 || cyc_fd < 0) {
+    bad("hw-counters", "opening the counters failed",
+        (long)(insn_fd < 0 ? insn_fd : cyc_fd));
+    if (insn_fd >= 0)
+      close(insn_fd);
+    if (cyc_fd >= 0)
+      close(cyc_fd);
+    return;
+  }
+  ioctl(insn_fd, PERF_EVENT_IOC_RESET, 0);
+  ioctl(cyc_fd, PERF_EVENT_IOC_RESET, 0);
+  ioctl(insn_fd, PERF_EVENT_IOC_ENABLE, 0);
+  ioctl(cyc_fd, PERF_EVENT_IOC_ENABLE, 0);
+  burn_ms(120);
+  ioctl(insn_fd, PERF_EVENT_IOC_DISABLE, 0);
+  ioctl(cyc_fd, PERF_EVENT_IOC_DISABLE, 0);
+  insns = read_count(insn_fd);
+  cycles = read_count(cyc_fd);
+  close(insn_fd);
+  close(cyc_fd);
+
+  printf("M126-SMOKE:   120 ms of work: %llu instructions, %llu cycles\n",
+         insns, cycles);
+  fflush(stdout);
+  /* 120 ms of a tight loop on any CPU this decade retires far more than a
+   * million instructions and burns far more than a million cycles. */
+  judge("hw-counters", insns > 1000000ull && cycles > 1000000ull,
+        "the counters did not move with the work", (long)insns);
+}
+
+/* The counter belongs to a task, not to the machine: a counter opened on a
+ * child that does nothing must not collect the parent's work. */
+static void check_hw_per_task(void) {
+  struct perf_event_attr a;
+  int fd;
+  int pipefd[2];
+  pid_t child;
+  unsigned long long idle_child;
+
+  if (!hw_present()) {
+    skip("hw-per-task", "this CPU has no architectural PMU (a TCG guest)");
+    return;
+  }
+  if (pipe(pipefd) != 0) {
+    bad("hw-per-task", "pipe", -1);
+    return;
+  }
+  child = fork();
+  if (child == 0) {
+    char c;
+
+    close(pipefd[1]);
+    /* Do nothing at all, measurably: block until the parent is finished. */
+    (void)!read(pipefd[0], &c, 1);
+    _exit(0);
+  }
+  close(pipefd[0]);
+  if (child < 0) {
+    bad("hw-per-task", "fork", -1);
+    close(pipefd[1]);
+    return;
+  }
+
+  attr_init(&a, PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS);
+  fd = perf_open(&a, child, -1, -1, 0);
+  if (fd < 0) {
+    bad("hw-per-task", "opening a counter on the child failed", (long)fd);
+    close(pipefd[1]);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    return;
+  }
+  ioctl(fd, PERF_EVENT_IOC_RESET, 0);
+  ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+  burn_ms(120); /* the PARENT burns; the child is blocked on the pipe */
+  ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+  idle_child = read_count(fd);
+  close(fd);
+  close(pipefd[1]);
+  waitpid(child, NULL, 0);
+
+  printf("M126-SMOKE:   a blocked child retired %llu instructions while the "
+         "parent burned 120 ms\n", idle_child);
+  fflush(stdout);
+  /* It is not zero -- the child is woken to die, and the read(2) it is
+   * blocked in costs something -- but it is nothing like the parent's
+   * hundreds of millions. */
+  judge("hw-per-task", idle_child < 10000000ull,
+        "a blocked child was credited with the parent's work",
+        (long)idle_child);
+}
+
+/* PERF_TYPE_RAW passes an event selector straight to the hardware, and
+ * PERF_TYPE_HW_CACHE names branches. Both must count the same thing the
+ * generic branch event counts, because they ARE the same counter. */
+static void check_hw_raw_and_cache(void) {
+  struct perf_event_attr a;
+  int raw_fd, cache_fd;
+  unsigned long long raw, cache;
+
+  if (!hw_present()) {
+    skip("hw-raw-cache", "this CPU has no architectural PMU (a TCG guest)");
+    return;
+  }
+  /* 0x00C4: architectural "branch instructions retired". */
+  attr_init(&a, PERF_TYPE_RAW, 0x00C4);
+  raw_fd = perf_open(&a, 0, -1, -1, 0);
+  attr_init(&a, PERF_TYPE_HW_CACHE,
+            PERF_COUNT_HW_CACHE_BPU | (PERF_COUNT_HW_CACHE_OP_READ << 8) |
+                (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16));
+  cache_fd = perf_open(&a, 0, -1, -1, 0);
+  if (raw_fd < 0 || cache_fd < 0) {
+    bad("hw-raw-cache", "raw or cache event refused",
+        (long)(raw_fd < 0 ? raw_fd : cache_fd));
+    if (raw_fd >= 0)
+      close(raw_fd);
+    if (cache_fd >= 0)
+      close(cache_fd);
+    return;
+  }
+  ioctl(raw_fd, PERF_EVENT_IOC_RESET, 0);
+  ioctl(cache_fd, PERF_EVENT_IOC_RESET, 0);
+  ioctl(raw_fd, PERF_EVENT_IOC_ENABLE, 0);
+  ioctl(cache_fd, PERF_EVENT_IOC_ENABLE, 0);
+  burn_ms(80);
+  ioctl(raw_fd, PERF_EVENT_IOC_DISABLE, 0);
+  ioctl(cache_fd, PERF_EVENT_IOC_DISABLE, 0);
+  raw = read_count(raw_fd);
+  cache = read_count(cache_fd);
+  close(raw_fd);
+  close(cache_fd);
+
+  printf("M126-SMOKE:   branches: %llu raw, %llu through HW_CACHE\n", raw,
+         cache);
+  fflush(stdout);
+  /* The same event counted twice over the same 80 ms: both must be large, and
+   * within a factor of four of each other (they run over slightly different
+   * windows, and the loop is not perfectly uniform). */
+  judge("hw-raw-cache",
+        raw > 100000ull && cache > 100000ull && raw < cache * 4 &&
+            cache < raw * 4,
+        "the raw and HW_CACHE branch counters disagree", (long)raw);
+}
+
 static void check_refusals(void) {
   struct perf_event_attr a;
   int fd;
 
-  /* No PMU here: a hardware counter must be refused, not answered with zero. */
-  attr_init(&a, PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES);
+  /* A hardware event the architectural PMU has no counter for: bus cycles is
+   * model-specific, so it must still be refused rather than answered with a
+   * number taken from some other event. */
+  attr_init(&a, PERF_TYPE_HARDWARE, PERF_COUNT_HW_BUS_CYCLES);
   fd = perf_open(&a, 0, -1, -1, 0);
-  judge("refuses-hardware", fd < 0 && errno == EOPNOTSUPP,
-        "a hardware counter was accepted although there is no PMU driver",
+  judge("refuses-unknown-hw", fd < 0 && errno == EOPNOTSUPP,
+        "an event with no architectural counter behind it was accepted",
         (long)fd);
   if (fd >= 0)
     close(fd);
@@ -514,6 +703,9 @@ int main(void) {
   check_page_faults();
   check_context_switches();
   check_read_format();
+  check_hw_counters();
+  check_hw_per_task();
+  check_hw_raw_and_cache();
   check_refusals();
   check_sampling();
   check_refresh();

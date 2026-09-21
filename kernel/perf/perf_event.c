@@ -117,6 +117,10 @@ struct perf_ev {
   u64 period_ns, ns_left;
   u64 nr_samples;
 
+  /* A hardware counter, when this event is one: the slot the PMU driver gave
+   * us, or -1 for a software counter. */
+  int pmu_slot;
+
   /* The ring buffer, kernel-owned physical pages the process maps. */
   u64 rb_phys;
   usize rb_pages; /* control page + data pages */
@@ -144,6 +148,15 @@ void perf_event_paranoid_set(int v) { g_paranoid = v; }
 
 /* Whether this attr names something really counted here. */
 static int perf_attr_supported(const struct perf_event_attr *a) {
+  if (a->type == PERF_TYPE_HARDWARE || a->type == PERF_TYPE_HW_CACHE ||
+      a->type == PERF_TYPE_RAW) {
+    /* The PMU driver decides: it knows which counters this CPU has and which
+     * architectural events it reports as available. On a machine with no PMU
+     * at all it refuses everything, and hardware events stay -EOPNOTSUPP. */
+    u64 evsel;
+
+    return perf_pmu_map(a, &evsel) == 0;
+  }
   if (a->type != PERF_TYPE_SOFTWARE)
     return 0;
   switch (a->config) {
@@ -183,6 +196,8 @@ static u64 perf_raw_one(u64 config, struct task *t) {
 
 /* The same, summed over every task when the event watches the machine. */
 static u64 perf_raw(const struct perf_ev *ev) {
+  if (ev->pmu_slot >= 0)
+    return perf_pmu_slot_count(ev->pmu_slot);
   if (ev->attr.config == PERF_COUNT_SW_CPU_CLOCK)
     return ktime_monotonic_ns();
   if (ev->target)
@@ -587,6 +602,10 @@ void perf_event_task_exit(struct task *t) {
 static const struct vfs_file_ops perf_file_ops;
 
 static void perf_free(struct perf_ev *ev) {
+  if (ev->pmu_slot >= 0) {
+    perf_pmu_slot_free(ev->pmu_slot);
+    ev->pmu_slot = -1;
+  }
   if (ev->rb_phys) {
     for (usize i = 0; i < ev->rb_pages; i++)
       pmm_free_frame(ev->rb_phys + (u64)i * PAGE_SIZE);
@@ -856,6 +875,25 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
                                            : (usize)pid);
   ev->leader = ev;
   ev->refresh = -1;
+  ev->pmu_slot = -1;
+  if (attr.type == PERF_TYPE_HARDWARE || attr.type == PERF_TYPE_HW_CACHE ||
+      attr.type == PERF_TYPE_RAW) {
+    u64 evsel = 0;
+    int rc = perf_pmu_map(&attr, &evsel);
+
+    if (rc == 0) {
+      /* exclude_user / exclude_kernel are privilege filters the counter
+       * itself applies, so they are the one place where what is asked for is
+       * exactly what the hardware is told. */
+      rc = perf_pmu_slot_alloc(evsel, ev->target, !attr.exclude_user,
+                               !attr.exclude_kernel);
+    }
+    if (rc < 0) {
+      kfree(ev);
+      return rc; /* -EOPNOTSUPP with no PMU, -EBUSY with no counter free */
+    }
+    ev->pmu_slot = rc;
+  }
   ev->enabled = attr.disabled ? 0 : 1;
   ev->since = ktime_monotonic_ns();
   ev->base = perf_raw(ev);

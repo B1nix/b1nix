@@ -9,6 +9,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/cgroup.h>
 #include <b1nix/mm.h>
+#include <b1nix/userfaultfd.h>
 #include <b1nix/psi.h>
 #include <b1nix/rwlock.h>
 #include <b1nix/vfs.h>
@@ -2019,6 +2020,26 @@ static int vmm_handle_page_fault_inner(u64 fault_addr, u64 error_code) {
       return 0;
     fault_note(0, 0, "protection key refused the access");
     return -1;
+  }
+
+  /* M126: userfaultfd. A registered range's faults belong to a monitor in
+   * userspace, and it must be asked BEFORE any of the cases below looks at the
+   * page -- a fresh anonymous read would otherwise be answered with the shared
+   * zero page, and a write to a write-protected page would quietly take the
+   * copy-on-write path, and in both cases the monitor would never hear about
+   * the access it exists to see.
+   *
+   * Asked with no VM lock held, because servicing the fault means sleeping
+   * until the monitor installs the page, and the monitor needs those locks.
+   * Returns non-zero only when the page is really there now; everything else
+   * falls through to the ordinary paths, including a monitor that never
+   * answered. */
+  if ((error_code & PF_USER) && current_task) {
+    if (uffd_handle_fault(page_aligned, (error_code & PF_WRITE) != 0,
+                          (error_code & PF_PRESENT) != 0)) {
+      fault_note(0, 0, "a userfaultfd monitor served this page");
+      return 0;
+    }
   }
 
   extern void eviction_evict_page(void);

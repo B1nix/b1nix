@@ -65,6 +65,9 @@ int vfs_inotify_rm_watch(int fd, int wd);
  * directory for create/delete with `name` set). Cheap no-op when no inotify
  * instances are active. */
 void vfs_inotify_notify(struct vfs_node *node, u32 mask, const char *name);
+/* Whether any instance exists, for the hot paths that would otherwise build an
+ * event on every read and every close. */
+int vfs_inotify_watching(void);
 /* Rename: the two halves share a cookie so a watcher can pair them, which is
  * the whole point of IN_MOVED_FROM/IN_MOVED_TO. */
 void vfs_inotify_notify_move(struct vfs_node *old_dir, const char *old_name,

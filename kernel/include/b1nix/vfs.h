@@ -1195,6 +1195,15 @@ struct vfs_handle {
   void *private_data; /* Used for pipe, socket, etc. */
   const struct vfs_file_ops *ops;
   int flags;
+  /* This descriptor must not itself generate filesystem-notification events.
+   *
+   * fanotify hands the monitor an open descriptor for the object each event
+   * names. Reading or closing THAT descriptor is an access like any other, so
+   * it produces another event, which produces another descriptor -- a monitor
+   * that does its job feeds itself for ever, and the machine stops doing
+   * anything else. Linux marks those files FMODE_NONOTIFY for the same
+   * reason. */
+  u8 no_notify;
   /* The absolute path this descriptor was opened at.
    *
    * A node can be reached by more than one name -- a bind mount gives the same

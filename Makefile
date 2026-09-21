@@ -587,10 +587,12 @@ KERNEL_SOURCES := \
 	kernel/mm/page_cache.c \
 	kernel/mm/page_audit.c \
 	kernel/mm/swap.c \
+	kernel/mm/userfaultfd.c \
 	kernel/mm/psi.c \
 	kernel/mm/eviction.c \
 	kernel/sched/scheduler.c \
 	kernel/perf/perf_event.c \
+	kernel/perf/pmu_x86.c \
 	kernel/syscall/syscall.c \
 	kernel/syscall/linux_abi.c \
 	kernel/syscall/linux_modern.c \
@@ -605,6 +607,7 @@ KERNEL_SOURCES := \
 	kernel/fs/pipe.c \
 	kernel/fs/eventpoll.c \
 	kernel/fs/inotify.c \
+	kernel/fs/fanotify.c \
 	kernel/fs/fat/fat32.c \
 	kernel/fs/fat/exfat.c \
 	kernel/fs/proc/procfs.c \

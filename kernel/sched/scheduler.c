@@ -12,6 +12,7 @@
 #include <b1nix/user_namespace.h>
 #include <b1nix/panic.h>
 #include <b1nix/perf_event.h>
+#include <b1nix/userfaultfd.h>
 #include <b1nix/posix.h>
 #include <b1nix/runqueue.h>
 #include <b1nix/ptrace.h>
@@ -5641,6 +5642,9 @@ static int scheduler_yield_inner(void) {
 #endif
 
   g_last_switch_tick = scheduler_ticks;
+  /* M126: read this CPU's hardware counters before the switch, so the interval
+   * just ended is credited to the task that ran it and not to its successor. */
+  perf_pmu_switch(old_task ? old_task->id : 0);
   if (wakelat_enabled())
     wakelat_switch_in(new_task);
   arch_context_switch(&old_task->context, &new_task->context,
@@ -7825,6 +7829,9 @@ void scheduler_exit_current(int exit_code) {
   /* M126: tell any perf ring watching this task that it is going, so a
    * `perf report` can close its map of the process. */
   perf_event_task_exit(current_task);
+  /* M126: a userfaultfd monitor that dies must not leave the threads it was
+   * serving asleep on a descriptor nobody will read again. */
+  uffd_task_exit(current_task);
   /* A vfork parent waiting on this task must be released before teardown. */
   scheduler_vfork_release();
   if (current_task == 0) {

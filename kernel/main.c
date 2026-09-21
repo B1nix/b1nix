@@ -16,6 +16,7 @@
 #include <b1nix/gdbstub.h>
 #include <b1nix/initramfs.h>
 #include <b1nix/mm.h>
+#include <b1nix/perf_event.h>
 #include <b1nix/net.h>
 #include <b1nix/netproto.h>
 #include <b1nix/module.h>
@@ -1072,6 +1073,7 @@ void kernel_main(usize arg0, usize arg1)
 	BOOTMARK(29);	/* ramdisk_init */
 	loop_init();            /* loop block devices + /dev/loop-control */
 	zram_init();            /* compressed RAM block device, sized from /sys */
+	perf_pmu_init();        /* M126: the CPU's own performance counters */
 	BOOTMARK(30);	/* loop_init */
 	vt_init();              /* M107 virtual terminals + console font/keymap */
 	BOOTMARK(31);	/* magenta: device init survived, VTs up */

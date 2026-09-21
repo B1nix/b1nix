@@ -27,4 +27,24 @@ void perf_event_task_exit(struct task *t);
 int perf_event_paranoid_get(void);
 void perf_event_paranoid_set(int v);
 
+/* ── the hardware PMU (kernel/perf/pmu_x86.c) ───────────────────────────────
+ *
+ * Counters the CPU increments itself: cycles, instructions, cache and branch
+ * events. Detected from CPUID's architectural-PMU leaf, so a machine without
+ * one (every TCG guest) reports none and hardware events stay refused. */
+struct perf_event_attr;
+
+void perf_pmu_init(void);
+int perf_pmu_available(void);
+/* Translate an attr into an event selector, or a negative errno. */
+int perf_pmu_map(const struct perf_event_attr *attr, u64 *evsel_out);
+/* Claim a hardware counter for `target` (a pid, 0 = the whole machine).
+ * Returns the slot, -EBUSY when every counter is taken. */
+int perf_pmu_slot_alloc(u64 evsel, usize target, int user, int kernel);
+void perf_pmu_slot_free(int slot);
+u64 perf_pmu_slot_count(int slot);
+/* Read the counters and credit the interval to the task that ran it. */
+void perf_pmu_tick(usize running_pid);
+void perf_pmu_switch(usize prev_pid);
+
 #endif

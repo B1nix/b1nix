@@ -356,6 +356,12 @@ int vfs_inotify_rm_watch(int fd, int wd) {
 static void inotify_notify_cookie(struct vfs_node *node, u32 mask,
                                   const char *name, u32 cookie);
 
+/* Is any inotify instance alive? The hot paths (every read, every close) ask
+ * before they build an event nobody wants. */
+int vfs_inotify_watching(void) {
+  return __atomic_load_n(&g_inotify_active, __ATOMIC_ACQUIRE) != 0;
+}
+
 void vfs_inotify_notify(struct vfs_node *node, u32 mask, const char *name) {
   inotify_notify_cookie(node, mask, name, 0);
 }
