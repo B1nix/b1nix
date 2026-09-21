@@ -1682,6 +1682,14 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
     if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in6)) return -EINVAL;
     s->local.in6 = *(const struct b1nix_sockaddr_in6 *)addr;
     s->bound = 1;
+    if (s->type == B1NIX_SOCK_STREAM && s->local.in6.sin6_port == 0) {
+      u16 p = tcp_alloc_bind_port(); /* see the IPv4 path */
+
+      if (!p)
+        return -EADDRINUSE;
+      s->local.in6.sin6_port = ntoh16(p); /* the swap is its own inverse */
+      return 0;
+    }
     if (s->type == B1NIX_SOCK_DGRAM) {
       if (s->local.in6.sin6_port == 0) { /* "any port" — see the IPv4 path */
         s->local.in6.sin6_port = udp_autobind(h);
@@ -1706,6 +1714,18 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
   if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in)) return -EINVAL;
   s->local.in = *(const struct b1nix_sockaddr_in *)addr;
   s->bound = 1;
+  /* bind(port=0) on a stream socket asks the kernel for an ephemeral port, and
+   * the caller reads it back with getsockname(2). Left at zero, listen() put a
+   * listener on port 0 and every connect to the address the caller was given
+   * went nowhere. */
+  if (s->type == B1NIX_SOCK_STREAM && s->local.in.sin_port == 0) {
+    u16 p = tcp_alloc_bind_port();
+
+    if (!p)
+      return -EADDRINUSE;
+    s->local.in.sin_port = ntoh16(p); /* the swap is its own inverse */
+    return 0;
+  }
   if (s->type == B1NIX_SOCK_DGRAM) {
     /* bind(port=0) means "any port", not "port zero" — musl's resolver does
      * exactly this before sending its queries. Assign a real one, or the

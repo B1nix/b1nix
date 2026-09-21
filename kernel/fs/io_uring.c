@@ -46,13 +46,14 @@
  *     existing completion machinery (M70), used rather than duplicated, and it
  *     is what IORING_FEAT_FAST_POLL describes.
  *
- * The consequence, stated plainly because it is a real limit: an armed request
- * makes progress while its owner is inside io_uring_enter (or enters it again).
- * A program that submits and then blocks somewhere else entirely — select() on
- * an unrelated descriptor, say — does not get that completion until it comes
- * back. Every liburing and fio submission pattern does come back, because that
- * is what io_uring_enter(GETEVENTS) is for. SQPOLL, which would need a kernel
- * thread of its own, is refused rather than faked.
+ * A request left armed does not depend on its owner coming back: the first
+ * time a ring arms anything it gets a completion thread of its own (see
+ * iou_cq_thread), a kernel thread in the owner's address space that sleeps on
+ * vfs_poll_chan and sweeps the ring on every readiness wake. That is what lets
+ * a program submit and then spin on the completion ring in shared memory, as
+ * liburing's socket tests do, and it is what IORING_FEAT_FAST_POLL promises.
+ * A ring that only ever touches regular files arms nothing and never starts
+ * one.
  *
  * WHY THE RINGS ARE A DEVICE NODE
  *
@@ -318,6 +319,9 @@ struct io_ring_ctx {
   volatile int sq_stop;
   volatile int sq_alive;
   int sq_wait; /* the address is the channel the submission thread sleeps on */
+  /* Started once, the first time this ring arms a request it cannot finish
+   * inside io_uring_enter: see iou_async_kick. */
+  volatile int cq_started;
 
   /* IORING_REGISTER_FILE_ALLOC_RANGE: where IORING_FILE_INDEX_ALLOC looks. */
   u32 falloc_off, falloc_len;
@@ -3672,15 +3676,110 @@ static void iou_sq_thread(void *arg) {
 /* Stop the submission thread and wait for it to be gone. Everything after this
  * may free what the thread was reading. */
 static void iou_sq_thread_stop(struct io_ring_ctx *ctx) {
-  if (!ctx->sq_tid)
+  /* cq_started as well as sq_tid: the completion thread's id is stored after
+   * it is created, and a ring torn down inside that window must still be told
+   * to stop. */
+  if (!ctx->sq_tid && !__atomic_load_n(&ctx->cq_started, __ATOMIC_ACQUIRE))
     return;
   __atomic_store_n(&ctx->sq_stop, 1, __ATOMIC_RELEASE);
   scheduler_wake_all(&ctx->sq_wait);
+  /* The completion thread sleeps on the readiness channel, not on sq_wait. */
+  scheduler_wake_all(vfs_poll_chan);
   while (__atomic_load_n(&ctx->sq_alive, __ATOMIC_ACQUIRE)) {
     scheduler_wake_all(&ctx->sq_wait);
+    scheduler_wake_all(vfs_poll_chan);
     scheduler_yield();
   }
   ctx->sq_tid = 0;
+}
+
+/* ---- the completion thread (every other ring) ---------------------------
+ *
+ * An armed request used to make progress only while its owner was inside
+ * io_uring_enter, and that is not where a program waits. liburing's socket
+ * test submits a readv on a unix socket, sees nothing there, and then spins on
+ * the completion ring in userspace — io_uring_for_each_cqe reads shared memory
+ * and enters no system call at all. The sender wrote its thirty-three bytes
+ * into the socket and the reader never learned, because the only thing that
+ * would have re-tested the request was the enter it was never going to make.
+ * That is not a missing feature of the ABI, it is the ABI: a completion
+ * arrives on its own.
+ *
+ * So a ring that arms anything gets a thread, the same shape as the SQPOLL one
+ * and sharing its fields: a kernel thread that has adopted the owner's address
+ * space and descriptor table, so the data can be copied into the owner's
+ * buffers. It sleeps on vfs_poll_chan — the readiness channel every socket
+ * receive path, every ISR and the timer tick already wake — and sweeps the
+ * ring each time it comes round. Rings that only ever touch regular files
+ * never arm anything and never pay for one.
+ */
+
+static int iou_any_armed(struct io_ring_ctx *ctx) {
+  int armed = 0;
+
+  iou_lock(ctx);
+  for (struct iou_req *r = ctx->live; r; r = r->next)
+    if (r->state == IOU_ST_ARMED) {
+      armed = 1;
+      break;
+    }
+  iou_unlock(ctx);
+  return armed;
+}
+
+static void iou_cq_thread(void *arg) {
+  struct io_ring_ctx *ctx = (struct io_ring_ctx *)arg;
+
+  if (scheduler_adopt_owner_context(ctx->owner_tgid) < 0) {
+    __atomic_store_n(&ctx->sq_stop, 1, __ATOMIC_RELEASE);
+    iou_ctx_put(ctx);
+    return;
+  }
+  __atomic_store_n(&ctx->sq_alive, 1, __ATOMIC_RELEASE);
+
+  while (!__atomic_load_n(&ctx->sq_stop, __ATOMIC_ACQUIRE)) {
+    /* The owner's address space is this thread's: stop the moment the reaper
+     * can start on it, exactly as the submission thread does. */
+    if (!scheduler_owner_context_alive(ctx->owner_tgid))
+      break;
+    if (__atomic_load_n(&ctx->enabled, __ATOMIC_ACQUIRE))
+      iou_progress(ctx);
+    /* The bound is what keeps an armed deadline honest on a machine where
+     * nothing else happens to wake the channel. */
+    scheduler_wait_prepare_timeout(vfs_poll_chan, SCHED_MS_TO_TICKS(10));
+    if (__atomic_load_n(&ctx->sq_stop, __ATOMIC_ACQUIRE))
+      scheduler_wait_cancel();
+    else
+      scheduler_wait_commit();
+  }
+
+  scheduler_release_owner_context();
+  __atomic_store_n(&ctx->sq_alive, 0, __ATOMIC_RELEASE);
+  iou_ctx_put(ctx);
+}
+
+/* Start that thread the first time this ring has something armed. An SQPOLL
+ * ring already has one doing the same sweep. */
+static void iou_async_kick(struct io_ring_ctx *ctx) {
+  int tid;
+
+  if (ctx->flags & IORING_SETUP_SQPOLL)
+    return;
+  if (__atomic_load_n(&ctx->cq_started, __ATOMIC_ACQUIRE))
+    return;
+  if (!iou_any_armed(ctx))
+    return;
+  if (__atomic_exchange_n(&ctx->cq_started, 1, __ATOMIC_ACQ_REL))
+    return; /* another submitter got there first */
+  iou_ctx_get(ctx); /* the thread's reference */
+  tid = kthread_create("io_uring-cq", iou_cq_thread, ctx);
+  if (tid < 0) {
+    /* No thread: the ring still works the way it always did, from inside
+     * io_uring_enter. Leave the flag set so this is not retried per request. */
+    iou_ctx_put(ctx);
+    return;
+  }
+  ctx->sq_tid = tid;
 }
 
 /* Everything the ring still owns when its last descriptor goes away. */
@@ -4266,6 +4365,9 @@ static isize iou_enter(int fd, u32 to_submit, u32 min_complete, u32 flags,
     iou_progress(ctx);
   }
 
+  /* Anything still armed outlives this call, and the owner is free to spin on
+   * the completion ring without ever coming back. */
+  iou_async_kick(ctx);
   iou_trace("enter", to_submit, min_complete, submitted);
   return submitted;
 }
@@ -4886,10 +4988,9 @@ static isize iou_register_probe(struct io_ring_ctx *ctx, u64 uaddr,
     case IORING_OP_PIPE:
       supported = 1;
       break;
-    /* Not implemented, and the probe is the place that says so:
-     * the extended-attribute four (no xattrs in this VFS), URING_CMD (no
-     * driver takes a passthrough command), the three futex opcodes,
-     * RECV_ZC/EPOLL_WAIT/READV_FIXED/WRITEV_FIXED. */
+    /* Not implemented, and the probe is the place that says so: RECV_ZC,
+     * which needs a network stack that can hand a receive buffer's pages
+     * straight to userspace. Everything else this header names is above. */
     default:
       supported = 0;
       break;
@@ -5158,13 +5259,11 @@ static isize iou_register(int fd, u32 opcode, u64 arg, u32 nr_args) {
     rc = 0;
     break;
   default:
-    /* Personalities (this kernel runs every request as the submitter, so a
-     * stored credential set would have nothing to switch to), registered ring
-     * descriptors, io-wq affinity, NAPI busy-poll, the clock selection, buffer
-     * cloning, ring resizing, memory regions and the query interface: none of
-     * them exist here. -EINVAL is what a kernel without the opcode answers,
-     * which is what liburing tests for, and IORING_REGISTER_PROBE plus the
-     * absent feature bits say so in advance. */
+    /* io-wq affinity, NAPI busy-poll, the clock selection, buffer cloning,
+     * ring resizing, memory regions and the query interface: none of them
+     * exist here. -EINVAL is what a kernel without the opcode answers, which
+     * is what liburing tests for, and IORING_REGISTER_PROBE plus the absent
+     * feature bits say so in advance. */
     rc = -EINVAL;
     break;
   }

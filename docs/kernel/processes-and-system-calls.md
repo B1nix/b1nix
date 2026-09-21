@@ -117,33 +117,48 @@ The ring descriptor is a node handle over an anonymous `VFS_DEVICE` inode whose
 no thread per request and no io-wq pool. A file that cannot block is read or
 written inline. A file that can — a socket, a pipe, a tty — is asked for its
 readiness first with its own `->poll` op; not ready means the request is armed
-and left on the ring, and `io_uring_enter`'s wait loop re-tests it every time
-`vfs_poll_chan` is woken, which every ISR and every socket receive path already
-does (M70). That is what `IORING_FEAT_FAST_POLL` describes, and it is why
-submitting a read on an empty pipe returns at once instead of parking the
-submitter.
+and left on the ring, and it is re-tested every time `vfs_poll_chan` is woken,
+which every ISR and every socket receive path already does (M70). That is what
+`IORING_FEAT_FAST_POLL` describes, and it is why submitting a read on an empty
+pipe returns at once instead of parking the submitter.
 
-The limit that follows is worth stating rather than discovering: an armed
-request makes progress while its owner is inside `io_uring_enter`. Every
-liburing and `fio` submission pattern comes back there, because that is what
-`IORING_ENTER_GETEVENTS` is for; a program that submits and then blocks on
-something else entirely does not get its completion until it returns. SQPOLL,
-which needs a kernel thread of its own, is **refused** rather than faked.
+**A completion does not wait for its owner to come back.** The first time a
+ring arms anything it starts a completion thread of its own (`iou_cq_thread`),
+the same shape as the SQPOLL one: a kernel thread that has adopted the owner's
+address space and descriptor table, so the data can be copied into the owner's
+buffers, sleeping on `vfs_poll_chan` and sweeping the ring on each wake. A ring
+that only ever touches regular files arms nothing and never starts one.
+
+Re-testing only inside `io_uring_enter` is what this used to do, and the cost
+was not theoretical: `io_uring_for_each_cqe` reads shared memory, so a program
+that submits and then watches the completion ring makes no system call at all.
+liburing's socket test is written that way — the sender wrote its
+thirty-three bytes into a unix socket, and the reader spun for ever on a
+request nothing would look at again.
 
 Refusing is the theme, and it is the lesson `kernel/fs/mount_api.c` records for
 the new mount API: userspace probes for io_uring and switches strategy
 wholesale. So `io_uring_setup` answers `EINVAL` to every `IORING_SETUP_*` flag
-this kernel cannot honour — SQPOLL, IOPOLL, SQE128, CQE32, CQE_MIXED, NO_MMAP,
-ATTACH_WQ, DEFER_TASKRUN, REGISTERED_FD_ONLY, NO_SQARRAY, HYBRID_IOPOLL —
+this kernel cannot honour — `SQ_AFF` (nothing here can pin a thread to a CPU),
+`ATTACH_WQ`, `NO_MMAP`, `REGISTERED_FD_ONLY`, `HYBRID_IOPOLL`, `CQE_MIXED` —
 `params->features` advertises only what is true, an opcode that is not
 implemented completes with `EINVAL`, and `IORING_REGISTER_PROBE` reports that
 same set, which is the mechanism the ABI provides for the question.
 
 What works:
 
-- **Opcodes:** NOP, READ, WRITE, READV, WRITEV, READ_FIXED, WRITE_FIXED, FSYNC,
-  SYNC_FILE_RANGE, POLL_ADD, POLL_REMOVE, ACCEPT, CONNECT, SEND, RECV, TIMEOUT,
-  TIMEOUT_REMOVE, LINK_TIMEOUT, ASYNC_CANCEL, FILES_UPDATE and CLOSE. An offset
+- **Opcodes:** every one this header names but `RECV_ZC` — the data movers
+  (READ, WRITE, READV, WRITEV, the `_FIXED` forms of all four, READ_MULTISHOT,
+  SPLICE, TEE), the synchronising ones (FSYNC, SYNC_FILE_RANGE, FALLOCATE,
+  FTRUNCATE), the filesystem set (OPENAT, OPENAT2, STATX, RENAMEAT, UNLINKAT,
+  MKDIRAT, SYMLINKAT, LINKAT and the four xattr opcodes), the socket set
+  (ACCEPT, CONNECT, SEND, RECV, SENDMSG, RECVMSG, SEND_ZC, SENDMSG_ZC,
+  SHUTDOWN, SOCKET, BIND, LISTEN), the waiting ones (POLL_ADD, POLL_REMOVE,
+  TIMEOUT, TIMEOUT_REMOVE, LINK_TIMEOUT, ASYNC_CANCEL, WAITID, the three FUTEX
+  opcodes, EPOLL_CTL, EPOLL_WAIT), and NOP, CLOSE, PIPE, FILES_UPDATE,
+  MSG_RING, FIXED_FD_INSTALL, URING_CMD and the advisory pair. `RECV_ZC` would
+  need a network stack that can hand a receive buffer's pages to userspace, so
+  the probe says it is absent. An offset
   of `-1` means the descriptor's own position (`IORING_FEAT_RW_CUR_POS`), and
   `O_APPEND` beats any offset the caller passes, as it does on Linux.
   A vectored transfer over a descriptor that can block asks it again between
@@ -172,12 +187,14 @@ What works:
 - **`IORING_ENTER_EXT_ARG`**, so `io_uring_wait_cqe_timeout` has a deadline. A
   signal mask passed with it is refused rather than ignored.
 
-What is not there: SQPOLL and IOPOLL, provided-buffer rings
-(`IOSQE_BUFFER_SELECT`, `REGISTER_PBUF_RING`), multishot poll and recv,
-`SENDMSG`/`RECVMSG`, zero-copy send, `URING_CMD`, `MSG_RING`, personalities,
-restrictions, NAPI, ring resizing, and the filesystem opcodes (`OPENAT`,
-`STATX`, `RENAMEAT`, `UNLINKAT`, the xattr family). Each is absent from the
-probe rather than half-present.
+Also here: `IORING_SETUP_SQPOLL` (the submission thread above),
+`IOPOLL`, `SQE128`, `CQE32`, `NO_SQARRAY`, `DEFER_TASKRUN`, `R_DISABLED`,
+provided buffers in both shapes (`PROVIDE_BUFFERS`/`REMOVE_BUFFERS` and
+`REGISTER_PBUF_RING`, chosen with `IOSQE_BUFFER_SELECT`), multishot
+poll/accept/recv/read, direct descriptors with `IORING_FILE_INDEX_ALLOC`,
+personalities, restrictions and the registered-ring descriptors
+(`IORING_ENTER_REGISTERED_RING`). What is not there is absent from the probe
+rather than half-present.
 
 `userspace/bin/smoke/m125_smoke.c` drives the rings by hand in the posix lane —
 the head/tail protocol, the layout and the mmap offsets, not liburing's view of
@@ -194,50 +211,49 @@ which is how the tail of it is measured in a guest the head has not worn out.
 As of this milestone, measured in six parts at 4 GiB against the same harness
 on the branch point:
 
-| | before | after | after, on a boot that did not hit the defect below |
-|---|---|---|---|
-| pass | 89 | **106** | **116** |
-| fail | 73 | 45 | 57 |
-| skip | 48 | 28 | 31 |
-| timeout | 7 | 13 | 13 |
-| tests that ran | 217 | 192 | 217 |
+| | before | after |
+|---|---|---|
+| pass | 89 | **129** |
+| fail | 73 | 49 |
+| skip | 48 | 26 |
+| timeout | 7 | 13 |
+| tests that ran | 217 | 217 |
 
 Seventeen tests stopped skipping because the feature they probe for now exists.
-The middle column is this tree measured as it stands: two of the six boots end
-in the panic described below and lose the tests after it. The right-hand column
-is an intermediate build of the same feature set whose boots happened not to
-trip it, and is what the features are worth once the defect is fixed.
+The remaining failures are the opcodes still absent and tests for
+`IOSQE_IO_DRAIN` ordering. `fio --ioengine=io_uring` is the second consumer,
+run by stage 15 with `FIO=1 make debian-image`, plain and with
+`registerfiles=1 fixedbufs=1`.
 
-The timeouts went **up**, and that is worth saying plainly rather than hiding in
-the total: `socket`, `send_recv`, `send_recvmsg`, `sendmsg_iov_clean` and
-`recv-bundle-short-ooo` used to stop at a refused `IORING_OP_SOCKET` or a
-refused setup flag and now get past it, only to reach a UDP `bind(port = 0)`
-that this kernel does not answer with an ephemeral port — the same gap
-`accept.t` names with `t_bind_ephemeral_port: Assertion 'addr->sin_port != 0'`,
-and a networking one, not an io_uring one. The remaining failures are the
-opcodes still absent, the syzkaller reproducers (they `mmap` at a hint below
-4 GiB, which this kernel relocates), and tests for `IOSQE_IO_DRAIN` ordering.
-`fio --ioengine=io_uring` is the second consumer, run by stage 15 with
-`FIO=1 make debian-image`, plain and with `registerfiles=1 fixedbufs=1`.
+Three defects the suite found were **not in io_uring** and are fixed where they
+belong:
 
-**One defect liburing found is open, and it is worth the space.** Run the two
-syzkaller reproducers `232c93d07b74` and `a0908ae19763` in one boot together
-with the rest of their part of the suite, and the machine panics later — inside
-`__ext4_new_inode`, with the heap allocator's poison in a register, or inside
-`ext4_writepages` at the harness's closing `sync`. It needs **both**
-reproducers; either one alone is clean, at 4 GiB and at 8 GiB alike, so it is
-not simple exhaustion. It disappears if `IORING_OP_OPENAT` is refused — because
-the reproducers then create no files at all — which places the trigger at file
-creation under the process and memory churn two fork bombs make, and the defect
-in the create path's error handling rather than in io_uring. It is recorded here
-because io_uring is what made it reachable: before this milestone nothing could
-ask the kernel to create a file from a fuzzed SQE. Not root-caused.
+- `bind(port = 0)` on a stream socket left the port at zero, so `getsockname`
+  answered zero and `t_bind_ephemeral_port` asserted. `tcp_alloc_bind_port`
+  now hands out a port nothing in that network namespace holds, for AF_INET
+  and AF_INET6 alike. The gap `accept.t` named is closed.
+- An advisory `mmap` hint inside the low 4 GiB was silently relocated, because
+  that range is the identity window: 2 MiB supervisor huge pages cloned into
+  every address space. The page-fault path has split that huge page for a
+  covering VMA since `MAP_FIXED` needed it, so the hint is now honoured too —
+  every syzkaller reproducer maps its arena at `0x20000000` and then writes to
+  the address it asked for, and a relocated mapping made that a SIGSEGV. Below
+  the first huge page (the AP trampoline, the BIOS area) a hint is still
+  relocated: that memory is the kernel's.
+- A `fsync(2)` on an unlinked file on an imported filesystem answered `EINVAL`
+  (`lkpifs_fsync` now syncs through the superblock when the name is gone).
 
-Two defects liburing found were not in io_uring at all and are fixed here: a
-`fsync(2)` on an unlinked file on an imported filesystem answered `EINVAL`
-(`lkpifs_fsync` now syncs through the superblock when the name is gone), and a
+Left over from before: a
 static `ET_EXEC` faults in its own image before `main()`, which is why the
 suite is built `-static-pie`.
+
+The heap use-after-free this milestone used to record — a panic in
+`__ext4_new_inode` or `ext4_writepages` when both syzkaller reproducers ran in
+one boot — has not been seen since those reproducers started passing; part 1 of
+the suite now runs to its end. One boot of part 3 did panic during the final
+measurement and three re-runs of the same part were clean, so something rare is
+still there; its log was overwritten before it could be read, and it is not
+claimed fixed.
 
 ## Observability: perf_event_open (M126)
 

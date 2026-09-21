@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <linux/io_uring.h>
 #include <poll.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -523,6 +524,98 @@ static void check_pipe_async(void) {
 
   close(pfd[0]);
   close(pfd[1]);
+  ring_free(&r);
+}
+
+/* A completion that arrives while the owner is NOT in the kernel.
+ *
+ * io_uring_for_each_cqe reads shared memory: a program that submits and then
+ * watches the completion ring makes no system call at all, and liburing's
+ * socket tests are written that way. A request that only made progress inside
+ * io_uring_enter left them spinning for ever on data that had already been
+ * written. Nothing here enters the ring after the submission. */
+static void check_async_completion(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+  int pfd[2];
+  char buf[16];
+  pid_t child;
+
+  if (ring_make(&r, 8, 0, 0) < 0) {
+    bad("async-completion", "no ring", 0);
+    return;
+  }
+  if (pipe(pfd) < 0) {
+    bad("async-completion", "no pipe", -1);
+    ring_free(&r);
+    return;
+  }
+  memset(buf, 0, sizeof(buf));
+
+  struct io_uring_sqe *sqe = sq_get(&r);
+
+  sqe->opcode = IORING_OP_READ;
+  sqe->fd = pfd[0];
+  sqe->addr = (unsigned long long)(unsigned long)buf;
+  sqe->len = sizeof(buf);
+  sqe->off = (unsigned long long)-1;
+  sqe->user_data = 77;
+  if (io_uring_enter_(r.fd, 1, 0, 0, 0, 0) != 1) {
+    bad("async-completion", "the submission was refused", -1);
+    close(pfd[0]);
+    close(pfd[1]);
+    ring_free(&r);
+    return;
+  }
+
+  child = fork();
+  if (child == 0) {
+    struct timespec nap = {0, 200 * 1000 * 1000};
+
+    close(pfd[0]);
+    nanosleep(&nap, 0);
+    if (write(pfd[1], "async", 5) != 5)
+      _exit(1);
+    _exit(0);
+  }
+  if (child < 0) {
+    bad("async-completion", "fork failed", -1);
+    close(pfd[0]);
+    close(pfd[1]);
+    ring_free(&r);
+    return;
+  }
+  close(pfd[1]);
+
+  /* Watch the ring, and nothing else. Five seconds is twenty-five times the
+   * child's nap; a miss here is a completion that never came, not a slow one. */
+  struct timespec t0, now;
+  int got = 0;
+
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  for (;;) {
+    if (cq_get(&r, &cqe)) {
+      got = 1;
+      break;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec - t0.tv_sec > 5)
+      break;
+    sched_yield();
+  }
+  judge("async-completion",
+        got && cqe.user_data == 77 && cqe.res == 5 &&
+            memcmp(buf, "async", 5) == 0,
+        "a request armed on a pipe never completed while its owner stayed in "
+        "userspace",
+        got ? (long)cqe.res : -1L);
+
+  {
+    int st = 0;
+
+    waitpid(child, &st, 0);
+  }
+  close(pfd[0]);
   ring_free(&r);
 }
 
@@ -3278,6 +3371,7 @@ int main(void) {
   check_nop();
   check_file_rw();
   check_pipe_async();
+  check_async_completion();
   check_timeout_and_cancel();
   check_links();
   check_registration();

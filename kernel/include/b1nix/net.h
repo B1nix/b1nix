@@ -277,6 +277,7 @@ int tcp_close(struct tcp_conn *conn);
 /* Claim a connection slot for a listener (or 0 when the pool is exhausted). The
  * returned conn is stored on the socket state so a later close() reclaims it. */
 struct tcp_conn *tcp_listen(u16 local_port, int backlog);
+u16 tcp_alloc_bind_port(void);
 struct tcp_conn *tcp_accept(u16 local_port, struct ipv4_addr *client_ip, u16 *client_port);
 /* Socket-table snapshot for /proc/net/{tcp,udp} (netstat). Fills up to `max`
  * entries and returns the count written. `state` carries the Linux

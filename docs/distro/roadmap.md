@@ -104,11 +104,14 @@ ship to.
 
 ## Phase C: cgroup v2
 
-- [ ] `planned` Kernel milestone M127, pulled ahead of M125 because systemd's
+- [x] `done` Kernel milestone M127, pulled ahead of M125 because systemd's
   whole model rests on it: delegation, `MemoryMax`, `CPUWeight`,
   `memory.events`, PSI.
-- [ ] `planned` Proof through the distribution: systemd slices enforce limits,
-  `systemd-oomd` kills inside a cgroup, `/proc/pressure/*` moves under load.
+- [x] `partial` Proof through the distribution: on the systemd lane a
+  `MemoryMax=48M` unit's `tail /dev/zero` is SIGKILLed inside its own cgroup
+  while PID 1 carries on, two `CPUWeight=` units at 100 and 1000 divide the CPU
+  1:9.8 by their own `cpu.stat`, and `/proc/pressure/cpu` moves under that
+  load. `systemd-oomd` has not been run.
 
 Detail in [../kernel/roadmap.md](../kernel/roadmap.md) under M127.
 
@@ -175,7 +178,7 @@ distribution must not inherit.
 ## Running alongside
 
 Kernel work does not stop for the phases. What each remaining gap costs the
-distribution is in [../kernel/abi-gaps.md](../kernel/abi-gaps.md). M130 (Wi-Fi), M129 (power and
-suspend), M125 (io_uring) and M126 (perf, eBPF) each land as a
-`b1nix-kernel` release the overlay ships; the self-host build lane stays as a
-kernel test on release tags.
+distribution is in [../kernel/abi-gaps.md](../kernel/abi-gaps.md). M125
+(io_uring) and M126 (perf, eBPF) are closed; M130 (Wi-Fi) and M129 (power and
+suspend) each land as a `b1nix-kernel` release the overlay ships, and the
+self-host build lane stays as a kernel test on release tags.

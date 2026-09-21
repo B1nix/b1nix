@@ -19,6 +19,7 @@
  *   MM-SMOKE: ok wx-data-noexec
  *   MM-SMOKE: ok wx-exec-after-mprotect
  *   MM-SMOKE: ok wx-text-readonly
+ *   MM-SMOKE: ok mmap-low-hint (x86_64)
  *   MM-SMOKE: done
  */
 #include <signal.h>
@@ -914,6 +915,51 @@ static int test_wx_exec_after_mprotect(void) {
 }
 
 /* This program's own .text must not be writable. */
+/* ---- test: an advisory mmap hint in the low 4 GiB is honoured ------------
+ *
+ * Linux places a mapping at a free hint address, and programs written against
+ * that write to the address they asked for. On x86_64 the low 4 GiB is the
+ * kernel's identity window — 2 MiB supervisor huge pages in every address
+ * space — so a page there is a huge-page split away from working, and the
+ * hint used to be silently relocated: the program then stored to a supervisor
+ * page and died with SIGSEGV. The aarch64 port shares its first L0 entry
+ * between the kernel and every process, so a low hint is relocated there by
+ * design and this check does not apply. */
+#if defined(__x86_64__)
+static int test_mmap_low_hint(void) {
+	void *hint = (void *)0x20000000UL;
+	size_t len = 0x100000; /* 1 MiB, inside one 2 MiB identity huge page */
+	volatile unsigned char *p;
+
+	p = mmap(hint, len, PROT_READ | PROT_WRITE,
+	         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED)
+		return 1;
+	if ((void *)p != hint) {
+		munmap((void *)p, len);
+		return 2;
+	}
+	p[0] = 0xa5;
+	p[len - 1] = 0x5a;
+	if (p[0] != 0xa5 || p[len - 1] != 0x5a) {
+		munmap((void *)p, len);
+		return 3;
+	}
+	/* The pages around the written ones are the split's own leaves, and must
+	 * read as anonymous zeroes rather than as whatever the identity window
+	 * mapped there. */
+	for (size_t off = 4096; off < len - 4096; off += 4096) {
+		if (p[off] != 0) {
+			munmap((void *)p, len);
+			return 4;
+		}
+	}
+	if (munmap((void *)p, len) != 0)
+		return 5;
+	return 0;
+}
+#endif
+
 static int test_wx_text_readonly(void) {
 	int status = child_status(child_write_text, (void *)(uintptr_t)&marker);
 
@@ -1031,6 +1077,15 @@ int main(void) {
 		return 150 + rc;
 	}
 	marker("MM-SMOKE: ok wx-text-readonly\n");
+
+#if defined(__x86_64__)
+	rc = test_mmap_low_hint();
+	if (rc != 0) {
+		marker_fail("mmap-low-hint", rc);
+		return 160 + rc;
+	}
+	marker("MM-SMOKE: ok mmap-low-hint\n");
+#endif
 
 	marker("MM-SMOKE: done\n");
 	return 0;

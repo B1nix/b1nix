@@ -6,8 +6,7 @@ incomplete or limited · `planned` not implemented · `deferred` postponed ·
 
 This is the kernel's roadmap. The distribution built on it has its own, in
 [../distro/roadmap.md](../distro/roadmap.md); its phases name the kernel
-milestones they block on, and M127 is ahead of M125 because systemd's model
-rests on cgroup v2.
+milestones they block on.
 
 Userspace is not written here. It comes from existing distributions — Debian
 trixie for the distribution itself and the glibc ABI lane, Alpine for the fast
@@ -164,6 +163,10 @@ answers which question, are in [../versioning.md](../versioning.md).
 | M121 Kernel only | done | Own userspace replaced by Alpine and Debian packages, native syscall ABI archived (`archive/kernel/native-abi/`); self-hosted kernel boots; Debian glibc lane 41/41; aarch64 wedges, zstd btrfs and a dentry-list heap corruption fixed. |
 | M122 Known corruption and SMP defects | done | Block-cache writeback claims, PMM metadata off the AP trampoline, page-cache insert race, task claim by lease CAS, no double reap; proven by `fsverify` at 6 CPUs (14/14) and soak runs. |
 | M123 Namespaces for containers | done | User, IPC, cgroup, PID (real init) and time namespaces; mount table tracks attachment for binds and `pivot_root`; `unshare`, `bwrap`, rootless `podman` and `systemd-nspawn` run. |
+| M124 Missing modern system calls | done | `openat2`, `pidfd_getfd`, `kcmp`, futex2, `process_mrelease`/`process_madvise`, `sched_setattr`; keyrings, Landlock, PKU, `memfd_secret`; `statmount`/`listmount`, `cachestat`, `remap_file_pages`, mempolicy, ext4's own `quotactl`; a vDSO on both arches. Probed 66/66 in the Debian lane. |
+| M125 io_uring | done | Every opcode this uapi names but `RECV_ZC`, SQPOLL/IOPOLL, provided buffers in both shapes, multishot, direct descriptors, personalities and restrictions; a completion thread per ring, so a request completes while its owner watches the ring from userspace. liburing 2.12: 89 → 129 pass over all 217. One rare panic in part 3 of that suite is unexplained — see [processes-and-system-calls.md](processes-and-system-calls.md). |
+| M126 Observability | done | `perf_event_open` with the CPU's own PMU, sampling, `inherit`, `enable_on_exec` and group reads — the distribution's `perf stat`/`record`/`report` run on it; `userfaultfd`; `fanotify` with permission events; eBPF as an interpreter with a path-walking verifier (`partial`: no JIT, BTF, CO-RE or kprobes). The ad-hoc `kprof` profiler is gone. |
+| M127 Resource control | done | cgroup v2 `memory`/`cpu`/`io`/`pids`, an OOM killer that ranks by RSS and `oom_score_adj`, PSI, zram and zswap, and reclaim inside a cgroup with every swapped page charged to its owner. Proved on Alpine and against Debian's own systemd units. |
 
 ## M102b: amdgpu on RX 6600 (render-only) + radeonsi
 
@@ -174,51 +177,6 @@ answers which question, are in [../versioning.md](../versioning.md).
 ## M102c: nouveau
 
 - [ ] `planned` Pick generation (pre-Turing without signed firmware vs GSP); import unmodified, fix the shim.
-
-## M124: Missing modern system calls
-
-Per-call state: [processes-and-system-calls.md](processes-and-system-calls.md).
-
-- [x] `done` Process and threading: `openat2` (`RESOLVE_*`), `pidfd_getfd`, `kcmp`, futex2 (`futex_waitv`, `futex_wake`, `futex_wait`), `process_mrelease`, `process_madvise`, `sched_setattr`/`sched_getattr`.
-- [x] `done` Security: the key retention service (`keyctl`, `add_key`, `request_key`), Landlock (ABI 3, enforced in the VFS and on exec), protection keys (x86 PKU: per-thread PKRU, `pkey_alloc`/`pkey_free`/`pkey_mprotect`, execute-only mappings, `SEGV_PKUERR`), and `memfd_secret`, whose pages are removed from every kernel mapping of physical memory.
-- [x] `done` Filesystems and memory: `statmount`/`listmount` with never-reused mount ids, `cachestat`, `remap_file_pages`, `mbind`/`get_mempolicy`/`set_mempolicy`/`set_mempolicy_home_node` with single-node semantics, and `quotactl`/`quotactl_fd` on the imported filesystems — ext4's own quotas, enforced.
-- [x] `done` A vDSO on x86_64 and aarch64: `clock_gettime`, `gettimeofday`, `time` and `clock_getres` without entering the kernel for the TSC/CNTVCT clocks (32 ns vs 262 ns per call on KVM); musl and glibc both use it.
-- [x] `done` Each call is probed in the Debian lane by its result and errno (66/66) and in `m124_smoke` on both arches; protection keys are proved on a CPU that has them in the `pku` lane (QEMU TCG `-cpu max`), and quotas against the distribution's own `mkfs.ext4 -O quota`, `setquota`, `repquota` and `e2fsck`. The unmapped-syscall log line stays silent through a Plasma session. Chromium was not run.
-
-## M125: io_uring
-
-Per-feature detail: [processes-and-system-calls.md](processes-and-system-calls.md).
-
-- [x] `done` `io_uring_setup`/`io_uring_enter`/`io_uring_register` against Linux 6.18.51's uapi header, vendored rather than retyped: the shared rings, `IORING_SETUP_SQPOLL` (a kernel thread that adopts the owner's address space and descriptor table, with `sq_thread_idle` and `IORING_SQ_NEED_WAKEUP`), `IOPOLL`, `CQE32`, `SQE128`, `NO_SQARRAY`, `DEFER_TASKRUN` and `R_DISABLED`. What is still refused is refused at setup with Linux's own errno: `SQ_AFF` (nothing can pin the thread), `ATTACH_WQ`, `NO_MMAP`, `REGISTERED_FD_ONLY`, `HYBRID_IOPOLL`, `CQE_MIXED`.
-- [x] `done` 48 opcodes, and nothing else pretends to work: the filesystem set (`OPENAT`/`OPENAT2`/`STATX`/`FALLOCATE`/`FTRUNCATE`/`RENAMEAT`/`UNLINKAT`/`MKDIRAT`/`SYMLINKAT`/`LINKAT`), the socket set (`SENDMSG`/`RECVMSG`/`SEND_ZC`/`SENDMSG_ZC`/`SHUTDOWN`/`SOCKET`/`BIND`/`LISTEN`), `SPLICE`/`TEE`/`EPOLL_CTL`/`MSG_RING`/`WAITID`/`PIPE`/`FIXED_FD_INSTALL`, and the advisory pair. An unimplemented opcode is `EINVAL` and `IORING_REGISTER_PROBE` names exactly the set that works.
-  Provided buffers come in both shapes (`PROVIDE_BUFFERS`/`REMOVE_BUFFERS` and `REGISTER_PBUF_RING`, selected with `IOSQE_BUFFER_SELECT` and reported in `IORING_CQE_F_BUFFER`), multishot poll/accept/recv/read with `IORING_CQE_F_MORE`, direct descriptors including `IORING_FILE_INDEX_ALLOC`, and the register operations `BUFFERS2`/`BUFFERS_UPDATE`/`FILES2`/`RESTRICTIONS`/`SYNC_CANCEL`/`FILE_ALLOC_RANGE`/`IOWQ_MAX_WORKERS`/`PBUF_STATUS`.
-- [x] `done` Completion from the existing ISR→wakeup paths (M70) rather than a thread per request, and a link chain is issued in a **loop**: one C frame per chain, not per link — `fpos.t` links 2048 reads and one frame each ran off the 256 KiB kernel stack.
-- [x] `done` Proof: 79 checks in the posix lane drive the rings by hand, and liburing 2.12's own 217 tests run in the Debian lane in six parts at 4 GiB. Against the same harness on the branch point: **89 → 106 pass, 73 → 45 fail, 48 → 28 skip, 7 → 13 timeout**; the baseline ran all 217, this tree runs 192 because the defect below kills two of the six boots. An intermediate build of the same feature set, whose boots happened not to hit it, measured **116 pass, 57 fail, 31 skip, 13 timeout over all 217** — that is what the features are worth once the defect is fixed. The extra timeouts are tests that used to stop at a refused setup and now reach a UDP `bind(port = 0)`, which this kernel does not give an ephemeral port — the gap `accept.t` already named. `fio --ioengine=io_uring` moves data, plain and with registered files and buffers.
-- [ ] `open` **A heap use-after-free in the imported ext4, newly reachable.** Running liburing's two syzkaller reproducers `232c93d07b74` and `a0908ae19763` in one boot, together with the rest of that part of the suite, panics later in `__ext4_new_inode` (a register holding the allocator's poison) or in `ext4_writepages` at the closing `sync`. It needs BOTH reproducers — each alone is clean — and it disappears if `IORING_OP_OPENAT` is refused, because the reproducers then create no files. So the trigger is file creation under the process and memory churn two fork bombs make, and the defect is in the create path's error handling, not in io_uring; it is recorded here because io_uring is what made it reachable. Not root-caused. Reproduce with `DEBIAN_MEM_MB=4096 DEBIAN_EXTRA_CMDLINE=b1nix.liburing-part=1/6 sh tests/debian-smoke.sh`.
-
-## M126: Observability
-
-Per-feature detail: [processes-and-system-calls.md](processes-and-system-calls.md).
-
-- [x] `done` `perf_event_open`: software counters, the CPU's own PMU (cycles, instructions, cache and branch events through CPUID's architectural leaf, on the fixed counters where a KVM guest only backs those), `PERF_TYPE_RAW` and the `HW_CACHE` pairs an architectural PMU really has. Timer-driven sampling with user call chains, the mmap'd ring buffer, `attr.inherit`, `enable_on_exec`, group reads and `PERF_FORMAT_LOST`. `/proc/sys/kernel/perf_event_paranoid` decides what an unprivileged caller may profile.
-- [x] `done` `userfaultfd`: MISSING and write-protect faults handed to a monitor, `UFFDIO_COPY`, `ZEROPAGE`, `WAKE`, `WRITEPROTECT`, `REGISTER`/`UNREGISTER`, `poll(2)` and the non-blocking read. MINOR faults are refused (there is no page cache behind the mappings to show), and a monitor that closes its descriptor releases every waiter instead of freezing the process.
-- [x] `done` `fanotify`: marks on a file or on a whole mount, `FAN_OPEN`/`ACCESS`/`MODIFY`/`CLOSE_WRITE`/`CLOSE_NOWRITE`, an open descriptor per event, and permission events (`FAN_OPEN_PERM`) whose `FAN_DENY` really makes `open(2)` return EPERM. The same hooks gave inotify the `IN_OPEN`, `IN_ACCESS` and `IN_CLOSE_*` events it never had.
-- [x] `partial` eBPF: the whole instruction set in an interpreter, hash and array maps, ten helpers, `BPF_PROG_TEST_RUN`, and programs attached to a perf event with `PERF_EVENT_IOC_SET_BPF`. The verifier walks every path with a model of each register and refuses uninitialised reads, out-of-bounds stack and map access, a map value used before it is tested for NULL, and backward jumps. **No JIT, no BTF and no CO-RE**, no kprobe or tracepoint attach points, and no bounded loops — a program from `bpftrace` or a CO-RE toolchain will not load, and says so at load time with the reason in the verifier log.
-- [x] `done` The ad-hoc kernel profiler is gone: `kprof`'s RIP histogram and its `b1nix.sysprof` boot flag were 200 lines answering the question perf now answers better, and `/proc/b1nix-kprof` says where to look instead. What stays there is what perf cannot answer here — the tick distribution, the interrupts-off sections, the wait sites.
-- [x] `done` Proof, three ways. 22 checks in the posix lane (`m126_smoke`, `m126_uffd_smoke`, `m126_fanotify_smoke`, `m126_bpf_smoke`) each make the thing they measure happen: 120 ms of work retires 400 million instructions on the PMU and a blocked child is credited with 21 thousand, a monitor fills a page a thread is waiting on, `FAN_DENY` turns an open into EPERM, and a BPF program counts 60 samples into a map. The **distribution's own perf** runs in the Debian lane: `perf stat` counts 2.34 billion instructions in 976 million cycles, `perf record` takes 80 samples through the ring buffer, and `perf report` reads its own `perf.data` back and attributes them to symbols.
-
-## M127: Resource control
-
-Ahead of M125 and M126: it blocks phase C of
-[../distro/roadmap.md](../distro/roadmap.md), and no ISO ships before it.
-
-Per-controller detail: [memory-and-scheduling.md](memory-and-scheduling.md).
-
-- [x] `done` cgroup v2 controllers, each advertised only because it is enforced: `memory` (`memory.current` measured from the members' page tables, `memory.max` enforced from the fault path on an exact measurement), `cpu` (`cpu.weight` as a stride on the M117 scheduler, `cpu.max` as a quota per period), `io` (per-device `io.stat` and rate ceilings at the block layer) and `pids`.
-- [x] `done` An OOM killer that ranks by resident size and `oom_score_adj` — one walk shared by the machine-wide and the per-cgroup killer — and a `memory.events` that counts only what happened.
-- [x] `done` PSI at `/proc/pressure/{cpu,memory,io}`, measured from stall regions in the block layer, reclaim and swap-in. No per-cgroup pressure files: they would be copies of the global one.
-- [x] `done` Compressed swap and reclaim inside a cgroup: `/dev/zram0` (a block device whose blocks live LZ4-compressed in RAM, sized through `/sys/block/zram0/disksize`, measured by `mm_stat`), zswap in front of a real device, and a `memory.max` that now reclaims the cgroup's OWN pages before it kills anything. Every page written out is charged to the cgroup that owned it, so `memory.swap.current`, `memory.swap.max` and `memory.stat`'s `pgscan`/`pgsteal` are measured rather than reported as zero.
-- [x] `done` Proved twice: `m127_smoke` and `m127_swap_smoke` on the Alpine lane (22 checks, every one an observed kill, refusal, ratio or byte that came back out of a compressed device) and Debian's own systemd on the systemd lane, where a `MemoryMax=48M` unit's `tail /dev/zero` dies of `SIGKILL` inside it within a second while PID 1 carries on, two `CPUWeight=` units at 100 and 1000 divide the CPU 1:9.8 by their own `cpu.stat`, and `/proc/pressure/cpu` moves under that load.
 
 ## M128: Large memory and NUMA
 

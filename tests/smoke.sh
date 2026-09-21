@@ -2127,6 +2127,11 @@ check_output "$LOG" "MM-SMOKE: ok mmap-after-sigkill" "a task SIGKILLed inside m
 check_output "$LOG" "MM-SMOKE: ok wx-data-noexec" "W^X: an anonymous PROT_READ|PROT_WRITE mapping is not executable — jumping into it raises SIGSEGV"
 check_output "$LOG" "MM-SMOKE: ok wx-exec-after-mprotect" "W^X: mprotect(PROT_READ|PROT_EXEC) still grants execute, so the JIT flip every runtime performs keeps working"
 check_output "$LOG" "MM-SMOKE: ok wx-text-readonly" "W^X: a process's own .text is not writable"
+if [ "$ARCH" = "aarch64" ]; then
+	skipped "MM-SMOKE: ok mmap-low-hint" "this port shares its first L0 entry between the kernel and every process, so a mapping hint under 512 GiB is relocated by design"
+else
+	check_output "$LOG" "MM-SMOKE: ok mmap-low-hint" "an advisory mmap hint inside the low 4 GiB identity window is honoured and the pages there are ordinary anonymous memory (a relocated hint made every program that writes to the address it asked for die with SIGSEGV)"
+fi
 check_output "$LOG" "MM-SMOKE: done" "MM smoke completes"
 
 # ── M40 Linux ABI compatibility ──
@@ -3063,6 +3068,7 @@ check_output "$POSIX_LOG" "M125-SMOKE: ok file-fsync" "IORING_OP_FSYNC completes
 check_output "$POSIX_LOG" "M125-SMOKE: ok pipe-submit-does-not-block" "submitting a read on an empty pipe returns at once instead of blocking the submitter"
 check_output "$POSIX_LOG" "M125-SMOKE: ok pipe-not-complete-yet" "that read has no completion until there is data"
 check_output "$POSIX_LOG" "M125-SMOKE: ok pipe-async" "the armed pipe read completes with the data once it arrives"
+check_output "$POSIX_LOG" "M125-SMOKE: ok async-completion" "a request left armed completes while its owner is in userspace and never re-enters the ring (io_uring_for_each_cqe reads shared memory, so a program that submits and then watches the ring makes no system call at all)"
 check_output "$POSIX_LOG" "M125-SMOKE: ok poll-add" "IORING_OP_POLL_ADD reports POLLIN when the pipe becomes readable"
 check_output "$POSIX_LOG" "M125-SMOKE: ok timeout" "IORING_OP_TIMEOUT expires with -ETIME after its interval and not before"
 check_output "$POSIX_LOG" "M125-SMOKE: ok cancel" "IORING_OP_ASYNC_CANCEL takes down a pending poll: -ECANCELED for it, 0 for the cancel"

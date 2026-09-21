@@ -967,6 +967,41 @@ static u16 tcp_alloc_port(void) {
   return port;
 }
 
+/* An ephemeral local port for a bind(port=0) on a stream socket.
+ *
+ * bind(2) with port 0 asks the kernel to pick one, and getsockname(2) is how
+ * the caller learns which — liburing's socket tests bind that way and assert
+ * on the answer, and a port left at zero makes every connect to it go to
+ * port 0. Skips anything this namespace already holds; the search is bounded,
+ * and an exhausted range says so rather than handing out a duplicate. */
+u16 tcp_alloc_bind_port(void) {
+  u64 irq = irq_save();
+  u32 ns;
+  u16 got = 0;
+
+  tcp_lock();
+  ns = namespace_net_current();
+  for (int tries = 0; tries < 64512 && !got; tries++) {
+    u16 port = tcp_alloc_port();
+    int taken = 0;
+
+    if (port < 1025)
+      continue;
+    for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
+      if (tcp_conns[i].used && tcp_conns[i].netns == ns &&
+          tcp_conns[i].local_port == port) {
+        taken = 1;
+        break;
+      }
+    }
+    if (!taken)
+      got = port;
+  }
+  tcp_unlock();
+  irq_restore(irq);
+  return got;
+}
+
 /* ── Find connection by remote (family-aware) ── */
 static struct tcp_conn *tcp_find_conn_af(u8 family, struct ipv4_addr v4,
                                          const struct in6_addr_k *v6,

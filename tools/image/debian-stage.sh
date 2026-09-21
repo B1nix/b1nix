@@ -798,6 +798,11 @@ if [ -d /opt/liburing ] && ls /opt/liburing/*.t >/dev/null 2>&1; then
 	# what makes the last test as trustworthy as the first.
 	lu_part=$(sed -n 's/.*b1nix\.liburing-part=\([0-9]*\/[0-9]*\).*/\1/p' \
 		/proc/cmdline 2>/dev/null)
+	# b1nix.liburing-timeout=<seconds> replaces the per-test kill timeout, for
+	# watching a test that hangs run to its end instead of dying at 20 s.
+	lu_to=$(sed -n 's/.*b1nix\.liburing-timeout=\([0-9]*\).*/\1/p' \
+		/proc/cmdline 2>/dev/null)
+	lu_to=${lu_to:-${LIBURING_TIMEOUT:-20}}
 	lu_pn=${lu_part%%/*}
 	lu_pm=${lu_part##*/}
 	lu_idx=0
@@ -820,7 +825,7 @@ if [ -d /opt/liburing ] && ls /opt/liburing/*.t >/dev/null 2>&1; then
 			continue
 			;;
 		esac
-		timeout -s KILL "${LIBURING_TIMEOUT:-20}" "$t" >/tmp/liburing-run/out 2>&1
+		timeout -s KILL "$lu_to" "$t" >/tmp/liburing-run/out 2>&1
 		rc=$?
 		case $rc in
 		0)
@@ -840,6 +845,11 @@ if [ -d /opt/liburing ] && ls /opt/liburing/*.t >/dev/null 2>&1; then
 			echo "DEBIAN-SMOKE: liburing-fail $n rc=$rc $(tail -3 /tmp/liburing-run/out 2>/dev/null | tr -d '\r' | tr '\n' '|')"
 			;;
 		esac
+		# A single named test is somebody working on that one failure: print
+		# everything it said, not the two lines a whole-suite run can afford.
+		if [ -n "$lu_only" ]; then
+			sed 's/^/DEBIAN-SMOKE: liburing-out /' /tmp/liburing-run/out 2>/dev/null
+		fi
 		rm -rf /tmp/liburing-run/* 2>/dev/null
 	done
 	cd / || exit 1
