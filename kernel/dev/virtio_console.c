@@ -26,6 +26,7 @@
 #include <b1nix/virtio.h>
 #include <b1nix/virtio_console.h>
 #include <string.h>
+#include <b1nix/suspend.h>
 
 #define VIRTIO_VENDOR_ID 0x1AF4
 #define VIRTIO_CONSOLE_DEVICE_ID_MODERN 0x1043 /* virtio device type 3 */
@@ -335,8 +336,12 @@ void virtio_console_poll(void)
 		*q->notify = q->vq.queue_idx;
 	spin_unlock(&vc_lock);
 	interrupts_restore(flags);
-	if (got)
+	if (got) {
 		serial_tty_hvc_input(in, got);
+		/* Typing on the virtual console ends a suspend, as typing on a real
+		 * one does (M129). */
+		suspend_wake_event("console");
+	}
 }
 
 void virtio_console_init(void)

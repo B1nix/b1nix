@@ -23,6 +23,8 @@
 #include <b1nix/vfs.h>
 #include <string.h>
 #include <b1nix/platform.h>
+#include <b1nix/irq.h>
+#include <b1nix/suspend.h>
 
 #define CMOS_ADDR 0x70
 #define CMOS_DATA 0x71
@@ -309,9 +311,12 @@ static int rtc_alarm_read(struct rtc_wkalrm_k *out) {
   u32 match = *pl031_reg(PL031_MR);
   u32 mask = *pl031_reg(PL031_IMSC);
   u32 ris = *pl031_reg(PL031_RIS);
+  u32 dr = pl031_present() ? *pl031_reg(PL031_DR) : match;
   spin_unlock_irqrestore(&rtc_lock, flags);
   memset(out, 0, sizeof(*out));
-  rtc_epoch_to_tm(match, &out->time);
+  /* Back through the same two clocks the write crossed, so RTC_WKALM_RD
+   * reports the time of day RTC_WKALM_SET was given. */
+  rtc_epoch_to_tm(rtc_now_unix_seconds() + (u64)(u32)(match - dr), &out->time);
   out->enabled = (mask & 1) ? 1 : 0;
   out->pending = (ris & 1) ? 1 : 0;
   return 0;
@@ -326,14 +331,26 @@ static int rtc_alarm_write(const struct rtc_time_k *t, int enable) {
       t->tm_hour < 0 || t->tm_hour > 23)
     return -EINVAL;
   u64 flags;
+  /* The time of day is resolved against the clock RTC_RD_TIME reports (the
+   * wall clock), and the match register is then written in the counter's own
+   * domain. Those are two clocks: rtc_hw_read answers from the wall clock,
+   * which is anchored to the PL031 at boot and settable afterwards, while the
+   * match register is compared against the raw PL031 counter. Building the
+   * alarm from the counter and comparing it with a time of day the caller
+   * read from the wall clock put the alarm a whole day out the moment
+   * anything set the clock -- so the delta is computed in one domain and
+   * applied in the other. */
+  u64 delta;
   spin_lock_irqsave(&rtc_lock, &flags);
-  u64 now = *pl031_reg(PL031_DR);
-  u64 midnight = (now / 86400ULL) * 86400ULL;
+  u64 wall = rtc_now_unix_seconds();
+  u64 dr = pl031_present() ? *pl031_reg(PL031_DR) : wall;
+  u64 midnight = (wall / 86400ULL) * 86400ULL;
   u64 when = midnight + (u64)t->tm_hour * 3600ULL + (u64)t->tm_min * 60ULL +
              (u64)t->tm_sec;
-  if (when <= now)
+  if (when <= wall)
     when += 86400ULL;
-  *pl031_reg(PL031_MR) = (u32)when;
+  delta = when - wall;
+  *pl031_reg(PL031_MR) = (u32)(dr + delta);
   *pl031_reg(PL031_ICR) = 1;
   *pl031_reg(PL031_IMSC) = enable ? 1u : 0u;
   spin_unlock_irqrestore(&rtc_lock, flags);
@@ -351,6 +368,53 @@ static int rtc_set_status_b(u8 bit, int on) {
   *pl031_reg(PL031_IMSC) = on ? 1u : 0u;
   spin_unlock_irqrestore(&rtc_lock, flags);
   return 0;
+}
+
+/* ── The alarm as a wake source (M129) ──────────────────────────────────
+ *
+ * QEMU virt wires the PL031 to SPI 2, i.e. GIC INTID 34; the device tree says
+ * so and no other board this port runs on has a PL031 at all, which is the
+ * same condition pl031_present() already answers. The handler clears the
+ * match in ICR — an interrupt left asserted at the device is an interrupt the
+ * GIC re-delivers for ever — and hands the wake to the suspend path. */
+#define PL031_IRQ 34
+
+static volatile u64 g_rtc_irq_count;
+
+static int rtc_alarm_irq(void *ctx) {
+  u64 flags;
+  u32 ris;
+
+  (void)ctx;
+  spin_lock_irqsave(&rtc_lock, &flags);
+  ris = *pl031_reg(PL031_RIS);
+  if (ris & 1)
+    *pl031_reg(PL031_ICR) = 1;
+  spin_unlock_irqrestore(&rtc_lock, flags);
+  if (!(ris & 1))
+    return 0;
+  __atomic_fetch_add(&g_rtc_irq_count, 1, __ATOMIC_RELAXED);
+  suspend_wake_event("rtc");
+  return 1;
+}
+
+static int rtc_wake_armed_cb(void *ctx) {
+  (void)ctx;
+  return pl031_present() && (*pl031_reg(PL031_IMSC) & 1);
+}
+
+void rtc_wake_source_init(void) {
+  if (!pl031_present())
+    return;
+  if (irq_register_handler(PL031_IRQ, rtc_alarm_irq, 0) != 0)
+    return;
+  *pl031_reg(PL031_ICR) = 1; /* whatever is stale, before the line is live */
+  irq_unmask_isa(PL031_IRQ);
+  suspend_register_wake_source("rtc", rtc_wake_armed_cb, 0);
+}
+
+u64 rtc_wake_irq_count(void) {
+  return __atomic_load_n(&g_rtc_irq_count, __ATOMIC_RELAXED);
 }
 
 /* The wall clock is monotonic time plus a base (kernel/lib/wallclock.c),
@@ -587,6 +651,75 @@ static int rtc_set_status_b(u8 bit, int on) {
   cmos_write(CMOS_STATUS_B, b);
   spin_unlock_irqrestore(&rtc_lock, flags);
   return 0;
+}
+
+
+/* ── The alarm as a wake source (M129) ──────────────────────────────────
+ *
+ * The CMOS alarm registers have been writable since M107 and nothing was
+ * listening: IRQ 8 was never routed, so `rtcwake` could arm an alarm that
+ * interrupted nothing. It is claimed here.
+ *
+ * Two details decide whether this works at all. The line is ISA — edge
+ * triggered, active high — so it is routed with irq_unmask_isa rather than
+ * the PCI INTx defaults irq_unmask assumes; programmed as active-low level it
+ * reads as permanently asserted and the machine takes the interrupt for ever.
+ * And the MC146818 raises exactly ONE interrupt until status register C is
+ * read: C latches the alarm/periodic/update flags and clears them on read, so
+ * a handler that does not read it gets one alarm per boot.
+ *
+ * The lock matters too. The CMOS is an index/data port pair, so an ioctl that
+ * has written 0x0B into port 0x70 and been interrupted before reading 0x71
+ * would read register C's value as register B's. rtc_lock is taken with
+ * interrupts saved for exactly this reason.
+ */
+static volatile u64 g_rtc_irq_count;
+
+static int rtc_alarm_irq(void *ctx) {
+  u64 flags;
+  u8 c;
+
+  (void)ctx;
+  spin_lock_irqsave(&rtc_lock, &flags);
+  c = cmos_read(0x0C); /* reading it is the acknowledgement */
+  spin_unlock_irqrestore(&rtc_lock, flags);
+  /* Bits 6..4 are the periodic, alarm and update-ended flags. None set means
+   * the line was not ours — IRQ 8 can be shared. */
+  if (!(c & 0x70))
+    return 0;
+  __atomic_fetch_add(&g_rtc_irq_count, 1, __ATOMIC_RELAXED);
+  if (c & 0x20)
+    suspend_wake_event("rtc");
+  return 1;
+}
+
+static int rtc_wake_armed_cb(void *ctx) {
+  u64 flags;
+  u8 b;
+
+  (void)ctx;
+  spin_lock_irqsave(&rtc_lock, &flags);
+  b = cmos_read(CMOS_STATUS_B);
+  spin_unlock_irqrestore(&rtc_lock, flags);
+  return (b & RTC_B_AIE) ? 1 : 0;
+}
+
+void rtc_wake_source_init(void) {
+  u64 flags;
+
+  if (irq_register_handler(8, rtc_alarm_irq, 0) != 0)
+    return;
+  /* Drain whatever the firmware left latched, or the first real alarm never
+   * arrives: the MC146818 holds IRQF asserted until C is read. */
+  spin_lock_irqsave(&rtc_lock, &flags);
+  (void)cmos_read(0x0C);
+  spin_unlock_irqrestore(&rtc_lock, flags);
+  irq_unmask_isa(8);
+  suspend_register_wake_source("rtc", rtc_wake_armed_cb, 0);
+}
+
+u64 rtc_wake_irq_count(void) {
+  return __atomic_load_n(&g_rtc_irq_count, __ATOMIC_RELAXED);
 }
 
 #endif /* CMOS vs PL031 backend */

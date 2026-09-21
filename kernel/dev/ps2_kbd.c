@@ -4,6 +4,7 @@
 #include <b1nix/ktime.h>
 #include <b1nix/input.h>
 #include <b1nix/io.h>
+#include <b1nix/suspend.h>
 #include <b1nix/sched.h>
 #include <b1nix/types.h>
 #include <b1nix/bootinfo.h>
@@ -99,6 +100,8 @@ static u8 kbd_dev_read(void) { return 0; }
  * init compose regardless of order. */
 void ps2_kbd_init(void)
 {
+	/* A key can end a suspend once this controller is live (M129). */
+	suspend_register_input_source();
 	kbd_debug_enabled = bootinfo_has_flag("b1nix.kbd-debug");
 
 	/* M107: hand the builtin layout to the VT keymap. From here on every
@@ -396,6 +399,12 @@ void ps2_kbd_interrupt_handler(void)
 		}
 		u8 data = inb(0x60);
 
+		/* A key ends a suspend (M129) — but only a key. This function is
+		 * also called from the timer tick to poll the controller, and
+		 * reporting a wake on entry ended every suspend in two
+		 * milliseconds, "woken by keyboard", with nobody at the keyboard.
+		 * A byte really came out of the controller here. */
+		suspend_wake_event("keyboard");
 		if (status & 0x20) {
 			ps2_mouse_handle_byte(data);
 		} else {

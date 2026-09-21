@@ -17,6 +17,7 @@
 void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
+u64 paging_cr3_to_pml4(u64 cr3);
 #include <b1nix/serial.h>
 #include <b1nix/panic.h>
 #include <b1nix/perf_event.h>
@@ -33,6 +34,15 @@ void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/types.h>
 #include <stdio.h>
 #include <string.h>
+
+/* Local-timer interrupts taken on this machine. /proc/interrupts prints it as
+ * LOC, and it is how a tickless kernel is told from one that merely claims to
+ * be: an idle second costs a handful of these instead of a thousand (M129). */
+static volatile u64 g_local_timer_irqs;
+
+u64 arch_local_timer_count(void) {
+  return __atomic_load_n(&g_local_timer_irqs, __ATOMIC_RELAXED);
+}
 
 /* ── Page-fault profile ─────────────────────────────────────────────────────
  * How many demand-paging faults a run takes and what they cost, printed beside
@@ -609,6 +619,18 @@ int irq_dispatch(int irq) {
 
 void irq_unmask(u32 irq) { if (irq < 256) x86_pic_unmask((u8)irq); }
 
+/* The same line, with ISA rather than PCI defaults -- see irq.h. */
+void irq_unmask_isa(u32 irq) {
+  if (irq >= 16)
+    return;
+  if (ioapic_active()) {
+    ioapic_route_irq((u8)irq, (u8)(32 + irq), (u8)lapic_id(),
+                     /*level_low=*/0);
+    return;
+  }
+  x86_pic_unmask((u8)irq);
+}
+
 void x86_pic_unmask(u8 irq) {
   /* IOAPIC mode: program a redirection entry instead of poking the (now
    * masked) 8259. Default to PCI semantics — level-triggered, active-low —
@@ -692,6 +714,12 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
    * still gated on the VFS chain-walk rwlock audit, M28 item 3). */
   if (frame->vector == 64) {
     struct percpu *pcpu = get_percpu();
+
+    /* Every local-timer interrupt, counted. It is what /proc/interrupts calls
+     * LOC, and it is how a tickless kernel is told from a kernel that merely
+     * says it is one: an idle second costs a handful of these instead of a
+     * thousand (M129). */
+    __atomic_fetch_add(&g_local_timer_irqs, 1, __ATOMIC_RELAXED);
 
     /* Pick up (and re-assert) a watchpoint request. */
     if (watch_addr)
@@ -906,7 +934,95 @@ static void x86_irq_handler_dispatch(struct interrupt_frame *frame) {
   x86_irq_handler_inner(frame);
 }
 
+/* ── MSR reads and writes that may fault (M129) ──────────────────────────
+ *
+ * A model-specific register is only there if the processor says it is, and
+ * the CPUID bit that says so is not always enough: a hypervisor can advertise
+ * a feature and still #GP on the register behind it (KVM does exactly this
+ * for several of the power-management ones). A kernel that reads such a
+ * register on the strength of the CPUID bit alone dies on the machines it was
+ * supposed to work on.
+ *
+ * So the accessor records the instruction it is about to run, and the #GP
+ * handler below looks for that record: if the fault is at the recorded
+ * address, it steps over the instruction and reports the failure instead of
+ * killing the machine. Per CPU, because two cores may probe at once, and
+ * armed for exactly one instruction. */
+struct msr_probe {
+  u64 rip;    /* the rdmsr/wrmsr this CPU is running, 0 when not probing */
+  u32 faulted;
+};
+static struct msr_probe g_msr_probe[MAX_CPUS];
+
+static struct msr_probe *msr_probe_slot(void) {
+  struct percpu *pc = get_percpu();
+  unsigned cpu = pc ? pc->cpu_id : 0;
+
+  if (cpu >= MAX_CPUS)
+    cpu = 0;
+  return &g_msr_probe[cpu];
+}
+
+/* Returns 1 when the fault was a probe's and has been stepped over. */
+static int msr_probe_fixup(struct interrupt_frame *frame) {
+  struct msr_probe *p;
+
+  if (frame->vector != 13 && frame->vector != 6)
+    return 0; /* #GP, or #UD on a CPU without the instruction at all */
+  if ((frame->cs & 3) != 0)
+    return 0; /* ring 3 cannot be inside one of these */
+  p = msr_probe_slot();
+  if (!p->rip || p->rip != frame->rip)
+    return 0;
+  p->faulted = 1;
+  frame->rip += 2; /* both rdmsr and wrmsr are 0x0f 0x32 / 0x0f 0x30 */
+  return 1;
+}
+
+int arch_rdmsr_safe(u32 msr, u64 *out) {
+  struct msr_probe *p;
+  u32 lo = 0, hi = 0;
+  u64 flags = interrupts_save();
+  int ok;
+
+  p = msr_probe_slot();
+  p->faulted = 0;
+  __asm__ volatile("lea 1f(%%rip), %0\n\t"
+                   "1: rdmsr"
+                   : "=r"(p->rip), "=a"(lo), "=d"(hi)
+                   : "c"(msr)
+                   : "memory");
+  ok = !p->faulted;
+  p->rip = 0;
+  interrupts_restore(flags);
+  if (ok && out)
+    *out = ((u64)hi << 32) | lo;
+  return ok ? 0 : -1;
+}
+
+int arch_wrmsr_safe(u32 msr, u64 value) {
+  struct msr_probe *p;
+  u64 flags = interrupts_save();
+  int ok;
+
+  p = msr_probe_slot();
+  p->faulted = 0;
+  __asm__ volatile("lea 1f(%%rip), %0\n\t"
+                   "1: wrmsr"
+                   : "=r"(p->rip)
+                   : "a"((u32)value), "d"((u32)(value >> 32)), "c"(msr)
+                   : "memory");
+  ok = !p->faulted;
+  p->rip = 0;
+  interrupts_restore(flags);
+  return ok ? 0 : -1;
+}
+
 static void x86_exception_handler_inner(struct interrupt_frame *frame) {
+  /* A probing MSR access that faulted: step over it and let the caller see
+   * the failure. Before everything else, because this is not an error. */
+  if (msr_probe_fixup(frame))
+    return;
   /* M36: route #BP (int3, vector 3) and #DB (single-step, vector 1) to the
    * GDB serial stub when the kernel was booted with b1nix.gdb. Off by default
    * so an ordinary/test boot never blocks waiting on a host debugger. */
@@ -1111,7 +1227,7 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
              (void *)(usize)(ft ? ft->pml4_phys : 0), (void *)(usize)rsp0,
              (void *)(usize)ksp, (void *)(usize)fa, (void *)(usize)klo,
              (unsigned)xcr0, (unsigned)cr4,
-             (ft && cr3 != ft->pml4_phys) ? " BAD-CR3" : "",
+             (ft && paging_cr3_to_pml4(cr3) != ft->pml4_phys) ? " BAD-CR3" : "",
              (ft && rsp0 != ksp) ? " BAD-RSP0" : "",
              (klo && !(fa > klo && fa < klo + 64u * 1024u)) ? " BAD-FRAME" : "",
              (frame->cs != 0x23 || frame->ss != 0x1B) ? " BAD-SEL" : "");

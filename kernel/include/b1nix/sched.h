@@ -208,6 +208,20 @@ struct vm_area {
   /* Protection key every page of the mapping carries (pkey_mprotect); 0 is
    * the default key, and the only one without key hardware. */
   u8 pkey;
+  /* NUMA policy for this range (mbind, M128): MPOL_* in mpol_mode, the mode
+   * flags in mpol_flags, and the node mask as a bitmap — NUMA_MAX_NODES is 8,
+   * so 16 bits is room to spare. MPOL_DEFAULT (0) means the task's own policy
+   * decides, which is what every mapping starts as. */
+  u8 mpol_mode;
+  u8 mpol_flags;
+  u16 mpol_nodes;
+  /* set_mempolicy_home_node(2): the node this range would rather be on, +1 so
+   * that 0 keeps meaning "not set". */
+  u16 mpol_home;
+  /* M128, transparent huge pages: 0 = follow the machine default, 1 =
+   * MADV_HUGEPAGE, -1 = MADV_NOHUGEPAGE. vma_split copies the whole struct, so
+   * a mapping cut in two carries its advice into both halves. */
+  i8 thp;
   struct vm_area *next;
   /* Only while retired: the list of mappings unlinked but not yet freed,
    * because a page-fault walker may still be holding one. See vma_retire. */
@@ -690,9 +704,14 @@ void scheduler_block_on_timeout(void *chan, u64 timeout_ticks);
  * the interrupt controller for, so both are things to read rather than assume.
  * sched_tick_hz() returns what the timer was armed with. */
 u32 sched_tick_hz(void);
+/* The idle-interval cap in ticks, 0 when the timer beats at a fixed rate. */
+u64 arch_dynticks_cap(void);
 /* Tell the scheduler a wake_tick deadline was armed. MUST be called by every
  * site that assigns task->wake_tick a future tick. */
 void sched_note_deadline(u64 tick);
+/* Wake any CPU parked with its timer programmed for later than `tick`, so it
+ * reprograms for this deadline (M129). A no-op where the tick is fixed. */
+void arch_kick_idle_before(u64 tick);
 /* sigtimedwait(): declare/withdraw the set this task is parked for, so posting
  * one of those signals can wake it instead of leaving it to poll. */
 void sched_sigwait_arm(u64 set);
@@ -753,6 +772,21 @@ void scheduler_notify_wait_event(usize parent_id);
 /* The calling task stops on a job-control signal and reports it. */
 void scheduler_self_stop(int sig);
 void scheduler_sleep_ticks(u64 ticks);
+
+/* ── The freezer (M129) ──────────────────────────────────────────────────
+ * Hold every userspace task except the caller off the CPU, so a suspend has
+ * something to suspend. Not SIGSTOP: nothing is reported to a parent, no
+ * waitpid wakes, and each task's own state is left exactly as it was found.
+ *
+ * sched_freeze_userspace returns 0 once every candidate is marked AND off
+ * every CPU, or -EBUSY if one would not leave its CPU within timeout_ms -- in
+ * which case it has already thawed the ones it marked, because a half-frozen
+ * machine is worse than one that did not suspend. sched_thaw_userspace undoes
+ * a freeze and is safe to call when nothing is frozen. */
+int sched_freeze_userspace(u64 timeout_ms);
+void sched_thaw_userspace(void);
+/* How many tasks the last successful freeze is holding. */
+int sched_frozen_count(void);
 void scheduler_on_timer_tick(void);
 void scheduler_exit_current(int exit_code) __attribute__((noreturn));
 /* Tell the scheduler which pid is /bin/init, so its death is reported loudly

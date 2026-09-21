@@ -23,6 +23,7 @@
 #include <b1nix/kprintf.h>
 #include <b1nix/pkeys.h>
 #include <b1nix/secretmem.h>
+#include <b1nix/cpuidle.h>
 #include <b1nix/sched.h>
 #include "../syscall/linux_modern.h"
 #include <b1nix/klog.h>
@@ -570,6 +571,16 @@ static u8    g_task_subreaper[TASK_SLOTS];
  * exit path delivers it.
  */
 static u8    g_task_kcrit[TASK_SLOTS];
+
+/* The freezer's bit, one per slot. Declared here with the other side tables
+ * because the slot allocator clears it; what it means, and everything that
+ * sets it, is further down beside sched_freeze_userspace. */
+static u8 g_task_frozen[TASK_SLOTS];
+static int g_frozen_tasks;
+
+static inline int sched_task_frozen(usize index) {
+  return __atomic_load_n(&g_task_frozen[index], __ATOMIC_ACQUIRE) != 0;
+}
 
 void scheduler_kcrit_enter(void) {
   if (!current_task)
@@ -1366,6 +1377,7 @@ static struct task *find_unused_task(int user) {
       g_task_oom_score_adj[i] = 0;
       g_task_cg_stride_pct[i] = 0;
       g_task_cg_throttled[i] = 0;
+      g_task_frozen[i] = 0; /* a recycled slot is never still frozen */
       linux_modern_task_reset(i);
       g_task_fdlock_owner[i] = 0;
       g_task_exiting[i] = 0;
@@ -1735,6 +1747,114 @@ static inline int sched_cg_throttled(const struct task *t, usize index) {
   return 1;
 }
 
+/* ── The freezer (M129) ──────────────────────────────────────────────────
+ *
+ * A suspend that leaves userspace running is not a suspend. Before the machine
+ * parks itself in s2idle every task with an address space -- except the one
+ * that asked for the suspend -- has to stop, and start again on the way back
+ * out with nothing about it changed.
+ *
+ * SIGSTOP already parks a task, and is the wrong tool: a job-control stop is
+ * reported to the parent, wakes waitpid(WUNTRACED), sets a last_stop_signal a
+ * debugger reads, and is undone by a SIGCONT anyone may send. None of that is
+ * true of a freeze, which userspace is not supposed to be able to see at all.
+ * So the freezer has its own bit, and the only thing that bit does is make the
+ * picker pass the task over. Its state is left exactly as it was found -- a
+ * task blocked in read() is still BLOCKED, a runnable one still READY -- and a
+ * thaw is a store of zero plus a kick.
+ *
+ * A task is only marked once it is off every CPU. That is the whole of the
+ * safety argument: a task that is not executing is not holding a spinlock
+ * (this kernel never sleeps or yields under one), so nothing a kernel thread
+ * spins for can be frozen mid-hold. A task still on a CPU is left alone and
+ * re-examined on the next pass -- it reaches a scheduling point within a tick,
+ * in ring 3 by preemption and in the kernel by blocking or returning. If some
+ * task never leaves its CPU before the deadline the freeze FAILS, and failing
+ * means thawing everything that was already marked: a half-frozen machine is
+ * the one outcome worse than not suspending.
+ */
+/* Has this task anything to freeze? Kernel threads are deliberately left
+ * running: they are what services the wake interrupt, and they are also what
+ * would deadlock on a lock a frozen task still holds. */
+static int freezer_candidate(const struct task *t) {
+  if (!t || t == current_task || !t->pml4_phys)
+    return 0;
+  switch (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE)) {
+  case TASK_RUNNING:
+  case TASK_READY:
+  case TASK_BLOCKED:
+  case TASK_SLEEPING:
+    return 1;
+  default:
+    return 0; /* UNUSED, STOPPED, DEAD, REAPING: nothing to hold still */
+  }
+}
+
+void sched_thaw_userspace(void) {
+  int thawed = 0;
+
+  for (usize i = 0; i < TASK_SLOTS; i++) {
+    if (__atomic_load_n(&g_task_frozen[i], __ATOMIC_RELAXED)) {
+      __atomic_store_n(&g_task_frozen[i], 0, __ATOMIC_RELEASE);
+      thawed++;
+    }
+  }
+  g_frozen_tasks = 0;
+  if (thawed)
+    ipi_reschedule_all();
+}
+
+int sched_frozen_count(void) { return g_frozen_tasks; }
+
+int sched_freeze_userspace(u64 timeout_ms) {
+  u64 deadline = ktime_monotonic_ns() + timeout_ms * 1000000ull;
+
+  for (;;) {
+    int marked = 0, on_cpu = 0;
+
+    for (usize i = 0; i < g_task_hwm && i < TASK_SLOTS; i++) {
+      struct task *t = T(i);
+
+      if (!__atomic_load_n(&g_task_frozen[i], __ATOMIC_RELAXED)) {
+        if (!freezer_candidate(t))
+          continue;
+        /* Marked whether or not it is running.
+         *
+         * Marking only the tasks that happen to be off a CPU cannot converge
+         * against a task that spins: it is the only runnable thing on its
+         * CPU, so the picker keeps choosing it and it is never off-CPU to be
+         * marked — the freeze then fails with EBUSY on a machine that is
+         * working perfectly. The mark does not stop a task mid-instruction;
+         * it only takes it out of the picker, so the task leaves its CPU at
+         * its next scheduling point (a tick in ring 3, a block or a return in
+         * the kernel) and cannot be chosen again. That is the freezer Linux
+         * has, and it is safe for the same reason: this kernel never
+         * schedules away from a task holding a spinlock, so a task the picker
+         * has dropped is not holding one when it stops.
+         */
+        __atomic_store_n(&g_task_frozen[i], 1, __ATOMIC_RELEASE);
+      }
+      /* Outstanding until it is really off every CPU. */
+      if (t && task_running_somewhere(t))
+        on_cpu++;
+      else
+        marked++;
+    }
+    if (!on_cpu) {
+      g_frozen_tasks = marked;
+      return 0;
+    }
+    if (ktime_monotonic_ns() >= deadline) {
+      sched_thaw_userspace();
+      return -EBUSY;
+    }
+    /* Tell the CPUs still carrying one to look at their runqueue again, then
+     * give them a tick to act on it. */
+    ipi_reschedule_all();
+    scheduler_sleep_ticks(1);
+  }
+}
+
 static struct task *pick_next_task(void) {
   if (current_task == 0) {
     return 0;
@@ -1795,6 +1915,8 @@ static struct task *pick_next_task(void) {
         continue;
       if (sched_cg_throttled(t, task_index(t)))
         continue; /* cpu.max spent; the scan will not take it either */
+      if (sched_task_frozen(task_index(t)))
+        continue; /* frozen for a suspend (M129) */
       /* A cgroup-weighted task is not taken from here.
        *
        * This path hands out the head of the queue without comparing passes --
@@ -1922,6 +2044,8 @@ static struct task *pick_next_task(void) {
       continue; /* pinned elsewhere by sched_setaffinity */
     if (sched_cg_throttled(t, index))
       continue; /* its cgroup has spent this period's cpu.max */
+    if (sched_task_frozen(index))
+      continue; /* frozen for a suspend (M129) */
 
     int priority = t->priority;
     u64 pass = g_task_pass[index];
@@ -1955,6 +2079,8 @@ static struct task *pick_next_task(void) {
       if (on_ap && !t->ap_runnable)
         continue;
       if (pcpu && !sched_task_allowed_on_cpu(t, pcpu->cpu_id))
+        continue;
+      if (sched_task_frozen(index))
         continue;
       /* A task a cgroup is weighting gets a far wider window.
        *
@@ -2000,7 +2126,8 @@ static struct task *pick_next_task(void) {
       current_task->state == TASK_RUNNING &&
       g_task_cg_stride_pct[task_index(current_task)] &&
       current_task->priority >= max_priority &&
-      !sched_cg_throttled(current_task, task_index(current_task))) {
+      !sched_cg_throttled(current_task, task_index(current_task)) &&
+      !sched_task_frozen(task_index(current_task))) {
     usize ci = task_index(current_task);
     u64 stride = sched_effective_stride(ci);
 
@@ -2371,8 +2498,14 @@ void sched_note_deadline(u64 tick)
 	__atomic_fetch_add(&g_wake_deadline_gen, 1, __ATOMIC_RELEASE);
 	while (cur == 0 || tick < cur) {
 		if (__atomic_compare_exchange_n(&g_wake_deadline, &cur, tick, 1,
-		                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+		                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+			/* A CPU already parked with its one-shot timer set for later
+			 * than this cannot know about it: nothing re-reads the deadline
+			 * list on a halted core. Kick it (M129). No-op when the tick is
+			 * fixed, and on a machine where no CPU is idle. */
+			arch_kick_idle_before(tick);
 			return;
+		}
 	}
 }
 
@@ -5948,11 +6081,7 @@ void scheduler_wait_commit(void) {
     /* The halted span is idle time, yet current_task still names the waiter:
      * close its interval now and drop the span, or the next flush bills it. */
     sched_acct_leave_kernel();
-#if defined(__x86_64__)
-    __asm__ volatile("sti; hlt" : : : "memory");
-#elif defined(__aarch64__)
-    __asm__ volatile("msr daifclr, #2; wfi" : : : "memory");
-#endif
+    cpuidle_enter(); /* the machine's deepest idle state, and counted (M129) */
     sched_acct_skip_idle();
   }
   /* Drop any unfired deadline armed by scheduler_wait_prepare_timeout: an

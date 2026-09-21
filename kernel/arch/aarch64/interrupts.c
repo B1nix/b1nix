@@ -24,6 +24,16 @@
 #include "platform.h"
 #include <stdio.h>
 
+/* Local-timer interrupts taken on this machine, reported as LOC in
+ * /proc/interrupts. What tells a tickless kernel from one that says it is
+ * (M129). */
+static volatile u64 g_local_timer_irqs;
+
+u64 arch_local_timer_count(void)
+{
+	return __atomic_load_n(&g_local_timer_irqs, __ATOMIC_RELAXED);
+}
+
 /* GICv2, wherever this board puts it. Initialized via platform_gicd_base() /
  * platform_gicc_base() and updated from device tree if needed. */
 static u64 g_gicd = 0;
@@ -133,6 +143,12 @@ void irq_unmask(u32 irq) {
   GICD_ISENABLER(irq / 32) = 1u << (irq % 32);
 }
 
+/* A GIC line is described by the firmware, not by an ISA convention, and this
+ * port's SPIs are already programmed edge/level correctly at boot -- so the
+ * ISA-defaults variant is the plain unmask here. It exists so a driver shared
+ * with x86_64 (the RTC alarm) has one call to make on both. */
+void irq_unmask_isa(u32 irq) { irq_unmask(irq); }
+
 void gic_cpu_init(void);
 
 static void gic_init(void)
@@ -235,7 +251,7 @@ static u64 timer_interval_ticks(u64 freq)
  * The sleep is capped anyway. Some periodic work does not register a deadline
  * with anybody -- the guest watchdog, the serial receive drain -- and the cap
  * bounds how late that gets rather than requiring every such site to be found
- * first. Default 10 ticks (100 ms); `b1nix.dynticks=1` gives back the fixed
+ * first. Default 10 ticks (100 ms); `b1nix.dynticks=0` gives back the fixed
  * periodic beat, which is what a bisect wants. */
 static u64 dynticks_cap(void)
 {
@@ -244,39 +260,85 @@ static u64 dynticks_cap(void)
 	if (cap == ~0ull) {
 		char buf[24];
 
-		/* OFF by default, and the reason is worth keeping.
+		/* ON by default since M129, with the idle gate and the kick that
+		 * make it safe (see the x86_64 port's note in
+		 * kernel/arch/x86_64/lapic.c). The history that kept it off:
 		 *
-		 * It was on for exactly one commit. Two full suites passed with it,
-		 * and both were lying: a test-support thread (m47-input-inject) was
-		 * polling every 2 ticks and its beat kept the timer programmed often
-		 * enough to hide what one-shot costs. The moment that poller was fixed
-		 * to wait for an event, six checks failed reproducibly -- all of them
-		 * signal latency: a signal to a task asleep in nanosleep, ppoll's
-		 * sub-millisecond timeout, waitpid's EINTR.
+		 * It was on for exactly one commit years before that. Two full suites
+		 * passed with it, and both were lying: a test-support thread
+		 * (m47-input-inject) was polling every 2 ticks and its beat kept the
+		 * timer programmed often enough to hide what one-shot costs. The
+		 * moment that poller was fixed to wait for an event, six checks failed
+		 * reproducibly -- all of them signal latency: a signal to a task
+		 * asleep in nanosleep, ppoll's sub-millisecond timeout, waitpid's
+		 * EINTR.
 		 *
-		 * That is the real precondition, and it is not "find the pollers": a
-		 * task asleep on a deadline must be woken when a signal is POSTED, not
-		 * when its own timer happens to fire. Waking &task->pending_signals
-		 * from the posting sites was tried and broke eight other checks,
-		 * because which waits a signal may interrupt is a policy this kernel
-		 * already implements carefully (SIGCHLD must not cut waitpid short).
-		 * Until signal posting wakes sleepers through THAT policy, one-shot
-		 * ticks are not correct here. */
-		cap = 0;
-		if (bootinfo_has_flag("b1nix.dynticks"))
-			cap = 10;
-		if (bootinfo_get_kv("b1nix.dynticks", buf, sizeof(buf)) == 0) {
+		 * The precondition was that a task asleep on a deadline is woken when
+		 * a signal is POSTED, not when its own timer happens to fire — and
+		 * through the policy this kernel already implements, since which waits
+		 * a signal may interrupt is a careful question (SIGCHLD must not cut
+		 * waitpid short). sched_wake_for_signal is that policy, and it now
+		 * promotes a target out of TASK_SLEEPING as well as TASK_BLOCKED and
+		 * TASK_STOPPED. Both full suites pass with the idle cap in place.
+		 * `b1nix.dynticks=0` restores the fixed periodic beat, which is what a
+		 * bisect wants. */
+		cap = 10;
+		if (bootinfo_get_kv("b1nix.dynticks", buf, sizeof(buf))) {
 			u64 v = 0;
 			const char *p = buf;
+			int digits = 0;
 
-			while (*p >= '0' && *p <= '9')
+			while (*p >= '0' && *p <= '9') {
 				v = v * 10 + (u64)(*p++ - '0');
-			if (v)
-				cap = v;
+				digits++;
+			}
+			/* Only a value that is really there overrides the default.
+			 * The lookup is true on a hit; testing it for zero parsed an
+			 * uninitialised buffer for every key nobody gave. */
+			if (digits)
+				cap = v; /* b1nix.dynticks=0 turns it off */
 		}
 	}
 	return cap;
 }
+
+/* Wake any CPU parked with its timer set for later than `tick` (M129).
+ *
+ * The same rule as the x86_64 port: a CPU that has parked does not re-read
+ * the deadline list, so a deadline armed against it afterwards has to reach
+ * it as an interrupt. The record each CPU leaves in timer_deadline_tick is
+ * what says whether any of them needs one — without that test this would be
+ * an inter-processor interrupt per armed deadline, thousands a second. The
+ * GIC's reschedule SGI goes to every other CPU at once, which is coarser
+ * than naming one, and still costs nothing when nobody is parked late. */
+void arch_kick_idle_before(u64 tick)
+{
+	extern void gicv3_send_resched_others(void);
+	int wake = 0;
+
+	for (int cpu = 0; cpu < g_max_cpus && cpu < MAX_CPUS; cpu++) {
+		struct percpu *pc = get_percpu_n(cpu);
+		u64 armed;
+
+		if (!pc)
+			continue;
+		armed = __atomic_load_n(&pc->timer_deadline_tick, __ATOMIC_ACQUIRE);
+		if (!armed || armed <= tick)
+			continue;
+		/* Claim it, so a burst of arms costs one kick and not one each. */
+		if (__atomic_compare_exchange_n(&pc->timer_deadline_tick, &armed, 0, 0,
+		                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+			wake = 1;
+	}
+	if (wake) {
+		__asm__ volatile("sev" ::: "memory");
+		if (get_online_cpu_count() > 1)
+			gicv3_send_resched_others();
+	}
+}
+
+/* See the x86_64 port: the cap /proc/b1nix-tick reports. */
+u64 arch_dynticks_cap(void) { return dynticks_cap(); }
 
 static void timer_rearm(void)
 {
@@ -288,9 +350,19 @@ static void timer_rearm(void)
 
 	u64 interval = timer_interval_ticks(freq);
 	u64 cap = dynticks_cap();
+	struct percpu *pc = get_percpu();
 
 	__asm__ volatile("mrs %0, cntv_cval_el0" : "=r"(cval));
 	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(now));
+
+	/* Only an idle CPU gets a long interval: on a CPU with work the stretched
+	 * tick is a scheduling quantum by accident, not tickless (M129). */
+	if (cap && !(pc && pc->idle_task &&
+	             pc->cur_task == (struct task *)pc->idle_task &&
+	             !pc->runqueue.head))
+		cap = 0;
+	if (!cap && pc)
+		__atomic_store_n(&pc->timer_deadline_tick, 0, __ATOMIC_RELEASE);
 
 	if (cap) {
 		u64 next = sched_next_deadline_tick();
@@ -327,6 +399,12 @@ static void timer_rearm(void)
 		cval += interval * skip;
 		if (cval <= now)
 			cval = now + interval * skip;
+		/* Published before the timer is armed: an arm that races this finds
+		 * the value it has to beat and kicks us, which costs one spurious
+		 * interrupt. The other order loses the kick. */
+		if (pc)
+			__atomic_store_n(&pc->timer_deadline_tick,
+			                 scheduler_get_ticks() + skip, __ATOMIC_RELEASE);
 		__asm__ volatile("msr cntv_cval_el0, %0" : : "r"(cval));
 		return;
 	}
@@ -590,6 +668,8 @@ static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 	}
 
 	if (irq == TIMER_IRQ) {
+		/* Counted for /proc/interrupts' LOC line: see the x86_64 port. */
+		__atomic_fetch_add(&g_local_timer_irqs, 1, __ATOMIC_RELAXED);
 		timer_rearm();
 
 		/* EOI BEFORE scheduler_on_timer_tick, mirroring the x86_64 LAPIC

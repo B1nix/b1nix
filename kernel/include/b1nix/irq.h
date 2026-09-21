@@ -37,6 +37,15 @@ int irq_unregister_handler(u32 irq, irq_handler_fn fn, void *ctx);
  * the arch x86_pic_unmask so drivers don't reach into arch code directly. */
 void irq_unmask(u32 irq);
 
+/* Route and unmask a LEGACY ISA line, with the ISA defaults: edge-triggered,
+ * active high. irq_unmask above assumes PCI INTx semantics (level, active
+ * low), which is right for every line a PCI driver asks for and wrong for the
+ * handful of motherboard devices that are not on the PCI bus -- an edge-
+ * triggered line programmed as active-low level reads as permanently asserted
+ * and the machine takes that interrupt for ever. The RTC's IRQ 8 is the one
+ * this exists for. Any ACPI interrupt-source override still wins. */
+void irq_unmask_isa(u32 irq);
+
 /* Dispatch every handler registered for `irq` (called from the arch IRQ entry).
  * Returns the OR of the handlers' return values (1 if any claimed it). */
 int irq_dispatch(int irq);

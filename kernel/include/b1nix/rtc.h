@@ -37,4 +37,12 @@ extern u64 rtc_boot_time_seconds;
 void rtc_dev_init(void);
 void rtc_dev_register_nodes(void);
 
+/* M129: the alarm as a wake source. Claims the interrupt the alarm raises
+ * (IRQ 8 on x86_64, the PL031's GIC line on aarch64), acknowledges it at the
+ * device and registers the RTC with the suspend path, so an alarm armed
+ * through RTC_WKALM_SET can end an s2idle. Called once at boot. */
+void rtc_wake_source_init(void);
+/* How many alarm interrupts this machine has taken. /proc/interrupts. */
+u64 rtc_wake_irq_count(void);
+
 #endif

@@ -207,10 +207,19 @@ int lkpi_wake_task(struct lkpi_task *t)
 
 void lkpi_sleep_ms(unsigned ms)
 {
-	u64 deadline = scheduler_get_ticks() + ((u64)ms * (u64)sched_tick_hz()) / 1000u;
+	u64 ticks = ((u64)ms * (u64)sched_tick_hz()) / 1000u;
 
-	while (scheduler_get_ticks() < deadline)
-		scheduler_sleep_ticks(1);
+	/* One sleep, not a loop of one-tick sleeps.
+	 *
+	 * msleep() is a delay with nothing to wait for: upstream runs it to
+	 * completion and a wake cannot cut it short, so slicing it bought nothing
+	 * and cost a timer interrupt per millisecond. That is not free on a
+	 * tickless kernel — it IS the tick: btrfs-cleaner sleeping this way kept a
+	 * deadline one tick out at all times, and the machine took ~1800 timer
+	 * interrupts a second while completely idle (M129). */
+	if (!ticks)
+		ticks = 1;
+	scheduler_sleep_ticks(ticks);
 }
 
 u64 lkpi_sleep_jiffies(u64 jiffies_count)
@@ -282,8 +291,15 @@ u64 lkpi_sleep_jiffies(u64 jiffies_count)
 		} else {
 			now = scheduler_get_ticks();
 			if (now < deadline) {
+				u64 cap = infinite ? (u64)per_jiffy * 10u : (u64)per_jiffy;
+
+				/* A wait with no deadline at all is woken by its waker, not by
+				 * this slice: the slice only bounds a wake that raced the park
+				 * and was lost. Ten jiffies bounds it just as well as one and
+				 * costs a tenth of the wakeups, which is what an idle machine
+				 * notices (M129). */
 				left = deadline - now;
-				slice = left < per_jiffy ? left : per_jiffy;
+				slice = left < cap ? left : cap;
 				scheduler_sleep_ticks(slice);
 			}
 		}
@@ -470,8 +486,19 @@ void lkpi_schedule(void)
 
     if (t->sleep_requested) {
       t->sleep_requested = 0;
-      for (int i = 0; i < 10 && !t->wake_pending; i++)
+      /* One tick, then the rest in one sleep.
+       *
+       * The short first sleep is for the wake that raced the park: it was
+       * posted before this task published itself, so nothing will wake it and
+       * only wake_pending says it happened. After that the task is parked
+       * properly and an explicit wake ends the sleep by making it runnable —
+       * so the remaining nine ticks cost one timer interrupt instead of nine.
+       * Ten one-tick sleeps per park is what kept an idle machine ticking at
+       * a kilohertz with every imported kernel thread parked (M129). */
+      if (!t->wake_pending)
         scheduler_sleep_ticks(1);
+      if (!t->wake_pending)
+        scheduler_sleep_ticks(9);
       t->wake_pending = 0;
       return;
     }

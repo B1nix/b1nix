@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/bootinfo.h>
 #include <b1nix/arch.h>
+#include <b1nix/cpuidle.h>
 #include <b1nix/lapic.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
@@ -134,14 +135,27 @@ int lapic_timer_start_periodic_ms(u32 ms) {
  * rather than counting them (see scheduler_on_timer_tick): a tick that never
  * arrives is not time lost, it is time the next tick catches up on.
  *
- * `b1nix.dynticks[=<max-idle-ticks>]`, default OFF -- and off for a reason that
- * is not x86-specific. On aarch64 it was on for exactly one commit: two full
- * suites passed and both were lying, because a test thread polling every two
- * ticks kept the timer programmed often enough to hide the cost. With that
- * poller fixed, six checks failed reproducibly, all of them signal latency. The
- * precondition is that a task asleep on a deadline is woken when a signal is
- * POSTED, through this kernel's existing interrupt policy rather than around
- * it. Until that holds, this is a measurement tool, not a default. */
+ * `b1nix.dynticks[=<max-idle-ticks>]`, default ON at ten ticks (M129).
+ *
+ * The original precondition — a task asleep on a deadline must be woken when a
+ * signal is POSTED, not when its own timer fires — now holds:
+ * sched_wake_for_signal promotes a target out of TASK_SLEEPING as well as
+ * TASK_BLOCKED and TASK_STOPPED, and the whole x86_64 suite passes with this
+ * on (1714 checks), signal latency included. What it buys, measured with
+ * /proc/interrupts' LOC row: an idle second costs 613 timer interrupts instead
+ * of 1826 once the pollers that kept a deadline one tick away are fixed
+ * (lkpi_sleep_ms and the park in lkpi_schedule).
+ *
+ * The other half is the gate below: the long interval applies to an IDLE CPU
+ * only — stretched on a CPU with work it is not tickless, it is a ten
+ * millisecond scheduling quantum by accident — and a deadline armed against a
+ * CPU that is already parked kicks it so it reprograms (arch_kick_idle_before).
+ * Without that kick the machine wedges on a wait served a whole idle interval
+ * late, every time round its caller's loop, which is how the gate was
+ * debugged. Measured with it in place: an idle second costs 636 timer
+ * interrupts instead of 1998, a busy one still takes its thousand per busy
+ * CPU, and the whole x86_64 suite passes. `b1nix.dynticks=0` puts the fixed
+ * beat back for a run that wants to compare. */
 static u64 lapic_dynticks_cap(void)
 {
     static u64 cap = ~0ull;
@@ -149,21 +163,31 @@ static u64 lapic_dynticks_cap(void)
     if (cap == ~0ull) {
         char buf[24];
 
-        cap = 0;
-        if (bootinfo_has_flag("b1nix.dynticks"))
-            cap = 10;
-        if (bootinfo_get_kv("b1nix.dynticks", buf, sizeof(buf)) == 0) {
+        cap = 10;
+        if (bootinfo_get_kv("b1nix.dynticks", buf, sizeof(buf))) {
             u64 v = 0;
             const char *c = buf;
+            int digits = 0;
 
-            while (*c >= '0' && *c <= '9')
+            while (*c >= '0' && *c <= '9') {
                 v = v * 10 + (u64)(*c++ - '0');
-            if (v)
-                cap = v;
+                digits++;
+            }
+            /* Only a value that is actually there overrides the default.
+             * The lookup is true on a hit -- testing it for zero read the
+             * value of a key nobody gave, which is an uninitialised buffer,
+             * and the cap became whatever was under the boot stack. */
+            if (digits)
+                cap = v; /* b1nix.dynticks=0 turns it off */
         }
     }
     return cap;
 }
+
+/* What the idle interval is capped at, in ticks; 0 when the tick is fixed.
+ * /proc/b1nix-tick reports it, which is how a test knows what to expect
+ * rather than guessing from the command line (M129). */
+u64 arch_dynticks_cap(void) { return lapic_dynticks_cap(); }
 
 void lapic_timer_rearm(void)
 {
@@ -177,6 +201,43 @@ void lapic_timer_rearm(void)
     tpms = lapic_ticks_per_ms();
     if (!tpms)
         return;
+
+    /* Only an IDLE CPU gets a long interval.
+     *
+     * A CPU with something runnable needs the tick for what the tick is for:
+     * preemption and the slice a compute-bound thread is allowed. Stretched
+     * there it is a ten-millisecond scheduling quantum by accident — measured,
+     * a busy second fell from a thousand timer interrupts to six hundred, and
+     * those are six hundred chances to preempt instead of a thousand. Linux
+     * draws the same line: NOHZ is an idle-CPU property.
+     *
+     * The record below is the other half. An idle CPU's timer is programmed
+     * for a deadline that was true when it parked; a deadline armed against
+     * it afterwards has to reprogram it, and nothing would have — the machine
+     * then serves that wait a whole idle interval late, every time round its
+     * caller's loop, which reads as a wedge rather than as latency. */
+    {
+        struct percpu *pc = get_percpu();
+        int idle = pc && pc->idle_task &&
+                   pc->cur_task == (struct task *)pc->idle_task &&
+                   !pc->runqueue.head;
+
+        if (!idle) {
+            u64 one = (u64)tpms * (u64)g_tick_period_ms;
+
+            if (pc)
+                __atomic_store_n(&pc->timer_deadline_tick, 0, __ATOMIC_RELEASE);
+            /* One tick, and it has to be programmed rather than skipped: the
+             * timer is in one-shot mode by now, and a one-shot left unarmed is
+             * a machine that never ticks again. */
+            if (one && one <= 0xFFFFFFFFULL) {
+                lapic_write(LAPIC_LVT_TIMER,
+                            LAPIC_TIMER_VECTOR | LAPIC_LVT_ONESHOT);
+                lapic_write(LAPIC_TIMER_INITCNT, (u32)one);
+            }
+            return;
+        }
+    }
 
     {
         u64 next = sched_next_deadline_tick();
@@ -207,8 +268,50 @@ void lapic_timer_rearm(void)
     if (!count || count > 0xFFFFFFFFULL)
         return; /* leave the timer as it is rather than program a bogus count */
 
+    {
+        struct percpu *pc = get_percpu();
+
+        /* Published before the timer is armed: a deadline armed on another
+         * CPU between these two stores finds the value it must beat and
+         * kicks us, which costs one spurious interrupt. The other order
+         * loses the kick entirely. */
+        if (pc)
+            __atomic_store_n(&pc->timer_deadline_tick,
+                             scheduler_get_ticks() + (count / ((u64)tpms *
+                                 (u64)g_tick_period_ms)),
+                             __ATOMIC_RELEASE);
+    }
     lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LAPIC_LVT_ONESHOT);
     lapic_write(LAPIC_TIMER_INITCNT, (u32)count);
+}
+
+/* Wake any CPU whose idle timer is programmed for later than `tick`.
+ *
+ * Called where a deadline is armed. A parked CPU does not re-read the
+ * deadline list, so the only thing that can make it reprogram its one-shot is
+ * an interrupt — and the reschedule IPI is one it already knows how to take.
+ * The recorded deadline is cleared here so a burst of arms costs one kick,
+ * not one each. */
+void arch_kick_idle_before(u64 tick)
+{
+    if (!g_lapic_timer_periodic_active)
+        return;
+    for (int cpu = 0; cpu < g_max_cpus && cpu < MAX_CPUS; cpu++) {
+        struct percpu *pc = percpu_for_cpu(cpu);
+        u64 armed;
+
+        if (!pc)
+            continue;
+        armed = __atomic_load_n(&pc->timer_deadline_tick, __ATOMIC_ACQUIRE);
+        if (!armed || armed <= tick)
+            continue;
+        if (!__atomic_compare_exchange_n(&pc->timer_deadline_tick, &armed, 0, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue; /* somebody else is kicking it */
+        if (pc->cpu_id == (u32)cpu && pc == get_percpu())
+            continue; /* this CPU is not parked: it is running this code */
+        lapic_send_ipi(pc->apic_id, RESCHEDULE_VECTOR | LAPIC_ICR_FIXED);
+    }
 }
 
 int lapic_timer_periodic_active(void) { return g_lapic_timer_periodic_active; }
@@ -465,6 +568,14 @@ static void smp_setup_trampoline(u64 pml4_phys, u64 stack_virt,
     *(volatile u64 *)(tv + TRAMP_CPU_OFF)   = cpu_id;
     *(volatile u64 *)(tv + TRAMP_READY_OFF) = 0;   /* ready flag init */
     *(volatile u64 *)(tv + TRAMP_APMAIN_OFF) = (u64)(usize)ap_main;
+    /* Five-level paging is a property of the machine, not of a CPU: the CR3
+     * above names a PML5 when the BSP enabled LA57, and an AP that left the
+     * bit clear would walk it as a PML4 (M128). */
+    {
+      extern int paging_la57(void);
+
+      *(volatile u64 *)(tv + TRAMP_LA57_OFF) = (u64)paging_la57();
+    }
 }
 
 /* ── AP-worker trampoline ──
@@ -610,7 +721,7 @@ void ap_main(u32 cpu_id) {
             extern u64 g_idle_halts;
 
             g_idle_halts++;
-            __asm__ volatile("sti; hlt" : : : "memory");
+            cpuidle_enter();
         }
     }
 }

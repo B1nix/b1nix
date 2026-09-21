@@ -22,6 +22,7 @@
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/sched.h>
+#include <b1nix/suspend.h>
 #include <b1nix/posix.h>
 #include <b1nix/serial.h>
 #include <b1nix/serial_tty.h>
@@ -717,8 +718,11 @@ void serial_tty_tick(void) {
      * a shell waiting in poll on the serial tty never sees its input.
      * scheduler_wake_all preserves the caller's IRQ state, so it is safe
      * from this ISR context (tcp_input wakes the same channel similarly). */
-    if (got)
+    if (got) {
       scheduler_wake_all(vfs_poll_chan);
+      /* A byte on the console ends a suspend, the same way a key does. */
+      suspend_wake_event("serial");
+    }
   }
 }
 
@@ -741,6 +745,8 @@ usize serial_tty_fg_pgrp(int idx) {
 }
 
 void serial_tty_init(void) {
+  /* A byte on the console can end a suspend (M129). */
+  suspend_register_input_source();
   memset(sttys, 0, sizeof(sttys));
   for (int i = 0; i < STTY_COUNT; i++) {
     struct serial_tty *t = &sttys[i];

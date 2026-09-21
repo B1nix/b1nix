@@ -176,7 +176,12 @@ struct percpu {
     /* Outermost interrupts-off section in progress (b1nix.sysprof only). */
     u64 irqoff_t0;
     void *irqoff_site;
-    u8 __pad[3776];  /* pad to 4KB total */
+    /* The tick this CPU's one-shot timer is programmed for while it is idle,
+     * 0 when it is not idle (M129). A deadline armed against an already-parked
+     * CPU has to reprogram that timer, and this is what says whether it needs
+     * to: see sched_note_deadline and arch_kick_idle_before. */
+    u64 timer_deadline_tick;
+    u8 __pad[3768];  /* pad to 4KB total */
 } __attribute__((aligned(4096)));
 
 /* Segment base management */
