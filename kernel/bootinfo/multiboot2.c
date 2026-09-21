@@ -336,6 +336,17 @@ int bootinfo_has_flag(const char *flag)
 int bootinfo_get_kv(const char *key, char *out, usize out_size)
 {
 	int rc;
+	/* A key that is not on the command line leaves the caller with an
+	 * EMPTY value, never with whatever was on its stack. kv_scan only
+	 * writes `out` on a hit and the memo path does not call it at all, so
+	 * every caller that reads the buffer after a miss -- which is all of
+	 * them, since the return value cannot tell a miss from a memoised
+	 * miss -- was reading uninitialised memory. That is how the tickless
+	 * cap came to be whatever four bytes happened to be under the boot
+	 * stack, and an idle CPU kept its kilohertz on a kernel that reports
+	 * itself as tickless. */
+	if (out && out_size)
+		out[0] = '\0';
 	if (memo_get(memo_absent, key, &rc))
 		return 0;
 	rc = kv_scan(key, out, out_size);

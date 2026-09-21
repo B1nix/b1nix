@@ -18,6 +18,10 @@
 #include <b1nix/types.h>
 #include <string.h>
 
+/* The largest table this parser will map. A DSDT of a megabyte does not
+ * exist; anything claiming to be one is a corrupt length field. */
+#define ACPI_MAX_TABLE_LEN (1u << 20)
+
 static int g_acpi_ready = 0;
 static u64 g_lapic_addr = 0;
 
@@ -176,7 +180,7 @@ static const struct acpi_sdt_header *map_sdt(u64 phys) {
         if (!h)
             return (const struct acpi_sdt_header *)0;
         u32 len = h->length;
-        if (len < sizeof(*h) || len > 65536)
+        if (len < sizeof(*h) || len > ACPI_MAX_TABLE_LEN)
             return (const struct acpi_sdt_header *)0;
         h = (const struct acpi_sdt_header *)vmm_map_mmio(phys, len, VMM_PRESENT);
         if (!h)
@@ -184,8 +188,9 @@ static const struct acpi_sdt_header *map_sdt(u64 phys) {
     }
     if (h->length < sizeof(*h))
         return (const struct acpi_sdt_header *)0;
-    /* Bound the table length (largest legitimate tables are a few KB). */
-    if (h->length > 65536)
+    /* Bound the table length. Most tables are a few KB, but the DSDT is a
+     * compiled program and a laptop's runs to a couple of hundred KB. */
+    if (h->length > ACPI_MAX_TABLE_LEN)
         return (const struct acpi_sdt_header *)0;
     if (!acpi_checksum_ok(h, h->length))
         return (const struct acpi_sdt_header *)0;
@@ -274,6 +279,84 @@ const struct acpi_sdt_header *acpi_find_table(const char *signature) {
         }
     }
 
+    return (const struct acpi_sdt_header *)0;
+}
+
+/* ── Table enumeration ─────────────────────────────────────────────── */
+
+/* How many entries the root table has. RSDT entries are 4 bytes, XSDT's are
+ * 8; the XSDT is preferred where both exist, exactly as acpi_find_table does. */
+int acpi_table_count(void) {
+    if (g_xsdt_phys) {
+        const struct acpi_sdt_header *x = map_sdt(g_xsdt_phys);
+        if (x && sig_eq(x->signature, "XSDT", 4))
+            return (int)((x->length - sizeof(*x)) / sizeof(u64));
+    }
+    if (g_rsdt_phys) {
+        const struct acpi_sdt_header *r = map_sdt(g_rsdt_phys);
+        if (r && sig_eq(r->signature, "RSDT", 4))
+            return (int)((r->length - sizeof(*r)) / sizeof(u32));
+    }
+    return 0;
+}
+
+const struct acpi_sdt_header *acpi_table_at(int idx) {
+    if (idx < 0)
+        return (const struct acpi_sdt_header *)0;
+    if (g_xsdt_phys) {
+        const struct acpi_sdt_header *x = map_sdt(g_xsdt_phys);
+        if (x && sig_eq(x->signature, "XSDT", 4)) {
+            int n = (int)((x->length - sizeof(*x)) / sizeof(u64));
+            if (idx >= n)
+                return (const struct acpi_sdt_header *)0;
+            const u8 *base = (const u8 *)x + sizeof(*x);
+            u64 phys = 0;
+            for (int b = 0; b < 8; b++)
+                phys |= ((u64)base[idx * 8 + b]) << (b * 8);
+            if (phys > 0xFFFFFFFFULL)
+                return (const struct acpi_sdt_header *)0;
+            return map_sdt(phys);
+        }
+    }
+    if (g_rsdt_phys) {
+        const struct acpi_sdt_header *r = map_sdt(g_rsdt_phys);
+        if (r && sig_eq(r->signature, "RSDT", 4)) {
+            int n = (int)((r->length - sizeof(*r)) / sizeof(u32));
+            if (idx >= n)
+                return (const struct acpi_sdt_header *)0;
+            const u32 *e = (const u32 *)((const u8 *)r + sizeof(*r));
+            return map_sdt((u64)e[idx]);
+        }
+    }
+    return (const struct acpi_sdt_header *)0;
+}
+
+/* The FADT's two pointers to the DSDT: the 32-bit one at offset 40 and, on a
+ * revision-2 or later table that is long enough to have it, the 64-bit X_DSDT
+ * at offset 140. The wide one wins when it is set, which is what firmware
+ * above 4 GiB relies on. */
+#define FADT_OFF_DSDT    40
+#define FADT_OFF_X_DSDT  140
+
+const struct acpi_sdt_header *acpi_dsdt(void) {
+    const struct acpi_sdt_header *fadt = acpi_find_table("FACP");
+    if (!fadt)
+        return (const struct acpi_sdt_header *)0;
+    const u8 *b = (const u8 *)fadt;
+    u64 phys = 0;
+    if (fadt->length >= FADT_OFF_X_DSDT + 8) {
+        for (int i = 0; i < 8; i++)
+            phys |= ((u64)b[FADT_OFF_X_DSDT + i]) << (i * 8);
+    }
+    if (!phys && fadt->length >= FADT_OFF_DSDT + 4) {
+        for (int i = 0; i < 4; i++)
+            phys |= ((u64)b[FADT_OFF_DSDT + i]) << (i * 8);
+    }
+    if (!phys || phys > 0xFFFFFFFFULL)
+        return (const struct acpi_sdt_header *)0;
+    const struct acpi_sdt_header *d = map_sdt(phys);
+    if (d && sig_eq(d->signature, "DSDT", 4))
+        return d;
     return (const struct acpi_sdt_header *)0;
 }
 

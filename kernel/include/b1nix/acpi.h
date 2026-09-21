@@ -134,6 +134,17 @@ int acpi_ready(void);
  * is permanent (boot-time MMIO window), so the caller may keep the pointer. */
 const struct acpi_sdt_header *acpi_find_table(const char *signature);
 
+/* Enumerate every table the RSDT/XSDT lists, in the order it lists them.
+ * acpi_find_table() returns only the first match for a signature, and a
+ * machine has as many SSDTs as its firmware felt like emitting -- the AML
+ * interpreter has to load all of them. Returns NULL past the end. */
+int acpi_table_count(void);
+const struct acpi_sdt_header *acpi_table_at(int idx);
+
+/* The DSDT, which is NOT in the root table: the FADT points at it (DSDT at
+ * offset 40, or X_DSDT at 140 on a revision-2 FADT). NULL without ACPI. */
+const struct acpi_sdt_header *acpi_dsdt(void);
+
 /* Discovered CPU count (BSP + enabled APs), 0 if ACPI unavailable. */
 int acpi_cpu_count(void);
 

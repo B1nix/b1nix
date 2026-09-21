@@ -1444,6 +1444,10 @@ u32 bootinfo_get_u32(const char *key, u32 fallback)
 
 int bootinfo_get_kv(const char *key, char *out, usize out_size)
 {
+	/* A miss leaves an EMPTY value behind, never the caller's stack: the
+	 * loop below only writes `out` on a hit, and a caller that reads the
+	 * buffer regardless was reading uninitialised memory. */
+	if (out && out_size) out[0] = '\0';
 	if (!key || !key[0]) return 0;
 	const char *cmd = aarch64_cmdline_buf;
 	usize klen = strlen(key);
