@@ -345,7 +345,7 @@ the budget, and the release checklist records the actual size.
   user can read before sending. Fields, privacy rules and the list it feeds:
   [b1nix-report.md](b1nix-report.md).
 - **Reference machines** that must work at every release, because they are the
-  ones on hand: the Intel-graphics laptop, the T480 over PXE, the SM8150
+  ones on hand: the Intel-graphics laptop, the UHD 620 laptop over PXE, the SM8150
   phone, and QEMU on both arches. Everything else is best-effort.
 - **Firmware loading** through the standard paths so Debian's
   `firmware-*` packages work unmodified; `b1nix-firmware` only fills gaps.
@@ -388,7 +388,7 @@ What a lane must look like — naming, stages, the known-degraded list — is in
 - **Soak and fuzz** — the existing soak harness on the release candidate, plus
   a syscall fuzzer (syzkaller is the obvious import; even a crude one finds
   the first tier of bugs in a from-scratch kernel).
-- **Hardware in the loop** — the T480 over PXE and the phone over fastboot, run
+- **Hardware in the loop** — the UHD 620 laptop over PXE and the phone over fastboot, run
   manually at a release, with the checklist below.
 - **The release checklist** lives in [release-checklist.md](release-checklist.md)
   and is mechanical: verify the lanes, the reference machines, the rescue recipe, the

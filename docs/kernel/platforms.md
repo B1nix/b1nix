@@ -1,7 +1,7 @@
 # Platforms and userspace
 
-Milestones M0–M1, M37, M94, M97, M104, M108, M111–M113, M119 and M121, plus
-AArch64 as a second target of the same kernel.
+Milestones M0–M1, M37, M94, M97, M104, M108, M111–M113, M119, M121 and M134,
+plus AArch64 as a second target of the same kernel.
 
 ## What b1nix is
 
@@ -17,12 +17,91 @@ them, and the `b1cc` compiler.
 
 The primary target runs in QEMU with KVM and on real machines. On real
 hardware it has driven e1000/e1000e and r8169 network cards, xHCI keyboards and
-mice, AHCI and NVMe disks, and ACPI with MADT and the IOAPIC (M37). A laptop
+mice, AHCI and NVMe disks, and ACPI with MADT and the IOAPIC (M37) — and, since M134, the bytecode
+inside the DSDT as well as the tables around it. A laptop
 with a UHD 620 is booted over PXE (`tools/run/pxe-serve.sh`) and, having no
 serial port, reports through netconsole. The kernel asks the processor what it
 is rather than guessing: the CPU name, `RNDR`/`RDRAND`, the physical address
 width and the TSC frequency come from CPUID, and `/proc/cpuinfo` shows the real
 flags (M119).
+
+## The firmware's own bytecode (M134)
+
+ACPI is two things wearing one name. The tables `kernel/dev/acpi.c` reads —
+RSDP, RSDT/XSDT, MADT, MCFG, SRAT, FADT — are structs: fields at fixed offsets,
+and a parser for them is a hundred lines. The DSDT is not that. It is a
+compiled program, and the SSDTs beside it are more of the same. A battery's
+remaining charge, a thermal zone's temperature, the sleep type this machine
+wants for soft-off, the frequencies a processor will accept: all of them are
+methods or packages inside that program, and none of them can be read by
+anything but an interpreter. That is what `kernel/dev/aml.c` is.
+
+**Loading.** The DSDT is found through the FADT (the 32-bit pointer at offset
+40, or `X_DSDT` at 140 where the table is long enough to have it), and every
+SSDT the root table lists is loaded after it; `acpi_table_at()` enumerates the
+root table for that, because `acpi_find_table()` only ever returns the first
+match for a signature and a machine has as many SSDTs as its firmware felt
+like emitting. The load pass walks the term list building the namespace —
+scopes, devices, processors, thermal zones, power resources, names, methods,
+packages, buffers, operation regions and their fields — and executes nothing.
+It can walk past a construct it has never seen because every declaration in
+AML carries a `PkgLength`, so skipping one is arithmetic rather than
+understanding; an `If` at declaration level is followed when its predicate can
+be decided, because firmware does hide declarations behind one. Whatever is
+skipped is counted and reported, so "the parser did not understand this
+machine" is a number rather than a silence.
+
+**Evaluating.** Methods are run on demand, never at load. The evaluator
+covers the arithmetic, bitwise and logical opcodes,
+`If`/`Else`/`While`/`Return`/`Break`/`Continue`, `Store` and `CopyObject` with
+ACPI's conversion rules, `Index`, `DerefOf`, `RefOf`, `SizeOf`, `Match`,
+`Mid`/`Concat`/`ToString` and the other conversions, the `CreateXField` buffer
+fields, method invocation with arguments and locals, and field access through
+`SystemMemory` and `SystemIO` regions — index fields, the five access widths
+and the three update rules included. A revision-1 table gets 32-bit
+arithmetic, because that is what its author tested against. `\_OSI` answers
+the Windows strings and nothing else, for the same reason Linux does: firmware
+branches on the answer, and a kernel that claims nothing takes a path nobody
+has ever run.
+
+Two things bound it. Everything runs under one lock and nothing sleeps:
+`Sleep` and `Stall` are bounded busy waits, so a firmware asking for a long nap
+costs a bounded delay rather than a stalled CPU. And every evaluation spends
+from a step budget, so a `While` that never falls out ends as an error instead
+of as a hung machine.
+
+**What it refuses.** PCI configuration space, the embedded controller, SMBus
+and CMOS are not implemented, and an access to one returns an error that
+propagates out of the whole evaluation. It is never answered with a zero. A
+battery reading 0% because the interpreter invented the number is worse than a
+battery that is absent, and the refusals are counted in `/proc/b1nix-acpi` so
+that a machine needing one says which. On QEMU this is visible: the PIIX link
+devices keep their routing in PCI config space, so `\_SB_.LNKA._STA` is
+refused, and the smoke suite checks that it is refused rather than answered.
+
+**What it is for.** `/sys/class/power_supply/BAT0/{type,present,status,capacity,energy_now,energy_full}`
+comes from `_STA`, `_BIF` and `_BST`; `AC0/online` from `_PSR`;
+`/sys/class/thermal/thermal_zoneN/{type,temp}` from a zone's `_TMP`. Each file
+re-evaluates its method on every read, because that is the only way a charge
+is ever current, and each is published only for a device the firmware really
+declares. No machine here declares one — a QEMU guest has no ACPI battery —
+so `/sys/class/power_supply` is empty, and the test insists on that rather
+than papering over it.
+
+**Reading it.** `/proc/b1nix-acpi` lists the tables loaded, the object counts
+by type, the terms the loader could not decode, the address spaces it refused,
+and the namespace itself, one absolute path per line. `/proc/b1nix-acpi-eval`
+is root-only and evaluates one object on demand: write a path and its integer
+arguments, read the answer back. Writing to it makes the kernel execute
+firmware bytecode, which may touch any I/O port or physical address the DSDT
+names, which is why it is mode 0600.
+
+On QEMU's `pc` machine that namespace is 354 objects — 105 methods, 53
+devices, 7 regions, 20 fields — with no term the loader could not decode.
+The boards on the other architecture have a device tree and no RSDP, so
+nothing is loaded there and the namespace is the handful of roots the
+specification says an operating system creates; `/proc/b1nix-acpi` says so,
+and the same test checks it.
 
 ## The AArch64 target
 

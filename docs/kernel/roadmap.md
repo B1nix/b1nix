@@ -180,17 +180,20 @@ answers which question, are in [../versioning.md](../versioning.md).
 
 ## M128: Large memory and NUMA
 
-- [ ] `planned` Direct map and PMM beyond 64 GiB verified on real hardware or a large QEMU guest (M41 verified 16 GiB); 5-level paging where the CPU supports LA57.
-- [ ] `planned` NUMA topology from ACPI SRAT/SLIT; per-node PMM zones and node-local allocation for kernel and page cache.
-- [ ] `planned` Memory policies behind `mbind`/`set_mempolicy` become real on multi-node machines; `/sys/devices/system/node`.
-- [ ] `planned` Transparent huge pages for anonymous memory, with the page tables and COW paths that implies.
+Per-subject detail: [memory-and-scheduling.md](memory-and-scheduling.md).
+
+- [x] `done` A 72 GiB guest boots and runs the whole suite on a 27 GiB host (`SMOKE_BIGMEM=1`). It found the defect that mattered: with that much RAM the 64-bit PCI window sits above the direct map, and every driver reaching a BAR through it faulted in ring 0.
+- [x] `done` Five-level paging behind `b1nix.la57`: a PML5 whose entries 0 and 511 both name the PML4, so every existing four-level walk stays correct. Proved by the `la57` lane (TCG `-cpu max,la57=on`, 856 checks), which also found the APs booting with their caches disabled.
+- [x] `done` NUMA from SRAT and SLIT: per-node free lists in the buddy allocator, allocation from the running CPU's node, and a node lookup that costs one compare on a single-node machine.
+- [x] `done` `mbind`/`set_mempolicy`/`get_mempolicy`/`set_mempolicy_home_node` really place pages — MPOL_BIND enforced, MPOL_INTERLEAVE by page offset, MPOL_MF_MOVE migrating — with `/sys/devices/system/node` for `numactl`. Proved on a two-node guest, per page and by each node's free memory moving.
+- [x] `partial` Transparent huge pages for anonymous memory, x86_64 only and off unless `b1nix.thp` asks. Ten checks on bytes (backing, COW, mprotect and munmap of half a block, no leak). Not done: a block is not reclaimable while it is a block, so `always` is unsafe under `memory.max` — and splitting from reclaim is not the answer, tried twice (inside the eviction pass, and a level above it in the cgroup's own reclaim): both wedge the machine, so the split has to happen where the charge is decided, before the allocation that would fail. A remapped address range also falls back to 4 KiB until an empty page table can be retired safely, which is what khugepaged would need too; aarch64 does nothing.
 
 ## M129: Power management
 
-- [ ] `planned` Idle: cpuidle with ACPI `_CST`/intel_idle-style MWAIT C-states instead of plain HLT; tickless idle CPUs.
-- [ ] `planned` Frequency: cpufreq with intel_pstate/HWP and ACPI `_PSS`; governors exposed under `/sys/devices/system/cpu`.
-- [ ] `planned` Suspend: s2idle first, then ACPI S3 with device suspend/resume ordering (NVMe, xHCI, i915, e1000e); `systemctl suspend` returns to a working desktop.
-- [ ] `planned` Battery and thermals on a laptop: ACPI battery/AC, thermal zones, vendor ACPI hotkeys; measured idle power against Linux on the same machine.
+- [x] `done` Idle: one `cpuidle_enter` for every park (MWAIT C-states where the CPU has them, HLT/WFI otherwise) with per-CPU counters under `/sys/devices/system/cpu/cpuN/cpuidle`, and a tickless idle CPU — an idle second costs 620 timer interrupts instead of 1998, a busy one still takes its thousand. `/proc/interrupts` gained `LOC`, `/proc/b1nix-tick` the rate and the cap.
+- [x] `partial` Frequency: HWP, or the older ratio request, read through faulting-safe MSR accessors, with a writable `scaling_governor` and an honest `none` on a guest whose hypervisor hides the leaves. Not yet run on hardware that has HWP; ACPI `_PSS` is not read.
+- [x] `partial` Suspend: s2idle end to end on both arches — `/sys/power/state`, a freezer that is not SIGSTOP, and the RTC alarm as a wake source — proved by eleven checks including a hole of the right length in a frozen child's own clock, and by util-linux's `rtcwake -m freeze` on the Debian lane. ACPI S3 is absent rather than broken (it needs device suspend/resume and a resume trampoline), and a plain `echo freeze` with no alarm armed sleeps to the ten-second ceiling because the input wake source counts as armed on a console nobody types at.
+- [x] `partial` Battery and thermals: no longer blocked — M134's interpreter reads `_BST`/`_BIF`/`_PSR`/`_TMP` and publishes `/sys/class/power_supply` and `/sys/class/thermal` for what the firmware declares. No machine here declares any, so those paths are unexercised; hotkeys and the idle-power comparison are untouched.
 
 ## M130: More hardware through linuxkpi
 
@@ -233,3 +236,14 @@ Wi-Fi — so it runs before M128-M131.
 - [ ] `planned` The io_uring remainder: `RECV_ZC`, io-wq affinity, NAPI busy-poll, buffer cloning, ring resizing, memory regions and the query interface, and a `SEND_ZC` that pins the caller's pages instead of copying.
 - [ ] `planned` The observability remainder: tracepoints and kprobes, and eBPF with a JIT, BTF and CO-RE, so a `bpftrace` script or a CO-RE toolchain's program loads instead of being refused with a reason.
 - [ ] `planned` Proof: the Debian and systemd lanes pass with no lane-side workaround, an ISO boots on a UEFI machine, and every row this milestone names is gone from the gap table.
+
+## M134: ACPI methods
+
+Per-subject detail: [platforms.md](platforms.md).
+
+- [x] `done` An AML interpreter: the DSDT and every SSDT are loaded and the object tree built — scopes, devices, methods, packages, fields, operation regions. On QEMU's own firmware that is 354 objects, 105 methods, 53 devices, with no term the loader could not decode.
+- [x] `done` An evaluator for what those objects need: the opcodes, control flow, conversions, method calls with arguments and locals, and field access through SystemMemory and SystemIO. A runaway method spends a step budget and errors rather than hanging.
+- [x] `done` A refusal is a refusal: PCI config, embedded-controller, SMBus and CMOS regions return an error that propagates out of the evaluation and is recorded in `/proc/b1nix-acpi`, never a zero.
+- [x] `partial` The consumers: `/sys/class/power_supply/{BAT0,AC0}` and `/sys/class/thermal/thermal_zoneN` from `_STA`/`_BIF`/`_BST`/`_PSR`/`_TMP`, published only for devices the firmware declares — and no machine here declares any, so the code is written and unexercised.
+- [ ] `planned` What it is not used for yet: powering the machine off through `\_S5`, `_PSS` for cpufreq, GPE dispatch and `Notify` handlers, `_PRT` for interrupt routing.
+- [x] `done` Proof: thirteen checks against QEMU's own DSDT — `\_S5_` a package of four, `_HID` exactly `PNP0A03`, a 156-byte `_CRS`, a method with an argument that writes a CPU selector to an I/O port and reads the enabled bit back (0x0F for CPU 0, 0 for CPU 200), and a region refusal recorded rather than faked. On aarch64: no tables, roots only, nothing published.

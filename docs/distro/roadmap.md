@@ -147,7 +147,8 @@ Detail in [../kernel/roadmap.md](../kernel/roadmap.md) under M127.
 - [ ] `planned` [release-checklist.md](release-checklist.md) is followed
   literally; a step that needs judgement is rewritten until it does not.
 - [ ] `planned` `docs/release-checklist.md` run end to end on the reference
-  machines (the Intel-graphics laptop, the T480 over PXE, QEMU on both arches).
+  machines (the Intel-graphics laptop, the UHD 620 laptop over PXE, QEMU on
+  both arches).
 - [ ] `planned` Kernel `1.0.0` cut with the release.
 
 ## Phase F: arm64 in the same release

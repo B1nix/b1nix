@@ -113,3 +113,17 @@ NBD, software RAID (md), ATAPI drives and CFI NOR flash through MTD, which is
 enough for BusyBox's `losetup`, `nbd-client`, `readahead` and the other
 applets that stood on those layers (M107, M114). Swap works on a file or a partition. The root is
 writable and synced on shutdown (M21).
+
+On aarch64 the disk is virtio-blk over the mmio transport, where a request has
+a ten-second budget and a loaded TCG host does overrun it. A timeout is
+recoverable rather than fatal to the queue: the descriptors and the buffer stay
+the device's, the descriptor cursor rolls forward instead of restarting at zero,
+and a completion is matched by the used element's id — so the late answer to an
+abandoned request frees that request's buffer instead of being read as the
+status of the one in flight. Before that, one timeout desynchronised the ring
+and every later request failed.
+
+Open: under a fully parallel aarch64 run the log tree has been seen to reach
+`btrfs_cow_block` with a transaction handle whose `->transaction` is NULL. The
+COW check then aborts the transaction and the abort itself faults writing
+through that NULL pointer. Load-dependent, not reproduced on x86_64.

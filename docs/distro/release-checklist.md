@@ -28,7 +28,7 @@ login:
 
 - [ ] QEMU, both arches.
 - [ ] The Intel-graphics laptop.
-- [ ] The T480 over PXE.
+- [ ] The UHD 620 laptop over PXE.
 - [ ] The SM8150 phone over fastboot, with the way back to stock verified.
 - [ ] Suspend and resume once power management is claimed to work.
 - [ ] Wi-Fi associates once it is claimed to work.

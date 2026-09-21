@@ -15,7 +15,7 @@ lands when something is installable. They meet in
 | Where | What is in it |
 |---|---|
 | [kernel/roadmap.md](kernel/roadmap.md) | Kernel milestones, open and closed |
-| [kernel/platforms.md](kernel/platforms.md) | Targets, AArch64, distribution userspace lanes |
+| [kernel/platforms.md](kernel/platforms.md) | Targets, AArch64, ACPI and its bytecode, distribution userspace lanes |
 | [kernel/memory-and-scheduling.md](kernel/memory-and-scheduling.md) | Memory, scheduling, SMP |
 | [kernel/processes-and-system-calls.md](kernel/processes-and-system-calls.md) | Processes, signals, the Linux ABI surface |
 | [kernel/filesystems-and-storage.md](kernel/filesystems-and-storage.md) | VFS, filesystems, block layer |
