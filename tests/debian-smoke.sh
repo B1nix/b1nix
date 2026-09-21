@@ -252,10 +252,16 @@ for probe in \
 	"landlock:a Landlock ruleset confines a process to one directory, symlinks included" \
 	"quotactl:quotactl names its target as Linux does: ESRCH with quotas off, ENOTBLK, EINVAL, ENOSYS without quota operations" \
 	"memfd-secret:memfd_secret maps shared only, its owner uses it, /proc/self/mem cannot read it" \
-	"vdso-glibc:glibc time() and date(1) read the clock through the vDSO, under a seccomp filter that fails the clock system calls" \
-	"nspawn:systemd-nspawn runs a command as PID 1 of new namespaces, with the machine name as hostname and a /proc of its own"; do
+	"vdso-glibc:glibc time() and date(1) read the clock through the vDSO, under a seccomp filter that fails the clock system calls"; do
 	check_output "DEBIAN-SMOKE: ok ${probe%%:*}" "${probe#*:}"
 done
+
+# systemd-nspawn is in the systemd profile's image and not in the sysv one, so
+# it is graded only when the image carried it -- an absent container manager is
+# not a kernel failure.
+if grep -qa "DEBIAN-SMOKE: \(ok\|FAIL\) nspawn" "$LOG" 2>/dev/null; then
+	check_output "DEBIAN-SMOKE: ok nspawn" "systemd-nspawn runs a command as PID 1 of new namespaces, with the machine name as hostname and a /proc of its own"
+fi
 
 # M125. These two only run when the image was built to hold them, so they are
 # checked only when the harness says it got that far — an absent liburing
@@ -280,6 +286,18 @@ if grep -qa "DEBIAN-SMOKE: liburing suite starts" "$LOG" 2>/dev/null; then
 	done
 	sed -n 's/.*DEBIAN-SMOKE: \(liburing totals .*\)/  \1/p' "$LOG" | tail -1
 fi
+# M126. The distribution's own perf, when the image was built with PERF=1.
+if grep -qa "DEBIAN-SMOKE: perf is" "$LOG" 2>/dev/null; then
+	check_output "DEBIAN-SMOKE: ok perf-version" "the distribution's perf runs on this kernel"
+	check_output "DEBIAN-SMOKE: ok perf-stat" "perf stat counts task-clock and page-faults for a command it runs"
+	check_output "DEBIAN-SMOKE: ok perf-stat-hw" "perf stat counts cycles and instructions on the CPU's own counters"
+	check_output "DEBIAN-SMOKE: ok perf-record" "perf record samples a command through the mmap'd ring buffer and writes a perf.data"
+	check_output "DEBIAN-SMOKE: ok perf-report" "perf report reads its own perf.data back and attributes the samples to symbols"
+	sed -n 's/.*DEBIAN-SMOKE: \(perf counted .*\)/  \1/p' "$LOG" | tail -1
+	sed -n 's/.*DEBIAN-SMOKE: \(perf record took .*\)/  \1/p' "$LOG" | tail -1
+	sed -n 's/.*DEBIAN-SMOKE: \(perf report: .*\)/  \1/p' "$LOG" | tail -1
+fi
+
 if grep -qa "fio-io_uring" "$LOG" 2>/dev/null; then
 	check_output "DEBIAN-SMOKE: ok fio-io_uring" "fio writes 8 MiB through its own io_uring engine and the file is that size"
 	check_output "DEBIAN-SMOKE: ok fio-io_uring-fixed" "fio reads it back with registered files and registered buffers"

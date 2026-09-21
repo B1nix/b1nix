@@ -95,6 +95,14 @@ sysvinit)
 		_fio_pkgs=" fio"
 		RESOLVE_DEPS="${RESOLVE_DEPS:-1}"
 	fi
+	# PERF=1 adds the distribution's own perf (M126). It is the hardest user
+	# of perf_event_open there is -- it opens counters by name, maps the ring
+	# buffer, and parses its own records back -- and it is compiled against
+	# Linux's headers, so what it tests is the ABI.
+	if [ "${PERF:-0}" = "1" ]; then
+		_fio_pkgs="$_fio_pkgs linux-perf"
+		RESOLVE_DEPS="${RESOLVE_DEPS:-1}"
+	fi
 	PACKAGES="${PACKAGES:-procps libproc2-0 libncursesw6 sysvinit-core sysvinit-utils$_fio_pkgs}"
 	RESOLVE_DEPS="${RESOLVE_DEPS:-0}"
 	;;

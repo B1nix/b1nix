@@ -322,3 +322,86 @@ every CPU; otherwise the vDSO falls back to the system call, as it does for
 processes in a time namespace. `vdso_smoke` proves the fast path under a seccomp
 filter that refuses the clock calls, and the Debian lane's `vdso-glibc` probe
 does the same for glibc.
+
+
+## Observability: perf, userfaultfd, fanotify and eBPF (M126)
+
+Four ways for a program to see what the kernel is doing, and in two of the four
+to change the answer.
+
+### perf_event_open and the PMU
+
+A counter is a descriptor: `read(2)` gives the count, `ioctl(2)` starts and
+stops it, `mmap(2)` gives the ring buffer records are written into. The
+software counters come from accounting the kernel already keeps; the hardware
+ones come from the CPU (`kernel/perf/pmu_x86.c`), found through CPUID's
+architectural performance-monitoring leaf.
+
+Two details there are worth stating, because both were found by running the
+distribution's own `perf` rather than by reading a manual:
+
+* **The fixed counters matter.** A KVM guest may back `IA32_FIXED_CTR1`
+  (unhalted core cycles) and not the same event on a general-purpose counter:
+  cycles read as forty thousand over 120 ms of spinning through `IA32_PMCx`,
+  and as 549 million through the fixed counter. Linux prefers the fixed
+  counters for cycles, instructions and reference cycles, and so does this.
+* **Attribution is by interval, not by counter.** The counters are read at
+  every context switch and every tick, and the delta is credited to the task
+  that ran over that interval — which is exact at the switch boundaries, since
+  within a timeslice there is only one task to credit. A counter on a child
+  blocked in `read(2)` sees twenty thousand instructions while its parent burns
+  four hundred million.
+
+`perf stat`, `perf record` and `perf report` from Debian work on this kernel.
+Making them work needed `attr.inherit` (perf sets it on everything it opens),
+`enable_on_exec` (a counter opened on a child before it execs must start when
+the program does, not when the fork did), group reads, and `PERF_FORMAT_LOST`
+— which is a Linux 6.0 field `perf record` asks for unconditionally, and whose
+refusal made the whole recording fail before it started.
+
+### userfaultfd
+
+A fault in a registered range stops the faulting thread and puts a message on
+a descriptor; a monitor decides what the page should hold and fills it in with
+`UFFDIO_COPY` or `UFFDIO_ZEROPAGE`. The hook sits at the TOP of the fault
+handler, before any case looks at the page: a fresh anonymous read would
+otherwise be answered with the shared zero page and a write to a
+write-protected page would quietly take the copy-on-write path, and in both
+cases the monitor would never hear about the access it exists to see.
+
+A monitor that goes away does not freeze its process: closing the descriptor
+releases every waiter, and the fault falls through to the ordinary zero-fill.
+
+### fanotify
+
+inotify says what changed in a directory. fanotify says what the machine is
+DOING to its files — a mark on a whole mount, an open descriptor per event, and
+a permission event whose `FAN_DENY` makes the `open(2)` that triggered it
+return EPERM. That is the shape an antivirus scanner or a file-integrity
+monitor needs.
+
+The trap worth remembering: an event carries a descriptor, and reading or
+closing THAT descriptor is an access like any other, so it produces another
+event, which produces another descriptor. A monitor doing its job feeds itself
+for ever and the machine stops doing anything else. Linux marks those files
+`FMODE_NONOTIFY`; this kernel marks the handle `no_notify`, which is what
+`struct vfs_handle` grew that field for.
+
+### eBPF
+
+A program is verified, loaded and interpreted, and can be attached to a perf
+event so that it runs on every sample. Maps are how it keeps state that
+userspace reads while it runs: a profiler that counts into a map writes no
+records at all.
+
+The verifier is the part that matters. It walks every path with a model of
+what each register holds — uninitialised, a number, the context, a stack
+pointer at a known offset, a map, a map value that may be NULL, a map value
+that has been tested — and refuses the moment an instruction could do
+something the model cannot prove is in bounds. Backward jumps are refused
+outright, which is what makes the walk terminate; Linux required the same
+until bounded loops arrived.
+
+What is missing is stated at load time rather than discovered later: no JIT,
+no BTF (so no CO-RE), no kprobe or tracepoint attach points, and no program
+types outside the tracing ones.

@@ -22,6 +22,11 @@ void perf_event_tick_sample(u64 pc, u64 fp, int in_user, int cpu);
  * report` can close the map of a process that has gone. */
 void perf_event_task_exit(struct task *t);
 
+/* A task has just replaced its image. Events opened on it with
+ * attr.enable_on_exec start counting here -- which is what perf stat means by
+ * "count this command" and not the fork that led to it. */
+void perf_event_task_exec(struct task *t);
+
 /* The value /proc/sys/kernel/perf_event_paranoid reports, and the setting that
  * decides whether an unprivileged process may open an event. */
 int perf_event_paranoid_get(void);

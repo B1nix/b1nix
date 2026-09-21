@@ -55,8 +55,10 @@
 #include <b1nix/arch.h>
 #include <b1nix/bpf.h>
 #include <b1nix/bootinfo.h>
+#include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
+#include <b1nix/kprintf.h>
 #include <b1nix/ktime.h>
 #include <b1nix/mm.h>
 #include <b1nix/perf_event_abi.h>
@@ -201,14 +203,43 @@ static u64 perf_raw_one(u64 config, struct task *t) {
   }
 }
 
+/* Is `t` the target, or a descendant of it? attr.inherit means the counter
+ * covers the whole subtree the target started, which is what "count this
+ * command" means to the person who typed it. */
+static int perf_in_subtree(struct task *t, usize target) {
+  int depth = 0;
+
+  while (t && depth++ < 64) {
+    if (t->id == target || task_tgid(t) == target)
+      return 1;
+    if (!t->parent_id)
+      return 0;
+    t = scheduler_task_by_pid(t->parent_id);
+  }
+  return 0;
+}
+
 /* The same, summed over every task when the event watches the machine. */
 static u64 perf_raw(const struct perf_ev *ev) {
   if (ev->pmu_slot >= 0)
     return perf_pmu_slot_count(ev->pmu_slot);
   if (ev->attr.config == PERF_COUNT_SW_CPU_CLOCK)
     return ktime_monotonic_ns();
-  if (ev->target)
+  if (ev->target && !ev->attr.inherit)
     return perf_raw_one(ev->attr.config, scheduler_task_by_pid(ev->target));
+  if (ev->target) {
+    /* The target and everything it started, live or not yet reaped. */
+    u64 sum = 0;
+    usize slots = scheduler_task_slots();
+
+    for (usize i = 0; i < slots; i++) {
+      struct task *t = scheduler_task_slot(i);
+
+      if (t && perf_in_subtree(t, ev->target))
+        sum += perf_raw_one(ev->attr.config, t);
+    }
+    return sum;
+  }
   {
     u64 sum = 0;
 
@@ -589,6 +620,23 @@ static void perf_emit_task_records(struct perf_ev *ev, struct task *t) {
   }
 }
 
+void perf_event_task_exec(struct task *t) {
+  u64 flags;
+
+  if (!t || !g_events)
+    return;
+  spin_lock_irqsave(&g_perf_lock, &flags);
+  for (struct perf_ev *ev = g_events; ev; ev = ev->next) {
+    if (!ev->attr.enable_on_exec || ev->enabled)
+      continue;
+    if (ev->target && ev->target != t->id && task_tgid(t) != ev->target &&
+        !(ev->attr.inherit && perf_in_subtree(t, ev->target)))
+      continue;
+    perf_enable(ev);
+  }
+  spin_unlock_irqrestore(&g_perf_lock, flags);
+}
+
 void perf_event_task_exit(struct task *t) {
   u64 flags;
   u64 trailer[8];
@@ -691,6 +739,46 @@ static isize perf_handle_read(struct vfs_handle *h, char *buf, usize len) {
     vals[n++] = ev->time_running + (ev->enabled ? now - ev->since : 0);
   if (ev->attr.read_format & PERF_FORMAT_ID)
     vals[n++] = ev->id;
+  /* PERF_FORMAT_LOST: how many records this event had to drop because the
+   * reader was not keeping up. perf asks for it on every event it opens
+   * (Linux 6.0 and later), and refusing the format made `perf record` fail
+   * before it started. The number is real -- it is the same counter the
+   * PERF_RECORD_LOST record reports. */
+  if (ev->attr.read_format & PERF_FORMAT_LOST)
+    vals[n++] = ev->lost;
+
+  /* PERF_FORMAT_GROUP: the leader answers for the whole group in one read,
+   * which is how `perf stat -e '{a,b}'` reads counters that were scheduled
+   * together. The shape is nr, then the two optional times, then one entry
+   * per member. */
+  if (ev->attr.read_format & PERF_FORMAT_GROUP) {
+    u64 gvals[64];
+    u32 gn = 0;
+    u64 nr = 0;
+
+    for (struct perf_ev *m = g_events; m; m = m->next)
+      if (m->leader == ev->leader)
+        nr++;
+    gvals[gn++] = nr;
+    if (ev->attr.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED)
+      gvals[gn++] = ev->time_enabled + (ev->enabled ? now - ev->since : 0);
+    if (ev->attr.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING)
+      gvals[gn++] = ev->time_running + (ev->enabled ? now - ev->since : 0);
+    for (struct perf_ev *m = g_events; m && gn + 3 < 64; m = m->next) {
+      if (m->leader != ev->leader)
+        continue;
+      gvals[gn++] = perf_count_now(m);
+      if (ev->attr.read_format & PERF_FORMAT_ID)
+        gvals[gn++] = m->id;
+      if (ev->attr.read_format & PERF_FORMAT_LOST)
+        gvals[gn++] = m->lost;
+    }
+    spin_unlock_irqrestore(&g_perf_lock, flags);
+    if (len < gn * sizeof(u64))
+      return -ENOSPC;
+    memcpy(buf, gvals, gn * sizeof(u64));
+    return (isize)(gn * sizeof(u64));
+  }
   spin_unlock_irqrestore(&g_perf_lock, flags);
 
   if (len < n * sizeof(u64))
@@ -830,6 +918,33 @@ static const struct vfs_file_ops perf_file_ops = {
     .release = perf_handle_release,
 };
 
+/* Why an open was refused, said once per reason.
+ *
+ * perf reports a refusal as "<not supported>" and moves on, which tells the
+ * person nothing about WHICH of the thirty fields in perf_event_attr this
+ * kernel could not honour. One line per distinct reason costs nothing and is
+ * the difference between a guess and a fix. */
+static const char *g_refused[16];
+static int g_refused_n;
+
+static int perf_refuse(const char *why, int err) {
+  int seen = 0;
+
+  for (int i = 0; i < g_refused_n; i++)
+    if (g_refused[i] == why)
+      seen = 1;
+  if (!seen && g_refused_n < 16) {
+    g_refused[g_refused_n++] = why;
+    /* Written straight to the console rather than through the log level: a
+     * lane that boots quiet is exactly where this question gets asked. Once
+     * per distinct reason, so it cannot become noise. */
+    console_write("perf: refusing perf_event_open: ");
+    console_write(why);
+    console_write("\n");
+  }
+  return err;
+}
+
 /* ---- perf_event_open ---------------------------------------------------- */
 
 /* Every sample_type bit whose field this really writes. A caller asking for
@@ -841,7 +956,7 @@ static const struct vfs_file_ops perf_file_ops = {
 
 #define PERF_READ_FORMAT_SUPPORTED                                             \
   (PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING |           \
-   PERF_FORMAT_ID)
+   PERF_FORMAT_ID | PERF_FORMAT_LOST | PERF_FORMAT_GROUP)
 
 static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
   struct perf_event_attr attr;
@@ -863,26 +978,24 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
     return -EFAULT;
 
   if (!perf_attr_supported(&attr))
-    return -EOPNOTSUPP;
+    return perf_refuse("this counter is not one the kernel keeps", -EOPNOTSUPP);
   if (attr.sample_type & ~(u64)PERF_SAMPLE_SUPPORTED)
-    return -EOPNOTSUPP;
+    return perf_refuse("a sample_type field this does not produce",
+                       -EOPNOTSUPP);
   if (attr.read_format & ~(u64)PERF_READ_FORMAT_SUPPORTED)
-    return -EOPNOTSUPP;
-  /* A group read would have to report every member in one go; groups here are
-   * only a scheduling relationship, so the format is refused rather than
-   * answered with the leader's value alone. */
-  if (attr.read_format & PERF_FORMAT_GROUP)
-    return -EOPNOTSUPP;
-  if (attr.inherit)
-    /* Counting a task's children too needs the counter to follow fork; it does
-     * not, and reporting the parent's count as if it covered the children
-     * would be the wrong number rather than none. */
-    return -EOPNOTSUPP;
+    return perf_refuse("a read_format this does not produce", -EOPNOTSUPP);
+
+  /* attr.inherit: the counter covers the target's children too. perf stat
+   * sets it on every event it opens, because what a person means by "count
+   * this command" includes everything the command runs. Implemented by
+   * counting descendants at read time rather than by cloning the counter on
+   * fork -- the numbers are the same, and there is no counter to leak when a
+   * child exits. */
   if (attr.precise_ip)
-    return -EOPNOTSUPP; /* no PEBS-style hardware to make an IP exact */
+    return perf_refuse("precise_ip: no PEBS-style hardware here", -EOPNOTSUPP);
 
   if (pid == -1 && cpu == -1)
-    return -EINVAL; /* Linux refuses this pair */
+    return perf_refuse("pid == -1 with cpu == -1", -EINVAL);
   if (pid > 0 && !scheduler_task_by_pid((usize)pid))
     return -ESRCH;
   /* perf_event_paranoid: 2 lets an unprivileged caller profile only its own
@@ -901,11 +1014,14 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
     }
   }
 
+  struct perf_ev *group_leader = 0;
+
   if (group_fd >= 0) {
     struct vfs_handle *gh = scheduler_fd_get(group_fd);
 
     if (!gh || gh->ops != &perf_file_ops)
       return -EINVAL;
+    group_leader = (struct perf_ev *)gh->private_data;
   }
 
   if (g_nr_events >= PERF_MAX_EVENTS)
@@ -918,7 +1034,7 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
   ev->cpu = cpu;
   ev->target = (pid == -1) ? 0 : (pid == 0 ? (current_task ? current_task->id : 0)
                                            : (usize)pid);
-  ev->leader = ev;
+  ev->leader = group_leader ? group_leader : ev;
   ev->refresh = -1;
   ev->pmu_slot = -1;
   if (attr.type == PERF_TYPE_HARDWARE || attr.type == PERF_TYPE_HW_CACHE ||
@@ -958,9 +1074,11 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
      * there is no overflow interrupt to hang it off, so it is refused rather
      * than approximated. */
     if (attr.config != PERF_COUNT_SW_CPU_CLOCK &&
-        attr.config != PERF_COUNT_SW_TASK_CLOCK) {
+        attr.config != PERF_COUNT_SW_TASK_CLOCK && ev->pmu_slot < 0) {
       kfree(ev);
-      return -EOPNOTSUPP;
+      return perf_refuse("a sample_period on a counter with no overflow "
+                         "interrupt behind it",
+                         -EOPNOTSUPP);
     }
     ev->period_ns = attr.sample_period;
     ev->ns_left = attr.sample_period;
@@ -1071,11 +1189,60 @@ static int perf_rb_alloc(struct perf_ev *ev, usize pages) {
   return 0;
 }
 
+/* Every refused open, with what it asked for, said once per distinct shape.
+ * A tool reports "<not supported>" and moves on; this is the only place the
+ * combination it asked for can be seen. */
+static void perf_log_refusal(u64 uattr, int rc) {
+  static u64 seen[16];
+  static int seen_n;
+  struct perf_event_attr a;
+  u32 size = 0;
+
+  if (rc >= 0)
+    return;
+  if (syscall_copyin(&size, (const void *)(usize)(uattr + 4), sizeof(size)) < 0)
+    return;
+  memset(&a, 0, sizeof(a));
+  if (syscall_copyin(&a, (const void *)(usize)uattr,
+                     size > sizeof(a) ? sizeof(a) : size) < 0)
+    return;
+
+  u64 shape = ((u64)a.type << 40) ^ (a.config << 8) ^ (u64)(-rc);
+
+  for (int i = 0; i < seen_n; i++)
+    if (seen[i] == shape)
+      return;
+  if (seen_n < 16)
+    seen[seen_n++] = shape;
+
+  console_write("perf: refused an open, rc=-");
+  console_write_dec((u64)(-rc));
+  console_write(" type=");
+  console_write_dec(a.type);
+  console_write(" config=0x");
+  console_write_hex64(a.config);
+  console_write(" sample_type=0x");
+  console_write_hex64(a.sample_type);
+  console_write(" read_format=0x");
+  console_write_hex64(a.read_format);
+  console_write(" freq=");
+  console_write_dec(a.freq);
+  console_write(" period=");
+  console_write_dec(a.sample_period);
+  console_write(" precise=");
+  console_write_dec(a.precise_ip);
+  console_write("\n");
+}
+
 int perf_event_syscall(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4,
                        u64 *ret) {
   (void)a4;
   if (nr != PERF_NR_open)
     return 0;
-  *ret = (u64)perf_open(a0, (i32)a1, (i32)a2, (i32)a3, a4);
+
+  isize rc = perf_open(a0, (i32)a1, (i32)a2, (i32)a3, a4);
+
+  perf_log_refusal(a0, (int)rc);
+  *ret = (u64)rc;
   return 1;
 }

@@ -888,6 +888,97 @@ if command -v fio >/dev/null 2>&1; then
 	rm -f /tmp/fio-uring.dat
 fi
 
+# ── Stage 16: the distribution's own perf (M126) ───────────────────────────
+# perf is the reason perf_event_open(2) exists, and it is a far harder user of
+# it than a hand-written test: it opens counters by name, mmaps a ring buffer,
+# reads the records back, resolves them against /proc/<pid>/maps and
+# /proc/kallsyms, and refuses to print a profile it cannot parse. Debian's
+# binary is compiled against Linux's own headers, so what it exercises is the
+# ABI and not this kernel's idea of it.
+#
+# Debian's /usr/bin/perf is a wrapper that picks a versioned binary by
+# `uname -r`; b1nix does not answer with a Debian kernel version, so the
+# versioned binary is found and run directly when the wrapper gives up.
+perf_bin=""
+if command -v perf >/dev/null 2>&1 && perf --version >/dev/null 2>&1; then
+	perf_bin="perf"
+else
+	for cand in /usr/lib/linux-tools/*/perf /usr/lib/linux-tools-*/perf; do
+		[ -x "$cand" ] || continue
+		perf_bin="$cand"
+		break
+	done
+fi
+
+if [ -n "$perf_bin" ]; then
+	echo "DEBIAN-SMOKE: perf is $perf_bin"
+	"$perf_bin" --version >/dev/null 2>&1 && ok perf-version || bad perf-version
+
+	# perf stat, on software counters the kernel keeps itself.
+	stat_out=$("$perf_bin" stat -e task-clock,page-faults -x, -- \
+		sh -c 'i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done' 2>&1)
+	stat_clock=$(echo "$stat_out" | grep -a task-clock | cut -d, -f1 | cut -d. -f1)
+	if [ -n "$stat_clock" ] && [ "$stat_clock" -gt 0 ] 2>/dev/null; then
+		ok perf-stat
+	else
+		bad "perf-stat ($(echo "$stat_out" | tr '\n' '|' | cut -c1-160))"
+	fi
+
+	# perf stat on the CPU's own counters: this is the PMU, through the
+	# distribution's tool, on the event names a person actually types.
+	hw_out=$("$perf_bin" stat -e cycles,instructions -x, -- \
+		sh -c 'i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done' 2>&1)
+	hw_cycles=$(echo "$hw_out" | grep -a ',cycles' | cut -d, -f1)
+	hw_insns=$(echo "$hw_out" | grep -a ',instructions' | cut -d, -f1)
+	case "$hw_cycles" in ''|*[!0-9]*) hw_cycles=0 ;; esac
+	case "$hw_insns" in ''|*[!0-9]*) hw_insns=0 ;; esac
+	if [ "$hw_cycles" -gt 1000 ] && [ "$hw_insns" -gt 1000 ]; then
+		echo "DEBIAN-SMOKE: perf counted $hw_insns instructions in $hw_cycles cycles"
+		ok perf-stat-hw
+	else
+		bad "perf-stat-hw (cycles=$hw_cycles insns=$hw_insns: $(echo "$hw_out" | tr '\n' '|' | cut -c1-160))"
+	fi
+
+	# perf record, then perf report: the whole round trip through the mmap'd
+	# ring buffer, with perf parsing its own records back.
+	rm -f /tmp/perf.data
+	rec_out=$(cd /tmp && "$perf_bin" record -F 199 -o /tmp/perf.data -- \
+		sh -c 'i=0; while [ $i -lt 400000 ]; do i=$((i+1)); done' 2>&1)
+	rec_rc=$?
+	samples=$(echo "$rec_out" | grep -ao '[0-9]* samples' | head -1 | cut -d' ' -f1)
+	case "$samples" in ''|*[!0-9]*) samples=0 ;; esac
+	if [ "$rec_rc" = "0" ] && [ -s /tmp/perf.data ] && [ "$samples" -gt 0 ]; then
+		echo "DEBIAN-SMOKE: perf record took $samples samples"
+		ok perf-record
+	else
+		bad "perf-record (rc=$rec_rc samples=$samples: $(echo "$rec_out" | tr '\n' '|' | cut -c1-200))"
+		# perf -vv prints the whole perf_event_attr it asked for and the
+		# errno it got back, which is the only view of that from inside the
+		# guest: the kernel's own console belongs to this userspace by now.
+		vv=$("$perf_bin" record -vv -F 199 -o /tmp/perf-vv.data -- true 2>&1 |
+			grep -aE 'perf_event_attr|type|config|size|sample_freq|sample_type|read_format|disabled|inherit|freq|enable_on_exec|precise_ip|exclude|mmap|comm|task|sample_id_all|failed|Error' |
+			head -40)
+		echo "DEBIAN-SMOKE: perf -vv says:"
+		echo "$vv" | while IFS= read -r line; do
+			echo "DEBIAN-SMOKE:   vv $line"
+		done
+		rm -f /tmp/perf-vv.data
+	fi
+
+	if [ -s /tmp/perf.data ]; then
+		rep_out=$("$perf_bin" report -i /tmp/perf.data --stdio 2>&1 | head -40)
+		if echo "$rep_out" | grep -qa '%'; then
+			echo "DEBIAN-SMOKE: perf report: $(echo "$rep_out" | grep -a '%' | head -1 | tr -s ' ' | cut -c1-90)"
+			ok perf-report
+		else
+			bad "perf-report ($(echo "$rep_out" | tr '\n' '|' | cut -c1-200))"
+		fi
+	fi
+	rm -f /tmp/perf.data
+else
+	echo "DEBIAN-SMOKE: note perf is not installed in this image"
+fi
+
 echo "DEBIAN-SMOKE: done"
 
 # Let QEMU exit on its own where possible; the host harness kills it on timeout

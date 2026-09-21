@@ -10,6 +10,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/ptrace.h>
+#include <b1nix/perf_event.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
@@ -2578,6 +2579,11 @@ resolve:
    * when the new image first returns to ring 3, i.e. before its entry point
    * runs, which is where a debugger expects to regain control. */
   ptrace_event_exec(current_task);
+  /* M126: attr.enable_on_exec. perf opens its counters on a child that has not
+   * exec'd yet, disabled, and asks for them to start when the program it is
+   * measuring actually begins -- otherwise the count includes the fork and the
+   * loader, which is not what was asked to be measured. */
+  perf_event_task_exec(current_task);
   task_set_tls_base(current_task, 0);
   {
     extern void arch_set_fs_base(u64 base);

@@ -1452,22 +1452,22 @@ static int r_mountinfo(usize pid, struct sbuf *s) {
  * to report (a browser start-up that takes 95 s took 337 s with it on). A
  * reader that asks for the numbers when it wants them costs nothing in
  * between, so a script can take one sample per run and compare runs. */
-/* /proc/b1nix-kprof — the kernel-RIP histogram alone.
+/* /proc/b1nix-kprof — the tick distribution, and where the profile went.
  *
- * b1nix-prof prints everything: the syscall table, the page-fault profile, the
- * interrupts-off sections, the inode waits. That is the right thing to read
- * once, and the wrong thing to sample repeatedly while something is running --
- * the read itself took over a minute through the console and changed the
- * behaviour being measured. This one is thirty lines and can be taken every
- * few seconds. */
+ * This used to print the kernel's own RIP histogram. perf_event_open(2) now
+ * answers that question properly (M126): from userspace, per task or
+ * machine-wide, with call chains, through a ring buffer rather than the
+ * console -- the console read alone took over a minute and changed the
+ * behaviour being measured. What is left here is the per-CPU tick
+ * distribution, which is cheap, always on, and not a sampling question. */
 static int r_b1nix_kprof(usize pid, struct sbuf *s) {
   (void)pid;
-  (void)s;
-  {
-    extern void kprof_dump_histogram_pub(void);
+  u64 u = 0, k = 0, i = 0;
 
-    kprof_dump_histogram_pub();
-  }
+  kprof_tick_totals(&u, &k, &i);
+  sb_addf(s, "ticks user %lu kernel %lu idle %lu\n", (unsigned long)u,
+          (unsigned long)k, (unsigned long)i);
+  sb_puts(s, "profile: perf_event_open(2) with PERF_SAMPLE_IP\n");
   return 0;
 }
 
