@@ -46,7 +46,10 @@ struct vfs_inode;
 // File lock structure
 struct file_lock {
     struct file_lock *next;
-    struct vfs_inode *inode; // Inode this lock applies to
+    /* What the lock applies to: the inode for a file, and the open file
+     * description itself for a descriptor that has no inode -- a socket, a
+     * pipe, an eventfd. Compared, never dereferenced. */
+    void *inode;
     int pid;              // Process (thread group) owning a POSIX lock
     /* The open file description owning an OFD lock, and what tells the two
      * kinds apart: null for a POSIX lock. Never dereferenced -- it is an
@@ -65,7 +68,9 @@ int filelock_unlock(int fd);
 int filelock_check_lock(int fd, int lock_type, u64 start, u64 len, int *conflict_pid);
 int filelock_flock(int fd, int operation);
 int filelock_set_lock_ofd(int fd, int cmd, struct flock *fl);
-void filelock_release_all_by_pid_inode(int pid, struct vfs_inode *inode);
+/* Drop this process's POSIX locks on one scope: an inode, or -- for a
+ * descriptor that has none -- the open file description itself. */
+void filelock_release_all_by_pid_inode(int pid, void *scope);
 /* Every OFD lock held by one open file description, released when it closes. */
 void filelock_release_all_by_ofd(void *ofd);
 

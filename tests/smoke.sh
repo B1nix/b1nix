@@ -291,6 +291,14 @@ _prepare_hostshare() {
 	_hs="$PROJECT_DIR/smoke_run/hostshare"
 	mkdir -p "$_hs"
 	echo "Hello from Host through VirtIO-9P!" > "$_hs/hello_from_host.txt" 2>/dev/null || true
+	# A file larger than any 9p message, with a pattern that says WHERE a read
+	# went wrong rather than only that it did. apt reads a package index off a
+	# 9p share this way, in chunks of its own choosing, and reported "read
+	# (22: Invalid argument)" without saying which read.
+	if [ ! -s "$_hs/big_from_host.bin" ]; then
+		awk 'BEGIN { for (i = 0; i < 16384; i++) printf "%06d-b1nix-9p-payload-%030d\n", i, i }' \
+			>"$_hs/big_from_host.bin" 2>/dev/null || true
+	fi
 	_src="$PROJECT_DIR/build/$ARCH/rootfs/bin"
 	[ -d "$_src" ] || return 0
 
@@ -1572,7 +1580,16 @@ launch_iommu() {
 		# this lane pushed it from 00:0e.0 to 00:0f.0, the exception then named a
 		# legacy pci-bridge with no ACS capability at all, and the check failed
 		# reporting zero named ports.
+		# An EMPTY optical drive on the ICH9 this lane's own boot CD hangs off
+		# (port 3: 0 and 1 carry disks, 5 the boot CD).
+		# It is the one shape that used to stop the boot dead: an ATAPI port
+		# with no disc never completes READ CAPACITY, and the probe waited for
+		# it for ever. It adds no PCI device, so nothing else on this lane
+		# moves. The two checks on the other side are what say the probe gave
+		# up and carried on rather than hanging.
 		EXTRA_QEMU_ARGS="-machine q35,kernel-irqchip=split -device intel-iommu,intremap=on \
+			-drive if=none,id=iommuemptycd,media=cdrom \
+			-device ide-cd,drive=iommuemptycd,bus=ahci.3 \
 			-device pcie-root-port,id=iommurp,chassis=9 \
 			-device x3130-upstream,id=iommusw,bus=iommurp \
 			-device xio3130-downstream,id=iommudn0,bus=iommusw,chassis=10,slot=0 \
@@ -2194,6 +2211,7 @@ check_output "$LOG" "M110-9P: ok mount" "VirtIO-9P mount successful"
 check_output "$LOG" "M110-9P: ok read-host-file" "VirtIO-9P read file from host verified"
 check_output "$LOG" "M110-9P: ok write-guest-file" "VirtIO-9P write file from guest verified"
 check_output "$LOG" "M110-9P: ok readdir" "VirtIO-9P directory traversal verified"
+check_output "$LOG" "M110-9P: ok read-big" "a file larger than any 9p message reads whole, in chunks of the caller's choosing -- what apt does with a package index on a 9p share"
 check_output "$LOG" "M110-9P: done" "VirtIO-9P smoke complete"
 
 # ── M15 IPC, Security & Standard OS Features ──
@@ -2227,6 +2245,8 @@ check_output "$LOG" "M56-SMOKE: ok timerfd-epoll" "a repeating timerfd wakes epo
 check_output "$LOG" "M56-SMOKE: ok epoll" "epoll_wait wakes on a ready fd and times out when idle"
 check_output "$LOG" "M56-SMOKE: ok timerfd" "timerfd fires and is pollable via epoll"
 check_output "$LOG" "M56-SMOKE: ok timerfd-gettime" "timerfd_gettime reports the time left and the interval, and zeros once disarmed"
+check_output "$LOG" "M56-SMOKE: ok timerfd-abstime-boottime" "an absolute CLOCK_BOOTTIME deadline wakes epoll_wait that has no timeout of its own -- the shape sd-event uses for every timer unit"
+check_output "$LOG" "M56-SMOKE: ok timerfd-abstime-monotonic" "the same with CLOCK_MONOTONIC"
 check_output "$LOG" "M56-SMOKE: ok signalfd" "signalfd delivers a raised signal as a readable record"
 check_output "$LOG" "M56-SMOKE: ok seal" "F_SEAL_WRITE on a sealable memfd rejects writes"
 check_output "$LOG" "M56-SMOKE: done" "M56 smoke completes"
@@ -2861,6 +2881,7 @@ check_output "$LOG" "UNIX-SMOKE: ok rcvtimeo" "SO_RCVTIMEO makes a blocking recv
 check_output "$LOG" "UNIX-SMOKE: ok rcvtimeo-data" "a socket with SO_RCVTIMEO still returns data that is already there"
 check_output "$LOG" "UNIX-SMOKE: ok fionread" "FIONREAD reports the bytes queued on a unix socket (every event-driven server asks this)"
 check_output "$LOG" "UNIX-SMOKE: ok peer-close-hup" "poll reports POLLHUP once the peer of a connected unix socket closes"
+check_output "$LOG" "UNIX-SMOKE: ok dgram-outlives-sender" "a datagram survives the process that sent it -- systemd's readiness protocol is one datagram from a program that exits immediately"
 check_output "$LOG" "UNIX-SMOKE: ok listen-no-hup" "a LISTENING unix socket reports readability for a queued client and never POLLHUP"
 # The clock every bounded test is held to. A timer that fires early makes a
 # working program look hung, so these have to be right before any other timing
@@ -3024,6 +3045,8 @@ check_output "$LOG" "M34-PROC: ok proc-listing" "/proc lists files, self and a p
 check_output "$LOG" "M34-PROC: ok proc-pid-status" "/proc/<pid>/status reports the process"
 check_output "$LOG" "M34-PROC: ok sysfs-osrelease" "/sys/kernel/osrelease reads back"
 check_output "$LOG" "M34-PROC: ok sysfs-cpu" "/sys/devices/system/cpu/online reads back"
+check_output "$LOG" "M34-PROC: ok uptime-monotonic" "/proc/uptime and CLOCK_MONOTONIC agree: the kernel's clock and the one userspace reads are the same clock, whatever base each adds"
+check_output "$LOG" "M34-PROC: ok wchan-state" "/proc/<pid>/wchan names the call a sleeping child is parked in, and its state letter is S rather than D"
 check_output "$LOG" "M34-PROC: ok tools" "free/sysctl/top read /proc and /sys"
 check_output "$LOG" "M34-PROC: done" "M34 procfs smoke completes"
 # ── M35 core dumps + kallsyms ──
@@ -3131,6 +3154,7 @@ check_output "$LOG" "M75-GPU: ok gl-context" "M75: offscreen GL context creation
 check_output "$LOG" "M75-GPU: ok llvmpipe-render" "M75: software LLVMpipe GL rasterizer renders offscreen frame and passes pixel validation"
 check_output "$LOG" "M75-GPU: done" "M75 on-device GPU path test completes"
 # ── M73: modern I/O & introspection syscalls ──
+check_output "$LOG" "M73-SMOKE: ok symlink-empty-target" "symlink(\"\", path) is ENOENT, the answer Linux gives and the one apt's fallback for a file: repository expects"
 check_output "$LOG" "M73-SMOKE: ok statx" "statx returns size/mode/nlink/ino matching fstat (path + AT_EMPTY_PATH)"
 check_output "$LOG" "M73-SMOKE: ok sendfile" "sendfile copies a range, advances the explicit offset, leaves the src fd offset"
 check_output "$LOG" "M73-SMOKE: ok copy-file-range" "copy_file_range copies a byte range using independent explicit offsets"
@@ -3615,6 +3639,7 @@ check_output "$LOG" "M127-SWAP: ok swap-max" "memory.swap.max stops the reclaim:
 check_output "$LOG" "M127-SWAP: ok swapoff-zram" "swapoff pages everything back, leaves no cgroup charge behind and releases the device"
 check_output "$LOG" "M127-SWAP: done" "M127 compressed-swap suite completes"
 # ── M123: namespaces complete enough for containers (m123_smoke) ──
+check_output "$LOG" "M123-SMOKE: ok privatenetwork-sequence" "systemd's PrivateNetwork= sequence, call for call: an OFD lock on a socketpair, an empty MSG_DONTWAIT receive that answers EAGAIN, unshare(CLONE_NEWNET), and the namespace handle stored and rejoined over SCM_RIGHTS"
 check_output "$LOG" "M123-SMOKE: ok userns-unpriv" "an unprivileged task creates a user namespace, reads the overflow uid until it maps itself, then is root with every capability there"
 check_output "$LOG" "M123-SMOKE: ok userns-map-rules" "uid_map is written once; an unprivileged task maps only its own id, and gid_map only after setgroups is denied"
 check_output "$LOG" "M123-SMOKE: ok userns-ids" "ids translate both ways: host root reads as 65534 inside, a file made inside is 1000:1000 outside, an unmapped id is EINVAL"
@@ -3765,6 +3790,14 @@ check_output "$LOG" "M107-SMOKE: ok mount-api-create" "fsconfig(FSCONFIG_CMD_CRE
 check_output "$LOG" "M107-SMOKE: ok mount-api-fsmount" "fsmount(2) turns it into a mount attached nowhere"
 check_output "$LOG" "M107-SMOKE: ok mount-api-openat-detached" "the mount descriptor is a directory descriptor: a file can be written into the mount before it has a place (this is how systemd fills a credentials directory)"
 check_output "$LOG" "M107-SMOKE: ok mount-api-not-attached-yet" "and it is genuinely not reachable at the target until move_mount"
+check_output "$LOG" "M107-SMOKE: ok mountinfo-poll-not-stolen" "a watcher's POLLPRI on /proc/self/mountinfo survives another process reading the same file -- mount(8) reads it, and systemd's watch must still fire"
+check_output "$LOG" "M107-SMOKE: ok mountinfo-epollpri" "the same readiness through epoll_wait with EPOLLPRI, which is how systemd watches the mount table"
+check_output "$LOG" "M107-SMOKE: ok mountinfo-poll-consumed" "one table change raises POLLPRI once per descriptor: a second poll with nothing new times out, so an event loop is not rate-limited into dropping the real change"
+check_output "$LOG" "M107-SMOKE: ok mountinfo-nested-epoll" "and through the two levels systemd really uses: libmount's monitor is an epoll instance watching the table, registered in systemd's own epoll"
+check_output "$LOG" "M107-SMOKE: ok mountinfo-poll-reread" "and the table it then reads names the mount that was made"
+check_output "$LOG" "M107-SMOKE: ok mount-api-child-mounts" "a child makes a tmpfs mount with the options Debian's own .mount units pass, and exits"
+check_output "$LOG" "M107-SMOKE: ok mount-api-child-in-mountinfo" "the mount outlives its maker and /proc/self/mountinfo names it by the path the caller asked for -- what systemd grades a .mount unit by"
+check_output "$LOG" "M107-SMOKE: ok mount-api-child-usable" "and it is a filesystem afterwards, not a row in a table"
 check_output "$LOG" "M107-SMOKE: ok mount-api-move-mount" "move_mount(2) attaches it, with the bytes written before attachment intact"
 check_output "$LOG" "M107-SMOKE: ok mount-api-setattr" "mount_setattr(MOUNT_ATTR_RDONLY) really seals it: a write is refused with EROFS"
 check_output "$LOG" "M107-SMOKE: done" "M107 subsystem suite completes"
@@ -3891,6 +3924,10 @@ check_output "$INIT_LOG" "M108-SMOKE: ok init-openrc-runlevels" "OpenRC's defaul
 check_output "$INIT_LOG" "M108-SMOKE: ok init-shell" "the BusyBox-init boot reaches a usable shell"
 check_output "$INIT_LOG" "M108-SMOKE: ok init-reaps-orphan" "BusyBox init reaps an orphaned grandchild re-parented to PID 1"
 check_output "$INIT_LOG" "M108-SMOKE: ok init-respawns-getty" "killing the inittab getty makes PID 1 respawn it as a new process"
+# ── An empty optical drive on the q35 machine's own ICH9 ──
+check_iommu "$IOMMU_LOG" "did not answer a packet command" "an ATAPI port with no disc in it is given up on instead of waited for"
+check_iommu "$IOMMU_LOG" "packet device reports no medium" "and it is left alone rather than published as a disk that answers nothing"
+check_iommu "$IOMMU_LOG" "ahci: cd-rom registered" "the drive that DOES hold a disc is still found, after the empty one was passed over"
 # ── M100b: VT-d DMA remapping ──
 check_iommu "$IOMMU_LOG" "reboot: restarting (bootloader)" "reboot(RESTART2, \"bootloader\") reaches the kernel's reset path with its reason (a phone's \`reboot bootloader\`)"
 check_iommu "$AMDVI_LOG" "reboot: restarting" "SYS_REBOOT restart reaches the kernel's reset path"

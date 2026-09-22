@@ -70,6 +70,7 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/shm.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -1033,6 +1034,106 @@ static void check_ns_handle_keeps_alive(int out) {
     return reportf(out, "hostname in kept namespace \"%s\"", host);
 }
 
+
+/* systemd's PrivateNetwork=, step for step.
+ *
+ * The unit fails with status 225 (EXIT_NETWORK) and logs nothing, so the whole
+ * sequence is reproduced here: a SOCK_DGRAM socketpair is the store for the
+ * namespace handle, an OFD lock on that socket serialises the units that share
+ * it, an empty receive must answer EAGAIN (that is how "nobody has made the
+ * namespace yet" is detected), and the handle then goes back over the pair with
+ * SCM_RIGHTS. Every one of those is a call this kernel could refuse for its own
+ * reason, and the exit status names none of them. */
+static void check_privatenetwork_sequence(int rfd) {
+  int sp[2];
+
+  if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sp) != 0) {
+    reportf(rfd, "socketpair: %s", strerror(errno));
+    return;
+  }
+
+  /* posix_lock(fd, LOCK_EX): systemd takes it on the socket itself. */
+  struct flock fl = {0};
+  fl.l_type = F_WRLCK;
+  fl.l_whence = SEEK_SET;
+  if (fcntl(sp[0], F_OFD_SETLK, &fl) != 0) {
+    reportf(rfd, "F_OFD_SETLK on the socketpair: %s", strerror(errno));
+    return;
+  }
+
+  /* receive_one_fd(MSG_DONTWAIT) on an empty pair: EAGAIN means "make one". */
+  char cbuf[CMSG_SPACE(sizeof(int))];
+  struct iovec iov = {(void *)"", 0};
+  struct msghdr mh = {0};
+  mh.msg_iov = &iov;
+  mh.msg_iovlen = 1;
+  mh.msg_control = cbuf;
+  mh.msg_controllen = sizeof(cbuf);
+  ssize_t n = recvmsg(sp[0], &mh, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+  if (!(n < 0 && errno == EAGAIN)) {
+    reportf(rfd, "empty recvmsg(MSG_DONTWAIT) answered %zd errno %s, not EAGAIN",
+            n, strerror(errno));
+    return;
+  }
+
+  if (unshare(CLONE_NEWNET) != 0) {
+    reportf(rfd, "unshare(CLONE_NEWNET): %s", strerror(errno));
+    return;
+  }
+
+  int netns = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC | O_NOCTTY);
+  if (netns < 0) {
+    reportf(rfd, "open /proc/self/ns/net: %s", strerror(errno));
+    return;
+  }
+
+  /* send_one_fd(MSG_DONTWAIT): the handle is stored for the next unit. */
+  struct msghdr sh = {0};
+  char scbuf[CMSG_SPACE(sizeof(int))];
+  struct iovec siov = {(void *)"", 0};
+
+  memset(scbuf, 0, sizeof(scbuf));
+  sh.msg_iov = &siov;
+  sh.msg_iovlen = 1;
+  sh.msg_control = scbuf;
+  sh.msg_controllen = CMSG_SPACE(sizeof(int));
+  struct cmsghdr *cm = CMSG_FIRSTHDR(&sh);
+  cm->cmsg_level = SOL_SOCKET;
+  cm->cmsg_type = SCM_RIGHTS;
+  cm->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(cm), &netns, sizeof(int));
+  if (sendmsg(sp[1], &sh, MSG_DONTWAIT) < 0) {
+    reportf(rfd, "sendmsg(SCM_RIGHTS, MSG_DONTWAIT): %s", strerror(errno));
+    return;
+  }
+
+  /* And the next unit's half: take the handle back and join it. */
+  memset(cbuf, 0, sizeof(cbuf));
+  mh.msg_controllen = sizeof(cbuf);
+  n = recvmsg(sp[0], &mh, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+  if (n < 0) {
+    reportf(rfd, "recvmsg of the stored handle: %s", strerror(errno));
+    return;
+  }
+  struct cmsghdr *got = CMSG_FIRSTHDR(&mh);
+  if (!got || got->cmsg_type != SCM_RIGHTS) {
+    reportf(rfd, "the stored handle came back without SCM_RIGHTS");
+    return;
+  }
+  int joined;
+  memcpy(&joined, CMSG_DATA(got), sizeof(int));
+  if (setns(joined, CLONE_NEWNET) != 0) {
+    reportf(rfd, "setns(stored net handle): %s", strerror(errno));
+    return;
+  }
+
+  fl.l_type = F_UNLCK;
+  if (fcntl(sp[0], F_OFD_SETLK, &fl) != 0) {
+    reportf(rfd, "F_OFD_SETLK unlock: %s", strerror(errno));
+    return;
+  }
+}
+
 int main(void) {
   marker("M123-SMOKE: start\n");
   run("userns-unpriv", check_userns_unpriv);
@@ -1059,6 +1160,7 @@ int main(void) {
   run("timens-locked", check_timens_locked);
   run("ns-links", check_ns_links);
   run("ns-handle-keeps-alive", check_ns_handle_keeps_alive);
+  run("privatenetwork-sequence", check_privatenetwork_sequence);
   marker(g_fail ? "M123-SMOKE: done with failures\n" : "M123-SMOKE: done\n");
   return 0;
 }

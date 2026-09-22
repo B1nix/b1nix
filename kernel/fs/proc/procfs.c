@@ -569,7 +569,16 @@ static int r_uptime(usize pid, struct sbuf *s) {
    * one tick rate and no other, and unpadded it turned five milliseconds past
    * the second into ".5", i.e. half a second. The reader's time namespace
    * shifts it, as it shifts CLOCK_BOOTTIME (M123). */
-  i64 shifted = (i64)ktime_monotonic_ns() + namespace_clock_offset(7);
+  /* And the clock USERSPACE reads, not the kernel's own.
+   *
+   * The two differ by the base taken when the clock was handed over to the
+   * counter -- 58 ms on one AArch64 boot -- and this file is compared against
+   * CLOCK_BOOTTIME by everything that measures how long something has been
+   * running: a process's start time in ticks since boot against a
+   * clock_gettime() taken now. On Linux they are one clock, so they must agree
+   * here too. The kernel's log stamps stay on the kernel's clock, which the
+   * M110 selftest keeps within a second of this one. */
+  i64 shifted = (i64)ktime_user_monotonic_ns() + namespace_clock_offset(7);
   u64 ns = shifted > 0 ? (u64)shifted : 0;
   u64 sec = ns / 1000000000ull;
   u64 cs = (ns % 1000000000ull) / 10000000ull;
@@ -1405,26 +1414,70 @@ static int r_mounts(usize pid, struct sbuf *s) {
  * where the filesystem is mounted -- which is exactly what Debian's tmp.mount
  * and run-lock.mount did here.
  *
- * One generation for the whole system rather than one per open file: this
- * kernel's procfs nodes carry no per-descriptor state, and the watcher that
- * matters is systemd's single monitor. A second watcher would see an event it
- * has already consumed, which costs it a re-read and nothing else. */
-static u64 g_mountinfo_seen;
+ * Per DESCRIPTOR, and consumed by the poll itself.
+ *
+ * Linux keeps the generation it last reported in the open file (mounts_poll()
+ * compares ns->event against the seq_file's poll_event and stores it), so one
+ * change raises POLLPRI exactly once for each watcher. Two earlier shapes were
+ * both wrong: a single global "last seen" let mount(8)'s own read of the file
+ * acknowledge the change systemd had not been told about, and acknowledging on
+ * READ rather than in the poll left POLLPRI asserted until somebody read --
+ * which for systemd means the same event over and over. sd-event rate-limits an
+ * event source that fires too often, and it logged exactly that
+ * ("mount-monitor-dispatch entered rate limit state") before dropping the
+ * change that mattered: every Debian .mount unit then failed with "Mount
+ * process finished, but there is no mount".
+ *
+ * A descriptor that has never polled starts at 0, which no generation is, so
+ * its first poll reports a change -- as Linux's does for a freshly opened file
+ * whose poll_event starts at 0. */
+/* How many watchers have been told, and who last. Counted rather than logged:
+ * a poll runs with interrupts disabled and must not touch the console. Printed
+ * by vfs_mount_table_poll_stats() from a path that may. */
+static u64 g_mi_pri_reports;
+static usize g_mi_pri_last_pid;
+static u64 g_mi_poll_calls;
 
-static int mountinfo_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
+void mountinfo_poll_stats(u64 *calls, u64 *reports, usize *last_pid) {
+  if (calls)
+    *calls = __atomic_load_n(&g_mi_poll_calls, __ATOMIC_RELAXED);
+  if (reports)
+    *reports = __atomic_load_n(&g_mi_pri_reports, __ATOMIC_RELAXED);
+  if (last_pid)
+    *last_pid = g_mi_pri_last_pid;
+}
+
+static int mountinfo_poll(struct vfs_handle *h, struct vfs_node *node,
+                          struct b1nix_pollfd *pfd) {
   (void)node;
   pfd->revents = 0;
-  if (vfs_mount_generation() != __atomic_load_n(&g_mountinfo_seen,
-                                                __ATOMIC_ACQUIRE))
-    pfd->revents |= B1NIX_POLLPRI | B1NIX_POLLERR;
+  __atomic_fetch_add(&g_mi_poll_calls, 1, __ATOMIC_RELAXED);
+  {
+    u64 gen = vfs_mount_generation();
+
+    if (h && h->poll_seq != gen) {
+      h->poll_seq = gen;
+      pfd->revents |= B1NIX_POLLPRI | B1NIX_POLLERR;
+      __atomic_fetch_add(&g_mi_pri_reports, 1, __ATOMIC_RELAXED);
+      g_mi_pri_last_pid = current_task ? (usize)current_task->id : 0;
+    }
+  }
   return 0;
 }
 
 static int r_mountinfo(usize pid, struct sbuf *s) {
   (void)pid;
-  /* Reading is what acknowledges the change: the next poll is quiet until the
-   * table moves again. */
-  __atomic_store_n(&g_mountinfo_seen, vfs_mount_generation(), __ATOMIC_RELEASE);
+  /* Reading acknowledges nothing: the poll does that, per descriptor. Linux is
+   * the same -- a program may read this file without ever polling it, and a
+   * read by one process must not quiet another's watch. */
+  if (bootinfo_has_flag("b1nix.trace-mount")) {
+    char line[96];
+
+    snprintf(line, sizeof(line), "mountinfo: read by pid %lu at generation %llu",
+             current_task ? (unsigned long)current_task->id : 0ul,
+             (unsigned long long)vfs_mount_generation());
+    klog_info(line);
+  }
   usize cap = vfs_mount_capacity();
   struct b1nix_mount_entry *ents = kmalloc(cap * sizeof(*ents));
 
@@ -1990,6 +2043,21 @@ static void proc_comm(const struct task *t, char out[PROC_COMM_LEN]) {
   out[i] = '\0';
 }
 
+/* The state letter /proc reports for a task.
+ *
+ * Not the scheduler's own letter: it calls every wait-channel sleep BLOCKED and
+ * prints "D", and on Linux "D" means a wait a signal cannot break -- almost
+ * always disk I/O. Nearly every wait in this kernel is a loop that re-checks
+ * scheduler_signal_pending(), so reporting D for all of them told `ps`, `top`
+ * and every monitoring agent that a machine sleeping in epoll_wait was pinned on
+ * I/O. Sleeping tasks are reported "S"; the kernel's own stall dumps keep the
+ * scheduler's letter, where the distinction is the point. */
+static const char *proc_state_letter(int state) {
+  const char *st = scheduler_state_name(state);
+
+  return st[0] == 'D' ? "S" : st;
+}
+
 static const char *state_long(const char *abbr) {
   switch (abbr[0]) {
   case 'R': return "R (running)";
@@ -2010,7 +2078,7 @@ static int r_pid_status(usize pid, struct sbuf *s) {
             (unsigned long)pid);
     return 0;
   }
-  const char *st = scheduler_state_name((int)t->state);
+  const char *st = proc_state_letter((int)t->state);
   char comm[PROC_COMM_LEN];
   proc_comm(t, comm);
   sb_addf(s, "Name:\t%s\n", comm);
@@ -2135,6 +2203,36 @@ static int r_pid_cmdline(usize pid, struct sbuf *s) {
 
   if (t->name)
     sb_puts(s, t->name);
+  return 0;
+}
+
+/* /proc/<pid>/wchan — the kernel function a blocked task is waiting in.
+ *
+ * `ps -o wchan`, `procps`'s stall reports and every "what is this process
+ * stuck on" recipe read this file, and an absent one turns "blocked in
+ * epoll_wait" into "blocked", which is the difference between a diagnosis and
+ * a guess. The scheduler already records the return address every task parked
+ * at (for the stall dump); this resolves it to a symbol. A task that is
+ * runnable prints the empty string, as Linux does. */
+static int r_pid_wchan(usize pid, struct sbuf *s) {
+  struct task *t = scheduler_task_by_pid(pid);
+
+  if (!t)
+    return 0;
+  {
+    const char *st = scheduler_state_name(__atomic_load_n(&t->state,
+                                                          __ATOMIC_RELAXED));
+    void *site = scheduler_park_site(pid);
+    u64 off = 0;
+    const char *name = site ? ksym_lookup((u64)(usize)site, &off) : 0;
+
+    /* Only while it is actually parked: the recorded site outlives the wait,
+     * and printing it for a running task names a wait that has ended. */
+    if (st[0] != 'D' && st[0] != 'S')
+      return 0;
+    if (name)
+      sb_puts(s, name);
+  }
   return 0;
 }
 
@@ -2324,7 +2422,7 @@ static int r_pid_stat(usize pid, struct sbuf *s) {
           /* 45-48 */ "%lu %lu %lu 0 "
           /* 49-52 */ "0 0 0 0\n",
           (unsigned long)namespace_pid_to_user(t->id), comm,
-          scheduler_state_name((int)t->state),
+          proc_state_letter((int)t->state),
           /* As in status: kernel threads are pid 2's children. */
           (unsigned long)namespace_pid_to_user(
               t->pml4_phys == 0 && t->id > 2 ? 2 : t->parent_id),
@@ -3446,6 +3544,7 @@ static void procfs_make_tiddir(struct vfs_node *taskdir, usize tid) {
   procfs_mkchild(d, "status", VFS_DEVICE, r_pid_status, tid);
   procfs_mkchild(d, "stat", VFS_DEVICE, r_pid_stat, tid);
   procfs_mkchild(d, "comm", VFS_DEVICE, r_pid_comm, tid);
+  procfs_mkchild(d, "wchan", VFS_DEVICE, r_pid_wchan, tid);
   procfs_mkchild(d, "maps", VFS_DEVICE, r_pid_maps, tid);
   procfs_mkchild(d, "smaps", VFS_DEVICE, r_pid_smaps, tid);
   procfs_mkchild(d, "statm", VFS_DEVICE, r_pid_statm, tid);
@@ -3749,6 +3848,7 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   procfs_mkchild(d, "status", VFS_DEVICE, r_pid_status, pid);
   procfs_mkchild(d, "cmdline", VFS_DEVICE, r_pid_cmdline, pid);
   procfs_mkchild(d, "comm", VFS_DEVICE, r_pid_comm, pid);
+  procfs_mkchild(d, "wchan", VFS_DEVICE, r_pid_wchan, pid);
   procfs_mkchild(d, "stat", VFS_DEVICE, r_pid_stat, pid);
   procfs_mkchild(d, "maps", VFS_DEVICE, r_pid_maps, pid);
   procfs_mkchild(d, "smaps", VFS_DEVICE, r_pid_smaps, pid);

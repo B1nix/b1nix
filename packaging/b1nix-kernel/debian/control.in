@@ -7,9 +7,22 @@ Standards-Version: 4.7.0
 Homepage: https://github.com/B1nix/b1nix
 Rules-Requires-Root: no
 
+Package: b1nix-kernel-common
+Architecture: all
+Depends: ${misc:Depends}
+@KERNEL_COMMON_REPLACES@Description: files shared by every b1nix kernel release
+ The boot-counting mechanism and the bootloader writer: one initramfs hook, one
+ unit that marks a boot good, one script that rewrites the boot entries for
+ every kernel it finds, and the entry template they use.
+ .
+ They live here rather than in a kernel package because two kernel releases are
+ installed at once by design, and two packages cannot own one path. A release
+ package that shipped them could not be installed beside its predecessor: dpkg
+ refused the unpack with "trying to overwrite ... which is also in package".
+
 Package: b1nix-kernel-@RELEASE@
 Architecture: @DEB_ARCH@
-Depends: ${misc:Depends}, initramfs-tools | initramfs-tools-core
+Depends: ${misc:Depends}, b1nix-kernel-common (>= ${source:Version}), initramfs-tools | initramfs-tools-core
 Recommends: limine
 Provides: linux-image
 Description: Unix-like kernel with the Linux ABI, release @RELEASE@

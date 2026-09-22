@@ -11,6 +11,10 @@ RELEASE := $(shell cat debian/b1nix-release)
 PKG     := b1nix-kernel-$(RELEASE)
 DBG     := b1nix-kernel-$(RELEASE)-dbg
 HDR     := b1nix-kernel-headers-$(RELEASE)
+# The pieces that are the same for every release, and therefore cannot live in
+# a package whose name carries one: two releases are installed side by side and
+# two packages cannot own one path.
+COMMON  := b1nix-kernel-common
 
 %:
 	dh $@
@@ -40,19 +44,20 @@ override_dh_auto_install:
 	# /usr/lib, not /lib: trixie is merged-/usr and a package that writes to
 	# the aliased path is an error, not a style question.
 	install -d debian/$(PKG)/usr/lib/modules/$(RELEASE)
+	# ── what every release shares ───────────────────────────────────────
 	# The boot-counting mechanism: the initramfs hook that spends a try, and
 	# the unit that marks a boot good. docs/distro/boot-counting.md says why
 	# the decrement cannot live in userspace.
 	install -D -m 0755 files/initramfs-boot-count \
-		debian/$(PKG)/usr/share/initramfs-tools/scripts/init-premount/b1nix-boot-count
+		debian/$(COMMON)/usr/share/initramfs-tools/scripts/init-premount/b1nix-boot-count
 	install -D -m 0755 files/b1nix-boot-good \
-		debian/$(PKG)/usr/sbin/b1nix-boot-good
+		debian/$(COMMON)/usr/sbin/b1nix-boot-good
 	install -D -m 0644 files/b1nix-boot-good.service \
-		debian/$(PKG)/usr/lib/systemd/system/b1nix-boot-good.service
+		debian/$(COMMON)/usr/lib/systemd/system/b1nix-boot-good.service
 	install -D -m 0755 files/b1nix-update-bootloader \
-		debian/$(PKG)/usr/sbin/b1nix-update-bootloader
+		debian/$(COMMON)/usr/sbin/b1nix-update-bootloader
 	install -D -m 0644 files/limine-entry.conf.in \
-		debian/$(PKG)/usr/share/b1nix/limine-entry.conf.in
+		debian/$(COMMON)/usr/share/b1nix/limine-entry.conf.in
 	# ── the debug information ───────────────────────────────────────────
 	install -D -m 0644 out/b1nix-$(RELEASE).debug \
 		debian/$(DBG)/usr/lib/debug/boot/b1nix-$(RELEASE).debug
@@ -81,7 +86,7 @@ override_dh_dwz:
 override_dh_shlibdeps:
 
 override_dh_installsystemd:
-	dh_installsystemd -p$(PKG) --name=b1nix-boot-good --no-start b1nix-boot-good.service
+	dh_installsystemd -p$(COMMON) --name=b1nix-boot-good --no-start b1nix-boot-good.service
 
 override_dh_auto_clean:
 	rm -rf out

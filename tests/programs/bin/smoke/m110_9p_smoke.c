@@ -81,6 +81,53 @@ int main(int argc, char **argv) {
     marker("M110-9P: fail opendir\n");
   }
 
+  /* 5. A file larger than any 9p message, read in chunks of the caller's
+   * choosing. apt reads a package index off a 9p share exactly like this and
+   * reported "read (22: Invalid argument)"; a read that has to be split into
+   * several 9p messages is the one shape a small msize gets wrong. */
+  {
+    int bfd = open("/mnt/9p/big_from_host.bin", O_RDONLY);
+    struct stat bst;
+
+    if (bfd < 0 || fstat(bfd, &bst) != 0 || bst.st_size < 256 * 1024) {
+      marker("M110-9P: fail open-big\n");
+      if (bfd >= 0)
+        close(bfd);
+    } else {
+      static char big[256 * 1024];
+      long long total = 0;
+      int bad_errno = 0;
+      ssize_t n;
+
+      /* Each read asks for 256 KiB, far more than a 9p message carries. */
+      while ((n = read(bfd, big, sizeof(big))) > 0)
+        total += n;
+      if (n < 0)
+        bad_errno = errno;
+      close(bfd);
+
+      if (bad_errno) {
+        char why[96];
+
+        snprintf(why, sizeof(why), "M110-9P: fail read-big (errno=%d after %lld bytes)\n",
+                 bad_errno, total);
+        marker(why);
+      } else if (total != (long long)bst.st_size) {
+        char why[112];
+
+        /* Against the size the file says it has, not a number written here:
+         * a threshold of its own invention is a test that fails when the
+         * fixture changes and passes when the kernel is wrong. */
+        snprintf(why, sizeof(why),
+                 "M110-9P: fail read-big-short (%lld of %lld bytes)\n", total,
+                 (long long)bst.st_size);
+        marker(why);
+      } else {
+        marker("M110-9P: ok read-big\n");
+      }
+    }
+  }
+
   marker("M110-9P: done\n");
   return 0;
 }

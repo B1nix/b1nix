@@ -1460,6 +1460,20 @@ int vfs_socket(int domain, int type, int protocol) {
   if (type == B1NIX_SOCK_RAW && domain == B1NIX_AF_INET6 &&
       protocol != B1NIX_IPPROTO_ICMPV6)
     return -EPROTONOSUPPORT;
+  /* The netlink families this kernel actually carries: rtnetlink and the
+   * uevent broadcast. Every other protocol number used to get a socket that
+   * accepted a message and then failed to deliver it, which is the worst of
+   * the three possible answers. systemd-update-utmp asks for NETLINK_AUDIT,
+   * wrote its record, got EPROTO back from the send and exited 1 -- taking
+   * systemd-update-utmp-runlevel.service with it on a dependency. A Linux
+   * kernel built without audit refuses the socket instead, with
+   * EPROTONOSUPPORT, and every caller in the distribution knows that answer:
+   * journald logs "audit not supported" and carries on, and update-utmp writes
+   * its utmp record and exits 0. So refuse here rather than halfway through. */
+  if (domain == B1NIX_AF_NETLINK && protocol != NETLINK_ROUTE &&
+      protocol != NETLINK_KOBJECT_UEVENT)
+    return -EPROTONOSUPPORT;
+
   /* AF_PACKET is frames, not streams. */
   if (domain == B1NIX_AF_PACKET && type != B1NIX_SOCK_RAW &&
       type != B1NIX_SOCK_DGRAM)

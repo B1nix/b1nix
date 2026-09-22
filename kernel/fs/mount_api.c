@@ -54,6 +54,18 @@ static void mount_api_trace(const char *what, u32 cmd, const char *key,
   klog_info(line);
 }
 
+/* The same for a call that names two paths: move_mount's source and target. */
+static void mount_api_trace2(const char *what, u32 flags, const char *from,
+                             const char *to, int rc) {
+  if (!bootinfo_has_flag("b1nix.trace-mount"))
+    return;
+
+  char line[288];
+  snprintf(line, sizeof(line), "mount-api: %s flags=0x%x '%s' -> '%s' = %d",
+           what, flags, from ? from : "", to ? to : "", rc);
+  klog_info(line);
+}
+
 /* fsconfig(2) commands. */
 #define FSCONFIG_SET_FLAG       0
 #define FSCONFIG_SET_STRING     1
@@ -492,9 +504,13 @@ int vfs_move_mount_fd(int from_fd, const char *from_path, const char *to_path,
   if (h && h->ops == &mountfd_ops) {
     struct mountfd_state *m = h->private_data;
 
-    if (!m || m->attached || m->detached_id < 0)
+    if (!m || m->attached || m->detached_id < 0) {
+      mount_api_trace2("move-mount-bad-fd", flags, 0, to_path, -EINVAL);
       return -EINVAL;
+    }
     int rc = vfs_detached_attach(m->detached_id, to_path);
+
+    mount_api_trace2("move-mount-fd", flags, 0, to_path, rc);
     if (rc < 0)
       return rc;
     m->attached = 1;
@@ -502,9 +518,16 @@ int vfs_move_mount_fd(int from_fd, const char *from_path, const char *to_path,
   }
 
   /* The path form is MS_MOVE by another name. */
-  if (!from_path || !from_path[0])
+  if (!from_path || !from_path[0]) {
+    mount_api_trace2("move-mount-no-source", flags, 0, to_path, -EINVAL);
     return -EINVAL;
-  return vfs_move_mount(from_path, to_path);
+  }
+  {
+    int rc = vfs_move_mount(from_path, to_path);
+
+    mount_api_trace2("move-mount-path", flags, from_path, to_path, rc);
+    return rc;
+  }
 }
 
 int vfs_mount_setattr_fd(int fd, const char *path, u32 flags,

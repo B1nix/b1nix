@@ -656,7 +656,9 @@ static isize vt_node_read(struct vfs_node *node, u64 offset, char *buf,
   return (isize)n;
 }
 
-static int vt_node_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
+static int vt_node_poll(struct vfs_handle *h, struct vfs_node *node,
+                          struct b1nix_pollfd *pfd) {
+  (void)h;
   int idx = vt_index_of_node(node);
   pfd->revents = 0;
   if (idx < 0)

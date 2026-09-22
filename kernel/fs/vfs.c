@@ -236,6 +236,16 @@ u64 vfs_mount_generation(void) {
 
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
+  /* The number of mounts ever made, folded in first.
+   *
+   * Without it this is a hash of the table's CONTENTS, and a mount followed by
+   * its own unmount leaves the contents exactly as they were -- so a watcher
+   * that polled before and after saw no change at all, and a program that does
+   * that (every `mount`/`umount` pair, and libmount's own verification) was
+   * invisible. `mount_seq_next` only ever grows, so any mutation that adds an
+   * entry changes this value for good. */
+  g ^= mount_seq_next;
+  g *= 1099511628211ULL;
   for (usize i = 0; i < mount_hwm; i++) {
     if (!mounts[i].used)
       continue;
@@ -3204,7 +3214,9 @@ static isize null_write(struct vfs_node *node, u64 offset, const char *buffer,
   return (isize)size;
 }
 
-static int null_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
+static int null_poll(struct vfs_handle *h, struct vfs_node *node,
+                     struct b1nix_pollfd *pfd) {
+  (void)h;
   (void)node;
   pfd->revents = B1NIX_POLLIN | B1NIX_POLLOUT;
   return 0;
@@ -3354,7 +3366,9 @@ static void null_init_node(void) {
   }
 }
 
-static int tty_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
+static int tty_poll(struct vfs_handle *h, struct vfs_node *node,
+                    struct b1nix_pollfd *pfd) {
+  (void)h;
   (void)node;
   short revents = B1NIX_POLLOUT; /* the console is always writable */
 #ifndef __aarch64__
@@ -4927,7 +4941,7 @@ static int node_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   if (!h || !h->node)
     return -EBADF;
   if (h->node->inode->poll_cb)
-    return h->node->inode->poll_cb(h->node, pfd);
+    return h->node->inode->poll_cb(h, h->node, pfd);
   pfd->revents = 0;
   if (h->node->inode->type == VFS_FILE) {
     pfd->revents |= B1NIX_POLLIN | B1NIX_POLLOUT;
@@ -5129,14 +5143,24 @@ void vfs_close_handle(struct vfs_handle *h, int owner_pid) {
 
   if (h->kind == VFS_HANDLE_NODE && h->node && h->node->inode) {
     filelock_release_all_by_pid_inode(owner_pid, h->node->inode);
-    /* An OFD lock belongs to this description and dies with it -- that is the
-     * whole difference from a POSIX lock, which survives while any descriptor
-     * on the file remains open elsewhere in the process. */
-    filelock_release_all_by_ofd(h);
-    /* Dirty pages are no longer written here: the writeback thread does it
-     * (page_cache_flush_dirty_inodes), and fsync, sync and umount force it.
-     * close(2) waiting for the disk was 1.6 s of a desktop start-up. */
+  } else {
+    /* The same for a description with no inode, where the scope IS the
+     * description: a POSIX lock on a socket has to go when the socket does. */
+    filelock_release_all_by_pid_inode(owner_pid, h);
   }
+  /* Dirty pages are no longer written here: the writeback thread does it
+   * (page_cache_flush_dirty_inodes), and fsync, sync and umount force it.
+   * close(2) waiting for the disk was 1.6 s of a desktop start-up. */
+  /* An OFD lock belongs to this description and dies with it -- that is the
+   * whole difference from a POSIX lock, which survives while any descriptor on
+   * the file remains open elsewhere in the process.
+   *
+   * For EVERY description, not only for one that names a file: a lock taken on
+   * a socket is keyed by the description itself, and leaving it behind is worse
+   * than never having allowed it. The handle is freed and its memory reused, so
+   * the next description at that address inherits a lock nobody holds -- and
+   * the next F_SETLKW on it waits for ever. */
+  filelock_release_all_by_ofd(h);
 
   if (h->ops && h->ops->close)
     h->ops->close(h);
@@ -6174,8 +6198,17 @@ out:
 
 int vfs_symlink(const char *target, const char *link_path) {
   int res = 0;
-  if (!target || target[0] == '\0')
-    return -EINVAL;
+  if (!target)
+    return -EFAULT;
+  /* An empty target is ENOENT, which is what Linux answers -- not EINVAL.
+   *
+   * apt makes exactly this call while reading a `file:` repository: it links
+   * the index into /var/lib/apt/lists rather than copying it, and when the
+   * source comes out empty it reports the errno it got. With EINVAL it gave up
+   * on the index ("Symlinking file  to ...Packages.zst failed (22)") and then
+   * failed the whole update; ENOENT is the answer its fallback expects. */
+  if (target[0] == '\0')
+    return -ENOENT;
   if (link_path && (res = landlock_check_parent(link_path, LL_MAKE_SYM)))
     return res;
 
@@ -7010,8 +7043,9 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   if (bootinfo_has_flag("b1nix.trace-mount")) {
     char ml[192];
-    snprintf(ml, sizeof(ml), "vfs_mount: type='%s' target='%s' point=%p '%s'",
-             fstype, target, (void *)target_node, target_node->name);
+    snprintf(ml, sizeof(ml),
+             "vfs_mount: type='%s' target='%s' recorded='%s' point=%p '%s'",
+             fstype, target, rectgt, (void *)target_node, target_node->name);
     klog_info(ml);
   }
 
@@ -7237,6 +7271,21 @@ static void mount_record_target(const char *target, struct vfs_node *node,
       link[n] = '\0';
       copy_path(out, out_len, link);
       return;
+    }
+    /* The descriptor could not be turned back into a name -- but the NODE is
+     * right here, and it has one. Falling through to the textual resolution
+     * recorded the literal "/proc/self/fd/3", which is a path that names a
+     * descriptor of a process that is about to exit: /proc/self/mountinfo then
+     * carried a mount at a place nothing can reach, and systemd mounted the
+     * same filesystem again on its next pass. */
+    {
+      char canon[VFS_MAX_PATH];
+
+      if (node && vfs_get_node_path(node, canon, sizeof(canon)) == 0 &&
+          canon[0]) {
+        copy_path(out, out_len, canon);
+        return;
+      }
     }
   }
   if (target && target[0]) {
@@ -7545,6 +7594,48 @@ static int retarget_under(char *path, usize path_size, const char *from,
   return 1;
 }
 
+/* The whole table, as mountinfo would report it: what a mount is RECORDED
+ * under, which is the only thing an init system can match a unit against.
+ * Printed after a move under `b1nix.trace-mount`, because "the mount is there
+ * but systemd says there is no mount" is a question about this table and
+ * nothing else. */
+static void mount_table_trace(const char *why) {
+  static int trace = -1;
+
+  if (trace < 0)
+    trace = bootinfo_has_flag("b1nix.trace-mount") ? 1 : 0;
+  if (!trace)
+    return;
+  {
+    char line[224];
+
+    {
+      extern void mountinfo_poll_stats(u64 *calls, u64 *reports, usize *last_pid);
+      u64 calls = 0, reports = 0;
+      usize last = 0;
+
+      mountinfo_poll_stats(&calls, &reports, &last);
+      snprintf(line, sizeof(line),
+               "mount-table (%s): mountinfo polls=%llu told=%llu last-told-pid=%lu",
+               why, (unsigned long long)calls, (unsigned long long)reports,
+               (unsigned long)last);
+    }
+    klog_info(line);
+    for (usize i = 0; i < mount_hwm; i++) {
+      if (!mounts[i].used)
+        continue;
+      snprintf(line, sizeof(line),
+               "  [%lu] target='%s' type='%s' ns=%u seq=%llu parent=%llu%s",
+               (unsigned long)i, mounts[i].target, mounts[i].fstype,
+               (unsigned)mounts[i].mnt_ns,
+               (unsigned long long)mounts[i].seq,
+               (unsigned long long)mounts[i].parent_seq,
+               mount_visible(i) ? "" : " (other namespace)");
+      klog_info(line);
+    }
+  }
+}
+
 int vfs_move_mount(const char *source, const char *target) {
   if (!vfs_may_mount())
     return -EPERM;
@@ -7641,6 +7732,7 @@ int vfs_move_mount(const char *source, const char *target) {
   dcache_invalidate_node(dst_node);
   vfs_node_put(old_mp);
   vfs_node_put(src_node);
+  mount_table_trace(dst);
   return 0;
 }
 
@@ -8343,6 +8435,13 @@ isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries) {
   usize count = 0;
   for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i))
+      continue;
+    /* A mount that has not been given a place yet is not part of the machine's
+     * mount topology, and this list is what /proc/<pid>/mountinfo and
+     * /proc/mounts print. vfs_mounts_info() has always skipped them; this one
+     * did not, so every half-built sandbox appeared as a mount at
+     * "/.b1nix-detached/N" in the table an init system reads. */
+    if (mount_is_detached(mounts[i].target))
       continue;
     if (count < max_entries) {
       copy_path(out[count].source, sizeof(out[count].source), mounts[i].source);
@@ -9757,8 +9856,9 @@ int vfs_fcntl(int fd, int cmd, u64 arg) {
   case B1NIX_F_GETLK:
   case B1NIX_F_SETLK:
   case B1NIX_F_SETLKW:
-    if (h->kind != VFS_HANDLE_NODE)
-      return -EBADF;
+    /* Not only on files. Linux locks any open file description -- a socket and
+     * a pipe have inodes of their own there -- and refusing anything else with
+     * EBADF broke systemd's PrivateNetwork=, which locks a socketpair. */
     return filelock_set_lock(fd, cmd, (struct flock *)(usize)arg);
   case F_OFD_GETLK:
   case F_OFD_SETLK:
@@ -9766,8 +9866,6 @@ int vfs_fcntl(int fd, int cmd, u64 arg) {
     /* Owned by this open file rather than by the process. systemd takes one
      * of these on the random seed in the ESP, and while the call was refused
      * the unit never finished and the boot stopped behind it. */
-    if (h->kind != VFS_HANDLE_NODE)
-      return -EBADF;
     return filelock_set_lock_ofd(fd, cmd, (struct flock *)(usize)arg);
   default:
     /* Name the command we are refusing.

@@ -103,7 +103,7 @@ static int can_merge(u64 start1, u64 len1, u64 start2, u64 len2) {
   return (start1 <= end2 + 1) && (start2 <= end1 + 1);
 }
 
-static void merge_adjacent_locks(struct vfs_inode *inode, int pid, void *ofd) {
+static void merge_adjacent_locks(void *inode, int pid, void *ofd) {
   int merged;
   do {
     merged = 0;
@@ -142,7 +142,7 @@ static void merge_adjacent_locks(struct vfs_inode *inode, int pid, void *ofd) {
 /* True if some *other* pid holds a lock on `inode` that conflicts with a
  * [start, start+len) request of type `l_type`. Factored out so the blocking
  * F_SETLKW path can re-test the predicate after publishing BLOCKED. */
-static int filelock_conflict_exists(struct vfs_inode *inode, int my_pid,
+static int filelock_conflict_exists(void *inode, int my_pid,
                                     void *my_ofd, u64 start, u64 len,
                                     int l_type) {
   for (int i = 0; i < MAX_FILE_LOCKS; i++) {
@@ -169,7 +169,16 @@ static int filelock_do(int fd, int cmd, struct flock *fl, void *ofd) {
   if (!h)
     return -EBADF;
 
-  struct vfs_inode *inode = h->node->inode;
+  /* A file is locked by its inode, so two descriptors on the same file see
+   * each other's locks. A descriptor with no inode -- a socket, a pipe -- is
+   * locked by the open file description itself, which is what fork and dup
+   * share and therefore exactly the scope these locks are wanted at: systemd
+   * serialises the units that share a network namespace by taking an OFD lock
+   * on the socketpair the namespace handle is stored in, and refusing that
+   * failed every unit with PrivateNetwork= with EXIT_NETWORK and no message. */
+  struct vfs_inode *node_inode =
+      (h->kind == VFS_HANDLE_NODE && h->node) ? h->node->inode : 0;
+  void *inode = node_inode ? (void *)node_inode : (void *)h;
   int my_pid = filelock_owner();
   void *my_ofd = ofd;
 
@@ -177,7 +186,9 @@ static int filelock_do(int fd, int cmd, struct flock *fl, void *ofd) {
   if (fl->l_whence == B1NIX_SEEK_CUR) {
     start = h->offset + fl->l_start;
   } else if (fl->l_whence == B1NIX_SEEK_END) {
-    start = inode->size + fl->l_start;
+    /* Nothing to measure from on a socket: SEEK_END is the file's size, and a
+     * descriptor with no file has none. */
+    start = (node_inode ? node_inode->size : 0) + fl->l_start;
   }
   u64 end = fl->l_len ? start + fl->l_len - 1 : (u64)-1;
 
@@ -460,7 +471,7 @@ int filelock_flock(int fd, int operation) {
   return filelock_set_lock(fd, cmd, &fl);
 }
 
-void filelock_release_all_by_pid_inode(int pid, struct vfs_inode *inode) {
+void filelock_release_all_by_pid_inode(int pid, void *inode) {
   if (!filelock_initialized || !inode)
     return;
 

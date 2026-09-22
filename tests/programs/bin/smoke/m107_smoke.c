@@ -65,6 +65,9 @@
 #include <fcntl.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <sys/epoll.h>
+#include <sys/mount.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2077,6 +2080,10 @@ static void test_applet_chvt(void) {
 #define SYS_mount_setattr 442
 #endif
 
+#ifndef SYS_umount2
+#define SYS_umount2 166
+#endif
+#define FSCONFIG_SET_FLAG    0
 #define FSCONFIG_SET_STRING  1
 #define FSCONFIG_CMD_CREATE  6
 #define MOVE_MOUNT_F_EMPTY_PATH 4
@@ -2175,6 +2182,240 @@ static void test_mount_api(void) {
   close(fsfd);
 }
 
+
+/* What a .mount unit actually is: a CHILD makes the mount and exits, and the
+ * manager then looks for it in its own /proc/self/mountinfo.
+ *
+ * systemd grades a mount unit by exactly that -- "Mount process finished, but
+ * there is no mount" is what it says when mount(8) exited 0 and the row is not
+ * there, and it fails the unit with result 'protocol'. Debian's tmp.mount and
+ * run-lock.mount both failed that way, so the mount surviving its maker and
+ * being NAMED by the path the caller asked for are what this checks. */
+static void test_mount_api_child(void) {
+  const char *target = "/tmp/m107-mountchild";
+
+  (void)mkdir(target, 0755);
+
+  pid_t pid = fork();
+
+  if (pid < 0) {
+    fail("mount-api-child-fork", (int)pid);
+    return;
+  }
+  if (pid == 0) {
+    int fsfd = (int)syscall(SYS_fsopen, "tmpfs", 0);
+
+    if (fsfd < 0)
+      _exit(11);
+    /* The options Debian's own units pass, word for word. */
+    if (syscall(SYS_fsconfig, fsfd, FSCONFIG_SET_STRING, "mode", "1777", 0) != 0)
+      _exit(12);
+    if (syscall(SYS_fsconfig, fsfd, FSCONFIG_SET_FLAG, "strictatime", NULL, 0) != 0)
+      _exit(13);
+    if (syscall(SYS_fsconfig, fsfd, FSCONFIG_SET_STRING, "size", "5242880", 0) != 0)
+      _exit(14);
+    if (syscall(SYS_fsconfig, fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) != 0)
+      _exit(15);
+    int mfd = (int)syscall(SYS_fsmount, fsfd, 0, 0);
+    if (mfd < 0)
+      _exit(16);
+    if (syscall(SYS_move_mount, mfd, "", AT_FDCWD, target,
+                MOVE_MOUNT_F_EMPTY_PATH) != 0)
+      _exit(17);
+    /* mount(8) closes both and exits; so does this. */
+    close(mfd);
+    close(fsfd);
+    _exit(0);
+  }
+
+  int st = 0;
+  if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+    fail("mount-api-child-mounts", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return;
+  }
+  ok("mount-api-child-mounts");
+
+  /* The row the manager looks for: the mount point named as the caller named
+   * it, in the mount table of a process that did not make the mount. */
+  int found = 0;
+  FILE *mi = fopen("/proc/self/mountinfo", "r");
+  if (mi) {
+    char line[512];
+
+    while (fgets(line, sizeof(line), mi)) {
+      /* mountinfo field 5 is the mount point. */
+      char *p = line;
+      int field = 1;
+
+      while (*p && field < 5) {
+        if (*p == ' ')
+          field++;
+        p++;
+      }
+      char *end = p;
+      while (*end && *end != ' ')
+        end++;
+      *end = '\0';
+      if (strcmp(p, target) == 0) {
+        found = 1;
+        break;
+      }
+    }
+    fclose(mi);
+  }
+  check("mount-api-child-in-mountinfo", found, found);
+
+  /* And it is a real filesystem afterwards, not a name in a table. */
+  char file[128];
+  snprintf(file, sizeof(file), "%s/after", target);
+  int wfd = open(file, O_CREAT | O_WRONLY, 0600);
+  int wrote = wfd >= 0 && write(wfd, "x", 1) == 1;
+  if (wfd >= 0)
+    close(wfd);
+  check("mount-api-child-usable", wrote, wrote);
+
+  (void)syscall(SYS_umount2, target, 0);
+}
+
+
+/* One process cannot eat another's mount-table notification.
+ *
+ * systemd watches /proc/self/mountinfo for POLLPRI and re-reads the table when
+ * it fires; that is how a .mount unit learns its mount appeared. mount(8) reads
+ * the same file itself, right after mounting. While the kernel kept ONE "last
+ * seen" generation for the whole machine, that read acknowledged the change and
+ * systemd's watch stayed quiet: every Debian .mount unit failed with "Mount
+ * process finished, but there is no mount". */
+
+/* One table change, made and undone, so each readiness check below has an event
+ * of its own: the first poll consumes the one before it. */
+static int mount_table_bump(void) {
+  const char *p = "/tmp/m107-bump";
+
+  (void)mkdir(p, 0755);
+  if (mount("tmpfs", p, "tmpfs", 0, "mode=0755") != 0)
+    return 0;
+  return syscall(SYS_umount2, p, 0) == 0;
+}
+
+static void test_mountinfo_poll_not_stolen(void) {
+  const char *target = "/tmp/m107-pollsteal";
+  char buf[4096];
+
+  (void)mkdir(target, 0755);
+
+  int watch = open("/proc/self/mountinfo", O_RDONLY);
+  if (watch < 0) {
+    fail("mountinfo-poll-open", watch);
+    return;
+  }
+  /* Read it once, which is how a watcher acknowledges the current table. */
+  while (read(watch, buf, sizeof(buf)) > 0)
+    ;
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(watch);
+    fail("mountinfo-poll-fork", (int)pid);
+    return;
+  }
+  if (pid == 0) {
+    /* Mount, then read the table as mount(8) does. */
+    if (mount("tmpfs", target, "tmpfs", 0, "mode=0755") != 0)
+      _exit(21);
+    int f = open("/proc/self/mountinfo", O_RDONLY);
+    if (f >= 0) {
+      char b[4096];
+
+      while (read(f, b, sizeof(b)) > 0)
+        ;
+      close(f);
+    }
+    _exit(0);
+  }
+
+  int st = 0;
+  waitpid(pid, &st, 0);
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+    close(watch);
+    fail("mountinfo-poll-child", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return;
+  }
+
+  struct pollfd pfd = { .fd = watch, .events = POLLPRI };
+  int n = poll(&pfd, 1, 2000);
+
+  check("mountinfo-poll-not-stolen", n == 1 && (pfd.revents & POLLPRI),
+        n == 1 ? pfd.revents : n);
+
+  /* And through epoll, because that is how systemd watches it: one fd
+   * registered for EPOLLPRI, in the same loop as its signal fd. A readiness
+   * that poll(2) reports and epoll_wait does not is invisible to every event
+   * loop in the distribution. */
+  {
+    int ep = epoll_create1(0);
+    struct epoll_event ev = { .events = EPOLLPRI, .data.fd = watch };
+    struct epoll_event out[2];
+    int en = -1;
+
+    if (ep >= 0 && epoll_ctl(ep, EPOLL_CTL_ADD, watch, &ev) == 0 &&
+        mount_table_bump())
+      en = epoll_wait(ep, out, 2, 2000);
+    check("mountinfo-epollpri", en == 1 && (out[0].events & EPOLLPRI),
+          en == 1 ? (int)out[0].events : en);
+    if (ep >= 0)
+      close(ep);
+  }
+
+  /* One change, one event. The readiness is consumed by the poll itself, as
+   * Linux consumes it, so a second poll with nothing new must time out. When it
+   * did not, systemd saw the same event over and over, sd-event rate-limited
+   * the mount monitor ("mount-monitor-dispatch entered rate limit state") and
+   * the change that mattered was dropped. */
+  {
+    struct pollfd again = { .fd = watch, .events = POLLPRI };
+    int n2 = poll(&again, 1, 200);
+
+    check("mountinfo-poll-consumed", n2 == 0, n2 == 0 ? 0 : again.revents);
+  }
+
+  /* And the shape systemd actually builds: libmount hands it a monitor which
+   * is itself an epoll instance watching /proc/self/mountinfo for EPOLLPRI, and
+   * systemd registers THAT descriptor in its own loop for EPOLLIN. Two levels,
+   * and the readiness has to travel up both. */
+  {
+    int inner = epoll_create1(0);
+    int outer = epoll_create1(0);
+    struct epoll_event iev = { .events = EPOLLPRI, .data.fd = watch };
+    struct epoll_event oev = { .events = EPOLLIN, .data.fd = inner };
+    struct epoll_event out[2];
+    int on = -1;
+
+    if (inner >= 0 && outer >= 0 &&
+        epoll_ctl(inner, EPOLL_CTL_ADD, watch, &iev) == 0 &&
+        epoll_ctl(outer, EPOLL_CTL_ADD, inner, &oev) == 0 &&
+        mount_table_bump())
+      on = epoll_wait(outer, out, 2, 2000);
+    check("mountinfo-nested-epoll", on == 1 && out[0].data.fd == inner, on);
+    if (inner >= 0)
+      close(inner);
+    if (outer >= 0)
+      close(outer);
+  }
+
+  /* And the table the watcher now reads really names the new mount. */
+  lseek(watch, 0, SEEK_SET);
+  ssize_t got = read(watch, buf, sizeof(buf) - 1);
+  if (got > 0)
+    buf[got] = '\0';
+  else
+    buf[0] = '\0';
+  check("mountinfo-poll-reread", strstr(buf, target) != NULL, (int)got);
+
+  close(watch);
+  (void)syscall(SYS_umount2, target, 0);
+}
+
 int main(void) {
   marker("M107-SMOKE: start");
 
@@ -2220,6 +2461,8 @@ int main(void) {
   test_applet_chvt();
 
   test_mount_api();
+  test_mount_api_child();
+  test_mountinfo_poll_not_stolen();
 
   marker(g_fail ? "M107-SMOKE: done with failures" : "M107-SMOKE: done");
   return g_fail ? 1 : 0;

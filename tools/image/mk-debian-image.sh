@@ -1195,6 +1195,12 @@ if sd_start b1nix-notify.service; then
 	say "SYSTEMD-SMOKE: ok notify-ready"
 else
 	say "SYSTEMD-SMOKE: FAIL notify-ready"
+	# Which half failed: the datagram never arriving, or the service dying.
+	# `Result=` names it, and the journal carries systemd-notify's own error.
+	run systemctl show -p Result -p ExecMainStatus -p ActiveState \
+		-p NotifyAccess b1nix-notify.service
+	run journalctl -u b1nix-notify.service -n 15 --no-pager
+	run ls -la /run/systemd/notify
 fi
 systemctl stop b1nix-notify.service 2>/dev/null
 
@@ -1241,6 +1247,33 @@ else
 	say "SYSTEMD-SMOKE: ok protect-system"
 fi
 
+# Debian's own tmp.mount and run-lock.mount are NOT started here: on this image
+# their conditions do not hold (/tmp is already a directory on the root
+# filesystem), and systemd reports a skipped unit as success/inactive -- which
+# is neither a pass nor a failure and would make this lane lie either way. They
+# are exercised where they really run, on the installed system, by DISTRO-SMOKE.
+# What this lane checks instead is the mechanism underneath, by hand, below.
+
+# What a .mount unit is graded by, done by hand with the distribution's own
+# mount(8): the mount must appear in /proc/self/mountinfo under the path that
+# was asked for. systemd fails a mount unit with result 'protocol' when it does
+# not -- "Mount process finished, but there is no mount" -- and that is what
+# Debian's tmp.mount and run-lock.mount die of on an installed system.
+mkdir -p /run/b1nix-mnt
+if timeout 25 mount -t tmpfs tmpfs /run/b1nix-mnt \
+	-o mode=1777,strictatime,nosuid,nodev,size=50%,nr_inodes=1m >/run/b1nix-mnt.err 2>&1; then
+	if awk '{print $5}' /proc/self/mountinfo | grep -qx /run/b1nix-mnt; then
+		say "SYSTEMD-SMOKE: ok mount-in-mountinfo"
+	else
+		say "SYSTEMD-SMOKE: FAIL mount-in-mountinfo (mounted, but no row names it)"
+		run sh -c 'awk "{print \$1, \$5, \$9, \$10}" /proc/self/mountinfo | tail -12'
+		run sh -c 'cat /proc/mounts | tail -6'
+	fi
+	timeout 15 umount /run/b1nix-mnt 2>/dev/null
+else
+	say "SYSTEMD-SMOKE: FAIL mount-in-mountinfo (mount(8) failed: $(head -2 /run/b1nix-mnt.err | tr '\n' ' '))"
+fi
+
 # A timer: a clock the manager owns, rather than a sleep in a script.
 cat >/run/systemd/system/b1nix-tick.service <<'EOF'
 [Service]
@@ -1257,14 +1290,45 @@ EOF
 sd_load b1nix-tick.timer
 rm -f /run/b1nix-tick.count
 if sd_start b1nix-tick.timer; then
+	# What the manager says it will do, asked ONCE before the wait: every
+	# question costs a D-Bus round trip, which wakes PID 1 -- and a wake is
+	# exactly what is under test here, so the loop below must not do it.
+	say "SYSTEMD-SMOKE:   tick-armed $(timeout 15 systemctl show \
+		-p NextElapseUSecMonotonic -p ActiveState b1nix-tick.timer 2>&1 | tr '\n' ' ')uptime=$(cut -d' ' -f1 /proc/uptime)"
 	i=0
 	while [ $i -lt 15 ] && [ ! -f /run/b1nix-tick.count ]; do
 		i=$((i + 1)); sleep 1
+		# Passive only: /proc reads, no D-Bus. PID 1's state and the
+		# runnable-job count say whether the manager is asleep past a
+		# deadline or awake and not dispatching.
+		say "SYSTEMD-SMOKE:   tick-waiting i=$i pid1=$(awk '{print $3}' /proc/1/stat 2>/dev/null) wchan=$(cat /proc/1/wchan 2>/dev/null) uptime=$(cut -d' ' -f1 /proc/uptime)"
 	done
 	if [ -f /run/b1nix-tick.count ]; then
 		say "SYSTEMD-SMOKE: ok timer-fires"
 	else
 		say "SYSTEMD-SMOKE: FAIL timer-fires (started, never fired)"
+		# Which half failed: the timer, or seeing what it wrote. The
+		# service writes /run/b1nix-tick.count from its own process, so a
+		# unit that ran and a file that is not there is a VFS answer, not
+		# a timer one.
+		say "SYSTEMD-SMOKE:   tick-wait uptime=$(cut -d' ' -f1 /proc/uptime) wall=$(date -u +%H:%M:%S)"
+		run ls -la /run/b1nix-tick.count
+		run ls -la /run/
+		run findmnt -n /run
+		run stat -c '%n %i %s %Y' /run /run/b1nix-tick.count
+		# What the directory says a second later, from a fresh process.
+		sleep 2
+		say "SYSTEMD-SMOKE:   tick-recheck $([ -f /run/b1nix-tick.count ] && echo present || echo absent) uptime=$(cut -d' ' -f1 /proc/uptime)"
+		# What the manager thinks the timer is waiting for. "never fired"
+		# alone cannot say whether the timer was never armed, is armed for a
+		# deadline that has not come, or fired into a service that failed.
+		run systemctl list-timers --all --no-pager
+		run systemctl show -p Result -p NextElapseUSecMonotonic \
+			-p LastTriggerUSec -p AccuracyUSec b1nix-tick.timer
+		run systemctl show -p Result -p ExecMainStatus -p ActiveState \
+			b1nix-tick.service
+		run journalctl -u b1nix-tick.timer -u b1nix-tick.service \
+			-n 20 --no-pager
 	fi
 else
 	say "SYSTEMD-SMOKE: FAIL timer-fires"
@@ -1491,7 +1555,70 @@ systemctl unmask b1nix-tick.service >/dev/null 2>&1
 	} >/dev/kmsg 2>&1
 ) &
 
+# The echo units this harness started by hand have hit their start limit
+# BECAUSE the harness kept connecting to them; that is the test working, not a
+# failure of the machine. Clear them so the count below means what it says.
+for __own in b1nix-echo.service b1nix-echo.socket b1nix-echo-tcp.service \
+	b1nix-echo-tcp.socket b1nix-notify.service b1nix-tick.service; do
+	timeout 10 systemctl reset-failed "$__own" 2>/dev/null
+done
 say "SYSTEMD-SMOKE: units-loaded=$(systemctl list-units --no-legend --no-pager 2>/dev/null | wc -l) failed=$(systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null | wc -l)"
+# A count is not a diagnosis: name the units and the result each one carries,
+# because that word ("protocol", "exit-code", "timeout") is what says which
+# kernel behaviour the unit tripped over.
+for __fu in $(systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null |
+	sed 's/^[^a-zA-Z0-9]*//' | awk '{print $1}'); do
+	say "SYSTEMD-SMOKE:   failed-unit $__fu $(timeout 15 systemctl show \
+		-p Result -p ExecMainStatus -p StatusErrno "$__fu" 2>&1 | tr '\n' ' ')"
+	# systemd's own name for the status: 225 is not "error 225", it is
+	# EXIT_NETWORK, and that word is the whole diagnosis.
+	__fs=$(timeout 15 systemctl show -p ExecMainStatus "$__fu" 2>/dev/null |
+		sed 's/.*=//')
+	if [ -n "$__fs" ] && [ "$__fs" != "0" ]; then
+		say "SYSTEMD-SMOKE:     $__fu status $__fs = $(timeout 15 systemd-analyze exit-status "$__fs" 2>&1 | tr '\n' ' ' | head -c 200)"
+	fi
+	run journalctl -u "$__fu" -n 6 --no-pager
+done
+
+# The sandboxing options a distribution's own units ask for, one transient unit
+# each, so a refusal is named here rather than as an exit status on somebody
+# else's service. e2scrub_reap.service is PrivateNetwork=yes, and it failed with
+# nothing in the journal to say why.
+for __opt in PrivateNetwork=yes PrivateUsers=yes ProtectClock=yes \
+	RestrictNamespaces=yes PrivateDevices=yes ProtectHostname=yes \
+	CPUSchedulingPolicy=idle IOSchedulingClass=idle Nice=5 \
+	ProtectKernelTunables=yes MemoryDenyWriteExecute=yes; do
+	__on=$(echo "$__opt" | sed 's/=.*//')
+	# A name with no '=' would make systemd-run parse the option as a unit
+	# name; every entry above carries one, and this is what says so.
+	case "$__opt" in *=*) ;; *) continue ;; esac
+	systemctl reset-failed b1nix-sbx.service 2>/dev/null
+	__oerr=$(timeout 30 systemd-run -q --wait --unit=b1nix-sbx \
+		-p "$__opt" /bin/true 2>&1)
+	if [ $? = 0 ]; then
+		say "SYSTEMD-SMOKE: ok sandbox-$__on"
+	else
+		say "SYSTEMD-SMOKE: FAIL sandbox-$__on (${__oerr:-no output})"
+		# The refusal itself: the child logs which step of the sandbox setup
+		# failed, and that message names the syscall.
+		say "SYSTEMD-SMOKE:     sandbox-$__on $(timeout 15 systemctl show \
+			-p Result -p ExecMainStatus b1nix-sbx.service 2>&1 | tr '\n' ' ')"
+		run journalctl -u b1nix-sbx.service -n 10 --no-pager
+		# The same setup, step by step and outside systemd, so the step that
+		# fails is named rather than summarised as an exit status. systemd's
+		# PrivateNetwork= is: unshare the network namespace, bring `lo` up
+		# inside it, and bind-mount /proc/self/ns/net so JoinsNamespaceOf=
+		# units can share it.
+		if [ "$__on" = "PrivateNetwork" ]; then
+			run unshare -n /bin/true
+			run unshare -n ip link set lo up
+			run unshare -n ip addr show lo
+			: >/run/b1nix-nsnet 2>/dev/null
+			run unshare -n mount --bind /proc/self/ns/net /run/b1nix-nsnet
+			run sh -c 'mount --bind /proc/self/ns/net /run/b1nix-nsnet && umount /run/b1nix-nsnet && echo bind-ok'
+		fi
+	fi
+done
 
 say "SYSTEMD-SMOKE: done"
 SSTAGE_EOF

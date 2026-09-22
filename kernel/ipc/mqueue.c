@@ -209,7 +209,9 @@ static isize mq_read_cb(struct vfs_node *node, u64 offset, char *buf,
   return (isize)len;
 }
 
-static int mq_poll_cb(struct vfs_node *node, struct b1nix_pollfd *pfd) {
+static int mq_poll_cb(struct vfs_handle *h, struct vfs_node *node,
+                      struct b1nix_pollfd *pfd) {
+  (void)h;
   struct mqueue *q = mq_of_node(node);
   pfd->revents = 0;
   if (!q)

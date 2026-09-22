@@ -269,8 +269,22 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
  * is concerned, and a write path that could not be tested against a burner
  * would be code nobody has ever run.
  */
-static int ahci_packet_command(struct ahci_port_state *port, const u8 *acmd,
-                               void *buffer, u32 bytes) {
+static int ahci_wait_ci_clear_bounded(volatile struct ahci_port *p,
+                                      u32 slot_mask, u64 timeout_ms);
+static void ahci_port_disable(struct ahci_port_state *port,
+                              volatile struct ahci_port *p, const char *why);
+
+/* `timeout_ms` of 0 waits for ever, which is what the I/O path needs: its PRDT
+ * points at a caller's buffer and giving up would hand that memory back while
+ * the controller may still write into it. A PROBE can give up, and has to: an
+ * ATAPI port with no disc in it never completes READ CAPACITY, and the boot
+ * stopped there -- on QEMU's q35, which always carries an ICH9 AHCI, that was
+ * every boot with an empty optical drive attached. On the deadline the port is
+ * stopped before the buffer goes back, so nothing can be written into freed
+ * memory afterwards. */
+static int ahci_packet_command_bounded(struct ahci_port_state *port,
+                                       const u8 *acmd, void *buffer, u32 bytes,
+                                       u64 timeout_ms) {
   if (!port->present)
     return -1;
 
@@ -323,7 +337,15 @@ static int ahci_packet_command(struct ahci_port_state *port, const u8 *acmd,
   p->serr = p->serr;
   p->ci = 1;
 
-  ahci_wait_ci_clear(port, p, 1, "packet", port->port_num);
+  if (timeout_ms) {
+    if (ahci_wait_ci_clear_bounded(p, 1, timeout_ms) != 0) {
+      ahci_port_disable(port, p, "did not answer a packet command");
+      ahci_port_unlock(port);
+      return -1;
+    }
+  } else {
+    ahci_wait_ci_clear(port, p, 1, "packet", port->port_num);
+  }
 
   u32 tfd = p->tfd;
   if (tfd & 0x01) {
@@ -334,6 +356,11 @@ static int ahci_packet_command(struct ahci_port_state *port, const u8 *acmd,
   return 0;
 }
 
+static int ahci_packet_command(struct ahci_port_state *port, const u8 *acmd,
+                               void *buffer, u32 bytes) {
+  return ahci_packet_command_bounded(port, acmd, buffer, bytes, 0);
+}
+
 /* READ CAPACITY(10): the last addressable block and the block size. */
 static int ahci_packet_capacity(struct ahci_port_state *port, u64 *blocks,
                                 u32 *block_size) {
@@ -342,7 +369,9 @@ static int ahci_packet_capacity(struct ahci_port_state *port, u64 *blocks,
 
   if (!cap)
     return -1;
-  if (ahci_packet_command(port, acmd, cap, 8) != 0) {
+  /* Three seconds: a drive that has not answered READ CAPACITY by then has
+     nothing to read, and this runs during the probe. */
+  if (ahci_packet_command_bounded(port, acmd, cap, 8, 3000) != 0) {
     kfree(cap);
     return -1;
   }

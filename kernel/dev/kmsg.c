@@ -418,7 +418,9 @@ static isize kmsg_dev_write(struct vfs_node *node, u64 offset, const char *buf,
   return (isize)size;
 }
 
-static int kmsg_dev_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
+static int kmsg_dev_poll(struct vfs_handle *h, struct vfs_node *node,
+                          struct b1nix_pollfd *pfd) {
+  (void)h;
   (void)node;
   pfd->revents = B1NIX_POLLOUT;
   if (kmsg_pending(g_dev_cursor))
@@ -433,7 +435,9 @@ isize kmsg_proc_read(struct vfs_node *node, u64 offset, char *buf, usize size,
   return kmsg_read_common(&g_proc_cursor, buf, size, flags);
 }
 
-int kmsg_proc_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
+int kmsg_proc_poll(struct vfs_handle *h, struct vfs_node *node,
+                   struct b1nix_pollfd *pfd) {
+  (void)h;
   (void)node;
   pfd->revents = 0;
   if (kmsg_pending(g_proc_cursor))

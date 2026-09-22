@@ -80,10 +80,25 @@ else
 	bad "userspace-reaches-multi-user" "the in-guest checks never ran to the end"
 fi
 
-_state=$(marker "$BOOT_LOG" "state=" | sed 's/.*state=//')
+# The console carries carriage returns; a state of "starting\r" matches no
+# pattern below and lands in the catch-all, which is how a boot that had only
+# the checks' own job left was reported as if systemd had said something
+# unexpected.
+_state=$(marker "$BOOT_LOG" "state=" | sed 's/.*state=//' | tr -d '\r' |
+	awk '{print $1}')
 case "$_state" in
 running) ok "system-running" ;;
 degraded) ok "system-running" ;;  # graded below, unit by unit
+# "starting" with nothing left but the checks' own unit: systemd counts the job
+# it is running us from, so this is as far as a boot can get while a unit is
+# asking. The in-guest side says so explicitly before it goes on.
+starting)
+	if clean_log "$BOOT_LOG" | grep -qa "with only this unit left"; then
+		ok "system-running"
+	else
+		bad "system-running" "still starting, with jobs other than the checks' own"
+	fi
+	;;
 *) bad "system-running" "systemctl is-system-running said '${_state:-nothing}'" ;;
 esac
 

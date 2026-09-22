@@ -6106,6 +6106,16 @@ void scheduler_block_on_timeout(void *chan, u64 timeout_ticks) {
  */
 static void *g_park_site[SCHED_MAX_TASKS];
 
+/* The site one task last parked at, for /proc/<pid>/wchan. 0 when that task
+ * has never blocked -- the array is only ever written on the way into
+ * scheduler_wait_prepare, so a task that is running now still carries the
+ * place it last slept, exactly as Linux's wchan does. */
+void *scheduler_park_site(usize pid) {
+  if (pid >= SCHED_MAX_TASKS)
+    return 0;
+  return g_park_site[pid];
+}
+
 void scheduler_dump_park_sites(void) {
   for (usize i = 0; i < SCHED_MAX_TASKS; i++) {
     char line[96];

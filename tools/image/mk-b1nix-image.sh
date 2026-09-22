@@ -131,6 +131,14 @@ in_rootfs "apt-get clean" || die "could not clear the apt cache in the root tree
 # the repair dpkg itself asks for, and it costs nothing when there is nothing
 # to finish.
 in_rootfs "dpkg --configure -a" >/dev/null 2>&1 || true
+# And a run that failed in the UNPACK leaves a package neither installed nor
+# absent, which `dpkg --configure -a` cannot finish: apt then refuses every
+# later install with "unmet dependencies ... you might want to run apt
+# --fix-broken install", naming a package that is in fact right there in the
+# repository. This is that repair, and it too costs nothing when the tree is
+# clean. The root tree is cached between builds, so one failed build otherwise
+# poisons every build after it.
+in_rootfs "DEBIAN_FRONTEND=noninteractive apt-get -y --fix-broken install" >/dev/null 2>&1 || true
 in_rootfs "DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall b1nix-kernel b1nix-kernel-$RELEASE b1nix-base-files b1nix-tools" ||
 	die "installing the overlay failed"
 
@@ -212,10 +220,32 @@ say() { printf 'DISTRO-SMOKE: %s\n' "$*" >/dev/console; }
 # Sample the state only once startup has settled: a unit ordered after
 # multi-user.target still runs while jobs are queued, and "starting" says
 # nothing about whether the machine came up.
-# Bounded: on a machine where a job never finishes -- which is exactly the
-# machine this lane exists to report on -- an unbounded wait hangs the checks
-# and the lane learns nothing at all.
-timeout 60 systemctl is-system-running --wait >/dev/null 2>&1 || true
+# Bounded, and NOT silent: on a machine where a job never finishes -- which is
+# exactly the machine this lane exists to report on -- an unbounded wait hangs
+# the checks and the lane learns nothing at all. Worse, a quiet wait looks like
+# a wedge: the host kills a guest whose console has said nothing for 45 s, so a
+# deliberate wait has to say that it is waiting. It also names what it is
+# waiting for, which is the whole question when the wait does not end.
+__w=0
+while [ $__w -lt 60 ]; do
+	__st=$(timeout 10 systemctl is-system-running 2>&1)
+	case "$__st" in
+	running | degraded) break ;;
+	esac
+	# "starting" while the ONLY job left is this unit is as far as a boot can
+	# get: systemd counts our own job, so waiting for "running" from inside a
+	# unit waits for something that cannot happen. Linux behaves the same way.
+	__jobs=$(timeout 10 systemctl list-jobs --no-legend --no-pager 2>/dev/null)
+	__njobs=$(printf '%s\n' "$__jobs" | grep -c '[a-z]')
+	if [ "$__njobs" = "1" ] &&
+		printf '%s\n' "$__jobs" | grep -q 'b1nix-smoke\.service'; then
+		say "startup=$__st with only this unit left after ${__w}s"
+		break
+	fi
+	say "startup=$__st jobs=$__njobs after ${__w}s"
+	__w=$((__w + 5))
+	sleep 5
+done
 
 say "uname=$(uname -r)"
 say "os-release=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d \")"
@@ -268,6 +298,23 @@ if mount -t 9p b1nixrepo /mnt 2>/tmp/9p.err; then
 		apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/b1nix-smoke.list \
 			-o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0 2>&1 |
 			tail -3 | while read -r l; do say "apt-err=$l"; done
+		# Which call failed, not which message apt printed. apt reports "read
+		# (22: Invalid argument)" without saying what it read, and the answer
+		# decides whether this is a kernel gap or apt's own fallback working as
+		# designed. strace is in the image for exactly this.
+		if command -v strace >/dev/null 2>&1; then
+			# Not silent, and short: the host kills a guest whose console has
+			# said nothing for 45 s, and a quiet trace looks exactly like the
+			# wedge this lane exists to catch.
+			say "apt-strace=starting"
+			timeout 30 strace -f -qq -e trace=openat,open,read,pread64,readv,preadv,preadv2,symlink,symlinkat,lseek,ioctl \
+				apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/b1nix-smoke.list \
+				-o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0 \
+				>/tmp/apt-strace.txt 2>&1
+			say "apt-strace=done"
+			grep -a -- "-1 E" /tmp/apt-strace.txt | tail -12 |
+				while IFS= read -r l; do say "apt-syscall=$l"; done
+		fi
 	fi
 else
 	say "repo-mounted=no"
@@ -308,6 +355,131 @@ StandardOutput=journal
 [Install]
 WantedBy=multi-user.target
 UNIT
+# Why a boot stopped, when it stops before the checks above can run.
+#
+# A wedged boot prints nothing: the units that would have printed are the ones
+# waiting. This runs from sysinit, before anything can block, and says every few
+# seconds what the manager is still waiting for and which units have failed.
+# Gated on b1nix.smoke, like the harness itself, and it stops on its own.
+cat >"$ROOTFS/usr/local/sbin/b1nix-boot-probe" <<'PROBE'
+#!/bin/sh
+# Bounded: 24 reports, five seconds apart, then gone.
+# To the console, not /dev/kmsg: a kmsg write lands at the info level, which
+# the console drops unless the command line raised loglevel -- and this has to
+# be readable on the lane's ordinary command line.
+say() { printf 'BOOT-PROBE: %s\n' "$*" >/dev/console 2>/dev/null ||
+	echo "BOOT-PROBE: $*"; }
+# The two mount units Debian's local-fs.target waits for, asked about once:
+# their own journal carries systemd's reason, and a mount done by hand next to
+# them says whether the kernel or the manager is at fault.
+for u in run-lock.mount tmp.mount; do
+	timeout 15 systemctl show -p Result -p ActiveState "$u" 2>&1 |
+		while IFS= read -r l; do say "  $u $l"; done
+	timeout 15 journalctl -u "$u" -n 6 --no-pager 2>&1 |
+		while IFS= read -r l; do say "  $u| $l"; done
+done
+say "systemd $(timeout 10 systemctl --version 2>&1 | head -1)"
+# The table itself, line for line. Everything else about this is inference; the
+# bytes systemd's parser is handed are not.
+timeout 10 cat /proc/self/mountinfo | while IFS= read -r l; do say "  MI| $l"; done
+# And what the distribution's own libmount makes of it, which is the same
+# parser systemd uses.
+run findmnt --target /tmp --output TARGET,SOURCE,FSTYPE
+run findmnt --target /run/lock --output TARGET,SOURCE,FSTYPE
+# Which descriptors PID 1 holds, and what they name: the mount monitor is one of
+# them, and knowing whether it watches /proc/self/mountinfo directly or through
+# libmount's own epoll says which path has to carry the notification.
+for f in /proc/1/fd/*; do
+	[ -e "$f" ] || continue
+	say "  pid1 fd $(basename "$f") -> $(readlink "$f" 2>/dev/null)"
+done
+
+# Started again, now that the boot is quiet: a unit that fails at 0.9 s and
+# works at 7 s failed to a race, and one that fails both times does not.
+for u in tmp.mount run-lock.mount; do
+	timeout 20 systemctl reset-failed "$u" 2>/dev/null
+	if timeout 25 systemctl start "$u" >/tmp/probe-$u.err 2>&1 &&
+		[ "$(timeout 10 systemctl is-active "$u" 2>&1)" = "active" ]; then
+		say "retry $u: started"
+	else
+		say "retry $u: $(timeout 10 systemctl show -p Result -p ActiveState "$u" 2>&1 | tr '\n' ' ')$(head -1 /tmp/probe-$u.err 2>/dev/null)"
+	fi
+done
+
+# What PID 1 actually does when the mount table changes. strace is in the
+# image; eight seconds of it around a mount says whether the manager is told at
+# all -- whether its epoll returns the mountinfo descriptor and whether it then
+# opens the file again. Everything else about this bug is inference.
+if command -v strace >/dev/null 2>&1; then
+	( timeout 8 strace -qq -f -p 1 -e trace=epoll_wait,epoll_pwait,openat,ppoll \
+		>/tmp/probe-strace.txt 2>&1 ) &
+	sleep 2
+	mkdir -p /run/b1nix-strace-mnt
+	timeout 15 mount -t tmpfs tmpfs /run/b1nix-strace-mnt -o mode=1777 2>/dev/null
+	sleep 4
+	timeout 10 umount /run/b1nix-strace-mnt 2>/dev/null
+	wait
+	say "strace of pid 1 around a mount:"
+	grep -a "mountinfo" /tmp/probe-strace.txt | tail -6 |
+		while IFS= read -r l; do say "  st $l"; done
+	tail -8 /tmp/probe-strace.txt | while IFS= read -r l; do say "  st $l"; done
+fi
+
+mkdir -p /run/b1nix-probe-mnt
+if timeout 20 mount -t tmpfs tmpfs /run/b1nix-probe-mnt \
+	-o mode=1777,strictatime,nosuid,nodev,size=5242880 >/tmp/probe-mnt.err 2>&1; then
+	if awk '{print $5}' /proc/self/mountinfo | grep -qx /run/b1nix-probe-mnt; then
+		say "by-hand mount: mounted AND named in mountinfo"
+	else
+		say "by-hand mount: mounted but NOT in mountinfo"
+		timeout 10 awk '{print $1, $2, $5, $9}' /proc/self/mountinfo |
+			tail -10 | while IFS= read -r l; do say "  mi $l"; done
+	fi
+	timeout 10 umount /run/b1nix-probe-mnt 2>/dev/null
+else
+	say "by-hand mount FAILED: $(head -2 /tmp/probe-mnt.err | tr '\n' ' ')"
+fi
+
+i=0
+while [ $i -lt 24 ]; do
+	i=$((i + 1))
+	_state=$(timeout 10 systemctl is-system-running 2>&1)
+	_jobs=$(timeout 10 systemctl list-jobs --no-legend --no-pager 2>/dev/null | wc -l)
+	say "t=$(cut -d\  -f1 /proc/uptime) state=$_state jobs=$_jobs"
+	timeout 10 systemctl list-jobs --no-legend --no-pager 2>/dev/null |
+		head -30 | while IFS= read -r l; do say "  job $l"; done
+	timeout 10 systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null |
+		head -8 | while IFS= read -r l; do say "  failed $l"; done
+	# A unit stuck in "activating" is the one holding the boot: the jobs above
+	# are all merely waiting for it.
+	timeout 10 systemctl list-units --state=activating --no-legend --no-pager 2>/dev/null |
+		head -8 | while IFS= read -r l; do say "  activating $l"; done
+	case "$_state" in running | degraded) say "system is up"; exit 0 ;; esac
+	sleep 5
+done
+say "gave up watching"
+PROBE
+chmod 0755 "$ROOTFS/usr/local/sbin/b1nix-boot-probe"
+
+cat >"$ROOTFS/etc/systemd/system/b1nix-boot-probe.service" <<'UNIT'
+[Unit]
+Description=b1nix boot progress probe
+ConditionKernelCommandLine=b1nix.smoke
+DefaultDependencies=no
+After=systemd-journald.service
+Before=basic.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/b1nix-boot-probe
+StandardOutput=journal
+
+[Install]
+WantedBy=sysinit.target
+UNIT
+in_rootfs "systemctl enable b1nix-boot-probe.service" ||
+	die "could not enable the boot probe"
+
 in_rootfs "systemctl enable b1nix-smoke.service" || die "could not enable the smoke unit"
 
 printf 'b1nix\n' >"$ROOTFS/etc/hostname"
@@ -337,7 +509,11 @@ if [ "$PROFILE" = "broken" ]; then
 	# init=/bin/false on the broken entry only: the kernel boots, the
 	# initramfs hook counts the try, and userspace never comes up, so
 	# b1nix-boot-good never marks it good.
-	python3 - "$ROOTFS/tools/image/limine.conf" "$_broken" <<-'PY'
+	# The file b1nix-update-bootloader just wrote, which is on the ESP under
+	# the root tree -- not the template in the source tree, which is what this
+	# named and which does not exist inside the chroot at all: the stage died
+	# with FileNotFoundError before the fallback was ever exercised.
+	python3 - "$ROOTFS/boot/limine.conf" "$_broken" <<-'PY'
 		import sys
 		path, broken = sys.argv[1], sys.argv[2]
 		out = []

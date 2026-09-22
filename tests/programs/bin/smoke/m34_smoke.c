@@ -20,6 +20,9 @@
 #include <unistd.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <poll.h>
+#include <signal.h>
+#include <time.h>
 
 static void emit(const char *s) { write(1, s, strlen(s)); }
 
@@ -85,6 +88,84 @@ static int run_tool(char *const argv[]) {
   if (waitpid(pid, &status, 0) != pid)
     return -1;
   return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+
+/* /proc/<pid>/wchan and the state letter, on a child that really is asleep.
+ *
+ * Both answer the same question -- what is this process doing -- and both used
+ * to answer it wrongly: there was no wchan at all, and every sleeping task was
+ * reported "D", which on Linux means a wait no signal can break. A child
+ * parked in poll(NULL, 0, ...) is the simplest sleep there is, so its state
+ * must be "S" and its wchan must name the call it is in. */
+static int check_wchan_and_state(void) {
+    int pid = fork();
+
+    if (pid < 0)
+        return 0;
+    if (pid == 0) {
+        poll(NULL, 0, 4000);
+        _exit(0);
+    }
+
+    char path[64], buf[512];
+    int state_ok = 0, wchan_ok = 0;
+
+    /* Give it time to get INTO the sleep; a child that has not been scheduled
+     * yet is legitimately "R". */
+    for (int i = 0; i < 40 && !(state_ok && wchan_ok); i++) {
+        usleep(50000);
+
+        snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+        if (!state_ok && slurp(path, buf, sizeof(buf)) > 0) {
+            /* Field 3, after the parenthesised comm. */
+            char *close_paren = strrchr(buf, ')');
+
+            if (close_paren && close_paren[1] == ' ')
+                state_ok = (close_paren[2] == 'S');
+        }
+        snprintf(path, sizeof(path), "/proc/%d/wchan", pid);
+        if (!wchan_ok && slurp(path, buf, sizeof(buf)) > 0)
+            wchan_ok = (buf[0] != '\0' && buf[0] != '\n');
+    }
+
+    kill(pid, SIGKILL);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return state_ok && wchan_ok;
+}
+
+
+/* /proc/uptime and CLOCK_MONOTONIC are the same clock on Linux, and programs
+ * compare them: an agent that reads a process's start time in ticks since boot
+ * and then measures against clock_gettime is doing exactly that. This kernel
+ * keeps the counter and the counter-plus-a-base apart for good reasons (the
+ * vDSO cannot carry the kernel's clamp, and the S3 resume re-anchors the
+ * counter), so the two readings must still agree to well inside the tick. */
+static int check_uptime_matches_monotonic(void) {
+    char buf[128];
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    if (slurp("/proc/uptime", buf, sizeof(buf)) <= 0)
+        return 0;
+
+    double uptime = strtod(buf, NULL);
+    double mono = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    double skew = uptime - mono;
+
+    if (skew < 0)
+        skew = -skew;
+    if (skew < 0.05)
+        return 1;
+
+    char why[160];
+    snprintf(why, sizeof(why),
+             "M34-PROC: FAIL uptime-monotonic (/proc/uptime %.3f, CLOCK_MONOTONIC %.3f, %.3f s apart)\n",
+             uptime, mono, skew);
+    emit(why);
+    return -1;
 }
 
 int main(void) {
@@ -191,6 +272,21 @@ int main(void) {
     ok("tools");
   else
     fail("tools");
+
+  {
+    int r = check_uptime_matches_monotonic();
+
+    if (r > 0)
+      ok("uptime-monotonic");
+    else if (r == 0)
+      fail("uptime-monotonic");
+    /* r < 0 printed its own line with both readings. */
+  }
+
+  if (check_wchan_and_state())
+    ok("wchan-state");
+  else
+    fail("wchan-state");
 
   emit("M34-PROC: done\n");
   return 0;

@@ -269,6 +269,66 @@ static int test_timerfd_epoll_cadence(void) {
     return (wakeups == 10 && expirations >= 10);
 }
 
+/* The shape systemd's event loop actually uses: an ABSOLUTE deadline on
+ * CLOCK_BOOTTIME, and epoll_wait with NO timeout of its own. Every other
+ * timerfd check here passes a timeout to epoll_wait, which arms a task
+ * deadline as well -- so the timerfd could fail to wake anybody and the check
+ * would still pass on the timeout. sd-event never does that: the timerfd IS
+ * the timeout, so a timerfd that does not wake its poller leaves PID 1 asleep
+ * until something unrelated pokes it, and a .timer unit fires many seconds
+ * late.
+ *
+ * Reported as microseconds late so a failure says how late rather than only
+ * that it was. */
+static long long g_abstime_late_us = -1;
+
+static int test_timerfd_abstime_blocking(int clockid) {
+    int tfd = timerfd_create(clockid, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (tfd < 0)
+        return 0;
+
+    int ep = epoll_create1(0);
+    if (ep < 0) { close(tfd); return 0; }
+    struct epoll_event ev = { .events = EPOLLIN, .data.fd = tfd };
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, tfd, &ev) != 0) { close(ep); close(tfd); return 0; }
+
+    struct timespec now;
+    if (clock_gettime(clockid, &now) != 0) { close(ep); close(tfd); return 0; }
+
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+    its.it_value = now;
+    its.it_value.tv_nsec += 300 * 1000 * 1000; /* 300 ms from now */
+    if (its.it_value.tv_nsec >= 1000000000L) {
+        its.it_value.tv_nsec -= 1000000000L;
+        its.it_value.tv_sec += 1;
+    }
+    if (timerfd_settime(tfd, TFD_TIMER_ABSTIME, &its, NULL) != 0) {
+        close(ep); close(tfd); return 0;
+    }
+
+    struct epoll_event out[2];
+    int n = epoll_wait(ep, out, 2, -1); /* no timeout: the timerfd is the clock */
+    struct timespec after;
+    clock_gettime(clockid, &after);
+
+    long long late_us = ((long long)after.tv_sec - its.it_value.tv_sec) * 1000000LL +
+                        ((long long)after.tv_nsec - its.it_value.tv_nsec) / 1000LL;
+    g_abstime_late_us = late_us;
+
+    unsigned long long exp = 0;
+    int got = (n == 1 && out[0].data.fd == tfd &&
+               read(tfd, &exp, sizeof(exp)) == (ssize_t)sizeof(exp) && exp >= 1);
+    close(ep);
+    close(tfd);
+    /* Two bounds, and the lower one is the one that bites. timerfd_settime(2)
+     * promises the timer does not fire BEFORE its deadline; firing a fraction
+     * of a tick early leaves sd-event with an expired timer it will not re-arm,
+     * so `late_us` must not be negative. The upper bound is slack for the
+     * coarse tick and the capped idle interval. */
+    return got && late_us >= 0 && late_us < 500000;
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -287,6 +347,25 @@ int main(int argc, char **argv) {
     else                 marker("M56-SMOKE: FAIL timerfd\n");
     if (test_timerfd_gettime()) marker("M56-SMOKE: ok timerfd-gettime\n");
     else                        marker("M56-SMOKE: FAIL timerfd-gettime\n");
+
+    if (test_timerfd_abstime_blocking(CLOCK_BOOTTIME)) {
+        marker("M56-SMOKE: ok timerfd-abstime-boottime\n");
+    } else {
+        char why[96];
+        snprintf(why, sizeof(why),
+                 "M56-SMOKE: FAIL timerfd-abstime-boottime (%lld us late)\n",
+                 g_abstime_late_us);
+        marker(why);
+    }
+    if (test_timerfd_abstime_blocking(CLOCK_MONOTONIC)) {
+        marker("M56-SMOKE: ok timerfd-abstime-monotonic\n");
+    } else {
+        char why[96];
+        snprintf(why, sizeof(why),
+                 "M56-SMOKE: FAIL timerfd-abstime-monotonic (%lld us late)\n",
+                 g_abstime_late_us);
+        marker(why);
+    }
 
     if (test_signalfd()) marker("M56-SMOKE: ok signalfd\n");
     else                 marker("M56-SMOKE: FAIL signalfd\n");

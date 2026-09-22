@@ -1309,6 +1309,22 @@ static i32 iou_fd_to_direct(struct io_ring_ctx *ctx, int fd, u32 file_index) {
 
 /* ---- timeouts ----------------------------------------------------------- */
 
+/* An absolute deadline, as this file's clock counts.
+ *
+ * IORING_TIMEOUT_ABS and IORING_ENTER_ABS_TIMER hand over a reading of the
+ * caller's CLOCK_MONOTONIC, which is the raw counter; every comparison here is
+ * against ktime_monotonic_ns(), which is that counter plus the base taken at
+ * the TSC handover. Comparing the two directly is wrong by that base for the
+ * whole boot -- the same defect that made systemd's timers fire early. The
+ * interval to the deadline carries across unchanged, so convert through it. */
+static u64 iou_abs_deadline_ns(u64 user_abs_ns)
+{
+  u64 user_now = ktime_user_monotonic_ns();
+  u64 left = user_abs_ns > user_now ? user_abs_ns - user_now : 0;
+
+  return ktime_monotonic_ns() + left;
+}
+
 static int iou_timespec_in(u64 uaddr, u64 *out_ns) {
   struct __kernel_timespec ts;
 
@@ -1342,7 +1358,8 @@ static i32 iou_timeout_update(struct io_ring_ctx *ctx, u64 user_data, u64 ns,
     if (ltimeout ? !r->is_linktmo : !r->is_timeout)
       continue;
     r->has_deadline = 1;
-    r->deadline_ns = absolute ? ns : ktime_monotonic_ns() + ns;
+    r->deadline_ns = absolute ? iou_abs_deadline_ns(ns)
+                              : ktime_monotonic_ns() + ns;
     rc = 0;
     break;
   }
@@ -3234,7 +3251,7 @@ static int iou_submit_one(struct io_ring_ctx *ctx,
     req->timeout_etime_success =
         (sqe->timeout_flags & IORING_TIMEOUT_ETIME_SUCCESS) ? 1 : 0;
     req->deadline_ns = (sqe->timeout_flags & IORING_TIMEOUT_ABS)
-                           ? ns
+                           ? iou_abs_deadline_ns(ns)
                            : ktime_monotonic_ns() + ns;
   } else if (sqe->opcode == IORING_OP_LINK_TIMEOUT) {
     u64 ns = 0;
@@ -3257,7 +3274,7 @@ static int iou_submit_one(struct io_ring_ctx *ctx,
     }
     req->has_deadline = 1;
     req->deadline_ns = (sqe->timeout_flags & IORING_TIMEOUT_ABS)
-                           ? ns
+                           ? iou_abs_deadline_ns(ns)
                            : ktime_monotonic_ns() + ns;
   } else if (sqe->opcode == IORING_OP_POLL_ADD) {
     u32 mask = sqe->poll32_events;
@@ -4304,7 +4321,7 @@ static isize iou_enter(int fd, u32 to_submit, u32 min_complete, u32 flags,
 
       if (iou_timespec_in(arg.ts, &ns) < 0)
         return -EFAULT;
-      deadline = (flags & IORING_ENTER_ABS_TIMER) ? ns
+      deadline = (flags & IORING_ENTER_ABS_TIMER) ? iou_abs_deadline_ns(ns)
                                                   : ktime_monotonic_ns() + ns;
       have_deadline = 1;
     }

@@ -10,4 +10,4 @@
 #
 # Format: <unit name> <TAB or spaces> <why>
 
-e2scrub_reap.service	needs LVM snapshots, which the block layer does not offer; harmless
+# Empty, and that is the goal: every unit in the distribution starts.

@@ -342,6 +342,62 @@ static void test_unix_socket_events(void) {
   unlink(sun.sun_path);
 }
 
+/* A datagram must outlive the process that sent it.
+ *
+ * systemd's readiness protocol is exactly this: the service runs
+ * `systemd-notify --ready`, which sends one datagram to $NOTIFY_SOCKET and
+ * exits immediately; PID 1 reads it whenever its event loop next runs. A
+ * message that is dropped when its sender leaves makes a Type=notify service
+ * fail with "timeout" -- intermittently, because it depends on which side is
+ * scheduled first. */
+static void test_unix_dgram_outlives_sender(void) {
+    int srv = socket(AF_UNIX, SOCK_DGRAM, 0);
+    struct sockaddr_un sun;
+
+    if (srv < 0) {
+        marker("UNIX-SMOKE: fail dgram-socket\n");
+        return;
+    }
+    memset(&sun, 0, sizeof(sun));
+    sun.sun_family = AF_UNIX;
+    strcpy(sun.sun_path, "/tmp/unix-dgram-outlive.sock");
+    unlink(sun.sun_path);
+    if (bind(srv, (struct sockaddr *)&sun, sizeof(sun)) != 0) {
+        marker("UNIX-SMOKE: fail dgram-bind\n");
+        close(srv);
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+
+        if (c >= 0) {
+            sendto(c, "READY=1", 7, 0, (struct sockaddr *)&sun, sizeof(sun));
+            close(c);
+        }
+        _exit(0);
+    }
+    if (pid > 0) {
+        int st = 0;
+        char buf[32];
+        ssize_t n;
+
+        /* Reap first, so the sender is gone before the message is read. */
+        waitpid(pid, &st, 0);
+        usleep(50000);
+        n = recv(srv, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n == 7 && memcmp(buf, "READY=1", 7) == 0)
+            marker("UNIX-SMOKE: ok dgram-outlives-sender\n");
+        else
+            marker("UNIX-SMOKE: fail dgram-outlives-sender\n");
+    } else {
+        marker("UNIX-SMOKE: fail dgram-fork\n");
+    }
+    close(srv);
+    unlink(sun.sun_path);
+}
+
 /* shutdown(2)'s half-close, from the side that has to hear about it.
  *
  * Closing the write half is a statement to the PEER: its read must drain
@@ -809,6 +865,7 @@ static void test_dual_stack_accept(void) {
 
 int main(void) {
   test_unix_socket_events();
+  test_unix_dgram_outlives_sender();
   test_unix_half_close();
   test_unix_seqpacket_ctl();
   test_unix_dgram_pair_epoll();

@@ -67,7 +67,9 @@ struct vfs_node;
 struct b1nix_pollfd;
 isize kmsg_proc_read(struct vfs_node *node, u64 offset, char *buf, usize size,
                      int flags);
-int kmsg_proc_poll(struct vfs_node *node, struct b1nix_pollfd *pfd);
+struct vfs_handle;
+int kmsg_proc_poll(struct vfs_handle *h, struct vfs_node *node,
+                   struct b1nix_pollfd *pfd);
 /* Per-descriptor read cursor for /proc/kmsg (inode->open_cb). */
 struct vfs_handle;
 int kmsg_proc_open(struct vfs_node *node, struct vfs_handle *h);

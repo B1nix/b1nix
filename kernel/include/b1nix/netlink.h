@@ -28,6 +28,10 @@ isize netlink_socket_send(struct vfs_socket_state *s, const void *buf,
 
 /* The kernel-side ifindex the synthetic loopback interface is presented under.
  * Real NICs occupy 1..NET_MAX_NETDEVS through netdev_index_of(). */
+/* The protocol numbers: rtnetlink is 0, which is also what a caller passing no
+ * protocol at all gets. */
+#define NETLINK_ROUTE 0
+
 #define NETLINK_LO_IFINDEX 32
 
 /*

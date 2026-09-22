@@ -332,6 +332,21 @@ struct timerfd_state {
   int clockid;       /* which clock an ABSTIME deadline is measured against */
   u64 next_tick;     /* absolute tick of the next expiration; 0 = disarmed */
   u64 interval_ticks; /* 0 = one-shot */
+  /* The deadline on the CALLER's clock, in nanoseconds, and the interval in the
+   * same unit. Set for the monotonic family; 0 for the wall clock, which is
+   * compared in seconds.
+   *
+   * Whether the timer has expired is decided by THESE, not by the tick count.
+   * The tick clock and the counter userspace reads are two clocks: they differ
+   * by a fixed base, and on AArch64 they also run at slightly different rates
+   * (the tick period is programmed, the counter is the hardware's). Deciding
+   * readiness on ticks therefore fired up to a couple of milliseconds before
+   * the deadline the caller asked for -- and a timer that fires early is a
+   * timer sd-event drops, because it finds no event source due and re-arms
+   * nothing. next_tick stays, but only to schedule the WAKE: waking early is
+   * free, answering "ready" early is not. */
+  u64 deadline_ns;
+  u64 interval_ns;
   u64 expirations;   /* accumulated, cleared on read */
 };
 
@@ -365,6 +380,37 @@ static void timerfd_list_release(u64 flags) {
   interrupts_restore(flags);
 }
 
+/* `b1nix.trace-timerfd`: every arm, every wake and every readiness report, with
+ * the numbers each was computed from. A timer that fires late is either armed
+ * for the wrong tick or armed correctly and not woken, and nothing short of
+ * both sides of that printed says which. Bounded, because PID 1 arms timers
+ * thousands of times a boot. */
+static int timerfd_traced(void) {
+  static int on = -1;
+
+  if (on < 0)
+    on = bootinfo_has_flag("b1nix.trace-timerfd") ? 1 : 0;
+  return on;
+}
+
+static void timerfd_trace(const char *what, int clockid, u64 a, u64 b, u64 c) {
+  static unsigned told;
+
+  if (!timerfd_traced() || told >= 4000)
+    return;
+  told++;
+  kprintf(LOGLEVEL_WARNING, NULL,
+          "timerfd: %s by %s/%lu clock=%d %llu %llu %llu armed=%d due=%llu now=%llu",
+          what,
+          current_task && current_task->name ? current_task->name : "?",
+          current_task ? (unsigned long)current_task->id : 0ul,
+          clockid, (unsigned long long)a, (unsigned long long)b,
+          (unsigned long long)c,
+          __atomic_load_n(&g_armed_timerfds, __ATOMIC_RELAXED),
+          (unsigned long long)__atomic_load_n(&g_timerfd_due, __ATOMIC_RELAXED),
+          (unsigned long long)scheduler_get_uptime_ticks());
+}
+
 static void timerfd_note_deadline(u64 tick) {
   u64 cur = __atomic_load_n(&g_timerfd_due, __ATOMIC_ACQUIRE);
 
@@ -379,6 +425,29 @@ static void timerfd_note_deadline(u64 tick) {
 static void timerfd_advance(struct timerfd_state *t) {
   if (!t->armed || t->next_tick == 0)
     return;
+  if (t->deadline_ns) {
+    /* The caller's clock decides. */
+    u64 now_ns = ktime_user_monotonic_ns();
+
+    if (now_ns < t->deadline_ns)
+      return;
+    if (t->interval_ns == 0) {
+      t->expirations += 1;
+      t->next_tick = 0;
+      t->deadline_ns = 0;
+      t->armed = 0;
+      __atomic_sub_fetch(&g_armed_timerfds, 1, __ATOMIC_RELAXED);
+    } else {
+      u64 elapsed = now_ns - t->deadline_ns;
+      u64 n = 1 + elapsed / t->interval_ns;
+
+      t->expirations += n;
+      t->deadline_ns += n * t->interval_ns;
+      t->next_tick += n * (t->interval_ticks ? t->interval_ticks : 1);
+      timerfd_note_deadline(t->next_tick);
+    }
+    return;
+  }
   u64 now = scheduler_get_uptime_ticks();
   if (now < t->next_tick)
     return;
@@ -420,6 +489,7 @@ static isize timerfd_read(struct vfs_handle *h, char *buf, usize len) {
   u64 out = t->expirations;
   t->expirations = 0;
   __atomic_clear(&t->lock, __ATOMIC_RELEASE);
+  timerfd_trace("read", t->clockid, out, t->next_tick, t->interval_ticks);
   memcpy(buf, &out, sizeof(u64));
   return (isize)sizeof(u64);
 }
@@ -436,6 +506,9 @@ static int timerfd_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
    * the next read under the lock). */
   if (t->expirations != 0) {
     pfd->revents |= B1NIX_POLLIN;
+  } else if (t->armed && t->deadline_ns) {
+    if (ktime_user_monotonic_ns() >= t->deadline_ns)
+      pfd->revents |= B1NIX_POLLIN;
   } else if (t->armed && t->next_tick != 0 &&
              scheduler_get_uptime_ticks() >= t->next_tick) {
     pfd->revents |= B1NIX_POLLIN;
@@ -478,8 +551,10 @@ int vfs_timerfd_create(int clockid, int flags) {
    * BOOTTIME, gave up on the timer entirely. */
   if (clockid != B1NIX_CLOCK_REALTIME && clockid != B1NIX_CLOCK_MONOTONIC &&
       clockid != B1NIX_CLOCK_BOOTTIME && clockid != B1NIX_CLOCK_REALTIME_ALARM &&
-      clockid != B1NIX_CLOCK_BOOTTIME_ALARM)
+      clockid != B1NIX_CLOCK_BOOTTIME_ALARM) {
+    timerfd_trace("create-refused", clockid, (u64)(u32)flags, 0, 0);
     return -EINVAL;
+  }
   if (flags & ~(B1NIX_TFD_CLOEXEC | B1NIX_TFD_NONBLOCK))
     return -EINVAL;
   struct timerfd_state *t = kzalloc(sizeof(*t));
@@ -515,6 +590,7 @@ int vfs_timerfd_create(int clockid, int flags) {
   }
   if (flags & B1NIX_TFD_CLOEXEC)
     scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
+  timerfd_trace("create", clockid, (u64)(u32)flags, (u64)fd, 0);
   return fd;
 }
 
@@ -560,6 +636,19 @@ static void timerfd_current_locked(const struct timerfd_state *t,
   memset(out, 0, sizeof(*out));
   if (!t->armed || t->next_tick == 0)
     return;
+  if (t->deadline_ns) {
+    /* From the same clock the deadline is on, so a caller that asked for 300 ms
+     * and reads the time left immediately gets 300 ms and not the tick grid's
+     * opinion of it. */
+    u64 now_ns = ktime_user_monotonic_ns();
+    u64 rem_ns = t->deadline_ns > now_ns ? t->deadline_ns - now_ns : 0;
+
+    out->it_value.tv_sec = (i64)(rem_ns / 1000000000ull);
+    out->it_value.tv_nsec = (i64)(rem_ns % 1000000000ull);
+    out->it_interval.tv_sec = (i64)(t->interval_ns / 1000000000ull);
+    out->it_interval.tv_nsec = (i64)(t->interval_ns % 1000000000ull);
+    return;
+  }
   u64 now = scheduler_get_uptime_ticks();
   u64 rem = t->next_tick > now ? t->next_tick - now : 0;
   out->it_value.tv_sec = (i64)(rem / TICKS_PER_SEC);
@@ -603,6 +692,17 @@ int vfs_timerfd_settime(int fd, int flags,
                 new_value->it_value.tv_nsec == 0);
   u64 value = timespec_to_ticks(&new_value->it_value);
   u64 interval = timespec_to_ticks(&new_value->it_interval);
+  /* The tick the timer must not fire before, when the deadline can be placed
+   * on the monotonic clock exactly. 0 means "use base + value". */
+  u64 target_tick = 0;
+  /* The deadline on the caller's own clock, which is what expiry is decided by
+   * for the monotonic family. 0 for the wall clock. */
+  u64 want_deadline_ns = 0;
+  u64 want_interval_ns = 0;
+
+  if (new_value->it_interval.tv_sec >= 0 && new_value->it_interval.tv_nsec >= 0)
+    want_interval_ns = (u64)new_value->it_interval.tv_sec * 1000000000ull +
+                       (u64)new_value->it_interval.tv_nsec;
 
   /* TFD_TIMER_ABSTIME: it_value is a DEADLINE on this timerfd's clock, not a
    * delay. Treating it as a delay put every one of systemd's timeouts (which
@@ -631,7 +731,26 @@ int vfs_timerfd_settime(int fd, int flags,
 
       value = value > now_clock ? value - now_clock : 1;
     } else {
-      u64 now_ns = ktime_monotonic_ns();
+      /* TWO clocks, and telling them apart is the whole of it.
+       *
+       * The deadline is a reading of the caller's CLOCK_MONOTONIC, which both
+       * the system call and the vDSO answer from the raw counter. The timer
+       * fires off the tick counter, which follows the KERNEL's clock -- the
+       * counter plus a fixed base taken at the TSC handover. The two differ by
+       * that base for the whole boot, so resolving the deadline against the
+       * kernel's clock placed it wrong by a constant, in whichever direction
+       * the base happened to have: on the boots where it fired early, sd-event
+       * woke with no event source due, re-armed nothing (it only re-arms when
+       * the earliest deadline CHANGES), and PID 1 then slept until something
+       * unrelated poked it. A `.timer` unit asking for one second ran fifteen
+       * seconds late, on about half the boots.
+       *
+       * So: the remaining delay is computed entirely on the caller's clock,
+       * and only then placed on the kernel's tick grid, rounded UP so the
+       * timer cannot fire before the deadline -- which is what
+       * timerfd_settime(2) promises. Both clocks run at the same rate, so a
+       * delay carries across them unchanged. */
+      u64 now_ns = ktime_user_monotonic_ns();
       /* The deadline is on the clock as the caller's time namespace reads
        * it (M123); the timer runs on the kernel's. */
       i64 want_ns_signed = (i64)new_value->it_value.tv_sec * 1000000000LL +
@@ -640,10 +759,41 @@ int vfs_timerfd_settime(int fd, int flags,
       u64 want_ns = want_ns_signed > 0 ? (u64)want_ns_signed : 0;
       u64 tick_ns = 1000000000ull / TICKS_PER_SEC;
       u64 delay_ns = want_ns > now_ns ? want_ns - now_ns : 0;
+      u64 kernel_now_ns = ktime_monotonic_ns();
 
       value = (delay_ns + tick_ns - 1) / tick_ns;
       if (value == 0)
         value = 1; /* already due: fire on the next tick, not never */
+      if (delay_ns < ~0ull - kernel_now_ns)
+        target_tick = (kernel_now_ns + delay_ns + tick_ns - 1) / tick_ns;
+      /* And the deadline itself, kept in the caller's own units: that is what
+       * decides whether the timer has expired. The tick only decides when to
+       * look. */
+      want_deadline_ns = want_ns ? want_ns : 1;
+    }
+  } else if (!disarm && t->clockid != B1NIX_CLOCK_REALTIME &&
+             t->clockid != B1NIX_CLOCK_REALTIME_ALARM) {
+    /* A relative delay owes the caller the same "no earlier than" guarantee,
+     * and for the same reason: the tick this is added to is a floor. */
+    u64 tick_ns = 1000000000ull / TICKS_PER_SEC;
+    u64 now_ns = ktime_monotonic_ns();
+    u64 delay_ns = (u64)new_value->it_value.tv_sec * 1000000000ull +
+                   (u64)new_value->it_value.tv_nsec;
+    /* A relative delay needs no clock translation -- it is an interval, and
+     * both clocks run at the same rate. */
+
+    if (new_value->it_value.tv_sec >= 0 && new_value->it_value.tv_nsec >= 0 &&
+        delay_ns < ~0ull - now_ns) {
+      u64 want = (now_ns + delay_ns + tick_ns - 1) / tick_ns;
+
+      if (want <= TIMERFD_TICKS_MAX)
+        target_tick = want;
+      {
+        u64 user_now = ktime_user_monotonic_ns();
+
+        if (delay_ns < ~0ull - user_now)
+          want_deadline_ns = user_now + delay_ns;
+      }
     }
   }
 
@@ -659,13 +809,23 @@ int vfs_timerfd_settime(int fd, int flags,
     t->armed = 0;
     t->next_tick = 0;
     t->interval_ticks = 0;
+    t->deadline_ns = 0;
+    t->interval_ns = 0;
     if (was_armed)
       __atomic_sub_fetch(&g_armed_timerfds, 1, __ATOMIC_RELAXED);
   } else {
     u64 base = scheduler_get_uptime_ticks();
-    t->next_tick = (value > TIMERFD_TICKS_MAX - base) ? TIMERFD_TICKS_MAX
-                                                      : base + value;
+    if (target_tick) {
+      /* Never behind the clock: a deadline already past still owes the caller
+       * one expiry, on the next tick. */
+      t->next_tick = target_tick > base ? target_tick : base + 1;
+    } else {
+      t->next_tick = (value > TIMERFD_TICKS_MAX - base) ? TIMERFD_TICKS_MAX
+                                                        : base + value;
+    }
     t->interval_ticks = interval;
+    t->deadline_ns = want_deadline_ns;
+    t->interval_ns = want_deadline_ns ? want_interval_ns : 0;
     t->armed = 1;
     t->expirations = 0;
     if (!was_armed)
@@ -673,6 +833,9 @@ int vfs_timerfd_settime(int fd, int flags,
     timerfd_note_deadline(t->next_tick);
   }
   __atomic_clear(&t->lock, __ATOMIC_RELEASE);
+  timerfd_trace(disarm ? "disarm" : (flags & B1NIX_TFD_TIMER_ABSTIME) ? "arm-abs"
+                                                                     : "arm-rel",
+                t->clockid, value, t->next_tick, interval);
   return 0;
 }
 
@@ -698,6 +861,7 @@ void eventpoll_timer_tick(void) {
   }
   timerfd_list_release(flags);
   timerfd_note_deadline(next);
+  timerfd_trace("tick-wake", -1, now, next, 0);
   scheduler_wake_all(vfs_poll_chan);
 }
 

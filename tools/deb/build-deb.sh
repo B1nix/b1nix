@@ -67,6 +67,31 @@ else
 fi
 DATE=$(date -uR)
 
+# The release packages published before this one.
+#
+# b1nix-kernel-common took over the files every release used to ship its own
+# copy of -- the boot-counting hook, the boot-good unit, the bootloader writer.
+# Taking a path over from another package is exactly what Replaces is for, and
+# without it dpkg refuses the unpack ("trying to overwrite ... which is also in
+# package b1nix-kernel-6.6.0-b1nix-0.123.0") on every machine that has an older
+# release installed -- which is every machine that has ever upgraded. Replaces
+# WITHOUT Conflicts or Breaks, deliberately: the old release keeps its kernel
+# and stays bootable, which is the whole point of installing them side by side.
+#
+# The list is what the repository has published, since that is what a machine
+# can have installed. No older release, no field at all.
+_repo_pool="${REPO_POOL:-$ROOT_DIR/build/packages/repo/pool/main}"
+KERNEL_COMMON_REPLACES=""
+if [ -d "$_repo_pool" ]; then
+	_old=$(ls "$_repo_pool" 2>/dev/null |
+		sed -n 's/^\(b1nix-kernel-[0-9][^_]*\)_.*\.deb$/\1/p' |
+		grep -v -- '-dbg$' | grep -v '^b1nix-kernel-headers' |
+		grep -v "^b1nix-kernel-$RELEASE\$" | sort -u | paste -sd, - |
+		sed 's/,/, /g')
+	[ -n "$_old" ] && KERNEL_COMMON_REPLACES="Replaces: $_old
+"
+fi
+
 log "kernel release $RELEASE, package version $DEB_VERSION ($GIT_DESCRIBE)"
 
 # ── rendering a source package ──────────────────────────────────────────────
@@ -75,6 +100,15 @@ log "kernel release $RELEASE, package version $DEB_VERSION ($GIT_DESCRIBE)"
 # which is how debhelper finds a maintainer script for a package whose name
 # contains the release.
 render() { # src-file dst-file
+	# The Replaces list can be empty, and an empty value must leave no line
+	# behind -- a bare "Replaces:" is a parse error in a control file. It is
+	# substituted with awk rather than sed because it carries a newline.
+	awk -v repl="$KERNEL_COMMON_REPLACES" \
+	    '{ if (index($0, "@KERNEL_COMMON_REPLACES@")) {
+	           sub(/@KERNEL_COMMON_REPLACES@/, repl);
+	           if ($0 == "") next;
+	       }
+	       print }' "$1" >"$1.awk" && mv "$1.awk" "$1"
 	sed -e "s|@RELEASE@|$RELEASE|g" \
 	    -e "s|@DEB_ARCH@|$DEB_ARCH|g" \
 	    -e "s|@DEB_VERSION@|$DEB_VERSION|g" \

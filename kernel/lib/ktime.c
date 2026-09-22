@@ -69,6 +69,25 @@ void ktime_resume(u64 counter_ns_before, u64 slept_ns)
 	arch_tsc_reanchor(counter_ns_before + slept_ns);
 }
 
+/* CLOCK_MONOTONIC as USERSPACE reads it.
+ *
+ * Not the same number as ktime_monotonic_ns(): that one is the counter plus a
+ * fixed base taken at the handover, while both the system call and the vDSO
+ * answer the counter itself. The two therefore differ by a constant for the
+ * life of the boot, and any kernel code that compares a deadline USERSPACE
+ * computed has to use this one. Doing otherwise cost systemd its timers: a
+ * timerfd deadline resolved against the kernel's base fired a few hundred
+ * microseconds before the deadline on the caller's clock, sd-event found no
+ * event source due, re-armed nothing, and PID 1 slept until something
+ * unrelated woke it -- a `.timer` unit asking for one second ran fifteen
+ * seconds late, and only on the boots where the constant had the wrong sign. */
+u64 ktime_user_monotonic_ns(void)
+{
+	u64 tsc_ns = arch_tsc_monotonic_ns();
+
+	return tsc_ns ? tsc_ns : ktime_tick_ns();
+}
+
 u64 ktime_monotonic_ns(void)
 {
 	if (!__atomic_load_n(&ktime_tsc_active, __ATOMIC_ACQUIRE))

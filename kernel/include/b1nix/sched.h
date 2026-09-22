@@ -755,6 +755,8 @@ void scheduler_dump_tasks(void);
 /* Where each task last parked, by task id: the return address recorded on the
  * way into scheduler_wait_prepare. */
 void scheduler_dump_park_sites(void);
+/* That same address for one task, which is what /proc/<pid>/wchan reports. */
+void *scheduler_park_site(usize pid);
 /* Record the system call this task just entered, for that dump. */
 void task_note_syscall(u64 number);
 /* True when the current context may park on a wait channel (scheduler live, real

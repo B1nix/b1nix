@@ -30,11 +30,8 @@ a full Plasma session is what M124 used as its own proof.
 | perf: tracepoints, kprobes, and eBPF with a JIT, BTF or CO-RE | `bpftrace` and any CO-RE toolchain; `perf stat`/`record`/`report` on hardware and software counters work (M126), and each absence is refused at load or open with the reason | M133 | `m126_bpf_smoke` in the posix lane, and the distribution's own perf in the Debian lane |
 | Wi-Fi (mac80211/cfg80211, nl80211) | `iw`, `wpa_supplicant`, iwd, NetworkManager on anything wireless | M130 | — |
 | The kernel is not relocatable, so it cannot boot under UEFI | every UEFI machine, which is every machine sold in the last fifteen years; the distribution boots through Limine's BIOS path instead | M133 | Limine answers `PANIC: multiboot2: Could not find viable load address for executable` under OVMF. The multiboot2 header asks for a fixed load at 1 MiB and the firmware is already there. The tree's own ISOs fail identically, so this is the kernel and not the image. Fixing it means a relocatable kernel (multiboot2 tag 10, and page tables that do not assume 0x100000) |
-| AHCI probe hangs on a port with an empty ATAPI device | booting on QEMU's q35, which always carries an ICH9 AHCI controller | M133 | The boot stops dead after `ahci: port 2 ready (packet device)`. The soak notes have carried this one for a while; the distribution lanes work around it with `-machine pc` |
-| A mount is reported to `/proc/self/mountinfo` under the path it was recorded with, not the path the caller used | Debian's `tmp.mount` and `run-lock.mount` fail with `Result: protocol` — systemd mounts through `/proc/self/fd/N`, watches for `/tmp` to appear, and never sees it | M133 | Observed in `DISTRO-SMOKE`. The mount itself succeeds; only its name is wrong. The same one-node-two-names knot that `vfs_set_propagation` and `vfs_remount` now solve by matching on the node |
-| `sched_setscheduler` refuses what systemd asks for | `e2scrub_reap.service` exits `214/SETSCHEDULER` | M133 | Any unit with `CPUSchedulingPolicy=` hits it |
-| A `file:` repository cannot be read by apt | `apt-get update` against a local mirror: `Symlinking file  to …/Packages.zst failed (22)`, then `Failed to fetch store:…Packages Read error (22)` | M133 | Observed in `DISTRO-SMOKE` over a 9p share. Two suspects: `symlink()` with an empty target, and whatever apt's `store:` method does to read an index |
-| `systemd-sysusers` fails | user and group creation at boot | M133 | Last of the four units still failing after the mount fixes |
+| Debian's `tmp.mount` and `run-lock.mount` fail with `Result: protocol` | /tmp and /run/lock on an installed system; the boot reaches `multi-user.target` regardless since the mount-table notification was fixed | M133 | Observed in `DISTRO-SMOKE`. The mount itself succeeds and `/proc/self/mountinfo` names it correctly (a mount made by hand, in the same boot, is found), so what remains is between the notification and systemd's own bookkeeping: it runs `mount(8)`, the mount appears, and it still reports "Mount process finished, but there is no mount" |
+| A `file:` repository cannot be read by apt | `apt-get update` against a local mirror: `Failed to fetch store:…Packages Read error (22: Invalid argument)` | M133 | Observed in `DISTRO-SMOKE` over a 9p share. The first half is closed: apt's `Symlinking file  to …Packages.zst failed` now reports ENOENT, which is what Linux answers for an empty target and what apt's fallback expects. What remains is the `store:` method's read. Not the 9p transport -- a file larger than any 9p message reads whole on the same share (`M110-9P: ok read-big`) -- and not apt giving up early, since it then reports the index missing |
 | No ACPI events: no SCI handler, no GPE dispatch, no `Notify` | Nothing the platform raises reaches userspace — a lid close cannot suspend the machine, a power button press does nothing, and `upower`/`systemd-logind` see a battery that only changes when they poll it | M135 | The kernel has no SCI vector at all; `/sys/class/power_supply/BAT0` is re-evaluated on read and never announces a change |
 | `reboot(RB_POWER_OFF)` writes hard-coded QEMU/Bochs ports rather than `\_S5` through the FADT's PM1 control register | Powering off a real machine: the kernel prints "poweroff unsupported, halting" and leaves it running | M135 | `kernel/syscall/syscall.c` writes 0x604/0xB004/0x4004; the S3 path already reads the registers this needs |
 | cpufreq has no load-driven governor, no `policy*` layout and ignores `_PPC` | `cpupower`, `tuned` and every desktop power profile: the clock only moves when something writes a governor by hand, and the firmware's own ceiling on battery is not honoured | M135 | `/sys/devices/system/cpu/cpu0/cpufreq` offers `performance powersave` and no policy directory |
@@ -55,6 +52,10 @@ hunt:
 - **A `/proc` or `/sys` file whose content is the API.** `nlink` on a procfs
   directory, `/proc/pressure/*`, `/proc/self/fd/N` — userspace parses these,
   and a plausible-looking wrong value is worse than an absent file.
+- **An operation allowed only on files.** Record locks, `SO_PASSCRED`, and
+  everything else Linux handles generically above the filesystem apply to any
+  open file description — a socket, a pipe, an eventfd. Refusing them anywhere
+  else with EBADF is the shape that broke `PrivateNetwork=`.
 - **A flag accepted and ignored.** Accepting `MSG_DONTWAIT` or an `O_` flag
   without honouring it turns a clean error into a hang somewhere else.
 - **One rejected option name, a dozen dead units.** trixie's `mount(8)` and
@@ -67,7 +68,18 @@ hunt:
   neither the option nor the filesystem. An option belonging to the VFS rather
   than to a filesystem has to be accepted on every type.
 - **A wrong identifier.** The netlink port id taken for a process id cost a
-  full debugging session in the Debian kernel-swap work.
+  full debugging session in the Debian kernel-swap work. The same shape put
+  `e2scrub_reap.service` in this table under `sched_setscheduler`: its exit
+  status was read as 214 (EXIT_SETSCHEDULER) when it was 225 (EXIT_NETWORK),
+  and the call that failed was `fcntl(F_OFD_SETLK)` on the socketpair systemd
+  stores a network namespace in. An exit status is a number until systemd's own
+  table is asked what it means, which is why the lane now asks.
+- **A probe that cannot give up.** The I/O path may wait for ever — its buffer
+  belongs to a caller and abandoning the wait frees memory the controller may
+  still write into. A probe may not: an ATAPI port with no disc never completes
+  READ CAPACITY, and the AHCI probe waited for it for ever, so every q35 boot
+  with an empty optical drive stopped before userspace. A bounded wait that
+  stops the port before the buffer goes back has neither problem.
 
 ## Where to look when something breaks
 

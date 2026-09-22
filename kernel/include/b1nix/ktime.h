@@ -16,6 +16,12 @@
  * nanosecond resolution. It never goes backwards across the handover. */
 u64 ktime_monotonic_ns(void);
 
+/* CLOCK_MONOTONIC as userspace reads it: the counter, without the base the
+ * kernel's own clock adds. Every conversion of a deadline a program computed
+ * from clock_gettime() has to use this, or it resolves against a clock that
+ * program never sees. See kernel/lib/ktime.c. */
+u64 ktime_user_monotonic_ns(void);
+
 /* Continue the monotonic clock across a sleep that stopped its source: what the
  * COUNTER read on the way down, plus however long the machine was away (the
  * hardware clock is what knows). Called from the resume path before anything

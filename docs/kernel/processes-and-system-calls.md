@@ -42,7 +42,11 @@ data. `memfd_create` supports seals, and `epoll`, `eventfd`, `timerfd` and
 
 A crashing process leaves an ELF core dump, and the kernel symbolises its own
 addresses through kallsyms (M35). A GDB stub and a function tracer are there for
-kernel work (M36). `ptrace(2)` is complete enough for gdb and strace: regset
+kernel work (M36). `/proc/<pid>/wchan` names the kernel function a blocked task
+is waiting in, resolved from the return address the scheduler records on the way
+into every wait — which is what turns "PID 1 is blocked" into "PID 1 is blocked
+in `vfs_epoll_wait` past its own deadline". `ptrace(2)` is complete enough for
+gdb and strace: regset
 access (XSAVE on x86_64, FPSIMD on AArch64), the Yama `ptrace_scope` rules,
 `/proc/<pid>/task`, and crash capture for a process that faults (M80).
 
@@ -327,6 +331,46 @@ distribution's `perf record` has not been run against this.
 it counts happen — 120 ms of spinning against the task clock, 256 fresh pages
 against the fault counter, twenty sleeps against the switch counter — and then
 maps a ring, samples 300 ms at 200 Hz and walks the records it finds.
+
+## Two monotonic clocks, and which one a deadline belongs to
+
+The kernel has one monotonic clock in the sense that it never jumps, and two
+readings of it. `ktime_monotonic_ns()` is the counter plus a base taken when the
+clock was handed over from the scheduler tick to the TSC, and it is what the
+boot log, `/proc/uptime` and the tick counter are measured in.
+`clock_gettime(CLOCK_MONOTONIC)` — through the system call and through the vDSO
+alike — answers the counter itself, without that base, because the vDSO page
+cannot carry the clamp the kernel's version applies and the S3 resume re-anchors
+the counter rather than the base. The two therefore differ by a constant for the
+life of the boot.
+
+So every conversion of a deadline a program computed has to be done on the
+program's clock: `ktime_user_monotonic_ns()` is that reading, and
+`clock_nanosleep(TIMER_ABSTIME)`, `timerfd_settime(TFD_TIMER_ABSTIME)`,
+`IORING_TIMEOUT_ABS` and `IORING_ENTER_ABS_TIMER` all resolve through it. The
+remaining interval is what crosses between the two clocks unchanged; only then
+is it placed on the kernel's tick grid, rounded up, because
+`timerfd_settime(2)` promises a timer does not fire before its deadline.
+
+`/proc/uptime` answers the program's clock too, and so must anything else a
+program compares against `clock_gettime`: the two were 58 ms apart on an AArch64
+boot, which is what an agent measuring a process's age from its start time would
+have been wrong by. Only the kernel's own log stamps stay on the kernel's
+reading, and the M110 selftest keeps those within a second of it.
+
+Whether a timer has EXPIRED is decided on that same clock as well, in
+nanoseconds, rather than on the tick count: the two clocks differ by the base
+and, on AArch64, the tick grid is coarse enough that rounding to it fired a
+timer a millisecond or two early. The tick still decides when to LOOK -- waking
+early costs nothing, answering "ready" early costs the event loop its timer.
+
+That rounding is not a nicety. sd-event arms one timerfd for the earliest
+deadline it holds and re-arms only when that deadline changes: woken early it
+finds no event source due, changes nothing, and goes back to `epoll_wait` with a
+timer that has already fired and will not fire again. PID 1 then sleeps until
+something unrelated pokes it. The visible symptom was a `.timer` unit with
+`OnActiveSec=1s` running fifteen seconds late on about half the boots — half,
+because it depended on the sign of a constant fixed at the TSC handover.
 
 ## The vDSO
 

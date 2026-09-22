@@ -428,7 +428,12 @@ struct vfs_inode {
    * filesystem (going read-only is where it writes itself out clean). NULL
    * leaves the remount a change of b1nix's own mount flags. */
   int (*remount_cb)(struct vfs_node *root, u64 flags);
-  int (*poll_cb)(struct vfs_node *node, struct b1nix_pollfd *pfd);
+  /* Readiness. The HANDLE is passed as well as the node, because some
+   * readiness is per open file description rather than per object: the mount
+   * table's "it changed" is consumed by the poll itself, once per descriptor,
+   * exactly as Linux's mounts_poll() does with its own poll_event. */
+  int (*poll_cb)(struct vfs_handle *h, struct vfs_node *node,
+                 struct b1nix_pollfd *pfd);
   /* Called once per open(), after the handle exists, so a device can attach
    * per-descriptor state (h->private_data) and take over h->ops. Without it a
    * device node only ever sees `struct vfs_node *`, which is shared by every
@@ -1196,6 +1201,9 @@ struct vfs_handle {
   struct vfs_node *node;
   usize offset;
   void *private_data; /* Used for pipe, socket, etc. */
+  /* Per-descriptor readiness bookkeeping: what a poll_cb last acknowledged.
+   * /proc/self/mountinfo uses it for the mount-table generation. */
+  u64 poll_seq;
   const struct vfs_file_ops *ops;
   int flags;
   /* This descriptor must not itself generate filesystem-notification events.

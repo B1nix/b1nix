@@ -449,6 +449,15 @@ static void test_libc_correctness(void) {
     ok("realpath");
   else
     fail("realpath", res ? 0 : -1, 0);
+
+  /* An empty target is ENOENT, as Linux answers it -- not EINVAL. apt reads a
+   * `file:` repository by linking the index into its list directory, and the
+   * errno it gets decides whether it falls back or gives up on the index. */
+  unlink("/tmp/m85rp/empty");
+  if (symlink("", "/tmp/m85rp/empty") == -1 && errno == ENOENT)
+    ok("symlink-empty-target");
+  else
+    fail("symlink-empty-target", errno, ENOENT);
 }
 
 /* Scan a buffer of variable-length inotify_event records for one whose mask
