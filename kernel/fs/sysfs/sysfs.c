@@ -1374,16 +1374,52 @@ static isize sysfs_thp_enabled_write(struct vfs_node *node, u64 offset,
   return (isize)size;
 }
 
-/* The three numbers that say whether the feature is doing anything: blocks
- * installed, faults that wanted one and could not have it, and blocks broken
- * back into leaves. */
+/* The four numbers that say whether the feature is doing anything: blocks
+ * installed by a fault, faults that wanted one and could not have it, blocks
+ * broken back into leaves, and ranges khugepaged collapsed into a block. */
 static int sysfs_thp_stats(char *buf, usize cap) {
   return snprintf(buf, cap,
                   "thp_fault_alloc %lu\nthp_fault_fallback %lu\n"
-                  "thp_split_page %lu\n",
+                  "thp_split_page %lu\nthp_collapse_alloc %lu\n",
                   (unsigned long)thp_stat_alloc(),
                   (unsigned long)thp_stat_fallback(),
-                  (unsigned long)thp_stat_split());
+                  (unsigned long)thp_stat_split(),
+                  (unsigned long)thp_stat_collapse());
+}
+
+/* /sys/kernel/mm/transparent_hugepage/khugepaged/, the two files of it that
+ * mean something here: how many ranges the thread has collapsed, and how long
+ * it sleeps between passes. Linux's directory has more knobs; inventing files
+ * that change nothing would be worse than not having them. */
+static int sysfs_khugepaged_collapsed(char *buf, usize cap) {
+  return snprintf(buf, cap, "%lu\n", (unsigned long)thp_stat_collapse());
+}
+
+static int sysfs_khugepaged_sleep(char *buf, usize cap) {
+  return snprintf(buf, cap, "%lu\n", (unsigned long)thp_scan_sleep_ms());
+}
+
+static isize sysfs_khugepaged_sleep_write(struct vfs_node *node, u64 offset,
+                                          const char *buffer, usize size,
+                                          int flags) {
+  char tmp[24];
+  usize n = size < sizeof(tmp) - 1 ? size : sizeof(tmp) - 1;
+  u64 ms = 0;
+
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (!buffer || size == 0)
+    return -EINVAL;
+  memcpy(tmp, buffer, n);
+  tmp[n] = '\0';
+  for (usize i = 0; tmp[i] && tmp[i] != '\n'; i++) {
+    if (tmp[i] < '0' || tmp[i] > '9')
+      return -EINVAL;
+    ms = ms * 10 + (u64)(tmp[i] - '0');
+  }
+  thp_set_scan_sleep_ms(ms);
+  return (isize)size;
 }
 
 /* ── /sys/class/power_supply and /sys/class/thermal (M134) ───────────────
@@ -1618,6 +1654,22 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
       }
       sysfs_mkstr(th, "hpage_pmd_size", "%lu\n", (unsigned long)THP_SIZE);
       sysfs_mkchild(th, "stats", VFS_DEVICE, sysfs_thp_stats);
+      {
+        struct vfs_node *kh = sysfs_mkchild(th, "khugepaged", VFS_DIRECTORY, 0);
+
+        if (kh) {
+          struct vfs_node *sl;
+
+          sysfs_mkchild(kh, "pages_collapsed", VFS_DEVICE,
+                        sysfs_khugepaged_collapsed);
+          sl = sysfs_mkchild(kh, "scan_sleep_millisecs", VFS_DEVICE,
+                             sysfs_khugepaged_sleep);
+          if (sl) {
+            sl->inode->mode = 0644;
+            sl->inode->write_cb = sysfs_khugepaged_sleep_write;
+          }
+        }
+      }
     }
   }
   sysfs_mkchild(kern, "ostype", VFS_DEVICE, g_ostype);

@@ -55,10 +55,11 @@ rm -f "$ROOTFS/etc/init.d/hwdrivers" "$ROOTFS/etc/init.d/machine-id"
 [ -f "$ROOTFS/etc/fstab" ] ||
 	printf '# / is mounted by the kernel; nothing else is mounted at boot.\n' >"$ROOTFS/etc/fstab"
 
-# swclock's reference time (see runlevels): the build's, until the first
-# shutdown saves a later one.
+# /var/lib/misc exists for whatever wants it; swclock's reference file does not
+# get stamped here any more -- the service is not in a runlevel (see runlevels),
+# because the kernel sets the clock from the real RTC and the stamp could only
+# drag it backwards.
 mkdir -p "$ROOTFS/var/lib/misc"
-touch "$ROOTFS/var/lib/misc/openrc-shutdowntime"
 
 # Left behind by the from-source port, which installed under /libexec/openrc.
 rm -rf "$ROOTFS/libexec/openrc" "$ROOTFS/sbin/openrc-init" "$ROOTFS/sbin/openrc-shutdown"

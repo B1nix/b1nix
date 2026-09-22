@@ -94,6 +94,14 @@ void cgroup_mem_fault_charge(u64 fault_addr);
  * never sees the largest allocation a glibc process makes. */
 void cgroup_mem_charge_pages(u64 npages);
 
+/* Would charging `npages` to the running task's cgroup take it past a
+ * memory.max? Asked before a transparent huge page is installed, because a
+ * block commits 512 pages at once and is not reclaimable while it is a block:
+ * a cgroup that took one at its limit would have nothing to give back and be
+ * killed holding memory it was never going to touch. A refusal here is a
+ * fallback to ordinary 4 KiB pages, which reclaim can take. */
+int cgroup_mem_would_exceed(u64 npages);
+
 /* A major fault: the current task waited for a page to come back from swap.
  * Counted in memory.stat's pgmajfault for its cgroups. */
 void cgroup_mem_note_majfault(void);

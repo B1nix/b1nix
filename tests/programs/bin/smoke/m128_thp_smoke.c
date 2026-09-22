@@ -15,9 +15,8 @@
  *
  * The feature is off unless the boot line asks (b1nix.thp), so the test turns
  * it on through /sys/kernel/mm/transparent_hugepage/enabled for its own
- * duration and puts it back the way it found it. Where the knob will not move
- * — aarch64, which has no huge-page support in its page-table walkers — the
- * test says "mode never" and stops, and the suite records the rest as skipped.
+ * duration and puts it back the way it found it. A machine whose knob will not
+ * move says "mode never" and stops, and the suite records the rest as skipped.
  *
  * Markers (only emitted on verified success):
  *   M128-THP: start
@@ -29,7 +28,12 @@
  *   M128-THP: ok mprotect-half
  *   M128-THP: ok munmap-half
  *   M128-THP: ok nohugepage-splits
+ *   M128-THP: ok mprotect-keeps-block
+ *   M128-THP: ok fork-shares-block
+ *   M128-THP: ok recycled-range
+ *   M128-THP: ok khugepaged-collapse
  *   M128-THP: ok no-leak
+ *   M128-THP: stats <the kernel's own counters>
  *   M128-THP: blocks <n> of <rounds>
  *   M128-THP: done
  */
@@ -121,6 +125,20 @@ static void read_mode(char *out, size_t cap) {
   out[rb - lb - 1] = '\0';
 }
 
+/* One counter out of the kernel's own thp stats file ("<name> <value>" lines),
+ * or -1 when it is not there. */
+static long thp_stat(const char *name) {
+  char buf[256];
+  char *p;
+
+  if (read_file(THP_SYSFS "/stats", buf, sizeof(buf)) < 0)
+    return -1;
+  p = strstr(buf, name);
+  if (!p)
+    return -1;
+  return strtol(p + strlen(name), NULL, 10);
+}
+
 /* MemFree in kB, or -1. */
 static long mem_free_kb(void) {
   char buf[4096];
@@ -195,12 +213,9 @@ static int verify(const unsigned char *p, size_t len, unsigned seed) {
 /* A mapping whose first 2 MiB-aligned block is known. Returns the base of the
  * first whole block inside the mapping through *block.
  *
- * A block is only installed where no page table describes the address yet, so
- * every mapping this test wants huge-backed is taken BEFORE anything is
- * unmapped: an address range that has already held 4 KiB leaves keeps its page
- * table when the mapping goes, and the next mapping at the same address is
- * served 4 KiB at a time. (That is the kernel's rule, not an accident — see
- * thp_try_install.) */
+ * A block is installed where nothing describes the address yet, or where the
+ * page table left behind by an earlier mapping is empty — see the
+ * recycled-range check below, which is what proves the second half. */
 static unsigned char *map_huge(unsigned long *block) {
   unsigned char *p = mmap(NULL, MAP_BYTES, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -276,6 +291,21 @@ int main(void) {
   }
   fill(p, MAP_BYTES, 0x11);
   huge = smaps_anon_huge((unsigned long)p, &rss);
+  /* What the kernel itself counted, on one line: a mapping that is not
+   * block-backed is one of two different failures — no block was ever
+   * installed (fault_alloc 0, and fault_fallback says the fault path refused
+   * one) or a block was installed and something split it again. */
+  {
+    char st[256];
+
+    if (read_file(THP_SYSFS "/stats", st, sizeof(st)) > 0) {
+      for (char *q = st; *q; q++)
+        if (*q == '\n')
+          *q = ' ';
+      printf("M128-THP: stats %s\n", st);
+      fflush(stdout);
+    }
+  }
   judge("hugepage-backed", huge >= (long)(THP_SIZE / 1024),
         "AnonHugePages kB", huge);
   judge("data-intact", verify(p, MAP_BYTES, 0x11) && rss >= (long)(MAP_BYTES / 1024),
@@ -286,6 +316,8 @@ int main(void) {
     pid_t pid;
     int status = 0;
     int good = 1;
+
+    long huge_after_fork = -1;
 
     pid = fork();
     if (pid == 0) {
@@ -304,6 +336,11 @@ int main(void) {
       good = 0;
       status = -1;
     } else {
+      /* Before either side writes: the parent must STILL be 2 MiB-backed. A
+       * fork shares the block read-only and refcounts its 512 frames; it used
+       * to break every block in the parent apart instead, which cost a page
+       * table and 512 leaves per block for a child that may only read. */
+      huge_after_fork = smaps_anon_huge((unsigned long)p, NULL);
       /* The parent writes too, so both sides break the sharing. */
       fill(p, MAP_BYTES, 0x22);
       if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
@@ -313,6 +350,13 @@ int main(void) {
         good = 0;
     }
     judge("fork-cow", good, "child status", (long)status);
+    /* Graded separately from the data: sharing is an optimisation, losing a
+     * byte is a bug, and a run that confuses the two says nothing. The split
+     * counter is no use here — it is machine-wide, and the child is breaking
+     * its own copy of the block at the same moment — so this is read off the
+     * parent's own mapping, before the parent writes. */
+    judge("fork-shares-block", huge_after_fork >= (long)(THP_SIZE / 1024),
+          "AnonHugePages kB after fork", huge_after_fork);
   }
 
   /* ── 3. mprotect on half the range ────────────────────────────────── */
@@ -341,6 +385,50 @@ int main(void) {
       }
     }
     judge("mprotect-half", good, "errno", (long)errno);
+  }
+
+  /* ── 3b. mprotect over a WHOLE block keeps it one block ───────────── */
+  {
+    /* Protection is written into the 2 MiB entry instead of breaking it into
+     * 512 leaves: ld.so mprotects every segment it has just mapped, and that is
+     * no reason for a mapping to lose its blocks. Half a block is a different
+     * matter and is split — munmap-half below is that case.
+     *
+     * Its own mapping, because the mapping above has been forked and written
+     * through on both sides by now: every block in it was broken by the
+     * copy-on-write, so it could prove nothing about mprotect. */
+    int step = 0;
+    unsigned long b = 0;
+    unsigned char *m = map_huge(&b);
+
+    if (!m) {
+      step = 1;
+    } else {
+      fill(m, MAP_BYTES, 0x99);
+      if (smaps_anon_huge(b, NULL) < (long)(THP_SIZE / 1024))
+        step = 2; /* not block-backed to begin with: nothing to keep */
+      else if (mprotect((void *)b, THP_SIZE, PROT_READ) != 0)
+        step = 3;
+      else if (smaps_anon_huge(b, NULL) < (long)(THP_SIZE / 1024))
+        step = 4; /* the read-only mprotect broke the block */
+      else if (mprotect((void *)b, THP_SIZE, PROT_READ | PROT_WRITE) != 0)
+        step = 5;
+      else if (smaps_anon_huge(b, NULL) < (long)(THP_SIZE / 1024))
+        step = 6; /* putting the write back broke it */
+      else {
+        /* And it still holds what was written to it, and takes a write. */
+        if (!verify((unsigned char *)b, THP_SIZE,
+                    (unsigned)(0x99 + (b - (unsigned long)m) / 4096)))
+          step = 7;
+        else {
+          fill((unsigned char *)b, THP_SIZE, 0xaa);
+          if (!verify((unsigned char *)b, THP_SIZE, 0xaa))
+            step = 8;
+        }
+      }
+      munmap(m, MAP_BYTES);
+    }
+    judge("mprotect-keeps-block", step == 0, "step", (long)step);
   }
 
   /* ── 4. munmap of half a block, and the other half survives ───────── */
@@ -388,7 +476,114 @@ int main(void) {
     judge("nohugepage-splits", step == 0, "step", (long)step);
   }
 
-  /* ── 6. nothing leaks ─────────────────────────────────────────────── */
+  /* ── 6. an address range that has already been used at 4 KiB ─────── */
+  {
+    /* The case the kernel used to refuse. A mapping faulted at 4 KiB leaves
+     * its page table behind when it goes, and a directory entry naming a table
+     * is one the fault path may not take — so every long-lived allocator, which
+     * recycles addresses, got blocks once and 4 KiB pages ever after. The
+     * table is now taken out of the tree and kept until the process exits, so
+     * the SAME address is block-backed the second time round.
+     *
+     * Graded on the second mapping's own bytes and on AnonHugePages at that
+     * address: the first mapping is proved NOT to be huge first, or a pass
+     * would mean nothing. */
+    int step = 0;
+    unsigned char *first = mmap(NULL, MAP_BYTES, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (first == MAP_FAILED) {
+      step = 1;
+    } else if (madvise(first, MAP_BYTES, MADV_NOHUGEPAGE) != 0) {
+      step = 2;
+    } else {
+      unsigned long at = (unsigned long)first;
+      unsigned char *again;
+
+      fill(first, MAP_BYTES, 0x44); /* 4 KiB at a time, building the tables */
+      if (smaps_anon_huge(at, NULL) != 0)
+        step = 3; /* it was huge after all: the check proves nothing */
+      else if (munmap(first, MAP_BYTES) != 0)
+        step = 4;
+      else {
+        again = mmap((void *)at, MAP_BYTES, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (again == MAP_FAILED || (unsigned long)again != at) {
+          step = 5;
+        } else if (madvise(again, MAP_BYTES, MADV_HUGEPAGE) != 0) {
+          step = 6;
+        } else {
+          fill(again, MAP_BYTES, 0x66);
+          if (smaps_anon_huge(at, NULL) < (long)(THP_SIZE / 1024))
+            step = 7; /* still 4 KiB: the table was never retired */
+          else if (!verify(again, MAP_BYTES, 0x66))
+            step = 8; /* the block does not hold what was written to it */
+          munmap(again, MAP_BYTES);
+        }
+      }
+    }
+    judge("recycled-range", step == 0, "step", (long)step);
+  }
+
+  /* ── 7. khugepaged collapses a range that is already 4 KiB pages ──── */
+  {
+    /* The case the fault path cannot reach at all: memory that was touched
+     * before anything asked for huge pages. A block is only installed where
+     * nothing describes the address, so without a collapse a long-lived program
+     * — a shell, an allocator that faulted its arena in early — would hold
+     * ordinary pages for ever however long the feature is on.
+     *
+     * Faulted at 4 KiB on purpose (MADV_NOHUGEPAGE), proved NOT to be huge, and
+     * only then offered to khugepaged by turning the advice on. What is graded
+     * is the kernel's own collapse counter AND the bytes: a collapse copies
+     * 2 MiB into a fresh block, so a byte lost in the copy is the failure that
+     * matters. */
+    int step = 0;
+    long collapsed0 = thp_stat("thp_collapse_alloc");
+    unsigned char *c = mmap(NULL, MAP_BYTES, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (c == MAP_FAILED) {
+      step = 1;
+    } else if (madvise(c, MAP_BYTES, MADV_NOHUGEPAGE) != 0) {
+      step = 2;
+    } else {
+      fill(c, MAP_BYTES, 0x88);
+      if (smaps_anon_huge((unsigned long)c, NULL) != 0)
+        step = 3; /* huge already: nothing would be proved by a collapse */
+      else if (madvise(c, MAP_BYTES, MADV_HUGEPAGE) != 0)
+        step = 4;
+      else {
+        long huge_now = 0;
+        long collapsed1 = collapsed0;
+
+        /* khugepaged sleeps between passes (scan_sleep_millisecs, 200 ms by
+         * default) and takes a bounded number of blocks per pass, so this
+         * waits rather than assuming. Ten seconds is far longer than it needs
+         * and short enough to fail the lane rather than hang it. */
+        for (int i = 0; i < 200; i++) {
+          huge_now = smaps_anon_huge((unsigned long)c, NULL);
+          collapsed1 = thp_stat("thp_collapse_alloc");
+          if (huge_now >= (long)(THP_SIZE / 1024) && collapsed1 > collapsed0)
+            break;
+          usleep(50000);
+        }
+        if (huge_now < (long)(THP_SIZE / 1024))
+          step = 5; /* nothing was collapsed in ten seconds */
+        else if (collapsed1 <= collapsed0)
+          step = 6; /* it became huge some other way: prove nothing */
+        else if (!verify(c, MAP_BYTES, 0x88))
+          step = 7; /* the copy lost a byte */
+        printf("M128-THP: collapsed %ld ranges, AnonHugePages %ld kB\n",
+               collapsed1 - collapsed0, huge_now);
+        fflush(stdout);
+      }
+      munmap(c, MAP_BYTES);
+    }
+    judge("khugepaged-collapse", step == 0, "step", (long)step);
+  }
+
+  /* ── 8. nothing leaks ─────────────────────────────────────────────── */
   {
     enum { ROUNDS = 8 };
     unsigned char *m[ROUNDS];
@@ -418,10 +613,9 @@ int main(void) {
         good = 0;
       munmap(m[i], MAP_BYTES);
     }
-    /* Not every round gets a block: mmap hands back an address that a
-     * previous mapping already built a page table over, and a block is only
-     * installed where nothing describes the address yet. Most of them do, and
-     * most is what this check needs — a leak of one block is 2 MiB, and the
+    /* Not every round gets a block: one may land where a page table is
+     * neither absent nor empty, and free memory may be short of the reserve a
+     * block asks for. Most of them do, and most is what this check needs — a leak of one block is 2 MiB, and the
      * tolerance below is a quarter of that even if only half the rounds were
      * block-backed. A run where NONE were proves nothing and fails. */
     if (huge_rounds < ROUNDS / 2)

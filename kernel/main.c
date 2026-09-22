@@ -1438,6 +1438,9 @@ void kernel_main(usize arg0, usize arg1)
 	if (bootinfo_has_flag("b1nix.task-watch") &&
 	    kthread_create("task-watch", task_watch_thread, 0) < 0)
 		k_err("task-watch", "thread refused");
+	/* khugepaged, if the boot line asked for huge pages. A machine that turns
+	 * them on later through sysfs starts it then (thp_set_mode). */
+	thp_khugepaged_maybe_start();
 	/* M95: load the optional filesystems, the HDA sound driver and the IPv6
 	 * protocol modules from /lib/modules. Each is optional — the kernel boots
 	 * and passes its tests with any of them absent.

@@ -1,10 +1,13 @@
 # <runlevel> <service> -- linked into /etc/runlevels by stage-openrc.sh.
 # The kernel mounts /proc, /sys and /dev itself, so sysinit needs only procfs.
 sysinit procfs
-# No RTC driver: the clock starts at 1970 and every file looks written in the
-# future ("clock skew detected"). swclock sets it from a file's mtime, which
-# the image stamps at build time and shutdown refreshes.
-sysinit swclock
+# No swclock. It sets the clock from a file's mtime, which is what a machine
+# with no RTC needs -- and this kernel reads one (CMOS on x86_64, PL031 on
+# aarch64) before userspace starts, so the file was only ever older. With the
+# image's stamp a day behind the hardware clock, every boot moved the clock
+# backwards by that much and the RTC check reported the disagreement it exists
+# to catch. A board with no RTC at all starts at the kernel's own epoch and
+# says so, which is the honest answer.
 boot hostname
 default local
 shutdown killprocs

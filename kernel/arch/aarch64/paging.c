@@ -12,6 +12,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/mempolicy.h>
 #include <b1nix/mm.h>
+#include <b1nix/thp.h>
 #include <b1nix/userfaultfd.h>
 #include <b1nix/panic.h>
 #include <b1nix/user.h>
@@ -81,6 +82,10 @@ extern u8 __kernel_end[];
 #define SW_COW    (1ULL << 55)
 #define SW_SHARED (1ULL << 56)
 #define SW_USER   (1ULL << 57)
+/* A level-2 block this kernel installed for a user mapping (M128), as opposed
+ * to the identity map's own blocks: the frames of one are the process's and
+ * are freed with it, the frames of the other are not anybody's to release. */
+#define SW_THP    (1ULL << 58)
 
 #define AP_EL1_RW     (0ULL << 6)
 #define AP_EL1_EL0_RW (1ULL << 6)
@@ -234,11 +239,16 @@ static u64 *leaf_table_for(u64 space, u64 vaddr) {
 static u64 *split_block(u64 old_entry, u64 child_size, int child_is_page) {
   u64 *child = alloc_table();
   u64 base = old_entry & ADDR_MASK;
-  u64 attrs = old_entry & ~ADDR_MASK & ~0x3ULL;
+  /* SW_THP belongs to the block and does not survive it: the leaves are
+   * ordinary pages from here on, each with its own refcount, and a leaf that
+   * still claimed to be a block would be freed 512 times at teardown. */
+  u64 attrs = old_entry & ~ADDR_MASK & ~0x3ULL & ~SW_THP;
   u64 leaf_bits = child_is_page ? D_PAGE : D_BLOCK;
   for (usize i = 0; i < 512; i++) {
     child[i] = (base + i * child_size) | attrs | leaf_bits;
   }
+  if (old_entry & SW_THP)
+    thp_count_split();
   return child;
 }
 
@@ -481,6 +491,22 @@ void vmm_init(void) {
                    : "memory");
   tlb_flush_all();
 
+  /* Seed the buddy allocator. On x86_64 this happens when the direct map is
+   * built (pmm_switch_to_direct_map); here RAM is identity-mapped from boot,
+   * DIRECT_MAP_BASE is zero and nothing ever called it — so the buddy tree
+   * stayed unseeded and every allocation fell back to a bitmap scan. Worse,
+   * pmm_alloc_block_node refuses outright while the tree is not ready, so no
+   * contiguous block could be allocated at all on this port: transparent huge
+   * pages asked for an order-9 block and were told there was none, on a
+   * machine with a free gigabyte. The frames are all in the bitmap by now and
+   * the free-block headers live in the frames themselves, which the identity
+   * map already reaches. */
+  {
+    extern void pmm_switch_to_direct_map(void);
+
+    pmm_switch_to_direct_map();
+  }
+
   console_write("aarch64: vmm_init (real per-process 4-level paging active)\n");
 }
 
@@ -536,6 +562,30 @@ void vmm_unmap_page(u64 virtual_address) {
                                 virtual_address);
 }
 
+static int thp_entry_is_block(u64 entry);
+static u64 *thp_l2_slot(u64 *l0, u64 va);
+static u64 *thp_l0_of(u64 space);
+static u64 thp_block_leaf(u64 entry, u64 va);
+static int thp_mprotect_block(u64 *l0, u64 va, u64 flags);
+
+/* Release the 512 frames of a transparent huge page and clear its entry.
+ * Called with the page-table lock held, for a block the caller has already
+ * established is wholly inside the range being unmapped: clearing the entry
+ * unmaps all 2 MiB of it whatever the caller asked for, so a range that cuts
+ * one in half must have split it first (paging_thp_split_range). */
+static void thp_unmap_block(u64 *slot, u64 base) {
+  extern void eviction_unregister_page(u64 frame);
+  u64 block = *slot & ADDR_MASK;
+
+  *slot = 0;
+  tlb_flush_all(); /* break before make: 512 translations go at once */
+  for (usize i = 0; i < THP_PAGES; i++) {
+    eviction_unregister_page(block + i * PAGE_SIZE);
+    pmm_free_frame(block + i * PAGE_SIZE);
+  }
+  (void)base;
+}
+
 static void unmap_from_space_locked(u64 pml4_phys, u64 virtual_address) {
   u64 *l0 = (virtual_address >= 0x8000000000000000ULL || !pml4_phys)
                 ? kernel_l0_virt
@@ -547,6 +597,12 @@ static void unmap_from_space_locked(u64 pml4_phys, u64 virtual_address) {
   if ((l1[i1] & 0x3ULL) != D_TABLE) return;
   u64 *l2 = table_from_entry(l1[i1]);
   usize i2 = l2_index(virtual_address);
+  if (thp_entry_is_block(l2[i2])) {
+    /* The whole block goes, because the whole block is what the entry
+     * describes. A caller unmapping less than that has split it already. */
+    thp_unmap_block(&l2[i2], virtual_address & ~(THP_SIZE - 1));
+    return;
+  }
   if ((l2[i2] & 0x3ULL) != D_TABLE) return;
   u64 *l3 = table_from_entry(l2[i2]);
   usize i3 = l3_index(virtual_address);
@@ -572,6 +628,13 @@ void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address) {
 usize vmm_unmap_range_nosync(u64 base, usize npages, u64 *frames_out) {
   u64 _vmflags;
   u64 pml4_phys = current_task ? current_task->pml4_phys : 0;
+
+  /* Every block this range touches is broken up first — all of them, not only
+   * the ones it cuts in half: this path hands the caller one frame per page
+   * and has nowhere to report a 512-frame block. Before the lock, because
+   * splitting allocates. */
+  (void)paging_thp_split_range(pml4_phys, base, base + (u64)npages * PAGE_SIZE,
+                               0);
 
   vmm_write_acquire(&_vmflags);
   for (usize i = 0; i < npages; i++) {
@@ -653,6 +716,10 @@ void vmm_set_lazy(u64 virtual_address) {
 #define PF_NEEDS_FILE_FILL 2
 #define PF_NEEDS_FILE_CB 3
 
+static int thp_try_install(struct vm_area *vma, u64 va, u64 flags);
+static int thp_entry_is_block(u64 entry);
+static int thp_split_here(u64 *l0, u64 va);
+
 static int fault_anon_user_page(u64 va) {
   if (!current_task)
     return -1;
@@ -701,10 +768,6 @@ static int fault_anon_user_page(u64 va) {
       return -1;
   }
 
-  u64 frame = pf_alloc_anon_frame(hit, va);
-  if (!frame)
-    return -1;
-
   u64 flags = VMM_PRESENT | VMM_USER;
   /* Honour the mapping's protection instead of always mapping writable. */
   if (!hit || (hit->prot & PROT_WRITE))
@@ -715,6 +778,17 @@ static int fault_anon_user_page(u64 va) {
    * rather than guessing, which is what the x86_64 pager does here too. */
   if (hit && !(hit->prot & PROT_EXEC))
     flags |= VMM_NO_EXECUTE;
+
+  /* One 2 MiB block instead of 512 faults, where the mapping asked for it and
+   * the address range is free to take (M128). A refusal simply falls through
+   * to the ordinary page below, which is always correct. */
+  if (hit && thp_try_install(hit, va, flags))
+    return 0;
+
+  u64 frame = pf_alloc_anon_frame(hit, va);
+  if (!frame)
+    return -1;
+
   map_page_locked(va, frame, flags); /* invalidates the page itself */
   return 0;
 }
@@ -990,6 +1064,24 @@ static int handle_page_fault_locked(u64 fault_addr, u64 error_code,
     if ((l1[i1] & 0x3ULL) == D_TABLE) {
       u64 *l2 = table_from_entry(l1[i1]);
       usize i2 = l2_index(va);
+      if (thp_entry_is_block(l2[i2])) {
+        /* A transparent huge page already describes this address.
+         *
+         * A REFUSED access — a write to a block a fork shared copy-on-write, or
+         * one mprotect made read-only — is answered by breaking the block into
+         * its 512 leaves and letting the fault happen again against a page
+         * table the rest of this handler understands, which is what the x86_64
+         * port does at the same point. Anything else is a stale translation:
+         * another CPU installed the block while this one was on its way here,
+         * so publish it to this CPU's walker and let the instruction retry. */
+        if (error_code & 1) {
+          if (thp_split_here(l0, va) > 0)
+            return 0;
+          return -1;
+        }
+        tlb_flush_page(va);
+        return 0;
+      }
       if ((l2[i2] & 0x3ULL) == D_TABLE) {
         u64 *l3 = table_from_entry(l2[i2]);
         usize i3 = l3_index(va);
@@ -1209,6 +1301,12 @@ u64 paging_user_frame(u64 pml4_phys, u64 vaddr) {
   if ((l1[i1] & 0x3ULL) != D_TABLE) return 0;
   u64 *l2 = table_from_entry(l1[i1]);
   usize i2 = l2_index(vaddr);
+  /* Inside a transparent huge page the frame is the block's, offset by where
+   * the address falls in it. Answering "nothing mapped" here would tell every
+   * caller that reads a page by its frame — ptrace, the core dumper, the
+   * futex key — that a mapped page is absent. */
+  if (thp_entry_is_block(l2[i2]))
+    return (l2[i2] & ADDR_MASK) + (vaddr & (THP_SIZE - 1) & ~(PAGE_SIZE - 1));
   if ((l2[i2] & 0x3ULL) != D_TABLE) return 0;
   u64 *l3 = table_from_entry(l2[i2]);
   u64 entry = l3[l3_index(vaddr)];
@@ -1292,6 +1390,8 @@ static void mprotect_page_in_l0(u64 *l0, u64 virtual_address, u64 flags) {
 }
 
 void paging_mprotect_page(u64 virtual_address, u64 flags) {
+  (void)paging_thp_split_range(current_task ? current_task->pml4_phys : 0,
+                               virtual_address, virtual_address + PAGE_SIZE, 0);
   mprotect_page_in_l0(get_current_l0(), virtual_address, flags);
 }
 
@@ -1303,6 +1403,8 @@ void paging_mprotect_page_in_space(u64 pml4_phys, u64 vaddr, u64 flags) {
                                                            : phys_to_virt(pml4_phys);
   u64 f;
 
+  (void)paging_thp_split_range(pml4_phys, vaddr, vaddr + PAGE_SIZE, 0);
+
   vmm_write_acquire(&f);
   mprotect_page_in_l0(l0, vaddr, flags);
   vmm_write_release(f);
@@ -1312,14 +1414,37 @@ void paging_mprotect_range(u64 start, u64 end, u64 flags) {
   u64 f;
   u64 *l0 = get_current_l0();
 
+  /* A block the range only cuts in half is broken up first, because half a
+   * block cannot carry two protections — before the lock, because splitting
+   * allocates. One the range covers whole keeps its block descriptor and has
+   * the protection written into it (thp_mprotect_block below); ld.so mprotects
+   * every segment it has just mapped, and there is no reason for that to cost
+   * a mapping its blocks. */
+  (void)paging_thp_split_range(current_task ? current_task->pml4_phys : 0,
+                               start, end, 1);
+
   vmm_write_acquire(&f);
-  for (u64 va = start & ~(u64)(PAGE_SIZE - 1); va < end; va += PAGE_SIZE)
+  for (u64 va = start & ~(u64)(PAGE_SIZE - 1); va < end;) {
+    if ((va & (THP_SIZE - 1)) == 0 && va + THP_SIZE <= end &&
+        thp_mprotect_block(l0, va, flags)) {
+      va += THP_SIZE;
+      continue;
+    }
     mprotect_page_in_l0(l0, va, flags);
+    va += PAGE_SIZE;
+  }
   vmm_write_release(f);
 }
 
 void paging_unmap_range_from_space(u64 pml4_phys, u64 base, usize npages) {
   u64 f;
+
+  /* Blocks the range only cuts in half are broken up first, before the lock,
+   * because splitting allocates. One the range covers whole is released as a
+   * block by unmap_from_space_locked, which is what keeps teardown — the
+   * busiest caller here — allocating nothing. */
+  (void)paging_thp_split_range(pml4_phys, base, base + (u64)npages * PAGE_SIZE,
+                               1);
 
   /* One critical section for the whole range rather than npages of them: exit
    * tears down thousands of pages and the lock round-trip dominated. */
@@ -1378,6 +1503,11 @@ usize vmm_unmap_range_collect(u64 base, usize npages, u64 *frames_out) {
   usize nframes = 0;
   u64 _vmflags;
 
+  /* Blocks the range only cuts in half are broken up first, before the lock;
+   * one it covers whole is collected as a block below. */
+  (void)paging_thp_split_range(pml4_phys, base, base + (u64)npages * PAGE_SIZE,
+                               1);
+
   vmm_write_acquire(&_vmflags);
   for (usize i = 0; i < npages; i++) {
     u64 va = base + i * PAGE_SIZE;
@@ -1394,6 +1524,23 @@ usize vmm_unmap_range_collect(u64 base, usize npages, u64 *frames_out) {
       continue;
     u64 *l2 = table_from_entry(l1[i1]);
     usize i2 = l2_index(va);
+    if (thp_entry_is_block(l2[i2])) {
+      /* A whole block: its 512 frames go back to the caller, which frees them
+       * after the lock like any other page. A block the range only overlaps
+       * cannot be here — the split above has taken it apart. */
+      u64 blk = l2[i2] & ADDR_MASK;
+
+      if ((va & (THP_SIZE - 1)) != 0 || i + THP_PAGES > npages)
+        continue; /* could not be split (no memory): leave it mapped */
+      l2[i2] = 0;
+      tlb_flush_all();
+      for (usize k = 0; k < THP_PAGES; k++) {
+        eviction_unregister_page(blk + k * PAGE_SIZE);
+        frames_out[nframes++] = blk + k * PAGE_SIZE;
+      }
+      i += THP_PAGES - 1;
+      continue;
+    }
     if ((l2[i2] & 0x3ULL) != D_TABLE)
       continue;
     u64 *l3 = table_from_entry(l2[i2]);
@@ -1461,6 +1608,18 @@ static void free_user_subtree(u64 *table, int level) {
   for (usize i = 0; i < 512; i++) {
     u64 entry = table[i];
     if (level < 3) {
+      /* A transparent huge page whose mapping was never unmapped — the brk
+       * heap's blocks, say, which no VMA covers. Skipping it (which is what a
+       * block at a non-leaf level got before M128) leaks all 512 frames for
+       * the life of the machine. */
+      if (thp_entry_is_block(entry)) {
+        u64 block = entry & ADDR_MASK;
+
+        table[i] = 0;
+        for (usize k = 0; k < THP_PAGES; k++)
+          pmm_free_frame(block + k * PAGE_SIZE);
+        continue;
+      }
       if ((entry & 0x3ULL) == D_TABLE) {
         free_user_subtree(table_from_entry(entry), level + 1);
         pmm_free_frame(entry & ADDR_MASK);
@@ -1477,6 +1636,10 @@ static void free_user_subtree(u64 *table, int level) {
 void paging_free_address_space(u64 pml4_phys) {
   if (!pml4_phys) return;
   u64 *l0 = phys_to_virt(pml4_phys);
+
+  /* Tables that a block replaced while this space lived: nothing can be
+   * walking them now, so they go back with everything else. */
+  thp_release_orphan_tables(pml4_phys);
   for (usize i = 1; i < 512; i++) {
     if ((l0[i] & 0x3ULL) == D_TABLE) {
       free_user_subtree(table_from_entry(l0[i]), 1);
@@ -1549,6 +1712,30 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
       u64 *dst_l2 = alloc_table();
       dst_l1[i1] = virt_to_phys(dst_l2) | D_TABLE;
       for (usize i2 = 0; i2 < 512; i2++) {
+        if (thp_entry_is_block(src_l2[i2])) {
+          /* A transparent huge page is SHARED copy-on-write, like a 4 KiB leaf:
+           * both sides keep the block descriptor, read-only, and each of its
+           * 512 frames gains a reference. The first write from either side is a
+           * permission fault, which breaks the block into leaves that inherit
+           * the read-only AP and SW_COW, and the ordinary per-page
+           * copy-on-write resolves the page that was written. Splitting the
+           * parent's blocks here instead cost a page table and 512 leaves per
+           * block for a child that may only read. */
+          u64 entry = src_l2[i2];
+          u64 blk = entry & ADDR_MASK;
+
+          if ((entry & AP_EL1_EL0_RO) != AP_EL1_EL0_RO && !(entry & SW_SHARED)) {
+            entry &= ~AP_EL1_EL0_RO;
+            entry |= (entry & SW_USER) ? AP_EL1_EL0_RO : AP_EL1_RO;
+            entry |= SW_COW;
+            src_l2[i2] = entry; /* the parent loses write access too */
+            cow_marked = 1;
+          }
+          dst_l2[i2] = entry;
+          for (usize f = 0; f < THP_PAGES; f++)
+            pmm_ref_frame(blk + f * PAGE_SIZE);
+          continue;
+        }
         if ((src_l2[i2] & 0x3ULL) != D_TABLE) continue;
         u64 *dst_l3 =
             clone_leaf_table(table_from_entry(src_l2[i2]), &cow_marked);
@@ -1748,8 +1935,16 @@ void paging_free_swap_slots(u64 space) {
 int paging_user_writable(u64 space, u64 vaddr) {
   u64 *l3 = leaf_table_for(space, vaddr);
 
-  if (!l3)
+  if (!l3) {
+    /* A transparent huge page has no leaf to read: the block itself carries
+     * the permission. Without this a userfaultfd write-protect check refuses
+     * a write to a page that is perfectly writable. */
+    u64 *slot = thp_l2_slot(thp_l0_of(space), vaddr);
+
+    if (slot && thp_entry_is_block(*slot))
+      return (*slot & (2ULL << 6)) == 0;
     return 0;
+  }
 
   u64 entry = l3[l3_index(vaddr)];
 
@@ -1821,6 +2016,13 @@ void tlb_shootdown_all(void) { tlb_flush_all(); }
 
 void tlb_shootdown_page(u64 vaddr) { tlb_flush_page(vaddr); }
 void tlb_shootdown_current_mm(void) { tlb_flush_all(); }
+/* `tlbi vmalle1is` reaches every CPU in the inner-shareable domain and every
+ * address space at once, so naming one costs nothing here and changes
+ * nothing. */
+void tlb_shootdown_mm(u64 pml4_phys) {
+  (void)pml4_phys;
+  tlb_flush_all();
+}
 
 u64 vmm_virt_to_phys(void *virt) {
   u64 va = (u64)(usize)virt;
@@ -1910,6 +2112,14 @@ u64 paging_leaf_pte(u64 virtual_address) {
   if (!l2)
     return 0;
   u64 l2e = l2[l2_index(virtual_address)];
+  /* One page of a transparent huge page, described as the leaf it would be.
+   * Every caller of this — the fault reporter, syscall_copyout's pre-check,
+   * futex's key — asks about one 4 KiB page and tests the descriptor's own
+   * bits, so a block has to answer in that language or a perfectly good page
+   * reads as absent (copyout then returned EFAULT for memory the process had
+   * just written). */
+  if (thp_entry_is_block(l2e))
+    return thp_block_leaf(l2e, virtual_address);
   if ((l2e & 0x3ULL) != D_TABLE)
     return 0;
   u64 *l3 = table_from_entry(l2e);
@@ -1995,6 +2205,8 @@ u64 paging_user_pte(u64 pml4_phys, u64 vaddr) {
     return 0;
   u64 *l2 = table_from_entry(l1e);
   u64 l2e = l2[l2_index(vaddr)];
+  if (thp_entry_is_block(l2e))
+    return thp_block_leaf(l2e, vaddr);
   if ((l2e & 0x3ULL) != D_TABLE)
     return 0;
   u64 entry = table_from_entry(l2e)[l3_index(vaddr)];
@@ -2009,6 +2221,13 @@ void paging_reload_cr3(void) { tlb_flush_all(); }
  * the frames themselves where they are (mremap). The destination tables are
  * built by vmm_set_lazy, so nothing has to be allocated under the walk. */
 void paging_move_range(u64 old_start, u64 new_start, u64 len) {
+  /* The move works a leaf at a time, so nothing in either range may still be
+   * a block. Before any of it, because splitting allocates. */
+  u64 space = current_task ? current_task->pml4_phys : 0;
+
+  (void)paging_thp_split_range(space, old_start, old_start + len, 0);
+  (void)paging_thp_split_range(space, new_start, new_start + len, 0);
+
   for (u64 off = 0; off < len; off += PAGE_SIZE) {
     u64 from = old_start + off;
     u64 to = new_start + off;
@@ -2197,30 +2416,567 @@ u64 paging_reserve_kernel_va(usize size) {
   return va;
 }
 
-/* ── transparent huge pages (M128): not on this architecture ─────────────
+/* ── transparent huge pages (M128) ────────────────────────────────────────
  *
- * aarch64 has block descriptors at level 2 that would serve, but every
- * page-table walker in this file — the clone, the unmap paths, mprotect,
- * teardown — assumes a leaf is a page, and a half-audited set of them is
- * silent memory corruption rather than a slow machine. thp_init leaves the
- * mode at "never" here, so nothing ever installs one; these exist so the
- * generic callers need no #ifdef. */
-u64 paging_thp_bytes(u64 pml4_phys, u64 start, u64 end) {
-  (void)pml4_phys;
-  (void)start;
-  (void)end;
+ * A transparent huge page here is a level-2 BLOCK descriptor: 2 MiB of
+ * physically contiguous memory (a buddy order-9 allocation, so the alignment
+ * the architecture requires comes for free) described by one entry instead of
+ * a table of 512. SW_THP marks the ones this path made, so the kernel's own
+ * identity blocks — which cover memory that is not the caller's to release —
+ * are never mistaken for them.
+ *
+ * The rule that keeps the rest of the file correct is the x86_64 port's:
+ *
+ *   The fault path is the only thing that creates a block. Everything else
+ *   either breaks one up first or handles all 512 pages of it.
+ *
+ * Breaking one up allocates, so paging_thp_split_range is always called with
+ * no page-table lock held — at the top of the unmap, mprotect and mremap
+ * paths, and over the whole space before a fork clones it. The walkers that
+ * handle a block themselves rather than splitting are the unmap of a whole
+ * one, free_user_subtree at teardown (a skipped block would leak 512 frames),
+ * paging_user_resident, so a process using blocks does not read as having
+ * given its memory back, and paging_user_writable, so a write-protect check
+ * does not refuse a write to a page that is perfectly writable.
+ *
+ * Break-before-make is observed for every block this code installs or takes
+ * apart: the architecture permits no other transition between a block and a
+ * table describing the same addresses, and a TLB that holds both is allowed
+ * to produce anything at all. ensure_child's deliberate exception exists for
+ * the kernel's own 1 GiB block, which cannot be unmapped while it is running
+ * the code doing the unmapping; a user block has no such problem.
+ */
+
+u64 *paging_table_map(u64 frame) { return phys_to_virt(frame); }
+
+/* The level-2 entry covering `va`, and where it lives, without allocating and
+ * without following anything that is not a table. NULL when no level-2 table
+ * describes the address. */
+static u64 *thp_l2_slot(u64 *l0, u64 va) {
+  if (!l0)
+    return 0;
+  u64 e0 = l0[l0_index(va)];
+  if ((e0 & 0x3ULL) != D_TABLE)
+    return 0;
+  u64 *l1 = table_from_entry(e0);
+  if (!l1)
+    return 0;
+  u64 e1 = l1[l1_index(va)];
+  if ((e1 & 0x3ULL) != D_TABLE)
+    return 0;
+  u64 *l2 = table_from_entry(e1);
+  if (!l2)
+    return 0;
+  return &l2[l2_index(va)];
+}
+
+static u64 *thp_l0_of(u64 space) {
+  return space ? phys_to_virt(space) : kernel_l0_virt;
+}
+
+static int thp_entry_is_block(u64 entry) {
+  return (entry & 0x3ULL) == D_BLOCK && (entry & SW_THP) != 0;
+}
+
+/* One page of a block, written as the page descriptor it would have been: the
+ * same attributes, the frame the address falls on, and the page's own type
+ * bits. Reported to callers that ask about a single page; never stored. */
+static u64 thp_block_leaf(u64 entry, u64 va) {
+  u64 attrs = entry & ~ADDR_MASK & ~0x3ULL & ~SW_THP;
+  u64 frame = (entry & ADDR_MASK) + (va & (THP_SIZE - 1) & ~(PAGE_SIZE - 1));
+
+  return frame | attrs | D_PAGE;
+}
+
+/* The task the leaves belong to once a block is split, for the eviction ring,
+ * or NULL when the split is happening in somebody else's space (a teardown).
+ * Leaving them unregistered costs only that reclaim cannot take them until
+ * that space's own task faults again. */
+static struct task *thp_space_owner(u64 space) {
+  if (current_task && (space == 0 || space == current_task->pml4_phys))
+    return current_task;
   return 0;
+}
+
+u64 paging_thp_bytes(u64 pml4_phys, u64 start, u64 end) {
+  u64 *l0 = thp_l0_of(pml4_phys);
+  u64 bytes = 0;
+  u64 f;
+
+  if (!l0 || end <= start)
+    return 0;
+  vmm_write_acquire(&f);
+  for (u64 va = start & ~(THP_SIZE - 1); va < end; va += THP_SIZE) {
+    u64 *slot = thp_l2_slot(l0, va);
+
+    if (slot && thp_entry_is_block(*slot))
+      bytes += THP_SIZE;
+  }
+  vmm_write_release(f);
+  return bytes;
+}
+
+/* Break the one block covering `va` into its 512 leaves. Returns 1 when a
+ * block was split, 0 when there was none, -ENOMEM when the replacement table
+ * could not be allocated. No lock held on entry: the table is allocated first
+ * and committed second, because allocating under the page-table lock can
+ * reclaim, and reclaim writes pages out. */
+/* Replace the block at `va` with a table of 512 leaves. The caller holds the
+ * page-table lock and owns `spare`, which is consumed on success (and left
+ * alone when there was no block to split). Returns 1 when a block was split.
+ *
+ * The leaves inherit every attribute the block carried but its own mark: the
+ * read-only AP and SW_COW of a block a fork shared travel with them, which is
+ * what lets the ordinary per-page copy-on-write finish the job. */
+static int thp_split_commit(u64 *l0, u64 va, u64 *spare, u64 *block_out) {
+  u64 *slot = thp_l2_slot(l0, va);
+
+  if (!slot || !thp_entry_is_block(*slot))
+    return 0;
+  {
+    u64 entry = *slot;
+    u64 attrs = entry & ~ADDR_MASK & ~0x3ULL & ~SW_THP;
+    u64 block = entry & ADDR_MASK;
+
+    for (usize i = 0; i < 512; i++)
+      spare[i] = ((block + i * PAGE_SIZE) & ADDR_MASK) | attrs | D_PAGE;
+    /* Break before make: the block goes, every translation it cached is
+     * invalidated, and only then does the table take its place. */
+    *slot = 0;
+    tlb_flush_all();
+    *slot = virt_to_phys(spare) | D_TABLE;
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+    if (block_out)
+      *block_out = block;
+  }
+  thp_count_split();
+  return 1;
+}
+
+/* The same from inside the fault handler, which already holds the lock: a
+ * refused access to a block has to break it up before the rest of the handler
+ * can say anything about the page. Allocating here is what every other
+ * allocation in this port's fault path does (ensure_child, the anonymous frame,
+ * the copy-on-write copy) -- pmm_alloc_frame does not block on this side. */
+static int thp_split_here(u64 *l0, u64 va) {
+  u64 block = 0;
+  u64 *spare;
+
+  va &= ~(THP_SIZE - 1);
+  if (!l0)
+    return 0;
+  {
+    u64 *slot = thp_l2_slot(l0, va);
+
+    if (!slot || !thp_entry_is_block(*slot))
+      return 0;
+  }
+  spare = alloc_table_try();
+  if (!spare)
+    return -ENOMEM;
+  if (!thp_split_commit(l0, va, spare, &block)) {
+    pmm_free_frame(virt_to_phys(spare));
+    return 0;
+  }
+  /* The 512 pages are ordinary pages again: reclaim can reach them once it
+   * knows about them. */
+  if (current_task)
+    for (usize i = 0; i < THP_PAGES; i++)
+      eviction_register_page(current_task, va + i * PAGE_SIZE,
+                             block + i * PAGE_SIZE);
+  return 1;
+}
+
+static int thp_split_at_owner(u64 space, u64 va, struct task *owner) {
+  u64 *l0 = thp_l0_of(space);
+  u64 f;
+  u64 block = 0;
+  int split = 0;
+
+  if (!l0)
+    return 0;
+  va &= ~(THP_SIZE - 1);
+
+  vmm_write_acquire(&f);
+  {
+    u64 *slot = thp_l2_slot(l0, va);
+
+    if (!slot || !thp_entry_is_block(*slot)) {
+      vmm_write_release(f);
+      return 0;
+    }
+  }
+  vmm_write_release(f);
+
+  u64 *spare = alloc_table_try();
+
+  if (!spare)
+    return -ENOMEM;
+
+  vmm_write_acquire(&f);
+  if (thp_split_commit(l0, va, spare, &block))
+    spare = 0;
+  vmm_write_release(f);
+
+  if (spare) {
+    pmm_free_frame(virt_to_phys(spare)); /* another CPU got there first */
+  } else {
+    split = 1;
+    /* The 512 pages are ordinary pages again, so reclaim can take them — but
+     * only if reclaim knows about them. A block is never in the eviction ring
+     * (there is nothing there to take one page of), so registering the leaves
+     * here is what puts them back within its reach. */
+    if (owner)
+      for (usize i = 0; i < THP_PAGES; i++)
+        eviction_register_page(owner, va + i * PAGE_SIZE,
+                               block + i * PAGE_SIZE);
+  }
+  return split;
+}
+
+static int thp_split_at(u64 space, u64 va) {
+  return thp_split_at_owner(space, va, thp_space_owner(space));
 }
 
 int paging_thp_split_range(u64 pml4_phys, u64 start, u64 end, int partial_only) {
-  (void)pml4_phys;
-  (void)start;
-  (void)end;
-  (void)partial_only;
+  if (end <= start || thp_mode() == THP_MODE_NEVER)
+    return 0;
+  for (u64 va = start & ~(THP_SIZE - 1); va < end; va += THP_SIZE) {
+    if (partial_only && va >= start && va + THP_SIZE <= end)
+      continue; /* covered whole: the caller can release it as a block */
+    int rc = thp_split_at(pml4_phys, va);
+
+    if (rc < 0)
+      return rc;
+  }
   return 0;
 }
 
-int paging_thp_split_all(u64 pml4_phys) {
-  (void)pml4_phys;
-  return 0;
+/* Every block in the user half of one space, broken up, skipping whole levels
+ * at a time: an address space is mostly holes and a fork must not walk them
+ * page by page. `max_blocks` of 0 means all of them. */
+static int thp_split_space(u64 space, struct task *owner, usize max_blocks,
+                           usize *split_out) {
+  u64 *l0 = thp_l0_of(space);
+  usize split = 0;
+  int rc = 0;
+
+  if (split_out)
+    *split_out = 0;
+  if (!l0 || thp_mode() == THP_MODE_NEVER)
+    return 0;
+  /* L0[0] is the kernel half, shared by pointer: never a user block. */
+  for (usize i0 = 1; i0 < 512 && rc == 0; i0++) {
+    if ((l0[i0] & 0x3ULL) != D_TABLE)
+      continue;
+    u64 *l1 = table_from_entry(l0[i0]);
+
+    for (usize i1 = 0; i1 < 512 && rc == 0; i1++) {
+      if ((l1[i1] & 0x3ULL) != D_TABLE)
+        continue;
+      u64 *l2 = table_from_entry(l1[i1]);
+
+      for (usize i2 = 0; i2 < 512; i2++) {
+        if (!thp_entry_is_block(l2[i2]))
+          continue;
+        u64 va = ((u64)i0 << 39) | ((u64)i1 << 30) | ((u64)i2 << 21);
+        int one = thp_split_at_owner(space, va, owner);
+
+        if (one < 0) {
+          rc = one;
+          break;
+        }
+        if (one > 0 && ++split == max_blocks)
+          break;
+        /* The tables may have moved under the split; re-read this level. */
+        if ((l1[i1] & 0x3ULL) != D_TABLE)
+          break;
+        l2 = table_from_entry(l1[i1]);
+      }
+      if (max_blocks && split >= max_blocks)
+        break;
+    }
+    if (max_blocks && split >= max_blocks)
+      break;
+  }
+  if (split_out)
+    *split_out = split;
+  return rc;
+}
+
+/* Collapse the 512 leaves covering `base` into one block (khugepaged).
+ *
+ * The mirror of the x86_64 implementation, and for the same reasons: the fault
+ * path can only take a block where nothing is mapped, so the memory a program
+ * touched before huge pages were asked for would stay 4 KiB for ever. The 512
+ * pages are copied into a fresh block — they are ordinary frames from anywhere,
+ * and a block descriptor needs 2 MiB of contiguous aligned memory — with the
+ * page-table lock held across the copy, or a write landing halfway through
+ * would be lost. Break-before-make for the descriptor itself.
+ *
+ * Refused unless all 512 are present, private, anonymous user pages with a
+ * refcount of one and identical attributes: one descriptor cannot say two
+ * different things.
+ */
+int paging_thp_collapse(struct task *task, struct vm_area *vma, u64 base) {
+  extern void eviction_unregister_page(u64 frame);
+  u64 f;
+  u64 frames[THP_PAGES];
+  u64 attrs = 0;
+  u64 table_frame = 0;
+  u64 *l0;
+  int ok = 0;
+
+  if (!task || !task->pml4_phys || thp_mode() == THP_MODE_NEVER)
+    return 0;
+  if (!vma || !thp_vma_eligible(vma))
+    return 0;
+  base &= ~(THP_SIZE - 1);
+  if (base < vma->start || base + THP_SIZE > vma->end)
+    return 0;
+  l0 = thp_l0_of(task->pml4_phys);
+  if (!l0)
+    return 0;
+
+  const u64 perm_mask = AP_MASK | D_UXN | D_PXN | ATTR_INDX_MASK | D_AF |
+                        SH_INNER | SW_USER;
+
+  vmm_write_acquire(&f);
+  {
+    u64 *slot = thp_l2_slot(l0, base);
+    u64 *l3 = (slot && (*slot & 0x3ULL) == D_TABLE) ? table_from_entry(*slot) : 0;
+
+    if (l3) {
+      ok = 1;
+      for (usize i = 0; i < THP_PAGES && ok; i++) {
+        u64 pte = l3[i];
+        u64 frame = pte & ADDR_MASK;
+
+        if ((pte & 0x3ULL) != D_PAGE || !(pte & SW_USER) || (pte & SW_COW) ||
+            (pte & SW_SHARED) || !frame || frame == pmm_zero_page() ||
+            pmm_get_refcount(frame) != 1)
+          ok = 0;
+        else if (i == 0)
+          attrs = pte & perm_mask;
+        else if ((pte & perm_mask) != attrs)
+          ok = 0;
+      }
+    }
+  }
+  vmm_write_release(f);
+  if (!ok)
+    return 0;
+
+  int strict = 0;
+  int node = mempolicy_node_for(vma, base, &strict);
+  u64 block = pmm_alloc_block_node(9, node, node >= 0 ? strict : 0);
+
+  if (!block) {
+    thp_count_fallback();
+    return 0;
+  }
+
+  ok = 0;
+  vmm_write_acquire(&f);
+  {
+    u64 *slot = thp_l2_slot(l0, base);
+    u64 *l3 = (slot && (*slot & 0x3ULL) == D_TABLE) ? table_from_entry(*slot) : 0;
+
+    if (l3) {
+      ok = 1;
+      /* Re-checked under the lock this time it matters: the probe above ran in
+       * its own critical section and a fault, a copy-on-write or an unmap may
+       * have changed any of these leaves since. */
+      for (usize i = 0; i < THP_PAGES && ok; i++) {
+        u64 pte = l3[i];
+        u64 frame = pte & ADDR_MASK;
+
+        if ((pte & 0x3ULL) != D_PAGE || !(pte & SW_USER) || (pte & SW_COW) ||
+            (pte & SW_SHARED) || !frame || frame == pmm_zero_page() ||
+            pmm_get_refcount(frame) != 1 || (pte & perm_mask) != attrs)
+          ok = 0;
+        else
+          frames[i] = frame;
+      }
+      if (ok) {
+        for (usize i = 0; i < THP_PAGES; i++)
+          memcpy(phys_to_virt(block + i * PAGE_SIZE), phys_to_virt(frames[i]),
+                 PAGE_SIZE);
+        table_frame = *slot & ADDR_MASK;
+        /* Break before make. */
+        *slot = 0;
+        tlb_flush_all();
+        *slot = (block & ADDR_MASK) | attrs | SW_THP | D_BLOCK;
+        __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+      }
+    }
+  }
+  vmm_write_release(f);
+
+  if (!ok) {
+    for (usize i = 0; i < THP_PAGES; i++)
+      pmm_free_frame(block + i * PAGE_SIZE);
+    thp_count_fallback();
+    return 0;
+  }
+
+  tlb_flush_all();
+  /* The table the block replaced is kept, not freed: a walker without the lock
+   * may still hold a pointer into it (see thp_orphan_table). */
+  if (table_frame)
+    thp_orphan_table(table_frame, task->pml4_phys);
+  for (usize i = 0; i < THP_PAGES; i++) {
+    eviction_unregister_page(frames[i]);
+    pmm_free_frame(frames[i]);
+  }
+  thp_count_collapse();
+  return 1;
+}
+
+int paging_thp_split_for_reclaim(struct task *task, usize max_blocks) {
+  usize split = 0;
+
+  if (!task || !task->pml4_phys || !max_blocks)
+    return 0;
+  (void)thp_split_space(task->pml4_phys, task, max_blocks, &split);
+  return (int)split;
+}
+
+/* Write a protection into the block descriptor covering `va`, if that is what
+ * is there. Called with the page-table lock held and only for a block the
+ * caller's range covers whole. Returns 1 when a block was re-protected.
+ *
+ * Break-before-make is not needed: the descriptor keeps its type, its level
+ * and its output address, and only permission bits change — which the
+ * architecture allows in place, with the TLB invalidate that follows. */
+static int thp_mprotect_block(u64 *l0, u64 va, u64 flags) {
+  u64 *slot;
+
+  if (!l0)
+    return 0;
+  slot = thp_l2_slot(l0, va);
+  if (!slot || !thp_entry_is_block(*slot))
+    return 0;
+  {
+    u64 entry = *slot;
+    /* encode_leaf builds the permission and memory-type bits from the generic
+     * flags; the block keeps its own address, type and mark. */
+    u64 leaf = encode_leaf(entry & ADDR_MASK, flags | VMM_PRESENT);
+    u64 want = (leaf & ~0x3ULL) | D_BLOCK | SW_THP | (entry & (SW_COW | SW_SHARED));
+
+    if (want != entry) {
+      *slot = want;
+      __asm__ volatile("dsb ish" ::: "memory");
+      for (u64 p = va; p < va + THP_SIZE; p += PAGE_SIZE)
+        tlb_flush_page(p);
+    }
+  }
+  return 1;
+}
+
+/* Is this leaf table entirely empty? Called with the page-table lock held, so
+ * nothing can add a leaf under it — every writer of a leaf on this port takes
+ * the lock, the lazy marker included. */
+static int thp_table_is_empty(const u64 *table) {
+  for (usize i = 0; i < 512; i++)
+    if (table[i])
+      return 0;
+  return 1;
+}
+
+/* Install a block for the 2 MiB containing `va`, or report that nothing was
+ * installed. Called from the anonymous fault path with the page-table lock
+ * already held — which is why the only allocation it makes is the block
+ * itself, through pmm_alloc_block_node, the one allocator that never runs
+ * reclaim.
+ *
+ * The block is taken where the level-2 entry is absent, or where it names a
+ * table with nothing in it: such a table is out of the tree and kept until
+ * this address space dies (thp_orphan_table), because the walkers that
+ * descend without the lock may still hold a pointer into it.
+ *
+ * Returns 1 when the fault is served.
+ */
+static int thp_try_install(struct vm_area *vma, u64 va, u64 flags) {
+  u64 *l0 = get_l0_for_va(va);
+  u64 base = va & ~(THP_SIZE - 1);
+  u64 orphan = 0;
+
+  if (!l0 || !thp_vma_eligible(vma) || !current_task ||
+      !current_task->pml4_phys)
+    return 0;
+  if (base < vma->start || base + THP_SIZE > vma->end)
+    return 0;
+
+  {
+    u64 *slot = thp_l2_slot(l0, base);
+
+    if (slot && (*slot & 0x3ULL)) {
+      u64 *table = ((*slot & 0x3ULL) == D_TABLE) ? table_from_entry(*slot) : 0;
+
+      if (!table || !thp_table_is_empty(table))
+        return 0;
+      orphan = *slot & ADDR_MASK;
+    }
+  }
+
+  /* And only while the cgroup this task is in can spare them. A block is not
+   * reclaimable while it is a block, so a cgroup that took one at its
+   * memory.max would have nothing to give back and be killed holding 2 MiB it
+   * may never touch; 4 KiB pages are what reclaim can take. This is the same
+   * decision Linux makes when it charges a huge page before installing it. */
+  if (cgroup_mem_would_exceed(THP_PAGES)) {
+    thp_count_fallback();
+    return 0;
+  }
+
+  /* A block commits all 512 pages for a mapping that may touch one, so it is
+   * only taken while the machine can spare them. */
+  if (pmm_free_frame_count() < THP_PAGES * 8) {
+    thp_count_fallback();
+    return 0;
+  }
+
+  /* From the node the mapping's policy names, and strictly where MPOL_BIND
+   * says so: a block that ignored the policy would put 512 pages on the wrong
+   * node in one go. */
+  int strict = 0;
+  int node = mempolicy_node_for(vma, base, &strict);
+  u64 block = pmm_alloc_block_node(9, node, node >= 0 ? strict : 0);
+
+  if (!block) {
+    thp_count_fallback();
+    return 0;
+  }
+
+  u64 *l1 = ensure_child(l0, l0_index(base), 0);
+  u64 *l2 = l1 ? ensure_child(l1, l1_index(base), 1) : 0;
+
+  if (!l2) {
+    for (usize i = 0; i < THP_PAGES; i++)
+      pmm_free_frame(block + i * PAGE_SIZE);
+    thp_count_fallback();
+    return 0;
+  }
+
+  usize i2 = l2_index(base);
+  u64 leaf = encode_leaf(block, flags | VMM_PRESENT);
+  u64 entry = (leaf & ~0x3ULL) | D_BLOCK | SW_THP;
+
+  /* Break before make, for the recycled table as much as for a fresh entry:
+   * the old descriptor is cleared and flushed before the block appears. */
+  if (l2[i2]) {
+    l2[i2] = 0;
+    tlb_flush_all();
+  }
+  l2[i2] = entry;
+  __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+  tlb_flush_all();
+
+  if (orphan)
+    thp_orphan_table(orphan, current_task->pml4_phys);
+  thp_count_alloc();
+  /* The other 511 pages are the process's too; the fault hook charges one. */
+  cgroup_mem_charge_pages(THP_PAGES - 1);
+  return 1;
 }

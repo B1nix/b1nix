@@ -3181,18 +3181,22 @@ check_output "$POSIX_LOG" "M128-SMOKE: done" "the NUMA smoke completes"
 # ── M128: transparent huge pages for anonymous memory ──
 # The feature is off unless the boot line asks for it (b1nix.thp), so the test
 # turns it on for itself through /sys/kernel/mm/transparent_hugepage/enabled
-# and puts the knob back. Where the knob will not move — aarch64, whose
-# page-table walkers have no huge-page support — it reports "mode never" and
-# the checks below are recorded as skipped rather than passed.
+# and puts the knob back. Both ports install blocks — a 2 MiB directory entry
+# on x86_64, a level-2 block descriptor on aarch64 — so the same checks run on
+# both; a machine that reports "mode never" records them as skipped instead.
 check_output "$POSIX_LOG" "M128-THP: start" "the transparent-hugepage smoke starts"
 check_output "$POSIX_LOG" "M128-THP: ok sysfs" "/sys/kernel/mm/transparent_hugepage publishes the state and a 2 MiB hpage_pmd_size"
 if grep -qa "M128-THP: mode never" "$POSIX_LOG"; then
-	skipped "M128-THP: ok hugepage-backed" "this port installs no huge pages: aarch64's clone, unmap, mprotect and teardown walkers assume every leaf is a 4 KiB page, and a half-audited set of them is silent corruption"
+	skipped "M128-THP: ok hugepage-backed" "this machine reports the feature off and installs no huge pages"
 	skipped "M128-THP: ok data-intact" "same: nothing is 2 MiB-backed here"
 	skipped "M128-THP: ok fork-cow" "same"
 	skipped "M128-THP: ok mprotect-half" "same"
 	skipped "M128-THP: ok munmap-half" "same"
 	skipped "M128-THP: ok nohugepage-splits" "same"
+	skipped "M128-THP: ok mprotect-keeps-block" "same"
+	skipped "M128-THP: ok fork-shares-block" "same"
+	skipped "M128-THP: ok khugepaged-collapse" "same"
+	skipped "M128-THP: ok recycled-range" "same"
 	skipped "M128-THP: ok no-leak" "same"
 else
 	check_output "$POSIX_LOG" "M128-THP: ok hugepage-backed" "a MADV_HUGEPAGE anonymous mapping reports AnonHugePages in /proc/self/smaps — read out of the page-directory entries themselves, not out of madvise's return value"
@@ -3201,6 +3205,10 @@ else
 	check_output "$POSIX_LOG" "M128-THP: ok mprotect-half" "mprotect over part of a huge-backed range reads back the right bytes, and the rest of the mapping is untouched"
 	check_output "$POSIX_LOG" "M128-THP: ok munmap-half" "munmap of half a 2 MiB block frees only that half and leaves the other half's bytes in place"
 	check_output "$POSIX_LOG" "M128-THP: ok nohugepage-splits" "MADV_NOHUGEPAGE takes a block back apart — AnonHugePages falls to zero and not a byte of the mapping changes"
+	check_output "$POSIX_LOG" "M128-THP: ok mprotect-keeps-block" "mprotect over a range that covers a block whole writes the protection into the 2 MiB entry instead of breaking it into 512 leaves — ld.so mprotects every segment it maps, and that must not cost a mapping its blocks"
+	check_output "$POSIX_LOG" "M128-THP: ok fork-shares-block" "a fork SHARES the block copy-on-write instead of breaking the parent's apart: the parent is still 2 MiB-backed after the fork and before either side writes, and the first write on either side is resolved per page"
+	check_output "$POSIX_LOG" "M128-THP: ok khugepaged-collapse" "khugepaged collapses a range that was already faulted at 4 KiB into one block — the case the fault path cannot reach at all — proved by the kernel's own collapse counter moving and by every byte of the 8 MiB reading back after the copy"
+	check_output "$POSIX_LOG" "M128-THP: ok recycled-range" "an address range already faulted at 4 KiB is block-backed the second time round: the empty page table the first mapping left behind is taken out of the tree and kept until the process exits, so a program that recycles addresses — every long-lived allocator does — keeps getting blocks"
 	check_output "$POSIX_LOG" "M128-THP: ok no-leak" "eight rounds of mapping, filling and releasing 8 MiB leave the machine's free memory where it started, so no 512-frame block was leaked"
 fi
 check_output "$POSIX_LOG" "M128-THP: done" "the transparent-hugepage smoke completes"
@@ -3480,6 +3488,7 @@ check_output "$LOG" "M127-SWAP: ok zram-zero-pages" "a page of zeroes reads back
 check_output "$LOG" "M127-SWAP: ok swapon-zram" "mkswap's signature plus swapon(2) puts swap on the compressed device, whole, and /proc/swaps names the real device"
 check_output "$LOG" "M127-SWAP: ok cgroup-reclaim" "a cgroup that exceeds memory.max with cold pages is reclaimed into swap instead of killed: the process is alive afterwards and memory.stat's pgsteal counts the pages taken"
 check_output "$LOG" "M127-SWAP: ok cgroup-swap-cur" "those pages are charged to that cgroup's memory.swap.current, and every byte of the charge is released when the process dies"
+check_output "$LOG" "M127-SWAP: ok cgroup-reclaim-thp" "the same cgroup survives with transparent huge pages on for every mapping — which is what makes \"always\" a mode a machine can run in: a block is not reclaimable while it is a block, so one is refused where the charge would cross memory.max and the blocks already installed are broken up where that charge is decided (the marker is only emitted when huge pages really were installed and pages really were reclaimed)"
 check_output "$LOG" "M127-SWAP: ok swap-max" "memory.swap.max stops the reclaim: memory.swap.events counts the refusals and the runaway is killed as before"
 check_output "$LOG" "M127-SWAP: ok swapoff-zram" "swapoff pages everything back, leaves no cgroup charge behind and releases the device"
 check_output "$LOG" "M127-SWAP: done" "M127 compressed-swap suite completes"

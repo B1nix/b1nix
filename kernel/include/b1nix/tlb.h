@@ -30,6 +30,13 @@ void tlb_shootdown_page(u64 vaddr);
 void tlb_shootdown_all(void);
 void tlb_shootdown_current_mm(void);
 
+/* The same for an address space that is not the one running here: the CPUs
+ * that have `pml4_phys` loaded reload CR3, and nobody else is disturbed. What
+ * reclaim uses when it changes a sleeping task's page tables — a stale
+ * translation on the CPU that task last ran on outlives the change otherwise,
+ * and tlb_shootdown_current_mm would name the wrong address space. */
+void tlb_shootdown_mm(u64 pml4_phys);
+
 /* IPI handler entry point — called from x86_irq_handler_inner for
  * TLB_SHOOTDOWN_VECTOR. Must EOI itself. */
 void tlb_shootdown_handler(void);

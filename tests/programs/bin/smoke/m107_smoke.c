@@ -1741,6 +1741,20 @@ static void test_rtc_read(void) {
       diff = -diff;
     agrees = diff <= 2;
   }
+  /* Both readings, when they disagree: a composite verdict says a mismatch
+   * happened and nothing about which clock moved. */
+  if (!sane || !agrees) {
+    char line[192];
+
+    snprintf(line, sizeof(line),
+             "M107-SMOKE:   rtc %04d-%02d-%02d %02d:%02d:%02d vs system "
+             "%04d-%02d-%02d %02d:%02d:%02d",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min,
+             t.tm_sec, g ? g->tm_year + 1900 : 0, g ? g->tm_mon + 1 : 0,
+             g ? g->tm_mday : 0, g ? g->tm_hour : 0, g ? g->tm_min : 0,
+             g ? g->tm_sec : 0);
+    marker(line);
+  }
   check("rtc-read", sane && agrees,
         (long)((t.tm_year + 1900) * 10000 + sane * 10 + agrees));
 }

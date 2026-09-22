@@ -30,6 +30,11 @@
  *                     and memory.stat's pgsteal counts the pages taken
  *   cgroup-swap-cur   those pages are charged to that cgroup, and the charge
  *                     is released when they come back in
+ *   cgroup-reclaim-thp  the same with transparent huge pages on for every
+ *                     mapping: a cgroup whose memory is all 2 MiB blocks has
+ *                     nothing the eviction ring can take, so the charge path
+ *                     breaks its blocks up and reclaims the pages instead of
+ *                     killing it
  *   swap-max          memory.swap.max stops the reclaim: the cgroup has
  *                     nowhere to put pages, memory.swap.events counts the
  *                     refusals, and the runaway is killed as before
@@ -40,6 +45,7 @@
 #endif
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -484,6 +490,39 @@ static void cgpath(char *out, size_t cap, const char *cg, const char *file) {
     snprintf(out, cap, CGROOT "/%s", cg);
 }
 
+/* The bracketed word of a "always [madvise] never" file, without the
+ * brackets. Returns -1 when the file cannot be read or holds no such word. */
+static int read_mode_word(const char *path, char *out, size_t cap) {
+  char buf[128];
+  char *lb, *rb;
+
+  out[0] = '\0';
+  if (read_file(path, buf, sizeof(buf)) < 0)
+    return -1;
+  lb = strchr(buf, '[');
+  rb = lb ? strchr(lb, ']') : NULL;
+  if (!lb || !rb || (size_t)(rb - lb) >= cap)
+    return -1;
+  memcpy(out, lb + 1, (size_t)(rb - lb - 1));
+  out[rb - lb - 1] = '\0';
+  return 0;
+}
+
+/* One counter out of /sys/kernel/mm/transparent_hugepage/stats, whose lines
+ * are "<name> <value>". -1 when it is not there. */
+static long long thp_stat(const char *name) {
+  char buf[512];
+  char *p;
+
+  if (read_file("/sys/kernel/mm/transparent_hugepage/stats", buf,
+                sizeof(buf)) < 0)
+    return -1;
+  p = strstr(buf, name);
+  if (!p)
+    return -1;
+  return strtoll(p + strlen(name), NULL, 10);
+}
+
 static long long cg_ll(const char *cg, const char *file) {
   char p[256];
   cgpath(p, sizeof(p), cg, file);
@@ -826,6 +865,131 @@ static void check_swapoff(void) {
   ok("swapoff-zram");
 }
 
+/* The same cgroup, with transparent huge pages on for every eligible mapping.
+ *
+ * A block is not reclaimable while it is a block: the eviction ring holds
+ * 4 KiB pages and there is nothing in it to take one page of a 2 MiB entry. A
+ * cgroup whose memory is all blocks therefore reads as having nothing to give
+ * back, and before M128 closed it was killed with megabytes of cold memory in
+ * it — which is why `always` was not a mode to run a machine in. The charge
+ * path now breaks blocks up where the limit is decided, and this is what says
+ * so: the same hog, the same limit, with the knob at "always".
+ *
+ * A machine whose architecture will not take the knob is reported, not
+ * pretended: the marker then says the mode it really has and the check is not
+ * claimed.
+ */
+static void check_cgroup_reclaim_thp(void) {
+  char mode0[32] = {0};
+  char mode[32] = {0};
+  const char *KNOB = "/sys/kernel/mm/transparent_hugepage/enabled";
+
+  if (!swap_on_zram) {
+    failf("cgroup-reclaim-thp", "swap is not on zram");
+    return;
+  }
+  if (read_mode_word(KNOB, mode0, sizeof(mode0)) != 0) {
+    failf("cgroup-reclaim-thp", "%s: %s", KNOB, strerror(errno));
+    return;
+  }
+  if (write_file(KNOB, "always") != 0) {
+    failf("cgroup-reclaim-thp", "%s takes no write: %s", KNOB, strerror(errno));
+    return;
+  }
+  (void)read_mode_word(KNOB, mode, sizeof(mode));
+  if (strcmp(mode, "always") != 0) {
+    failf("cgroup-reclaim-thp", "the knob stayed at \"%s\"", mode);
+    (void)write_file(KNOB, mode0);
+    return;
+  }
+
+  if (cg_make("hogthp") != 0) {
+    failf("cgroup-reclaim-thp", "mkdir: %s", strerror(errno));
+    (void)write_file(KNOB, mode0);
+    return;
+  }
+  /* The same 12 MiB of limit for 36 MiB of memory the plain check uses — but
+   * every 2 MiB of it arrives as one block. */
+  if (cg_write("hogthp", "memory.max", "12582912") != 0) {
+    failf("cgroup-reclaim-thp", "memory.max: %s", strerror(errno));
+    cg_destroy("hogthp");
+    (void)write_file(KNOB, mode0);
+    return;
+  }
+
+  long long splits0 = thp_stat("thp_split_page");
+  long long allocs0 = thp_stat("thp_fault_alloc");
+
+  int pfd[2];
+  if (pipe(pfd) != 0) {
+    failf("cgroup-reclaim-thp", "pipe: %s", strerror(errno));
+    cg_destroy("hogthp");
+    (void)write_file(KNOB, mode0);
+    return;
+  }
+  pid_t pid = spawn_hog("hogthp", 36, pfd[1]);
+  if (pid < 0) {
+    failf("cgroup-reclaim-thp", "fork: %s", strerror(errno));
+    close(pfd[0]);
+    close(pfd[1]);
+    cg_destroy("hogthp");
+    (void)write_file(KNOB, mode0);
+    return;
+  }
+  close(pfd[1]);
+
+  /* Bounded, unlike the plain check's read: a cgroup that cannot make room
+   * kills its process, and a process killed while it is inside the kernel may
+   * take a moment to die. Waiting for ever would take the whole lane down with
+   * it, and "it never finished" is a result worth reporting. */
+  char c = 0;
+  ssize_t got = -1;
+  struct pollfd pfd0 = {.fd = pfd[0], .events = POLLIN};
+
+  if (poll(&pfd0, 1, 60000) > 0)
+    got = read(pfd[0], &c, 1);
+  close(pfd[0]);
+  msleep(300);
+
+  int status = 0;
+  int alive = child_alive(pid, &status);
+  long long pgsteal = cg_kv("hogthp", "memory.stat", "pgsteal");
+  long long current = cg_ll("hogthp", "memory.current");
+  long long oom_kill = cg_kv("hogthp", "memory.events", "oom_kill");
+  long long splits = thp_stat("thp_split_page") - splits0;
+  long long allocs = thp_stat("thp_fault_alloc") - allocs0;
+
+  if (got != 1) {
+    failf("cgroup-reclaim-thp",
+          "the child never finished: alive=%d status=%d oom_kill=%lld", alive,
+          status, oom_kill);
+  } else if (!alive) {
+    failf("cgroup-reclaim-thp",
+          "killed anyway (status %d, oom_kill %lld, blocks %lld, splits %lld)",
+          status, oom_kill, allocs, splits);
+  } else if (allocs <= 0) {
+    failf("cgroup-reclaim-thp",
+          "not one huge page was installed with the knob at \"always\": this "
+          "proves nothing about a cgroup full of blocks");
+  } else if (pgsteal <= 0) {
+    failf("cgroup-reclaim-thp", "pgsteal is %lld: nothing was reclaimed",
+          pgsteal);
+  } else if (current > 24ll * 1024 * 1024) {
+    failf("cgroup-reclaim-thp",
+          "memory.current is %lld with a 12M limit: the limit did not hold",
+          current);
+  } else {
+    note("36 MiB with huge pages on inside a 12M limit: current %lld, "
+         "pgsteal %lld, blocks installed %lld, split %lld",
+         current, pgsteal, allocs, splits);
+    ok("cgroup-reclaim-thp");
+  }
+
+  reap(pid);
+  cg_destroy("hogthp");
+  (void)write_file(KNOB, mode0);
+}
+
 int main(void) {
   marker("M127-SWAP: start\n");
 
@@ -840,6 +1004,7 @@ int main(void) {
   } else {
     check_swapon_zram();
     check_cgroup_reclaim();
+    check_cgroup_reclaim_thp();
     check_swap_max();
     /* Before the hierarchy goes away: the swapoff check reads what is left
      * charged to a cgroup, and that file only exists while it is mounted. */

@@ -325,6 +325,26 @@ void tlb_shootdown_current_mm(void) {
     spin_unlock_irqrestore(&g_tlb_lock, flags);
 }
 
+/* Another address space's mappings changed: flush on the CPUs that have THAT
+ * space loaded. Reclaim reaches here — it takes pages away from a task that is
+ * not the one running, and a CPU still holding the old translation would write
+ * into a frame the reclaim has already handed back. Flushing the current space
+ * instead (tlb_shootdown_current_mm) names a space no target has loaded and
+ * reaches nobody, which is silent. The local CPU is only reloaded when the
+ * space really is the one it is running. */
+void tlb_shootdown_mm(u64 pml4_phys) {
+    if (!pml4_phys)
+        return;
+    if (paging_cr3_to_pml4(read_cr3()) == pml4_phys)
+        cr3_reload();
+    if (g_max_cpus <= 1) return;
+    if (!__atomic_load_n(&g_tlb_enabled, __ATOMIC_ACQUIRE)) return;
+    u64 flags;
+    spin_lock_irqsave(&g_tlb_lock, &flags);
+    tlb_shootdown_dispatch(TLB_OP_ALL, 0, pml4_phys);
+    spin_unlock_irqrestore(&g_tlb_lock, flags);
+}
+
 /* M28 #6: reschedule IPI sender. No state to publish — the handler is just
  * lapic_eoi (see x86_irq_handler vector-66 branch). Genuinely fire-and-forget:
  * callers reach here with interrupts disabled (scheduler_wake_all runs under

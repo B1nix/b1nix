@@ -396,15 +396,24 @@ machine. The rule that makes the feature tractable is therefore a restriction:
 Breaking one up — `paging_thp_split_range` — allocates, so it is always called
 with no page-table lock held: at the top of `paging_unmap_range_from_space`,
 `vmm_unmap_range_collect`, `paging_mprotect_range` and `paging_move_range`,
-and over the whole address space before `fork` clones it. The unmap paths ask
-only for the blocks their range cuts in half; one a range covers whole is
-released as a block, which is what makes address-space teardown — the busiest
-caller — allocate nothing. The four walkers that handle a block themselves are
-the unmap of a whole one, `free_table` at teardown (which used to SKIP a huge
-entry at a non-leaf level, and would have leaked the whole 512-frame block),
+and over the whole address space before `fork` clones it (the aarch64 port
+splits at the same places, plus `vmm_unmap_range_nosync`, which reports one
+frame per page and has nowhere to put a block). The unmap paths ask only for the
+blocks their range cuts in half; one a range covers whole is released as a
+block, which is what makes address-space teardown — the busiest caller —
+allocate nothing. The four walkers that handle a block themselves are the unmap
+of a whole one, `free_table` at teardown (which used to SKIP a huge entry at a
+non-leaf level, and would have leaked the whole 512-frame block),
 `paging_user_resident`, so a process using blocks does not read as having given
 its memory back, and `paging_user_writable`, so a userfaultfd write-protect
 check does not refuse a write to a page that is perfectly writable.
+
+A range that covers a block WHOLE is a different case from one that cuts it in
+half, and `mprotect` now treats it as one: the protection goes into the 2 MiB
+entry and the block stays a block. `ld.so` mprotects every segment it has just
+mapped, so without that a dynamically linked program lost its blocks on the way
+up. Half a block still has to be split — half an entry cannot carry two
+protections.
 
 **Nothing in this path ever frees a page table.** That is the other half of why
 it is safe. `vmm_set_lazy` and the `/proc` walkers descend the tables without
@@ -417,11 +426,22 @@ only ever an optimisation: a fault with no leaf inside an anonymous mapping is
 zero-filled by the same handler, reading the protection off the mapping rather
 than off the marker.
 
-The consequence, and it is a real one: an address range that has already been
-faulted at 4 KiB granularity keeps its page table when the mapping goes, and
-the next mapping at that address is served 4 KiB at a time. A long-lived arena
-mapped once gets blocks; a program that churns mappings at recycled addresses
-gets them the first time round.
+**...or where the table that is there is empty.** A range that has already been
+faulted at 4 KiB keeps its page table when the mapping goes: the leaves are
+cleared, the table stays, and a directory entry naming a table is one the fault
+path may not take. Every long-lived allocator recycles addresses, so that meant
+blocks the first time round and 4 KiB pages ever after. An empty table is
+therefore taken out of the tree and ORPHANED rather than freed
+(`thp_orphan_table`): the frame stays claimed as a page table on a list
+belonging to its address space, and goes back when that space is torn down —
+when nothing can be walking it. A walker mid-descent reads the same zeroes it
+read before, and the two words the list threads through the frame are
+page-aligned physical addresses, which every walker reads as an absent entry.
+The cost is one frame per recycled 2 MiB range for the life of the process.
+What can be lost is at most a lazy marker another CPU installed between the
+emptiness check and the swap, and a lost marker is harmless for the reason
+above; nothing else writes a leaf without the lock, so no swap slot and no
+copy-on-write leaf can go missing.
 
 A block is a buddy order-9 allocation, so the 2 MiB alignment the hardware
 requires comes for free, and each of its 512 frames carries its own refcount —
@@ -436,36 +456,116 @@ a machine into eviction on behalf of a mapping that is perfectly correct as
 one.
 
 **A block is not reclaimable while it is a block.** The eviction ring holds
-4 KiB pages and there is nothing in it to take one page of a block, so a
-split registers the 512 leaves and puts them back within reclaim's reach —
-but nothing makes reclaim split a block in the first place. Having it do so
-was tried and reverted: reclaim is reached from inside the allocator,
-splitting allocates and takes the page-table lock, and the two orders do not
-agree — the machine wedged with the console silent. The consequence is the
-reason `always` is not a mode to run a machine in yet: a cgroup at its
-`memory.max` whose memory is all blocks has nothing to reclaim and is killed
-instead. `madvise` is the mode the suite runs green, and there the program has
-asked for the trade.
+4 KiB pages and there is nothing in it to take one page of a block, so a split
+registers the 512 leaves and puts them back within reclaim's reach. Having
+reclaim do the splitting was tried twice and reverted both times — reclaim is
+reached from inside the allocator, splitting allocates and takes the page-table
+lock, and the two orders do not agree: the machine wedged with the console
+silent. The split therefore happens one level out, where the charge against
+`memory.max` is decided (`cgroup_mem_charge_pages` → `cg_reclaim`), in task
+context with no lock held and before the allocation that would fail: when a
+batch of reclaim finds nothing to take and the feature is on, as many of the
+cgroup's blocks as that batch needs are broken up
+(`paging_thp_split_for_reclaim`, which registers the leaves against the task
+they belong to rather than the one running) and the batch is tried again.
 
-`fork` breaks the parent's blocks apart rather than sharing them. A huge
-copy-on-write entry would need a second representation and a fault path to
-break it, and the per-page copy-on-write that already exists is correct; the
-child re-forms its own blocks on its own faults.
+The other half is a refusal. A block that would take the cgroup past its
+`memory.max` is not installed at all (`cgroup_mem_would_exceed`): the fault
+falls back to a 4 KiB page, which reclaim can take. That is the same decision
+Linux makes when it charges a huge page before installing it, and between the
+two halves `always` is a mode a machine can be run in — a cgroup with a 12 MiB
+limit fills 36 MiB with the knob at `always`, loses the pages to swap and stays
+alive, which is what `cgroup-reclaim-thp` grades in the compressed-swap suite.
 
-**Off by default**, on x86_64 only. `b1nix.thp` selects madvise mode,
+**`fork` shares a block copy-on-write**, as it shares a 4 KiB page: both sides
+keep the 2 MiB entry, read-only, and each of the block's 512 frames gains a
+reference. The first write from either side is a protection fault, and the
+answer to a refused access to a block is always the same — break it into its
+512 leaves, which inherit the read-only flag and the copy-on-write mark, and
+let the ordinary per-page copy-on-write resolve the page that was written. So
+there is no second representation and no huge-page copy: a block that is only
+read stays one entry in both processes, and one that is written costs a page
+table and a copy of the one page that was touched. Breaking every block in the
+parent at fork time, which is what this did first, charged that price for a
+child that may never write at all.
+
+Two things had to be true before that worked. A **directory entry must not
+carry the leaves' restrictions**: the CPU takes the AND of write permission
+down the walk, so a split that copied the block's read-only flag into the new
+page table's own entry left every leaf under it read-only — the copy-on-write
+handler granted the write on the leaf, the retry faulted again, and the process
+died of a protection fault on a page its own tables said was writable
+(`pt_directory_flags`). And on aarch64 the fault handler has to do the split
+itself, under the lock it already holds, because that port services faults with
+the page-table lock held (`thp_split_here`).
+
+**khugepaged.** The fault path can only take a block where nothing describes
+the address yet, so everything a program touched before huge pages were asked
+for stays 4 KiB for ever — which is most of the memory of most long-lived
+programs. A kernel thread closes that: one pass every
+`khugepaged/scan_sleep_millisecs` (200 ms by default), at most eight blocks a
+pass, over the mappings of every task the scheduler knows. A range it can
+collapse is 512 present, private, anonymous user pages with a refcount of one
+and identical permissions — anything else is something one entry cannot
+describe — and the 512 pages are COPIED into a freshly allocated block, because
+the hardware needs 2 MiB of contiguous aligned memory and these frames are from
+wherever they were allocated. The copy runs under the page-table lock, which is
+what makes it safe: a write landing halfway through would otherwise be lost.
+The page table the block replaces is orphaned, as at any other block install,
+and the old frames go back to the allocator afterwards. What it has done is at
+`khugepaged/pages_collapsed` and in the `thp_collapse_alloc` counter.
+
+**What a block does not need**: a block is never in the eviction ring, so
+nothing samples the access flag of one — `paging_test_and_clear_accessed` and
+`paging_test_and_clear_dirty` answer about 4 KiB leaves and are not asked about
+a 2 MiB entry. Reclaim reaches a block's pages by splitting it first, which is
+the path above, and the dirty bit is only read for file mappings, which are
+never blocks.
+
+**Off by default**, on both arches. `b1nix.thp` selects madvise mode,
 `b1nix.thp=always` every eligible mapping, and
 `/sys/kernel/mm/transparent_hugepage/enabled` reads and writes the same state
 in Linux's `always [madvise] never` format beside `hpage_pmd_size` and a
-`stats` file counting blocks installed, refused and split. Per mapping it is
+`stats` file counting blocks installed, refused, split and collapsed, and a
+`khugepaged/` directory with the thread's own counter and its sleep. Per mapping it is
 `madvise(MADV_HUGEPAGE)` / `MADV_NOHUGEPAGE`, which are no longer no-ops:
-turning the advice off takes existing blocks back apart. aarch64 has block
-descriptors that would serve, but none of its walkers has been audited, so the
-knob will not move there and nothing installs one.
+turning the advice off takes existing blocks back apart.
+
+**aarch64** uses a level-2 block descriptor and the same rule, with three things
+of its own. Break-before-make is observed for every block installed or split —
+the architecture permits no other transition between a block and a table
+describing the same addresses — where `ensure_child`'s long-standing exception
+stands only for the kernel's own 1 GiB block, which cannot be unmapped while it
+is running the code doing the unmapping. A software bit (`SW_THP`) separates the
+blocks this path made from the identity map's own, whose frames are not
+anybody's to release. And the walkers that meet one now answer for it rather
+than about it: `paging_user_frame`, `paging_user_pte` and `paging_leaf_pte`
+report the page inside the block that the caller asked about, `paging_user_writable`
+reads the permission off the block, and `free_user_subtree` releases its 512
+frames instead of skipping a block at a non-leaf level and leaking them.
+
+Bringing it up found something older and larger: nothing on aarch64 had ever
+called `pmm_switch_to_direct_map`, which is where the buddy tree is seeded. It
+is x86_64's "the direct map now exists" hook, and this port's RAM is
+identity-mapped from boot, so the call had no obvious home and never got one.
+Every allocation had been falling back to a bitmap scan, and
+`pmm_alloc_block_node` refuses outright while the tree is unseeded — so no
+contiguous block could be allocated at all, on a machine with a free gigabyte.
+It is now called at the end of `vmm_init`.
 
 What a mapping actually holds is readable rather than assumed:
 `/proc/<pid>/smaps` is new, and its `AnonHugePages` is computed by walking the
 directory entries themselves. That is what `m128_thp_smoke` grades — that a
 4 MiB `MADV_HUGEPAGE` mapping reports it, that the bytes survive a fork and a
 copy-on-write write on both sides, an `mprotect` of half the range, a `munmap`
-of half a block and a `MADV_NOHUGEPAGE`, and that eight rounds of mapping,
-filling and releasing 8 MiB leave the machine's free memory where it started.
+of half a block and a `MADV_NOHUGEPAGE`, that a whole-block `mprotect` leaves
+the block alone (`mprotect-keeps-block`), that a `fork` shares it rather than
+splitting it (`fork-shares-block`), that an address already faulted at 4 KiB is
+block-backed the second time round (`recycled-range`), that khugepaged
+collapses a range that was faulted at 4 KiB on purpose — graded on the kernel's
+own collapse counter and on every byte of the 8 MiB reading back
+(`khugepaged-collapse`) — and that eight
+rounds of mapping, filling and releasing 8 MiB leave the machine's free memory
+where it started. It prints the kernel's own counters beside the verdict, so a
+mapping that is not block-backed says which of the two things happened: no block
+was installed, or one was and something split it again.

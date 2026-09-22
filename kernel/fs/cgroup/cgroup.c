@@ -81,6 +81,7 @@
 #include <b1nix/namespace.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/thp.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
 #include <stdio.h>
@@ -768,6 +769,39 @@ static usize cg_reclaim(struct cgroup *cg, u64 over_pages) {
     freed += eviction_reclaim_task(tasks[i], (usize)over_pages - freed,
                                    &scanned);
 
+  /* Nothing to take, and the cgroup's memory may be 2 MiB blocks: the eviction
+   * ring holds 4 KiB pages and there is nothing in it to take one page of a
+   * block, so a cgroup whose memory is all blocks reads as having nothing to
+   * give and is killed with megabytes of cold memory in it.
+   *
+   * Splitting is what puts those pages back within reclaim's reach, and THIS
+   * is the place it can happen: the charge against memory.max is decided here,
+   * in task context, with no lock held and before the allocation that would
+   * fail. Inside reclaim it cannot -- reclaim is reached from within the
+   * allocator, splitting allocates and takes the page-table lock, and the two
+   * orders do not agree; it was tried twice and wedged the machine both times.
+   * Only as many blocks as this batch needs, so a cgroup that is merely over
+   * by a page does not lose every block it has. */
+  if (!freed && thp_mode() != THP_MODE_NEVER) {
+    usize want_blocks = ((usize)over_pages + THP_PAGES - 1) / THP_PAGES;
+    usize blocks = 0;
+
+    if (!want_blocks)
+      want_blocks = 1;
+    for (int i = 0; i < n && blocks < want_blocks; i++) {
+      if (!cg_task_live(tasks[i]) || !tasks[i]->pml4_phys)
+        continue;
+      int one = paging_thp_split_for_reclaim(tasks[i], want_blocks - blocks);
+
+      if (one > 0)
+        blocks += (usize)one;
+    }
+    if (blocks)
+      for (int i = 0; i < n && freed < (usize)over_pages; i++)
+        freed += eviction_reclaim_task(tasks[i], (usize)over_pages - freed,
+                                       &scanned);
+  }
+
   spin_lock_irqsave(&cg_lock, &flags);
   for (struct cgroup *a = cg; a; a = a->parent) {
     a->mem_pgscan += scanned;
@@ -926,6 +960,31 @@ void cgroup_mem_fault_charge(u64 fault_addr) {
   eviction_protect_begin(current_task, fault_addr);
   cgroup_mem_charge_pages(1);
   eviction_protect_end();
+}
+
+int cgroup_mem_would_exceed(u64 npages) {
+  if (!cg_root || !npages ||
+      !__atomic_load_n(&cg_mem_limited, __ATOMIC_RELAXED))
+    return 0;
+  struct task *cur = current_task;
+
+  if (!cur || !cur->pml4_phys)
+    return 0;
+
+  u64 flags;
+  int over = 0;
+
+  spin_lock_irqsave(&cg_lock, &flags);
+  for (struct cgroup *a = cg_of(cur->id); a; a = a->parent) {
+    if (a->mem_max == CG_LIM_MAX)
+      continue;
+    if (a->mem_exact + a->mem_delta + npages > a->mem_max) {
+      over = 1;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&cg_lock, flags);
+  return over;
 }
 
 void cgroup_mem_charge_pages(u64 npages) {
