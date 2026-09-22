@@ -10,6 +10,7 @@
 #include <b1nix/pci.h>
 #include <b1nix/sched.h>
 #include <string.h>
+#include <b1nix/suspend.h>
 
 #define AHCI_MAX_PORTS 32
 
@@ -831,7 +832,78 @@ static int ahci_port_identify(struct ahci_port_state *port, u16 *identify_buf) {
   return 0;
 }
 
+/* Put the controller back after an S3 (M129).
+ *
+ * The HBA comes back at its reset state — no AHCI enable, no command list
+ * address, every port stopped — while this driver still holds the command
+ * lists, FIS areas and command tables it allocated at boot. So the registers
+ * are re-stated from what the driver already has rather than probed and
+ * allocated again: a resume that allocated would leak a set of buffers per
+ * sleep, and one that re-probed PCI would register a second disk for the same
+ * port. */
+static int ahci_resume(void *ctx) {
+  volatile struct ahci_hba_mem *abar = ahci_bar;
+  int timeout = 1000000;
+
+  (void)ctx;
+  if (!abar)
+    return 0; /* no controller was ever found: nothing to bring back */
+
+  abar->ghc |= AHCI_GHC_HR;
+  while ((abar->ghc & AHCI_GHC_HR) && timeout > 0) {
+    cpu_relax();
+    timeout--;
+  }
+  if (abar->ghc & AHCI_GHC_HR)
+    return -1;
+  abar->ghc |= AHCI_GHC_AE;
+
+  for (int i = 0; i < AHCI_MAX_PORTS; i++) {
+    struct ahci_port_state *port = &ports[i];
+    volatile struct ahci_port *p;
+
+    if (!port->present)
+      continue;
+    p = &abar->ports[i];
+    /* Stopped before its addresses are written, as at boot: a running engine
+     * reads the command list while it is being re-pointed. */
+    p->cmd &= ~AHCI_PxCMD_ST;
+    p->cmd &= ~AHCI_PxCMD_FRE;
+    timeout = 1000000;
+    while (timeout > 0 && ((p->cmd & AHCI_PxCMD_CR) || (p->cmd & AHCI_PxCMD_FR))) {
+      cpu_relax();
+      timeout--;
+    }
+    p->clb = (u32)(port->phys_cmd_list & 0xFFFFFFFF);
+    p->clbu = (u32)((port->phys_cmd_list >> 32) & 0xFFFFFFFF);
+    p->fb = (u32)(port->phys_fis & 0xFFFFFFFF);
+    p->fbu = (u32)((port->phys_fis >> 32) & 0xFFFFFFFF);
+    port->cmd_list[0].ctba = (u32)(port->phys_cmd_table & 0xFFFFFFFF);
+    port->cmd_list[0].ctbau = (u32)((port->phys_cmd_table >> 32) & 0xFFFFFFFF);
+    port->cmd_list[1].ctba =
+        (u32)((port->phys_cmd_table + PAGE_SIZE) & 0xFFFFFFFF);
+    port->cmd_list[1].ctbau =
+        (u32)(((port->phys_cmd_table + PAGE_SIZE) >> 32) & 0xFFFFFFFF);
+    p->serr = p->serr; /* the reset left errors latched (RW1C) */
+    p->is = p->is;
+    p->ie = 0xFFFFFFFF;
+    p->cmd |= AHCI_PxCMD_FRE;
+    p->cmd |= AHCI_PxCMD_ST;
+  }
+
+  abar->is = abar->is;
+  abar->ghc |= AHCI_GHC_IE;
+  return 0;
+}
+
 void ahci_init(void) {
+  static int resume_registered;
+
+  if (!resume_registered) {
+    suspend_register_device("ahci", ahci_resume, 0);
+    resume_registered = 1;
+  }
+
   struct pci_device_info pci;
   int found = pci_find_class(AHCI_PCI_CLASS, AHCI_PCI_SUBCLASS, 0, &pci);
   if (!found) {

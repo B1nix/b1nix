@@ -43,6 +43,8 @@
 #include <b1nix/resource_caps.h>
 #include <b1nix/acpi_power.h>
 #include <b1nix/aml.h>
+#include <b1nix/cpufreq.h>
+#include <b1nix/suspend.h>
 #include <b1nix/sched.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
@@ -607,7 +609,16 @@ static int r_cpuinfo(usize pid, struct sbuf *s) {
     sb_addf(s, "vendor_id\t: %s\n", vendor[0] ? vendor : "unknown");
     sb_addf(s, "model name\t: %s\n", model[0] ? model : "unknown");
     {
-      u32 khz = arch_cpu_khz();
+      /* The frequency the machine is running at, from the same source
+       * scaling_cur_freq uses: the scaling driver where there is one, the
+       * measured clock where there is not. Reading only the measured clock
+       * made this file and sysfs disagree the moment a driver could report a
+       * P-state, and every tool that prints "the CPU speed" picks one of the
+       * two. */
+      u32 khz = cpufreq_cur_khz();
+
+      if (!khz)
+        khz = arch_cpu_khz();
       if (khz)
         sb_addf(s, "cpu MHz\t\t: %lu.%03lu\n", (unsigned long)(khz / 1000),
                 (unsigned long)(khz % 1000));
@@ -1704,6 +1715,61 @@ static int r_b1nix_tick(usize pid, struct sbuf *s) {
   sb_addf(s, "hz %lu\n", (unsigned long)sched_tick_hz());
   sb_addf(s, "dynticks_cap %lu\n", (unsigned long)arch_dynticks_cap());
   sb_addf(s, "local_timer %lu\n", (unsigned long)arch_local_timer_count());
+  return 0;
+}
+
+/* /proc/b1nix-cpufreq — what the frequency driver is, and where its numbers
+ * came from.
+ *
+ * The sysfs files say what the frequency IS; this says whose statement that is.
+ * For the ACPI driver every line is the firmware's own declaration — the
+ * namespace path, the register `_PCT` names, and one line per P-state with the
+ * value written to ask for it — so a test can check that the kernel read what
+ * the firmware declared rather than that it produced a plausible number. The
+ * last line is the only thing here that is not a declaration: whether the
+ * request this kernel made was accepted by the register, which is the
+ * difference between a governor that works and one that reports success. */
+static int r_b1nix_cpufreq(usize pid, struct sbuf *s) {
+  int n = cpufreq_state_count();
+  int sel = cpufreq_selected_state();
+
+  (void)pid;
+  sb_addf(s, "driver %s\n", cpufreq_driver_name());
+  sb_addf(s, "governor %s\n", cpufreq_governor());
+  sb_addf(s, "cur_khz %lu\n", (unsigned long)cpufreq_cur_khz());
+  sb_addf(s, "min_khz %lu\n", (unsigned long)cpufreq_min_khz());
+  sb_addf(s, "max_khz %lu\n", (unsigned long)cpufreq_max_khz());
+  sb_addf(s, "states %d\n", n);
+  if (n > 0) {
+    sb_addf(s, "pss_path %s\n", cpufreq_pss_path());
+    sb_addf(s, "pct_space %s\n", cpufreq_pct_space_name());
+    for (int i = 0; i < n; i++)
+      sb_addf(s, "state %d khz %lu control 0x%lx\n", i,
+              (unsigned long)cpufreq_state_khz(i),
+              (unsigned long)cpufreq_state_control(i));
+    sb_addf(s, "selected %d\n", sel);
+    sb_addf(s, "request_took %d\n", cpufreq_request_took());
+    sb_addf(s, "status_value 0x%lx\n", (unsigned long)cpufreq_status_value());
+  }
+  return 0;
+}
+
+/* /proc/b1nix-suspend — what the machine can sleep as, and what it last did.
+ *
+ * /sys/power/state says what the states are called; this says what happened.
+ * `s3_count` and `s3_last_ms` are the only evidence a test can have that the
+ * machine really went down and came back rather than idled for a while: an
+ * s2idle suspend leaves them at zero however long it slept. */
+static int r_b1nix_suspend(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "states %s\n", suspend_states());
+  sb_addf(s, "s3_supported %d\n", arch_s3_supported());
+  if (!arch_s3_supported())
+    sb_addf(s, "s3_absent %s\n", arch_s3_why_not());
+  sb_addf(s, "s3_count %lu\n", (unsigned long)arch_s3_count());
+  sb_addf(s, "s3_last_ms %lu\n", (unsigned long)arch_s3_last_ms());
+  sb_addf(s, "wake_count %lu\n", (unsigned long)suspend_wake_count());
+  sb_addf(s, "last_wake %s\n", suspend_last_wake_source());
   return 0;
 }
 
@@ -4280,6 +4346,8 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "interrupts", VFS_DEVICE, r_interrupts, 0);
   procfs_mkchild(root, "b1nix-tick", VFS_DEVICE, r_b1nix_tick, 0);
   procfs_mkchild(root, "b1nix-acpi", VFS_DEVICE, r_b1nix_acpi, 0);
+  procfs_mkchild(root, "b1nix-cpufreq", VFS_DEVICE, r_b1nix_cpufreq, 0);
+  procfs_mkchild(root, "b1nix-suspend", VFS_DEVICE, r_b1nix_suspend, 0);
   {
     /* Writing here makes the kernel execute firmware bytecode, which can
      * touch any I/O port or physical address the DSDT names. Root only. */

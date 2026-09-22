@@ -181,6 +181,40 @@ u64 arch_tsc_monotonic_ns(void)
 	return (t / f) * 1000000000ull + ((t % f) * 1000000000ull) / f;
 }
 
+/* The generic timer is not reset by anything this port can enter, so there is
+ * no anchor to move: CNTVCT_EL0 counts on through a WFI and through the only
+ * "suspend" this port has (see arch_s3_supported below). Present so the generic
+ * resume path needs no #ifdef. */
+void arch_tsc_reanchor(u64 counter_ns)
+{
+	(void)counter_ns;
+}
+
+/* ── ACPI S3: not on this architecture ────────────────────────────────────
+ *
+ * S3 is an ACPI state entered through the FADT's PM1 control register, and the
+ * boards this port runs on have no ACPI at all — they describe themselves in a
+ * device tree. The equivalent here is PSCI's SYSTEM_SUSPEND, which is a
+ * different mechanism with a different contract (the firmware, not the OS, owns
+ * the resume entry point), and it is not implemented: /sys/power/state lists
+ * `freeze` alone, which is the truth about what this port can do. */
+int arch_s3_supported(void) { return 0; }
+
+const char *arch_s3_why_not(void)
+{
+	return "no ACPI on this architecture (PSCI SYSTEM_SUSPEND is not implemented)";
+}
+
+int arch_s3_enter(void) { return -ENODEV; }
+void arch_s3_firmware_wake(void) {}
+u64 arch_s3_count(void) { return 0; }
+void arch_s3_note_ms(u64 ms) { (void)ms; }
+u64 arch_s3_last_ms(void) { return 0; }
+
+/* No secondary CPU is ever parked here, because nothing on this port takes
+ * their state away; the generic code calls this only after a park. */
+int arch_relaunch_secondary_cpus(void) { return 0; }
+
 /* Busy-wait a real number of microseconds against the generic timer.
  *
  * The x86 counterpart counts port-0x80 reads when it has no calibrated clock;

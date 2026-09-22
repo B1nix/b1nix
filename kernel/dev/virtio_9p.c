@@ -10,6 +10,7 @@
 #include <b1nix/pci.h>
 #include <b1nix/sched.h>
 #include <string.h>
+#include <b1nix/suspend.h>
 
 #define VIRTIO_VENDOR_ID 0x1AF4
 #define MAX_VIRTIO_9P_DEVS 8
@@ -190,7 +191,34 @@ static int init_one_9p_device(struct pci_device_info *pci) {
   return 0;
 }
 
+/* Put every 9P transport back after an S3 (M129): the device is at its reset
+ * state, the driver's ring and its DMA buffers are not, and this re-states the
+ * agreement without allocating any of it again. The 9P session above (the fids,
+ * the negotiated msize) is the server's and the client's, not the device's, and
+ * survives the sleep untouched — which is why a mount stays mounted. */
+static int virtio_9p_resume(void *ctx) {
+  (void)ctx;
+  for (int i = 0; i < g_p9_dev_count && i < MAX_VIRTIO_9P_DEVS; i++) {
+    struct virtio_9p_dev *p9dev = &g_p9_devs[i];
+
+    if (!p9dev->dev.port_base)
+      continue;
+    /* This transport negotiated no feature bits at boot; the handshake is the
+     * same shape regardless. */
+    virtio_resume_begin(&p9dev->dev, 0);
+    virtq_resume(&p9dev->dev, &p9dev->vq);
+    virtio_resume_finish(&p9dev->dev);
+  }
+  return 0;
+}
+
 void virtio_9p_init(void) {
+  static int resume_registered;
+
+  if (!resume_registered) {
+    suspend_register_device("virtio-9p", virtio_9p_resume, 0);
+    resume_registered = 1;
+  }
   for (u16 bus = 0; bus < 256; bus++) {
     for (u8 slot = 0; slot < 32; slot++) {
       u16 vendor = pci_config_read16((u8)bus, slot, 0, 0);

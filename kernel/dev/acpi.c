@@ -360,6 +360,61 @@ const struct acpi_sdt_header *acpi_dsdt(void) {
     return (const struct acpi_sdt_header *)0;
 }
 
+/* The FADT fields a sleep needs (ACPI 6.x table 5-33), and the FACS the
+ * firmware reads the waking vector out of.
+ *
+ * Nothing else in the kernel has needed these: a poweroff goes through the
+ * PM1 control block as well, but the S3 path needs the FACS too — that is
+ * where the address the firmware jumps to on wake is written, and a sleep
+ * whose vector is not set never comes back.
+ */
+#define FADT_OFF_FACS          36
+#define FADT_OFF_PM1A_CNT      64
+#define FADT_OFF_PM1B_CNT      68
+#define FADT_OFF_PM1_CNT_LEN   89
+#define FADT_OFF_X_FACS        132
+
+static const u8 *fadt_bytes(u32 *len_out) {
+    const struct acpi_sdt_header *fadt = acpi_find_table("FACP");
+
+    if (!fadt)
+        return 0;
+    if (len_out)
+        *len_out = fadt->length;
+    return (const u8 *)fadt;
+}
+
+static u64 fadt_read(u32 off, int width) {
+    u32 len = 0;
+    const u8 *b = fadt_bytes(&len);
+    u64 v = 0;
+
+    if (!b || off + (u32)width > len)
+        return 0;
+    for (int i = 0; i < width; i++)
+        v |= (u64)b[off + i] << (i * 8);
+    return v;
+}
+
+u16 acpi_pm1a_cnt_port(void) { return (u16)fadt_read(FADT_OFF_PM1A_CNT, 4); }
+u16 acpi_pm1b_cnt_port(void) { return (u16)fadt_read(FADT_OFF_PM1B_CNT, 4); }
+
+u8 acpi_pm1_cnt_len(void) {
+    u8 n = (u8)fadt_read(FADT_OFF_PM1_CNT_LEN, 1);
+
+    /* The specification fixes this at two bytes; a firmware that says
+     * otherwise is describing a register this code would misuse. */
+    return n ? n : 2;
+}
+
+u64 acpi_facs_address(void) {
+    u64 phys = fadt_read(FADT_OFF_X_FACS, 8);
+
+    if (!phys)
+        phys = fadt_read(FADT_OFF_FACS, 4);
+    return phys;
+}
+
 /* ── Public API ────────────────────────────────────────────────── */
 
 int acpi_init(void) {

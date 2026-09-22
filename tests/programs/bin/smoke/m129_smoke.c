@@ -16,6 +16,11 @@
  *   M129-SMOKE: ok cpuidle-sysfs
  *   M129-SMOKE: ok cpufreq-honest
  *   M129-SMOKE: ok cpufreq-governor-set (only where a driver exists)
+ *   M129-SMOKE: ok pstates-declared    (only where ACPI declares _PSS)
+ *   M129-SMOKE: ok pstates-selected
+ *   M129-PSTATE: khz <list>            (what the firmware declared, in order)
+ *   M129-PSTATE: control <list>
+ *   M129-PSTATE: port <the register _PCT names>
  *   M129-SMOKE: idle <n> busy <n> per second
  *   M129-SMOKE: done
  */
@@ -257,6 +262,138 @@ int main(void) {
       if (fd >= 0) {
         (void)!write(fd, "performance", 11);
         close(fd);
+      }
+    }
+  }
+
+  /* ── the P-states ACPI declared (M129) ──────────────────────────────
+   *
+   * Only a machine whose firmware declares `_PSS` has any: a guest with no such
+   * table says so and the lane records the rest as skipped. Where they exist,
+   * every number printed here is the FIRMWARE's, read back out of
+   * /proc/b1nix-cpufreq, and the lane compares it against what the table
+   * declares — so this passes only if the interpreter read the table, the
+   * driver kept the values, and the sysfs files agree with both. */
+  {
+    static char proc[4096];
+    int n = read_file("/proc/b1nix-cpufreq", proc, sizeof(proc));
+    long states = -1;
+    char *p = n > 0 ? strstr(proc, "states ") : 0;
+
+    if (p)
+      states = strtol(p + 7, 0, 10);
+    if (states <= 0) {
+      printf("M129-SMOKE: no-pstates\n");
+      fflush(stdout);
+    } else {
+      char khz_list[256] = "";
+      char ctl_list[256] = "";
+      char avail[256] = "";
+      long first_khz = -1, last_khz = -1;
+      int good = 1;
+
+      /* One "state <i> khz <k> control 0x<c>" line per declared state. */
+      for (long i = 0; i < states; i++) {
+        char want[32];
+        char *line;
+        long khz, ctl;
+
+        snprintf(want, sizeof(want), "state %ld khz ", i);
+        line = strstr(proc, want);
+        if (!line) {
+          good = 0;
+          break;
+        }
+        khz = strtol(line + strlen(want), 0, 10);
+        line = strstr(line, "control ");
+        ctl = line ? strtol(line + 8, 0, 16) : -1;
+        if (khz <= 0 || ctl < 0) {
+          good = 0;
+          break;
+        }
+        if (i == 0)
+          first_khz = khz;
+        last_khz = khz;
+        snprintf(khz_list + strlen(khz_list), sizeof(khz_list) - strlen(khz_list),
+                 "%s%ld", i ? " " : "", khz);
+        snprintf(ctl_list + strlen(ctl_list), sizeof(ctl_list) - strlen(ctl_list),
+                 "%s0x%lx", i ? " " : "", ctl);
+      }
+      printf("M129-PSTATE: khz %s\n", khz_list);
+      printf("M129-PSTATE: control %s\n", ctl_list);
+      {
+        char *sp = strstr(proc, "pct_space ");
+        char *pp = strstr(proc, "pss_path ");
+
+        printf("M129-PSTATE: space %.*s path %.*s\n",
+               sp ? (int)strcspn(sp + 10, "\n") : 4, sp ? sp + 10 : "none",
+               pp ? (int)strcspn(pp + 9, "\n") : 4, pp ? pp + 9 : "none");
+      }
+      fflush(stdout);
+
+      /* sysfs must publish the same list, and its ends as the limits. */
+      read_file("/sys/devices/system/cpu/cpu0/cpufreq/"
+                "scaling_available_frequencies", avail, sizeof(avail));
+      {
+        char want[256];
+
+        snprintf(want, sizeof(want), "%s\n", khz_list);
+        good = good && strcmp(avail, want) == 0;
+      }
+      {
+        char mx[32] = "", mn[32] = "";
+
+        read_file("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", mx,
+                  sizeof(mx));
+        read_file("/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq", mn,
+                  sizeof(mn));
+        good = good && strtol(mx, 0, 10) == first_khz &&
+               strtol(mn, 0, 10) == last_khz;
+      }
+      judge("pstates-declared", good,
+            "the P-states, the sysfs list and the limits do not agree",
+            states);
+
+      /* Asking for the slowest state by frequency: the kernel must select the
+       * state the firmware declared for it, and report what the register did
+       * with the request rather than assuming. */
+      {
+        int fd = open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_setspeed",
+                      O_WRONLY);
+        char text[32];
+        int wrote = -1;
+        long sel = -1, cur = -1, took = -1;
+
+        snprintf(text, sizeof(text), "%ld", last_khz);
+        if (fd >= 0) {
+          wrote = (int)write(fd, text, strlen(text));
+          close(fd);
+        }
+        n = read_file("/proc/b1nix-cpufreq", proc, sizeof(proc));
+        p = n > 0 ? strstr(proc, "selected ") : 0;
+        if (p)
+          sel = strtol(p + 9, 0, 10);
+        p = n > 0 ? strstr(proc, "cur_khz ") : 0;
+        if (p)
+          cur = strtol(p + 8, 0, 10);
+        p = n > 0 ? strstr(proc, "request_took ") : 0;
+        if (p)
+          took = strtol(p + 13, 0, 10);
+        printf("M129-PSTATE: asked %ld selected %ld cur %ld took %ld\n",
+               last_khz, sel, cur, took);
+        fflush(stdout);
+        judge("pstates-selected",
+              wrote > 0 && sel == states - 1 && cur == last_khz && took == 1,
+              "the request did not reach the register the firmware named",
+              took);
+        /* Put the machine back where it was found. */
+        fd = open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_setspeed",
+                  O_WRONLY);
+        if (fd >= 0) {
+          snprintf(text, sizeof(text), "%ld", first_khz);
+          (void)!write(fd, text, strlen(text));
+          close(fd);
+        }
       }
     }
   }

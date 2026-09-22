@@ -410,7 +410,11 @@ void rtc_wake_source_init(void) {
     return;
   *pl031_reg(PL031_ICR) = 1; /* whatever is stale, before the line is live */
   irq_unmask_isa(PL031_IRQ);
-  suspend_register_wake_source("rtc", rtc_wake_armed_cb, 0);
+  /* The RTC alarm is a chipset wake: the PM1 event block carries an RTC bit
+   * the platform wakes on, so this source can end an S3 as well as an idle
+   * suspend (see SUSPEND_WAKE_DEEP). */
+  suspend_register_wake_source_flags("rtc", rtc_wake_armed_cb, 0,
+                                     SUSPEND_WAKE_DEEP);
 }
 
 u64 rtc_wake_irq_count(void) {
@@ -440,6 +444,25 @@ void rtc_set_unix_time(u64 sec) {
   }
   spin_unlock_irqrestore(&rtc_lock, flags);
   wallclock_set_ns(sec * 1000000000ull);
+}
+
+/* The hardware clock and the wall-clock correction, the two the generic suspend
+ * path asks for. On this port the x86 pair lives in kernel/arch/x86_64/rtc.c;
+ * here the same answers come from PL031, or from the settable soft clock on a
+ * board that has no RTC at all — in which case there is nothing that survives a
+ * power-off to correct anything from, and saying 0 is what stops the caller
+ * inventing a correction. */
+u64 rtc_hw_unix_seconds(void) {
+  if (!pl031_present())
+    return 0;
+  return (u64)*pl031_reg(PL031_DR);
+}
+
+void rtc_resync_wallclock(void) {
+  u64 secs = rtc_hw_unix_seconds();
+
+  if (secs)
+    wallclock_set_ns(secs * 1000000000ull);
 }
 
 #else
@@ -715,7 +738,11 @@ void rtc_wake_source_init(void) {
   (void)cmos_read(0x0C);
   spin_unlock_irqrestore(&rtc_lock, flags);
   irq_unmask_isa(8);
-  suspend_register_wake_source("rtc", rtc_wake_armed_cb, 0);
+  /* The RTC alarm is a chipset wake: the PM1 event block carries an RTC bit
+   * the platform wakes on, so this source can end an S3 as well as an idle
+   * suspend (see SUSPEND_WAKE_DEEP). */
+  suspend_register_wake_source_flags("rtc", rtc_wake_armed_cb, 0,
+                                     SUSPEND_WAKE_DEEP);
 }
 
 u64 rtc_wake_irq_count(void) {

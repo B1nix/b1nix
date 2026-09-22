@@ -188,6 +188,10 @@ void arch_udelay(u32 us);
 void arch_tsc_clock_init(void);
 int  arch_tsc_clock_ready(void);
 u64  arch_tsc_monotonic_ns(void);
+/* Make the counter read `counter_ns` again after a sleep that reset it: S3
+ * brings the time-stamp counter back at zero, and both this kernel's clock and
+ * the one userspace reads out of the vDSO are built on it. */
+void arch_tsc_reanchor(u64 counter_ns);
 u32 arch_cpu_max_khz(void);
 /* Exact TSC rate in kHz from CPUID leaf 15h, or 0 when the CPU does not
  * publish one and it has to be measured instead. */

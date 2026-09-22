@@ -85,6 +85,17 @@ u8 virtio_get_status(struct virtio_device *dev);
 u32 virtio_get_host_features(struct virtio_device *dev);
 void virtio_set_guest_features(struct virtio_device *dev, u32 features);
 int virtq_init(struct virtio_device *dev, u16 queue_idx, struct virtqueue *vq);
+
+/* ── after a sleep that reset the device (M129) ───────────────────────────
+ *
+ * An S3 takes the machine's power away, and every virtio device comes back at
+ * its reset state: no negotiated features, no queue address, nothing consumed.
+ * The driver's own memory is intact, so what a resume does is re-state the
+ * agreement — begin, re-publish each queue, finish — rather than allocate
+ * anything again. */
+void virtio_resume_begin(struct virtio_device *dev, u32 features);
+void virtq_resume(struct virtio_device *dev, struct virtqueue *vq);
+void virtio_resume_finish(struct virtio_device *dev);
 void virtq_kick(struct virtio_device *dev, struct virtqueue *vq);
 u8 virtio_read_isr(struct virtio_device *dev);
 

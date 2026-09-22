@@ -61,12 +61,19 @@
  * suspend, and thirty seconds of it was most of a test lane's budget. */
 #define SUSPEND_MAX_MS 10000
 
+/* How long a secondary CPU is given to reach its idle loop and park before an
+ * S3 is refused. A CPU running a kernel thread takes as long as that thread
+ * needs to block; a CPU that never parks means something is spinning, and
+ * sleeping with it live would lose whatever it held. */
+#define SUSPEND_PARK_MS 5000
+
 #define SUSPEND_MAX_SOURCES 4
 
 struct wake_source {
   const char *name;
   suspend_wake_armed_fn armed;
   void *ctx;
+  u32 flags;
 };
 
 static struct wake_source g_sources[SUSPEND_MAX_SOURCES];
@@ -78,17 +85,30 @@ static const char *volatile g_wake_source_name = "none";
  * window is an ordinary interrupt and must not be counted as a wake. */
 static volatile int g_suspended;
 
-const char *suspend_states(void) { return "freeze"; }
+/* What this machine really has. `mem` appears only where the firmware and the
+ * architecture both provide it; a state listed here that cannot be entered is
+ * how a suspend becomes a hang. */
+const char *suspend_states(void) {
+  return arch_s3_supported() ? "freeze mem" : "freeze";
+}
 
-int suspend_register_wake_source(const char *name, suspend_wake_armed_fn armed,
-                                 void *ctx) {
+int suspend_register_wake_source_flags(const char *name,
+                                       suspend_wake_armed_fn armed, void *ctx,
+                                       u32 flags) {
   if (!name || !armed || g_nsources >= SUSPEND_MAX_SOURCES)
     return -1;
   g_sources[g_nsources].name = name;
   g_sources[g_nsources].armed = armed;
   g_sources[g_nsources].ctx = ctx;
+  g_sources[g_nsources].flags = flags;
   g_nsources++;
   return 0;
+}
+
+int suspend_register_wake_source(const char *name, suspend_wake_armed_fn armed,
+                                 void *ctx) {
+  return suspend_register_wake_source_flags(name, armed, ctx,
+                                            SUSPEND_WAKE_IDLE);
 }
 
 void suspend_wake_event(const char *source) {
@@ -106,13 +126,166 @@ u64 suspend_wake_count(void) {
 
 const char *suspend_last_wake_source(void) { return g_wake_source_name; }
 
-/* Is anything armed right now that could end a suspend? */
-static const char *wake_source_armed(void) {
+/* ── device resume ──────────────────────────────────────────────────────── */
+
+#define SUSPEND_MAX_DEVICES 16
+
+struct resume_dev {
+  const char *name;
+  suspend_resume_fn resume;
+  void *ctx;
+};
+
+static struct resume_dev g_devices[SUSPEND_MAX_DEVICES];
+static int g_ndevices;
+
+int suspend_register_device(const char *name, suspend_resume_fn resume,
+                            void *ctx) {
+  if (!name || !resume || g_ndevices >= SUSPEND_MAX_DEVICES)
+    return -1;
+  g_devices[g_ndevices].name = name;
+  g_devices[g_ndevices].resume = resume;
+  g_devices[g_ndevices].ctx = ctx;
+  g_ndevices++;
+  return 0;
+}
+
+int suspend_resume_devices(void) {
+  int failed = 0;
+
+  for (int i = 0; i < g_ndevices; i++) {
+    /* Named BEFORE it is called, not after: a driver whose resume hangs is the
+     * most likely thing to go wrong on this path, and the last line on the
+     * console is then the only evidence of which one it was. */
+    console_write("power: resuming ");
+    console_write(g_devices[i].name);
+    console_write("\n");
+    if (g_devices[i].resume(g_devices[i].ctx) != 0) {
+      console_write("power: ");
+      console_write(g_devices[i].name);
+      console_write(" did not come back\n");
+      failed++;
+    }
+  }
+  return failed;
+}
+
+/* Is anything armed right now that could end a suspend? `need` is the class of
+ * source the state requires: an idle suspend takes anything, an S3 takes only a
+ * source the chipset itself wakes on. */
+static const char *wake_source_armed_kind(u32 need) {
   for (int i = 0; i < g_nsources; i++) {
+    if ((g_sources[i].flags & need) != need)
+      continue;
     if (g_sources[i].armed(g_sources[i].ctx))
       return g_sources[i].name;
   }
   return 0;
+}
+
+static const char *wake_source_armed(void) {
+  return wake_source_armed_kind(SUSPEND_WAKE_IDLE);
+}
+
+/* ACPI S3: the same freeze, then the platform's own sleep.
+ *
+ * Everything before the sleep is the s2idle path — the wake source has to be
+ * armed and userspace has to be off the CPUs — and everything after it is the
+ * architecture's (kernel/arch/x86_64/s3.c), which is where the processor is
+ * saved, the firmware is asked to sleep, and the machine is put back together
+ * on the way out. This function's own work is the bookkeeping either side of
+ * that and the honesty about what happened: a platform that refuses the state
+ * is reported as refusing it, not as a suspend that returned quickly. */
+static int suspend_enter_s3(const char *armed) {
+  u64 start, now;
+  u64 base_wakes;
+  int rc, slept;
+
+  if (!arch_s3_supported()) {
+    console_write("power: this machine has no S3 (");
+    console_write(arch_s3_why_not());
+    console_write(")\n");
+    return -EINVAL;
+  }
+  /* The other CPUs have to be off the processor: their state does not survive
+   * S3, and one that is INIT'd while it holds a lock takes the machine with
+   * it. They are parked from their idle loop, which is the one place an AP
+   * holds nothing. */
+  rc = sched_park_secondary_cpus(SUSPEND_PARK_MS);
+  if (rc < 0) {
+    console_write("power: refusing S3, a CPU would not park\n");
+    return -EBUSY;
+  }
+
+  base_wakes = suspend_wake_count();
+  __atomic_store_n(&g_suspended, 1, __ATOMIC_RELEASE);
+  rc = sched_freeze_userspace(SUSPEND_FREEZE_MS);
+  if (rc < 0) {
+    __atomic_store_n(&g_suspended, 0, __ATOMIC_RELEASE);
+    sched_unpark_secondary_cpus();
+    console_write("power: freeze aborted, userspace would not stop\n");
+    return rc;
+  }
+
+  console_write("power: mem (S3), ");
+  console_write_dec((u64)sched_frozen_count());
+  console_write(" task(s) held, wake source ");
+  console_write(armed);
+  console_write("\n");
+
+  start = ktime_monotonic_ns();
+  interrupts_disable();
+  /* The monotonic clock is repaired inside this call, before the resume touches
+   * anything that reads the time: the counter it is built on came back at zero,
+   * and only the hardware clock knows how long the machine was away (see
+   * x86_s3_restore_cpu). */
+  slept = arch_s3_enter();
+  interrupts_enable();
+  /* The firmware's hook, now that there is a timer again: it is a program, and
+   * QEMU's own spends time in Sleep(). Timed, because a resume that takes a
+   * minute is indistinguishable from a resume that hung unless the log says
+   * which part of it took the minute. */
+  if (slept > 0) {
+    arch_s3_firmware_wake();
+    /* The wall clock is built on the monotonic one and lost the same time; the
+     * hardware clock kept counting and is what it is corrected from. */
+    rtc_resync_wallclock();
+  }
+  now = ktime_monotonic_ns();
+
+  __atomic_store_n(&g_suspended, 0, __ATOMIC_RELEASE);
+
+  sched_unpark_secondary_cpus();
+  /* The devices, before userspace is let go: a task that resumes into a read
+   * from a disk whose controller has not been rebuilt waits for ever. */
+  if (slept > 0) {
+    int bad = suspend_resume_devices();
+
+    console_write("power: devices resumed");
+    if (bad) {
+      console_write(", ");
+      console_write_dec((u64)bad);
+      console_write(" failed");
+    }
+    console_write("\n");
+  }
+  sched_thaw_userspace();
+
+  if (slept > 0) {
+    arch_s3_note_ms((now - start) / 1000000ull);
+    console_write("power: resumed from S3 after ");
+    console_write_dec((now - start) / 1000000ull);
+    console_write(" ms, woken by ");
+    console_write(suspend_wake_count() != base_wakes ? suspend_last_wake_source()
+                                                     : "the platform");
+    console_write("\n");
+    return 0;
+  }
+  if (slept == 0) {
+    console_write("power: the platform did not enter S3\n");
+    return -EIO;
+  }
+  return slept;
 }
 
 int suspend_enter(const char *state) {
@@ -121,7 +294,22 @@ int suspend_enter(const char *state) {
   u64 base_wakes;
   int rc;
 
-  if (!state || strcmp(state, "freeze") != 0)
+  if (!state)
+    return -EINVAL;
+  if (strcmp(state, "mem") == 0) {
+    /* Only a source that can wake a powered-off machine will do here. There is
+     * no ceiling on an S3 — once the processor is off nothing of this kernel is
+     * left to time it out — so a sleep with nothing armed to end it is a dead
+     * machine rather than a long one. */
+    armed = wake_source_armed_kind(SUSPEND_WAKE_DEEP);
+    if (!armed) {
+      console_write("power: refusing S3, nothing armed can wake a powered-off "
+                    "machine (arm the RTC alarm)\n");
+      return -ENODEV;
+    }
+    return suspend_enter_s3(armed);
+  }
+  if (strcmp(state, "freeze") != 0)
     return -EINVAL;
 
   armed = wake_source_armed();

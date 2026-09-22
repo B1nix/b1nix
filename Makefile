@@ -213,6 +213,11 @@ AP_TRAMPOLINE_INC := $(INC_DIR)/ap_trampoline.inc
 # keeping the numbers in C by hand meant that growing the trampoline's code
 # silently moved the block and every AP triple-faulted on a garbage CR3.
 AP_TRAMPOLINE_OFFSETS := $(INC_DIR)/ap_trampoline_offsets.h
+# The same pair for the S3 wake-up blob: the firmware jumps to it in real mode
+# when the machine comes back, so it is a flat binary in low memory too, and its
+# data block is patched by generated offsets for the same reason.
+S3_WAKEUP_INC := $(INC_DIR)/s3_wakeup.inc
+S3_WAKEUP_OFFSETS := $(INC_DIR)/s3_wakeup_offsets.h
 INITRAMFS_B1CC_INCS := $(INITRAMFS_B1CC_M34_INC)
 INITRAMFS_B1CC_SELFHOST_INC := $(INC_DIR)/initramfs_b1cc_selfhost.inc
 
@@ -255,7 +260,8 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_MODULES_INC) \
 	$(INITRAMFS_M109_SWITCHROOT_INC) \
 		$(INITRAMFS_LD_MUSL_INC)
-GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(AP_TRAMPOLINE_OFFSETS) $(INITRAMFS_INCS)
+GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(AP_TRAMPOLINE_OFFSETS) \
+	$(S3_WAKEUP_INC) $(S3_WAKEUP_OFFSETS) $(INITRAMFS_INCS)
 endif
 
 DROPBEAR_VERSION := 2022.83
@@ -485,8 +491,8 @@ TARGET := x86_64-elf
 ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86_64/linker.ld
-ASM_SOURCES := kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S
-ARCH_SOURCES := kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_panel.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c kernel/arch/x86_64/memtype.c kernel/arch/x86_64/pkeys.c
+ASM_SOURCES := kernel/arch/x86_64/s3_asm.S kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S
+ARCH_SOURCES := kernel/arch/x86_64/s3.c kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_panel.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c kernel/arch/x86_64/memtype.c kernel/arch/x86_64/pkeys.c
 else ifeq ($(ARCH),aarch64)
 TARGET := aarch64-unknown-elf
 ARCH_CFLAGS := --target=$(TARGET) -mcpu=cortex-a53 -mgeneral-regs-only -DAARCH64
@@ -1484,6 +1490,7 @@ $(INITRAMFS_MODULES_INC): $(MODULE_KOS) tools/toolchain/kernel/gen_modules_initr
 $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
 $(BUILD_DIR)/kernel/arch/$(ARCH)/lapic.o: $(AP_TRAMPOLINE_INC) $(AP_TRAMPOLINE_OFFSETS)
+$(BUILD_DIR)/kernel/arch/$(ARCH)/s3.o: $(S3_WAKEUP_INC) $(S3_WAKEUP_OFFSETS)
 $(BUILD_DIR)/kernel/arch/aarch64/bootinfo.o: $(KERNEL_CMDLINE_INC)
 # initramfs.c moved under ramfs/ with the filesystem reorganisation; this rule
 # kept the old path and so matched nothing, which left the generated .inc files
@@ -1956,6 +1963,38 @@ $(INC_DIR)/initramfs_m92_musl_raw_diag.inc: tests/programs/bin/helpers/m92_musl_
 
 
 
+
+# ── S3 wake-up blob (flat binary linked at 0x9000) ──
+#
+# 0x9000 rather than 0x8000: the AP trampoline owns that page, and an AP started
+# after a resume would read this blob as its own start-up code. Everything below
+# 1 MiB is kept out of the frame allocator (see pmm.c), so both pages are ours.
+S3_WAKE_OBJ := $(BUILD_DIR)/kernel/arch/$(ARCH)/s3_wakeup_tmp.o
+S3_WAKE_BIN := $(BUILD_DIR)/s3_wakeup.bin
+
+$(S3_WAKE_OBJ): kernel/arch/$(ARCH)/s3_wakeup.S
+	@mkdir -p $(dir $@)
+	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
+
+$(S3_WAKE_BIN): $(S3_WAKE_OBJ)
+	$(LD) $(ARCH_LDFLAGS) $(AP_IMAGE_BASE) -Ttext 0x9000 -o $@ --oformat binary $<
+
+$(S3_WAKEUP_INC): $(S3_WAKE_BIN)
+	@mkdir -p $(dir $@)
+	$(XXD) -i -n s3_wakeup_bin $< > $@
+
+$(S3_WAKEUP_OFFSETS): $(S3_WAKE_OBJ)
+	@mkdir -p $(dir $@)
+	@printf '/* Generated from s3_wakeup.S — do not edit. */\n#ifndef B1NIX_S3_WAKEUP_OFFSETS_H\n#define B1NIX_S3_WAKEUP_OFFSETS_H\n' > $@
+	@$(NM) -n $< | awk '\
+		$$3 == "wake_magic"   { printf "#define S3W_MAGIC_OFF   0x%s\n", $$1 } \
+		$$3 == "saved_cr3"    { printf "#define S3W_CR3_OFF     0x%s\n", $$1 } \
+		$$3 == "saved_stack"  { printf "#define S3W_STACK_OFF   0x%s\n", $$1 } \
+		$$3 == "resume_entry" { printf "#define S3W_ENTRY_OFF   0x%s\n", $$1 } \
+		$$3 == "saved_la57"   { printf "#define S3W_LA57_OFF    0x%s\n", $$1 } \
+		$$3 == "saved_gdtr"   { printf "#define S3W_GDTR_OFF    0x%s\n", $$1 }' \
+		| sed 's/0x00*\([0-9a-f]\)/0x\1/' >> $@
+	@printf '#endif\n' >> $@
 
 # ── AP Trampoline (flat binary linked at 0x8000) ──
 AP_TRAMP_OBJ := $(BUILD_DIR)/kernel/arch/$(ARCH)/ap_trampoline_tmp.o

@@ -2942,8 +2942,14 @@ static void fill_result(struct aml_obj *o, struct aml_result *out) {
     }
 }
 
-int aml_evaluate(const char *path, const u64 *args, int nargs,
-                 struct aml_result *out) {
+/* The whole of an evaluation, with one option: `elem` of -1 flattens the
+ * object itself, and anything else flattens that element of the package it
+ * returned. A package of packages — which is what `_PSS` is, one inner package
+ * per P-state — cannot be read any other way through a flat result, and
+ * handing the caller the interpreter's own object layout instead would mean
+ * handing out a pointer whose lifetime is the interpreter's lock. */
+static int aml_evaluate_at(const char *path, const u64 *args, int nargs,
+                           int elem, struct aml_result *out) {
     if (!out)
         return AML_EARG;
     memset(out, 0, sizeof(*out));
@@ -2989,10 +2995,28 @@ int aml_evaluate(const char *path, const u64 *args, int nargs,
         err = AML_ENOENT;
     }
 
-    if (err == AML_OK)
-        fill_result(res, out);
+    if (err == AML_OK) {
+        if (elem < 0) {
+            fill_result(res, out);
+        } else if (res && res->type == AML_T_PACKAGE &&
+                   (u32)elem < res->u.pkg.n) {
+            fill_result(res->u.pkg.e[elem], out);
+        } else {
+            err = AML_EARG;
+        }
+    }
     aml_unref(res);
     spin_unlock(&g_aml_lock);
     return err;
+}
+
+int aml_evaluate(const char *path, const u64 *args, int nargs,
+                 struct aml_result *out) {
+    return aml_evaluate_at(path, args, nargs, -1, out);
+}
+
+int aml_evaluate_element(const char *path, const u64 *args, int nargs,
+                         u32 index, struct aml_result *out) {
+    return aml_evaluate_at(path, args, nargs, (int)index, out);
 }
 

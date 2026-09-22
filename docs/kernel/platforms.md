@@ -84,9 +84,32 @@ comes from `_STA`, `_BIF` and `_BST`; `AC0/online` from `_PSR`;
 `/sys/class/thermal/thermal_zoneN/{type,temp}` from a zone's `_TMP`. Each file
 re-evaluates its method on every read, because that is the only way a charge
 is ever current, and each is published only for a device the firmware really
-declares. No machine here declares one — a QEMU guest has no ACPI battery —
-so `/sys/class/power_supply` is empty, and the test insists on that rather
-than papering over it.
+declares. A QEMU guest has no ACPI battery, so on a plain boot
+`/sys/class/power_supply` is empty and the test insists on that rather than
+papering over it.
+
+**And a firmware that does declare them.** Code that nothing exercises is code
+nobody knows the state of, so the power-management lane boots a supplementary
+SSDT of its own (`tests/support/acpi/mk-ssdt.py`, loaded with QEMU's
+`-acpitable`): a battery with `_STA`/`_BIF`/`_BST`, an AC adapter with `_PSR`, a
+thermal zone with `_TMP`, and a processor container with `_PSS` and `_PCT`. It is
+AML written by hand — the host has no `iasl` — as a script rather than a
+checked-in blob, so what the firmware says is readable, and the script also
+writes out the same numbers in shell form. Every check compares what the kernel
+publishes against THAT file: the battery's capacity as a percentage of last-full,
+its energy and voltage in the micro- units sysfs uses, the zone's temperature in
+millidegrees Celsius, and the P-states and their control values. The kernel is
+being measured against the firmware's declaration rather than against a range of
+plausible numbers.
+
+**What the power management does with it.** cpufreq's third driver is ACPI's own:
+`_PSS` gives the frequency, the power and the value to write for each state,
+`_PCT` names the register to write it to (FunctionalFixedHW means the
+IA32_PERF_CTL pair; SystemIO means a chipset port), and that is the one mechanism
+that still works on a processor whose MSRs a hypervisor hides. The S3 sleep uses
+`\_S3` for the sleep type and calls `_PTS` before and `_WAK` after. So the
+interpreter is no longer a reader of tables: it is what the machine's power
+management runs on.
 
 **Reading it.** `/proc/b1nix-acpi` lists the tables loaded, the object counts
 by type, the terms the loader could not decode, the address spaces it refused,

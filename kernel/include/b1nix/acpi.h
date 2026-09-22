@@ -155,6 +155,18 @@ const struct acpi_cpu_entry *acpi_cpu(int idx);
  * IA32_APIC_BASE MSR — this is the firmware-declared default. */
 u64 acpi_lapic_address(void);
 
+/* ── the registers a sleep state is entered through (M129) ────────────────
+ *
+ * PM1a_CNT (and PM1b_CNT where the platform splits the block in two) is where
+ * SLP_TYP and SLP_EN are written; the FACS is where the address the firmware
+ * jumps to on wake is written. All three come out of the FADT, and all three
+ * are zero on a machine that has no FADT at all — a sleep is then refused
+ * rather than attempted against port zero. */
+u16 acpi_pm1a_cnt_port(void);
+u16 acpi_pm1b_cnt_port(void);
+u8  acpi_pm1_cnt_len(void);
+u64 acpi_facs_address(void);
+
 /* IOAPIC enumeration (for the future IRQ-routing rewrite; not used yet). */
 int acpi_ioapic_count(void);
 const struct acpi_ioapic_entry *acpi_ioapic(int idx);

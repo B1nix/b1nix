@@ -24,6 +24,7 @@
 #include <b1nix/sound.h>
 #include <b1nix/vfs.h>
 #include <string.h>
+#include <b1nix/suspend.h>
 
 /* ── PCI identity ────────────────────────────────────────────────────────── */
 #define AC97_PCI_VENDOR 0x8086
@@ -324,6 +325,36 @@ static int ac97_dsp_ioctl(struct vfs_node *node, u64 request, void *arg) {
 }
 
 /* ── Device init ─────────────────────────────────────────────────────────── */
+/* Put the codec back after an S3 (M129).
+ *
+ * The PCI header is restored before this runs, so the two I/O windows decode
+ * again; what does not come back is anything inside the device — the codec is
+ * muted and in reset, the rate is unset, and the PCM-out channel has forgotten
+ * where the descriptor list is. The list and the DMA buffer are still where they
+ * were allocated, so this is the same programming the bring-up does and no
+ * allocation at all. */
+static int ac97_resume(void *ctx) {
+	(void)ctx;
+	if (!ac97_nabm_port || !ac97_bdl_phys)
+		return 0;               /* no controller was ever brought up */
+
+	/* Out of reset, 48 kHz, unmuted — QEMU resets them muted, which is how a
+	 * resumed machine comes back silent with every write succeeding. */
+	outl(ac97_nabm_port + AC97_GLOB_CNT, 0);
+	{
+		u16 eac = inw(ac97_nam_port + AC97_NA_EXT_AUDIO_CTRL);
+
+		outw(ac97_nam_port + AC97_NA_EXT_AUDIO_CTRL,
+		     (u16)(eac | AC97_EACS_VRA));
+	}
+	outw(ac97_nam_port + AC97_NA_PCM_FRONT_RATE, 48000);
+	ac97_set_master_vol(100, 100, ac97_muted);
+	ac97_set_pcm_vol(100, 100, ac97_muted);
+	/* And the channel pointed at our descriptor list again. */
+	ac97_channel_arm();
+	return 0;
+}
+
 void ac97_init(void) {
 	struct pci_device_info pci;
 
@@ -374,6 +405,7 @@ void ac97_init(void) {
 	ac97_inited = 1;
 
 	/* Register the sound device interface. */
+	suspend_register_device("ac97", ac97_resume, 0);
 	ac97_sound_dev.name = "ac97";
 	ac97_sound_dev.sample_rate = 48000;
 	ac97_sound_dev.channels = 2;

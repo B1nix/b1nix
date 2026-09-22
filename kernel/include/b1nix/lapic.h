@@ -243,6 +243,11 @@ int lapic_timer_start_periodic_ms(u32 ms);
 int lapic_timer_periodic_active(void);
 /* Re-arm the tick for the next real deadline (b1nix.dynticks). No-op when off. */
 void lapic_timer_rearm(void);
+
+/* Put this CPU's local APIC back after a sleep that reset it: the enable bit,
+ * the per-CPU state, and the periodic timer at the rate already in force. Not
+ * lapic_init() — see the comment there for what that would cost a resume. */
+void lapic_resume(void);
 u32 lapic_read(u32 reg);
 void lapic_write(u32 reg, u32 val);
 u32 lapic_id(void);

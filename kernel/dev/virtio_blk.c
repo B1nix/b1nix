@@ -11,6 +11,7 @@
 #include <b1nix/pci.h>
 #include <b1nix/sched.h>
 #include <b1nix/types.h>
+#include <b1nix/suspend.h>
 #include <b1nix/virtio.h>
 #include <string.h>
 
@@ -688,7 +689,42 @@ static int virtio_find_nth_device(int n, struct pci_device_info *info) {
   return 0;
 }
 
+/* Put every virtio disk back after an S3 (M129).
+ *
+ * The device is at its reset state and this driver's memory is not, so the two
+ * are made to agree again: the same features it negotiated at boot, the same
+ * ring memory re-published, and both sides' idea of the ring back at zero. What
+ * this deliberately does not do is re-probe PCI or allocate a queue — the
+ * instance, its block-layer registration and its ring are all still here, and
+ * building a second set of them is how a resume leaks a device.
+ *
+ * Requests in flight are the caller's problem, and the reason the suspend path
+ * freezes userspace and waits for the queues to go quiet before sleeping: a
+ * request the device was chewing on when the power went is not completed by
+ * anybody, and the ring it lived in is about to be zeroed. */
+static int virtio_blk_resume(void *ctx) {
+  (void)ctx;
+  for (int i = 0; i < instance_count; i++) {
+    struct virtio_blk_instance *inst = &instances[i];
+
+    if (!inst->dev.port_base)
+      continue;
+    virtio_resume_begin(&inst->dev, inst->features);
+    virtq_resume(&inst->dev, &inst->vq);
+    inst->vq.avail->flags = 0;
+    irq_unmask(inst->dev.irq);
+    virtio_resume_finish(&inst->dev);
+  }
+  return 0;
+}
+
 void virtio_blk_init(void) {
+  static int resume_registered;
+
+  if (!resume_registered) {
+    suspend_register_device("virtio-blk", virtio_blk_resume, 0);
+    resume_registered = 1;
+  }
   instance_count = 0;
   int dev_idx = 0;
 

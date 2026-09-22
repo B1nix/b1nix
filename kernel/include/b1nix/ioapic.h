@@ -36,6 +36,12 @@ int  ioapic_active(void);
  * After the call the IRQ is unmasked. */
 void ioapic_route_irq(u8 legacy_irq, u8 vector, u8 dest_apic, int level_low);
 
+/* Re-program every route this kernel has installed. An S3 sleep leaves the
+ * chip at its reset state with every entry masked, and the devices that asked
+ * for those routes are in no position to ask again; the count returned is how
+ * many were replayed. */
+int  ioapic_resume(void);
+
 /* Mask/unmask an already-routed IRQ. */
 void ioapic_mask_irq(u8 legacy_irq);
 void ioapic_unmask_irq(u8 legacy_irq);

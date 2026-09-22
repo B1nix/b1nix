@@ -87,6 +87,62 @@ void rtc_init(void) {
 }
 
 
+/* The hardware clock, read out of CMOS, as unix seconds — not the wall clock.
+ *
+ * Everything else in this kernel asks the wall clock what time it is, and the
+ * wall clock is built on the monotonic one, which stops when the processor does.
+ * The CMOS clock is the only one that runs through an S3, so it is the only one
+ * that can say how long a machine was asleep. 0 when the read is not a date. */
+u64 rtc_hw_unix_seconds(void) {
+  u8 second, minute, hour, day, month, century, registerB;
+  u16 year;
+
+  for (int i = 0; i < 1000000 && is_updating(); i++)
+    ;
+  second = read_cmos(0x00);
+  minute = read_cmos(0x02);
+  hour = read_cmos(0x04);
+  day = read_cmos(0x07);
+  month = read_cmos(0x08);
+  year = read_cmos(0x09);
+  century = read_cmos(0x32);
+  registerB = read_cmos(0x0B);
+  if (!(registerB & 0x04)) {
+    second = (u8)((second & 0x0F) + ((second / 16) * 10));
+    minute = (u8)((minute & 0x0F) + ((minute / 16) * 10));
+    hour = (u8)(((hour & 0x0F) + (((hour & 0x70) / 16) * 10)) | (hour & 0x80));
+    day = (u8)((day & 0x0F) + ((day / 16) * 10));
+    month = (u8)((month & 0x0F) + ((month / 16) * 10));
+    year = (u16)((year & 0x0F) + ((year / 16) * 10));
+    century = (u8)((century & 0x0F) + ((century / 16) * 10));
+  }
+  if (!(registerB & 0x02) && (hour & 0x80))
+    hour = (u8)(((hour & 0x7F) + 12) % 24);
+  hour &= 0x7F;
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 ||
+      minute > 59 || second > 60)
+    return 0;
+  if (century >= 19 && century <= 21)
+    year = (u16)(century * 100 + year);
+  else
+    year = (u16)(year < 70 ? year + 2000 : year + 1900);
+  return rtc_civil_to_unix(year, month, day, hour, minute, second);
+}
+
+/* Put the wall clock back where the hardware clock says it is.
+ *
+ * An S3 sleep stops the monotonic clock's source and the wall clock with it, so
+ * a machine that slept for three seconds comes back believing no time passed.
+ * The RTC kept counting through the sleep — it is the one clock that does — so
+ * it is what the wall clock is corrected from. Called from the resume path,
+ * before anything reads the time. */
+void rtc_resync_wallclock(void) {
+  u64 secs = rtc_hw_unix_seconds();
+
+  if (secs)
+    wallclock_set_ns(secs * 1000000000ull);
+}
+
 /* The wall clock, in nanoseconds since the epoch.
  *
  * ONE value, from which both the seconds and the sub-second part are taken.

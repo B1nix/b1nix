@@ -16,6 +16,12 @@
  * nanosecond resolution. It never goes backwards across the handover. */
 u64 ktime_monotonic_ns(void);
 
+/* Continue the monotonic clock across a sleep that stopped its source: what the
+ * COUNTER read on the way down, plus however long the machine was away (the
+ * hardware clock is what knows). Called from the resume path before anything
+ * reads the clock. See kernel/lib/ktime.c. */
+void ktime_resume(u64 counter_ns_before, u64 slept_ns);
+
 /* Hand the clock over to the calibrated TSC. Called once, after lapic_init(). */
 void ktime_switch_to_tsc(void);
 

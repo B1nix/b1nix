@@ -40,6 +40,7 @@ static inline void smmuv3_fault_last(u64 *addr, u32 *sid, u8 *type)
 #include <lkpi/dma-mapping.h>
 #include <b1nix/sched.h>
 #include <string.h>
+#include <b1nix/suspend.h>
 
 /* Ceiling on the queue depth this driver will ask a controller for. Linux uses
  * 1024 entries per NVMe queue by default and clamps that to CAP.MQES; the depth
@@ -716,8 +717,66 @@ static int nvme_blk_discard(struct block_device *dev, u64 lba, u32 count)
     return ret == 0 ? 0 : -1;
 }
 
+/* Put the controller back after an S3 (M129).
+ *
+ * NVMe comes back the way it comes out of reset: disabled, with no admin queue
+ * and no I/O queues, while this driver still holds the queue memory, the
+ * identify buffers and the namespace geometry it learned at boot. So the
+ * controller is enabled again over the SAME queues — the addresses are written
+ * back into AQA/ASQ/ACQ, the rings are emptied so both sides agree that nothing
+ * is outstanding, and the I/O pair is created again with the admin commands the
+ * boot path used. Nothing is allocated and nothing is re-probed: an allocation
+ * here would leak a set of queues per sleep, and a re-probe would register a
+ * second disk for one controller.
+ */
+static int nvme_resume(void *ctx) {
+    volatile struct nvme_registers *regs = nvme.regs;
+    u32 cc;
+
+    (void)ctx;
+    if (!regs || !nvme.phys_admin_sq)
+        return 0;           /* no controller was ever found */
+
+    cc = regs->cc;
+    if (cc & NVME_CC_EN) {
+        regs->cc = cc & ~NVME_CC_EN;
+        if (nvme_wait_ready(regs, 0) < 0)
+            return -1;
+    }
+
+    /* Empty rings, and both sides' cursors back where a fresh controller
+     * expects them. A completion entry left over from before the sleep would be
+     * read as an answer to a command this driver is about to submit. */
+    memset(nvme.admin_sq, 0, nvme.queue_size * sizeof(struct nvme_sqe));
+    memset(nvme.admin_cq, 0, nvme.queue_size * sizeof(struct nvme_cqe));
+    memset(nvme.io_sq, 0, nvme.queue_size * sizeof(struct nvme_sqe));
+    memset(nvme.io_cq, 0, nvme.queue_size * sizeof(struct nvme_cqe));
+    nvme.admin_sq_tail = 0;
+    nvme.admin_cq_head = 0;
+    nvme.io_sq_tail = 0;
+    nvme.io_cq_head = 0;
+
+    regs->aqa = (nvme.queue_size - 1u) | ((nvme.queue_size - 1u) << 16);
+    regs->asq = nvme.phys_admin_sq;
+    regs->acq = nvme.phys_admin_cq;
+    regs->cc = NVME_CC_EN | NVME_CC_CSS_NVM | (0 << NVME_CC_MPS_SHIFT) |
+               (NVME_CC_IOSQES << 16) | (NVME_CC_IOCQES << 20);
+    if (nvme_wait_ready(regs, 1) < 0)
+        return -1;
+    if (nvme_create_io_cq(&nvme) < 0 || nvme_create_io_sq(&nvme) < 0)
+        return -1;
+    return 0;
+}
+
 void nvme_init(void)
 {
+    static int resume_registered;
+
+    if (!resume_registered) {
+        suspend_register_device("nvme", nvme_resume, 0);
+        resume_registered = 1;
+    }
+
     struct pci_device_info pci_info;
     int found = 0;
     

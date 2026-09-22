@@ -17,6 +17,7 @@
 #include <b1nix/virtio.h>
 #include <b1nix/virtio_gpu.h>
 #include <string.h>
+#include <b1nix/suspend.h>
 
 #define VIRTIO_VENDOR_ID 0x1AF4
 #define VIRTIO_GPU_DEVICE_ID_LEGACY 0x1010
@@ -519,6 +520,52 @@ static int virtio_gpu_setup_modern_queue(struct virtqueue *vq, u16 queue_idx)
     u16 notify_off = gpu_common_cfg->queue_notify_off;
     if (!gpu_notify_base) return -1;
     gpu_notify_addr[queue_idx] = (volatile u16 *)(gpu_notify_base + (u32)notify_off * gpu_notify_off_multiplier);
+    return 0;
+}
+
+/* Re-publish an already-allocated modern queue: the same ring memory, the same
+ * size, told to a device that has forgotten all of it. For a resume from S3, and
+ * deliberately separate from virtio_gpu_setup_modern_queue, which allocates —
+ * allocating a second ring per sleep is a leak the machine never gets back. */
+static int virtio_gpu_republish_modern_queue(struct virtqueue *vq, u16 queue_idx)
+{
+    usize desc_size;
+    u64 desc_phys, avail_phys, used_phys;
+
+    if (!gpu_common_cfg || !vq->desc || !vq->queue_size)
+        return -1;
+    desc_size = 16u * vq->queue_size;
+    desc_phys = (u64)(usize)vq->desc - vmm_direct_map_base();
+    avail_phys = desc_phys + desc_size;
+    used_phys = (u64)(usize)vq->used - vmm_direct_map_base();
+
+    /* Both sides back at zero: a device at reset has consumed nothing, and a
+     * ring left where it stood would be replayed from the beginning. */
+    memset(vq->desc, 0, desc_size);
+    vq->avail->idx = 0;
+    vq->avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
+    vq->used->idx = 0;
+    vq->last_used_idx = 0;
+
+    gpu_common_cfg->queue_select = queue_idx;
+    if (gpu_common_cfg->queue_size == 0)
+        return -1;
+    gpu_common_cfg->queue_desc_lo = (u32)(desc_phys & 0xffffffffU);
+    gpu_common_cfg->queue_desc_hi = (u32)(desc_phys >> 32);
+    gpu_common_cfg->queue_avail_lo = (u32)(avail_phys & 0xffffffffU);
+    gpu_common_cfg->queue_avail_hi = (u32)(avail_phys >> 32);
+    gpu_common_cfg->queue_used_lo = (u32)(used_phys & 0xffffffffU);
+    gpu_common_cfg->queue_used_hi = (u32)(used_phys >> 32);
+    gpu_common_cfg->queue_enable = 1;
+    {
+        u16 notify_off = gpu_common_cfg->queue_notify_off;
+
+        if (!gpu_notify_base)
+            return -1;
+        gpu_notify_addr[queue_idx] =
+            (volatile u16 *)(gpu_notify_base +
+                             (u32)notify_off * gpu_notify_off_multiplier);
+    }
     return 0;
 }
 
@@ -1873,6 +1920,63 @@ void virtio_gpu_dev_init(void)
     console_write("virtio-gpu: /dev/virtio-gpu (userspace VirGL) ready\n");
 }
 
+/* Put the display back after an S3 (M129).
+ *
+ * Two halves, and the second is the one that is easy to forget. The transport
+ * has to be re-stated — the device is at reset, with no negotiated features, no
+ * queue addresses and nothing consumed — and then the HOST-SIDE resource has to
+ * be created again: a virtio-gpu's scanout is an object the device owns, it went
+ * with the power, and the driver's own memory says nothing about that. Without
+ * the second half every later command names a resource the device has never
+ * heard of, which is what made a resumed machine answer a modesetting ioctl and
+ * then fail the scanout — a display that is there and never updates.
+ *
+ * The backing pages are the same ones (gpu_surface_phys), so the frame that was
+ * on screen before the sleep is the frame that comes back.
+ */
+static int virtio_gpu_resume(void *ctx)
+{
+    (void)ctx;
+    if (!gpu_ready)
+        return 0;
+
+    if (gpu_modern) {
+        if (!gpu_common_cfg)
+            return -1;
+        gpu_common_cfg->device_status = 0;
+        gpu_common_cfg->device_status = VIRTIO_STATUS_ACKNOWLEDGE;
+        gpu_common_cfg->device_status |= VIRTIO_STATUS_DRIVER;
+        gpu_common_cfg->driver_feature_select = 0;
+        gpu_common_cfg->driver_feature = gpu_virgl_ok ? (1u << VIRTIO_GPU_F_VIRGL) : 0;
+        gpu_common_cfg->driver_feature_select = 1;
+        gpu_common_cfg->driver_feature = 0;
+        gpu_common_cfg->device_status |= VIRTIO_STATUS_FEATURES_OK;
+        if (!(gpu_common_cfg->device_status & VIRTIO_STATUS_FEATURES_OK))
+            return -1;
+        if (virtio_gpu_republish_modern_queue(&controlq, 0) != 0 ||
+            virtio_gpu_republish_modern_queue(&cursorq, 1) != 0)
+            return -1;
+        gpu_common_cfg->device_status |= VIRTIO_STATUS_DRIVER_OK;
+    } else {
+        virtio_resume_begin(&gpu_dev, 0);
+        virtq_resume(&gpu_dev, &controlq);
+        virtq_resume(&gpu_dev, &cursorq);
+        controlq.avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
+        cursorq.avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
+        virtio_resume_finish(&gpu_dev);
+    }
+
+    /* The scanout the host had is gone with the host's copy of this device.
+     * Created again over the same backing pages, at the same geometry. */
+    if (gpu_width && gpu_height && gpu_surface_phys) {
+        if (virtio_gpu_create_scanout_resource(gpu_width, gpu_height) < 0) {
+            console_write("virtio-gpu: the scanout did not come back\n");
+            return -1;
+        }
+    }
+    return 0;
+}
+
 void virtio_gpu_init(void)
 {
     struct pci_device_info pci;
@@ -2010,6 +2114,7 @@ void virtio_gpu_init(void)
     gpu_cursor_resp_dma = dma + (VGPU_CTRL_REQ_PAGES + 2) * PAGE_SIZE;
 
     gpu_ready = 1;
+    suspend_register_device("virtio-gpu", virtio_gpu_resume, 0);
     controlq_next_pair = 0;
     cursorq_next_pair = 0;
     if (gpu_modern) {

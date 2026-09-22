@@ -51,6 +51,24 @@ void ktime_switch_to_tsc(void)
 	vdso_write_end(flags);
 }
 
+/* Continue the monotonic clock across a sleep that reset its source (M129).
+ *
+ * `counter_ns_before` is what the counter read on the way down and `slept_ns`
+ * how long the machine was away, measured by the one clock that kept running —
+ * the hardware clock. The counter is re-anchored to the sum, which is all it
+ * takes: this kernel's clock is the counter plus a fixed base, and the clock
+ * userspace reads through the vDSO IS the counter, so moving the counter's
+ * anchor carries both. Nothing here adjusts the base, because a base adjustment
+ * would fix the kernel's clock and leave every program's reading an interval
+ * that ended before it began.
+ */
+void ktime_resume(u64 counter_ns_before, u64 slept_ns)
+{
+	if (!__atomic_load_n(&ktime_tsc_active, __ATOMIC_ACQUIRE))
+		return;
+	arch_tsc_reanchor(counter_ns_before + slept_ns);
+}
+
 u64 ktime_monotonic_ns(void)
 {
 	if (!__atomic_load_n(&ktime_tsc_active, __ATOMIC_ACQUIRE))

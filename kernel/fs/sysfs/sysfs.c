@@ -983,13 +983,87 @@ static int g_cpu_cur_freq(char *b, usize c) {
 }
 
 static int g_cpu_max_freq(char *b, usize c) {
-  u32 khz = arch_cpu_max_khz();
+  /* A scaling driver knows the ceiling it will actually honour; CPUID's
+   * nominal maximum is the fallback for a machine with no driver at all. */
+  u32 khz = cpufreq_max_khz();
+
+  if (!khz)
+    khz = arch_cpu_max_khz();
   return snprintf(b, c, "%lu\n",
                   (unsigned long)(khz ? khz : arch_cpu_khz()));
 }
 
 static int g_cpu_min_freq(char *b, usize c) {
-  return snprintf(b, c, "%lu\n", (unsigned long)arch_cpu_khz());
+  u32 khz = cpufreq_min_khz();
+
+  return snprintf(b, c, "%lu\n",
+                  (unsigned long)(khz ? khz : arch_cpu_khz()));
+}
+
+/* The frequencies the platform declared, in the order it declared them. Only
+ * the ACPI driver has a list — HWP and the bus-ratio request describe a window,
+ * and a made-up list is worse than an absent file, so the file is not created
+ * for them (which is also what Linux does). */
+static int g_cpu_avail_freqs(char *b, usize c) {
+  int n = cpufreq_state_count();
+  int len = 0;
+
+  for (int i = 0; i < n; i++) {
+    u32 khz = cpufreq_state_khz(i);
+
+    if (!khz)
+      continue;
+    len += snprintf(b + len, c > (usize)len ? c - (usize)len : 0, "%s%lu",
+                    len ? " " : "", (unsigned long)khz);
+  }
+  len += snprintf(b + len, c > (usize)len ? c - (usize)len : 0, "\n");
+  return len;
+}
+
+/* scaling_setspeed: the frequency asked for, and a write asks the platform for
+ * the declared state nearest what was written. */
+static int g_cpu_setspeed(char *b, usize c) {
+  int sel = cpufreq_selected_state();
+
+  if (sel < 0)
+    return snprintf(b, c, "<unsupported>\n");
+  return snprintf(b, c, "%lu\n", (unsigned long)cpufreq_state_khz(sel));
+}
+
+static isize sysfs_setspeed_write(struct vfs_node *node, u64 offset,
+                                  const char *buffer, usize size, int flags) {
+  char text[24];
+  usize n = size < sizeof(text) - 1 ? size : sizeof(text) - 1;
+  unsigned long want = 0;
+  int best = -1;
+  u32 best_delta = 0;
+
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (!buffer || !size || cpufreq_state_count() == 0)
+    return -EINVAL;
+  memcpy(text, buffer, n);
+  text[n] = 0;
+  for (usize i = 0; text[i] && text[i] != '\n'; i++) {
+    if (text[i] < '0' || text[i] > '9')
+      return -EINVAL;
+    want = want * 10 + (unsigned long)(text[i] - '0');
+  }
+  if (!want)
+    return -EINVAL;
+  for (int i = 0; i < cpufreq_state_count(); i++) {
+    u32 khz = cpufreq_state_khz(i);
+    u32 delta = khz > (u32)want ? khz - (u32)want : (u32)want - khz;
+
+    if (best < 0 || delta < best_delta) {
+      best = i;
+      best_delta = delta;
+    }
+  }
+  if (best < 0 || cpufreq_request_state(best) != 0)
+    return -EIO;
+  return (isize)size;
 }
 
 static int g_cpu_governor(char *b, usize c) {
@@ -1440,20 +1514,22 @@ static isize sysfs_khugepaged_sleep_write(struct vfs_node *node, u64 offset,
   PS_BAT_RENDER(i, ACPI_BAT_STATUS, g_bat##i##_status)                       \
   PS_BAT_RENDER(i, ACPI_BAT_CAPACITY, g_bat##i##_capacity)                   \
   PS_BAT_RENDER(i, ACPI_BAT_NOW, g_bat##i##_now)                             \
-  PS_BAT_RENDER(i, ACPI_BAT_FULL, g_bat##i##_full)
+  PS_BAT_RENDER(i, ACPI_BAT_FULL, g_bat##i##_full)                           \
+  PS_BAT_RENDER(i, ACPI_BAT_VOLTAGE, g_bat##i##_voltage)                     \
+  PS_BAT_RENDER(i, ACPI_BAT_RATE, g_bat##i##_rate)
 
 PS_BAT_SET(0)
 PS_BAT_SET(1)
 
 struct ps_bat_ops {
-  sysfs_render type, present, status, capacity, now, full;
+  sysfs_render type, present, status, capacity, now, full, voltage, rate;
 };
 
 static const struct ps_bat_ops g_ps_bat[ACPI_PS_MAX_BATTERY] = {
     { g_bat0_type, g_bat0_present, g_bat0_status, g_bat0_capacity, g_bat0_now,
-      g_bat0_full },
+      g_bat0_full, g_bat0_voltage, g_bat0_rate },
     { g_bat1_type, g_bat1_present, g_bat1_status, g_bat1_capacity, g_bat1_now,
-      g_bat1_full },
+      g_bat1_full, g_bat1_voltage, g_bat1_rate },
 };
 
 static int g_ac0_online(char *b, usize c) { return acpi_power_ac_attr(0, b, c); }
@@ -1520,10 +1596,13 @@ static void sysfs_build_acpi_power(struct vfs_node *root) {
         if (acpi_power_battery_in_energy_units(i)) {
           sysfs_mkchild(d, "energy_now", VFS_DEVICE, g_ps_bat[i].now);
           sysfs_mkchild(d, "energy_full", VFS_DEVICE, g_ps_bat[i].full);
+          sysfs_mkchild(d, "power_now", VFS_DEVICE, g_ps_bat[i].rate);
         } else {
           sysfs_mkchild(d, "charge_now", VFS_DEVICE, g_ps_bat[i].now);
           sysfs_mkchild(d, "charge_full", VFS_DEVICE, g_ps_bat[i].full);
+          sysfs_mkchild(d, "current_now", VFS_DEVICE, g_ps_bat[i].rate);
         }
+        sysfs_mkchild(d, "voltage_now", VFS_DEVICE, g_ps_bat[i].voltage);
       }
       if (nac > 0) {
         struct vfs_node *d = sysfs_mkchild(psd, "AC0", VFS_DIRECTORY, 0);
@@ -1741,6 +1820,18 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
       sysfs_mkchild(cf, "scaling_driver", VFS_DEVICE, g_cpu_driver);
       sysfs_mkchild(cf, "scaling_available_governors", VFS_DEVICE,
                     g_cpu_governors);
+      /* Only where the platform really declared a list of them (M129). */
+      if (cpufreq_state_count() > 0) {
+        struct vfs_node *sp;
+
+        sysfs_mkchild(cf, "scaling_available_frequencies", VFS_DEVICE,
+                      g_cpu_avail_freqs);
+        sp = sysfs_mkchild(cf, "scaling_setspeed", VFS_DEVICE, g_cpu_setspeed);
+        if (sp && sp->inode) {
+          sp->inode->mode = 0644;
+          sp->inode->write_cb = sysfs_setspeed_write;
+        }
+      }
     }
   }
 

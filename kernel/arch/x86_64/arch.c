@@ -537,6 +537,44 @@ int arch_tsc_clock_ready(void) { return g_tsc_usable; }
 
 /* Nanoseconds since arch_tsc_clock_init(), or 0 when the counter is not fit to
  * be a clock (the caller then falls back to the tick). */
+/* Put the TSC clock back together after a sleep that reset the counter.
+ *
+ * S3 removes power from the processor, and the time-stamp counter comes back at
+ * zero. Everything computed from it then reads as a subtraction that underflowed
+ * — a monotonic clock 160 years in the future, which is what the scheduler's
+ * stall watchdog saw and shot the machine for. Re-anchoring is all it takes: the
+ * counter is measured again from here, and the caller (ktime_resume) supplies
+ * the monotonic value the clock must continue from. */
+/* Make the counter read `counter_ns` again, whatever it happens to hold now.
+ *
+ * For a resume from a sleep that reset it. The base is moved rather than the
+ * consumers adjusted, and that is deliberate: userspace reads CLOCK_MONOTONIC
+ * straight out of the counter through the vDSO — (counter - base) scaled, with
+ * no kernel offset in it — so a base set to "now" would hand every program a
+ * clock that had just restarted at zero. Programs measure intervals with it;
+ * one that spans the sleep must come out positive.
+ *
+ * The subtraction is deliberately allowed to wrap: base is unsigned and the
+ * value wanted is "the counter value this anchor implies", which for a counter
+ * that restarted from zero is a number below zero. Unsigned arithmetic gets the
+ * difference right anyway, which is the whole trick. */
+void arch_tsc_reanchor(u64 counter_ns) {
+  u64 khz = g_cpu_khz;
+  u64 cycles;
+
+  if (!g_tsc_usable || !khz)
+    return;
+  cycles = (counter_ns / 1000000ull) * khz +
+           ((counter_ns % 1000000ull) * khz) / 1000000ull;
+  g_tsc_base = arch_rdtsc_ordered() - cycles;
+  __atomic_store_n(&g_tsc_last_ns, counter_ns, __ATOMIC_RELAXED);
+  /* And the same anchor in the page userspace reads, or every program computes
+   * its own time from a counter origin that no longer exists — which reads as a
+   * clock that went backwards by a century, and is what made a test measure a
+   * three-second sleep as minus five hundred years. */
+  tsc_vdso_publish();
+}
+
 u64 arch_tsc_monotonic_ns(void) {
   if (!g_tsc_usable)
     return 0;

@@ -356,12 +356,33 @@ int main(void) {
           "the firmware declares no battery but /sys shows one", batteries);
   } else {
     char buf[64];
+    long cap = -1, full = -1, now = -1, volt = -1;
+    char status[32] = "";
     int good = read_file("/sys/class/power_supply/BAT0/capacity", buf,
                          sizeof(buf)) > 0;
-    long cap = good ? strtol(buf, 0, 10) : -1;
-    good = good && cap >= 0 && cap <= 100 &&
-           read_file("/sys/class/power_supply/BAT0/status", buf,
-                     sizeof(buf)) > 0;
+
+    if (good)
+      cap = strtol(buf, 0, 10);
+    if (read_file("/sys/class/power_supply/BAT0/energy_full", buf,
+                  sizeof(buf)) > 0)
+      full = strtol(buf, 0, 10);
+    if (read_file("/sys/class/power_supply/BAT0/energy_now", buf,
+                  sizeof(buf)) > 0)
+      now = strtol(buf, 0, 10);
+    if (read_file("/sys/class/power_supply/BAT0/voltage_now", buf,
+                  sizeof(buf)) > 0)
+      volt = strtol(buf, 0, 10);
+    if (read_file("/sys/class/power_supply/BAT0/status", status,
+                  sizeof(status)) > 0)
+      status[strcspn(status, "\n")] = 0;
+    /* Printed as well as judged: these are the firmware's own numbers, and the
+     * lane compares them against what the table declares. A check that only
+     * asked "is it a plausible percentage" would pass on an invented battery. */
+    printf("M134-AML: battery cap %ld full %ld now %ld volt %ld status %s\n",
+           cap, full, now, volt, status[0] ? status : "?");
+    fflush(stdout);
+    good = good && cap >= 0 && cap <= 100 && full > 0 && now >= 0 &&
+           now <= full && volt > 0 && status[0];
     judge("battery-sysfs", good, "the battery files do not read back", cap);
   }
 

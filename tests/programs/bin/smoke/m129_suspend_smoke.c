@@ -35,9 +35,15 @@
  *   M129-SUSPEND: ok child-runs-again
  *   M129-SUSPEND: ok rtc-irq-counted
  *   M129-SUSPEND: ok machine-alive
+ *   M129-SUSPEND: ok s3-slept        (only where the firmware declares \_S3)
+ *   M129-SUSPEND: ok s3-alive
+ *   M129-SUSPEND: ok s3-devices
  *   M129-SUSPEND: done
  */
+#include <b1nix/drm.h>
 #include <errno.h>
+#include <math.h>
+#include <stdint.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -446,6 +452,238 @@ int main(void) {
 
   /* 11. The machine still works. */
   judge("machine-alive", machine_alive(), "post-resume", 0);
+
+  /* 12. ACPI S3, where the machine has it.
+   *
+   * This is a different thing from the freeze above, and the difference is the
+   * point: the processor's state is GONE — the firmware powers it down and the
+   * kernel comes back through a real-mode trampoline — so a suspend that
+   * resumed and a machine that merely idled cannot be confused. What proves it
+   * is the kernel's own S3 counter, which an s2idle suspend never moves, and
+   * the machine still working afterwards. */
+  {
+    char states[64] = "";
+    char proc[512] = "";
+
+    read_file("/sys/power/state", states, sizeof(states));
+    if (!strstr(states, "mem")) {
+      read_file("/proc/b1nix-suspend", proc, sizeof(proc));
+      {
+        char *why = strstr(proc, "s3_absent ");
+
+        printf("M129-SUSPEND: no-s3 %.*s\n",
+               why ? (int)strcspn(why + 10, "\n") : 7,
+               why ? why + 10 : "unknown");
+      }
+      fflush(stdout);
+    } else {
+      long count_before_s3 = -1, count_after_s3 = -1, last_ms = -1;
+      unsigned long long s3_elapsed;
+      char *p;
+
+      read_file("/proc/b1nix-suspend", proc, sizeof(proc));
+      p = strstr(proc, "s3_count ");
+      if (p)
+        count_before_s3 = strtol(p + 9, 0, 10);
+
+      /* Arm the alarm again: the sleep that just happened consumed it. */
+      if (ioctl(rtc, RTC_RD_TIME, &t) == 0) {
+        memset(&alarm, 0, sizeof(alarm));
+        alarm.enabled = 1;
+        alarm.time = t;
+        alarm.time.tm_sec += ALARM_AHEAD;
+        if (alarm.time.tm_sec >= 60) {
+          alarm.time.tm_sec -= 60;
+          alarm.time.tm_min++;
+        }
+        if (alarm.time.tm_min >= 60) {
+          alarm.time.tm_min -= 60;
+          alarm.time.tm_hour++;
+        }
+        if (alarm.time.tm_hour >= 24)
+          alarm.time.tm_hour -= 24;
+        rc = ioctl(rtc, RTC_WKALM_SET, &alarm);
+      } else {
+        rc = -1;
+      }
+      if (rc != 0) {
+        bad("s3-slept", "the alarm could not be armed for the S3 test", errno);
+      } else {
+        t0 = now_ns();
+        rc = write_state("mem");
+        t1 = now_ns();
+        s3_elapsed = (t1 - t0) / 1000000ull;
+        read_file("/proc/b1nix-suspend", proc, sizeof(proc));
+        p = strstr(proc, "s3_count ");
+        if (p)
+          count_after_s3 = strtol(p + 9, 0, 10);
+        p = strstr(proc, "s3_last_ms ");
+        if (p)
+          last_ms = strtol(p + 11, 0, 10);
+        printf("M129-SUSPEND: s3 write rc %d, %llu ms elapsed, kernel says "
+               "%ld ms, count %ld -> %ld\n",
+               rc, s3_elapsed, last_ms, count_before_s3, count_after_s3);
+        fflush(stdout);
+        /* The counter is the witness: it moves only on the path that wrote
+         * SLP_TYP into PM1_CNT and came back through the wake-up trampoline. */
+        judge("s3-slept",
+              rc == 0 && count_after_s3 == count_before_s3 + 1 &&
+                  s3_elapsed >= (unsigned long long)(ALARM_AHEAD - 1) * 1000ull &&
+                  s3_elapsed < 20000ull,
+              "ms", (long)s3_elapsed);
+        /* And the machine is a machine again: the processor was rebuilt from
+         * what the kernel saved, so a file round trip, a fork and a syscall all
+         * have to work. */
+        judge("s3-alive", machine_alive(), "post-S3", 0);
+
+        /* And the DEVICES, which is the half of a suspend that is easy to
+         * get wrong quietly: the machine can be perfectly alive with a disk
+         * that answers nothing, a display that never updates again and an
+         * input device that reports no keys. Each of these is opened and
+         * exercised as far as a test without a human at the keyboard can:
+         * a non-blocking read of an evdev node must say "nothing yet"
+         * (EAGAIN) rather than "no such device", the DRM node must still
+         * answer an ioctl, and the audio device must still take a buffer. */
+        {
+          int good = 1;
+          int step = 0;
+          int fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+          char ev[32];
+
+          if (fd < 0) {
+            good = 0;
+            step = 1;
+          } else {
+            ssize_t n = read(fd, ev, sizeof(ev));
+
+            if (n < 0 && errno != EAGAIN) {
+              good = 0;
+              step = 2;
+            }
+            close(fd);
+          }
+          if (good) {
+            fd = open("/dev/dri/card0", O_RDWR);
+            if (fd < 0) {
+              good = 0;
+              step = 3;
+            } else {
+              /* Not just a query: a frame, all the way to the device.
+               *
+               * GETRESOURCES and GETCONNECTOR are answered out of the driver's
+               * own memory and would pass on a card whose queues never came
+               * back. CREATE_DUMB, ADDFB and SETCRTC are not: the last of them
+               * sends the scanout command to the device, so this fails on a
+               * virtio-gpu whose virtqueues were left where the reset put them.
+               */
+              uint32_t crtc = 0, connector = 0;
+              struct drm_mode_card_res res;
+
+              memset(&res, 0, sizeof(res));
+              res.crtc_id_ptr = (uint64_t)(uintptr_t)&crtc;
+              res.connector_id_ptr = (uint64_t)(uintptr_t)&connector;
+              res.count_crtcs = 1;
+              res.count_connectors = 1;
+              if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) != 0 || !crtc ||
+                  !connector) {
+                good = 0;
+                step = 4;
+              } else {
+                struct drm_mode_modeinfo mode;
+                struct drm_mode_get_connector conn;
+
+                memset(&mode, 0, sizeof(mode));
+                memset(&conn, 0, sizeof(conn));
+                conn.connector_id = connector;
+                conn.modes_ptr = (uint64_t)(uintptr_t)&mode;
+                conn.count_modes = 1;
+                if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) != 0 ||
+                    !mode.hdisplay) {
+                  good = 0;
+                  step = 5;
+                } else {
+                  struct drm_mode_create_dumb d;
+                  struct drm_mode_fb_cmd fbc;
+                  struct drm_mode_crtc set;
+
+                  memset(&d, 0, sizeof(d));
+                  d.width = mode.hdisplay;
+                  d.height = mode.vdisplay;
+                  d.bpp = 32;
+                  memset(&fbc, 0, sizeof(fbc));
+                  memset(&set, 0, sizeof(set));
+                  if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &d) != 0) {
+                    good = 0;
+                    step = 6;
+                  } else {
+                    fbc.width = d.width;
+                    fbc.height = d.height;
+                    fbc.pitch = d.pitch;
+                    fbc.bpp = 32;
+                    fbc.depth = 24;
+                    fbc.handle = d.handle;
+                    if (ioctl(fd, DRM_IOCTL_MODE_ADDFB, &fbc) != 0) {
+                      good = 0;
+                      step = 7;
+                    } else {
+                      set.crtc_id = crtc;
+                      set.fb_id = fbc.fb_id;
+                      set.set_connectors_ptr = (uint64_t)(uintptr_t)&connector;
+                      set.count_connectors = 1;
+                      set.mode = mode;
+                      set.mode_valid = 1;
+                      if (ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &set) != 0) {
+                        good = 0;
+                        step = 8;
+                      }
+                    }
+                  }
+                }
+              }
+              close(fd);
+            }
+          }
+          if (good) {
+            /* A tone, not silence, and at 880 Hz — a frequency nothing else in
+             * this lane plays (the audio test's own tone is 440). The lane's
+             * capture file is checked for it afterwards, so this proves the
+             * samples reached the emulated card AFTER the sleep rather than
+             * that a write returned a byte count. */
+            static short tone[48000];   /* half a second, stereo, 48 kHz */
+            const int frames = 12000;
+
+            for (int i = 0; i < frames; i++) {
+              double t = (double)i / 48000.0;
+              short v = (short)(12000.0 * sin(2.0 * 3.14159265358979 * 880.0 * t));
+
+              tone[i * 2] = v;
+              tone[i * 2 + 1] = v;
+            }
+            fd = open("/dev/dsp1", O_WRONLY);
+            if (fd < 0) {
+              /* A machine with no audio device is not a failure here. */
+              printf("M129-SUSPEND: no audio device after the resume\n");
+              fflush(stdout);
+            } else {
+              ssize_t wr = write(fd, (const char *)tone,
+                                 (size_t)frames * 2 * sizeof(short));
+
+              printf("M129-SUSPEND: audio 880Hz wrote %ld bytes\n", (long)wr);
+              fflush(stdout);
+              if (wr <= 0) {
+                good = 0;
+                step = 9;
+              }
+              /* Let the DMA run before the machine goes on to other things. */
+              usleep(600000);
+              close(fd);
+            }
+          }
+          judge("s3-devices", good, "step", (long)step);
+        }
+      }
+    }
+  }
 
   ioctl(rtc, RTC_AIE_OFF, 0);
   close(rtc);

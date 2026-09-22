@@ -301,15 +301,155 @@ and the cap, so a check knows what to expect instead of reading the command
 line and guessing.
 ## Suspend, and the freezer under it (M129)
 
-`/sys/power/state` lists one state and accepts one: `freeze`, which Linux
-calls suspend-to-idle. Userspace is stopped, every CPU parks in the deepest
-idle state `cpuidle_enter` found for it, and the machine comes back when a
-wake source raises an interrupt. Nothing is powered off and no firmware is
+`/sys/power/state` lists what the machine really has. `freeze` — Linux's
+suspend-to-idle — everywhere: userspace is stopped, every CPU parks in the
+deepest idle state `cpuidle_enter` found for it, and the machine comes back when
+a wake source raises an interrupt. Nothing is powered off and no firmware is
 called, which is why it works on hardware whose ACPI sleep path this kernel
-cannot drive. `mem` (ACPI S3) is absent rather than present and broken: it
-needs SLP_TYP from the DSDT written into the FADT's PM1 control ports and a
-resume through a real-mode trampoline with every device re-initialised, and a
-state that sleeps and cannot be woken is worse than a state that is not there.
+cannot drive. And `mem` — ACPI S3 — on a machine whose firmware declares
+`\_S3` and whose FADT names the registers to enter it through, which on this
+architecture means every PC: see below.
+
+**A wake source has a class.** A byte on a serial console ends an idle suspend
+and cannot end an S3: once the processor is powered off there is nothing left to
+take the interrupt, and there is no software ceiling either — the ten-second
+backstop that saves a `freeze` from a wake that never comes does not exist when
+the kernel is not running. So a source says whether it can wake a powered-off
+machine (`SUSPEND_WAKE_DEEP`; the RTC alarm can, the console cannot), and an S3
+with none of them armed is refused. A sleep nothing can end is not a suspend.
+
+## ACPI S3, and what it takes to come back (M129)
+
+S3 is the firmware's sleep: the OS writes the address of real-mode code into the
+FACS waking vector, writes the sleep type the firmware declared for `\_S3` into
+PM1_CNT, and the platform removes power from everything but memory. On wake the
+firmware hands back a processor at its power-on state — real mode, no paging, no
+long mode, caches disabled, one CPU — and jumps to that address. Everything the
+kernel was is in memory and nothing of it is in the processor.
+
+The path, in the order it runs:
+
+1. **The wake source is checked and armed.** A deep source has to be armed (see
+   above), and the RTC's alarm is armed as a WAKE event as well as an interrupt:
+   PM1_EN's RTC bit is what makes the chipset bring the machine back, and the
+   alarm alone — which is enough for an idle suspend — fires into a processor
+   that is not there. ACPI mode itself is enabled first (SCI_EN through the
+   FADT's SMI command port) on a platform the firmware left in legacy mode.
+2. **The other CPUs are parked** (`sched_park_secondary_cpus`). Their state does
+   not survive, and one INIT'd while it holds a lock takes the machine with it,
+   so they park from their idle loop — the one place an AP holds nothing — and an
+   S3 whose secondary CPU will not get there in time is refused.
+3. **The processor is saved** (`kernel/arch/x86_64/s3.c`): the callee-saved
+   registers and the stack pointer are pushed by `x86_s3_sleep_and_wake`, and the
+   descriptor tables, the control registers, the segment and syscall MSRs, the
+   PAT and XCR0 are recorded beside them.
+4. **The blob is placed and the vector armed.** `s3_wakeup.S` is a flat binary
+   linked at 0x9000 (0x8000 belongs to the AP trampoline; everything below 1 MiB
+   is outside the frame allocator), patched with the CR3 to load, the stack to
+   resume on, the GDTR to reload and the address to jump to. It prints one
+   character per stage to COM1 — `W`, `3`, `6` — which is the only debugging
+   surface a resume has before it has a kernel again, and it is what found two of
+   the defects below.
+5. **The sleep**: `wbinvd`, then SLP_TYP|SLP_EN into PM1a_CNT (and PM1b where the
+   block is split). A platform that returns from that write has refused the
+   state, and that is reported as a refusal rather than as a very short sleep.
+6. **The wake**: real mode → protected mode → CR3, CR4 (PAE, LA57 where the
+   kernel runs five-level) → EFER (LME, NXE) → CR0 with paging on and caches
+   enabled → 64-bit code → the kernel's GDT and the saved stack → C.
+7. **The processor is rebuilt** (`x86_s3_restore_cpu`), then the interrupt
+   hardware, then the clocks, then the secondary CPUs, then the devices, then
+   userspace is thawed.
+
+Five things had to be right, and each was wrong first:
+
+**The clocks.** The time-stamp counter comes back at zero. Everything built on it
+— this kernel's monotonic clock and the one userspace reads out of the vDSO —
+then computes a subtraction that underflowed, which reads as a clock 160 years
+ahead; the scheduler's stall watchdog shot the machine for it. The fix is to move
+the counter's ANCHOR rather than the consumers: `arch_tsc_reanchor` makes the
+counter read what it read on the way down plus however long the machine was away,
+measured by the hardware clock, which is the only clock that runs through an S3.
+Anchoring rather than offsetting matters because userspace's CLOCK_MONOTONIC *is*
+the counter — a base fixed in the kernel alone would leave every program
+measuring an interval that ended before it began.
+
+**The TSS descriptor is still busy.** The processor sets that bit in memory when
+a TSS is loaded, and memory survived; `ltr` on a busy descriptor is a
+general-protection fault, which with no IDT yet is a triple fault and a machine
+that reboots instead of resuming. It is cleared before the load.
+
+**The code selector.** The trampoline arrives on its own GDT's selector and then
+loads the kernel's, where that selector is something else. Nothing faults until
+the first operation that reloads CS — an interrupt return, a syscall — and then
+it faults with the selector in the error code. CS is reloaded with a far return
+the moment the kernel's GDT is in place, exactly as an AP does.
+
+**The PCI configuration space is reset.** BARs unassigned, bus mastering off,
+memory and I/O decoding disabled. A driver that resumes on top of that writes
+into a device that is not listening and reports success, which is the worst shape
+a resume can take. So the header is snapshotted during the PCI scan and restored
+FIRST, before any driver's resume runs (`pci-config` in the resume order).
+
+**`lapic_init()` is not a resume.** It also re-measures the processor's clock and
+re-anchors the counter, throwing away the anchor the suspend had just computed:
+the kernel's clock then read a constant, and a hundred-millisecond wait for the
+other processor spun for two minutes. `lapic_resume()` does the three things a
+resume needs — the enable bit in the APIC base MSR, the per-CPU LAPIC state, the
+periodic timer at the rate already in force — and nothing else. For the same
+class of reason the secondary CPU is started with a SIPI first and an INIT only
+as a fallback: the wake already left it waiting for a start-up message, and the
+INIT that was sent anyway was never accepted while the delivery-status spin held
+the machine for it.
+
+**The devices come back through a registry.** A driver with device state to
+rebuild registers a resume callback (`suspend_register_device`), and the resume
+calls them in registration order with interrupts on and the scheduler running:
+the PCI header first, then virtio-blk, AHCI, NVMe, virtio-9p, virtio-net, e1000,
+virtio-gpu, xHCI and the AC'97 codec. Each re-states the agreement rather than probing again — the ring, the
+queue, the command list and the buffers all still exist, and a resume that
+allocated them again would leak a set per sleep. A virtio device's ring is zeroed
+and re-published on both sides, because a device that comes back at reset
+believes it has consumed nothing and would otherwise replay every request the
+driver ever posted.
+
+What the firmware is asked for, and when: `_PTS(3)` before the sleep, `_WAK(3)`
+after it — and `_WAK` is called with interrupts back ON, because it is a program
+and QEMU's own spends time in `Sleep()`; running it with no timer cost the resume
+two minutes of its own.
+
+**A bus has state of its own.** xHCI comes back halted and reset, and the
+keyboard's slot and address belonged to the controller rather than to the driver:
+re-programming the rings leaves a keyboard that is plugged in and reports
+nothing. So the resume re-programs the controller over the rings it already has
+and then ENUMERATES THE PORTS AGAIN, which re-addresses the device and re-arms
+its interrupt endpoint. The driver's own enumeration markers appear a second
+time in the log, after the sleep, which is what the lane grades.
+
+**A display and a codec are device state too.** virtio-gpu's scanout is an
+object the HOST owns: it went with the power, and nothing in the driver's memory
+says so. A resume that only re-states the transport leaves every later command
+naming a resource the device has never heard of — a machine that answers a
+modesetting query and then fails the scanout, which is a display that is there
+and never updates. So the resume re-creates the resource over the same backing
+pages, at the same geometry, and the frame that was on screen comes back. The
+AC'97 codec is the same shape of problem with a simpler answer: it returns muted
+and in reset with the descriptor list forgotten, so a resumed machine is silent
+while every write still succeeds.
+
+**Proof.** The suspend lane arms the RTC alarm, writes `mem`, and grades the
+kernel's own S3 counter — which counts only the path that wrote SLP_TYP and came
+back through the trampoline, so an idle suspend cannot pass it — the length of
+the sleep as userspace measures it, and that a file round trip, a fork and a
+syscall all work afterwards — and that the DEVICES came back with it, which is
+the half of a suspend that fails quietly: an evdev node answers, the display
+takes a whole modeset (a dumb buffer, a framebuffer, a CRTC — the last of which
+sends the scanout command to the device), and the sound card plays. That last
+one is graded on what the emulator captured: the test writes an 880 Hz tone
+after the resume, nothing else in the lane plays that frequency, and the
+capture is searched for it. The lane also opens a QMP socket and a small waker
+(`tests/support/acpi/s3-waker.py`): QEMU's RTC does drive the wake path, so the
+guest wakes itself, and the waker is the insurance that says so rather than
+leaving a machine asleep for ever if it ever stops doing that.
 
 **The freezer** (`sched_freeze_userspace`) is not SIGSTOP. A job-control stop
 is reported to the parent, wakes `waitpid(WUNTRACED)`, sets a stop signal a
@@ -381,6 +521,85 @@ binary: the machine sleeps about three seconds, the alarm wakes it, and the
 guest writes a file and reads `/proc` afterwards — graded as
 `suspend-rtcwake` and `suspend-alive`. Nothing on that path is a b1nix
 interface, which is the point of running it.
+
+## Power management: what is not done (M135)
+
+The machine sleeps, wakes and scales. It does not manage its own power: nothing
+here reacts to a closed lid, lowers the clock because the machine is idle, or
+acts on a temperature. This is the list, kept here rather than in the roadmap
+because it is long and each line names the thing that is missing rather than a
+theme.
+
+**Events from the platform.** There is no SCI handler and no GPE dispatch, and
+`Notify` is not implemented, so nothing the firmware raises reaches the kernel:
+the power button, the lid switch, the adapter going in or out, a battery
+changing state, a thermal trip. Two consequences follow. A desktop cannot ask
+this kernel to suspend on a lid close, because the kernel never hears the lid.
+And the battery and thermal files are only ever evaluated when somebody reads
+them — a change is not an event, it is something a poller notices later.
+
+**Powering off.** `reboot(RB_POWER_OFF)` writes three hard-coded ports
+(`0x604`, `0xB004`, `0x4004` — QEMU and Bochs) and, on a machine that is
+neither, prints "poweroff unsupported, halting". The honest path is the one S3
+already uses: `\_S5` for the sleep type and the FADT's PM1 control register,
+which the kernel now reads anyway.
+
+**The resume remainder.** Ten drivers have a resume callback (see the S3
+section); these do not: Intel HDA, virtio-input, virtio-console, the PS/2
+controller, and the IOMMUs (VT-d/AMD-Vi domains and the interrupt-remapping
+table; SMMUv3 on aarch64). The PCI snapshot restores the BARs, the command
+register, the cache line, the latency timer and the interrupt line — and NOT
+the MSI or MSI-X capability, so a device driven over message-signalled
+interrupts comes back with no vectors. There is no quiesce (suspend) callback
+at all: the queues are not drained before the power goes, and what saves the
+machine today is that userspace is frozen rather than that the devices are
+idle. The resume list is flat — no ordering, no dependencies, and a driver that
+fails gets a line in the log and nothing else.
+
+**States that are absent.** Hibernate (S4) does not exist: no image, no
+`/sys/power/disk`. aarch64 has no deep sleep — PSCI `SYSTEM_SUSPEND` is not
+implemented, so `/sys/power/state` there is `freeze` alone. The `/sys/power`
+surface is one file: no `wakeup_count`, `mem_sleep`, `wakeup_sources` or
+`pm_wakeup_irq`. Only the RTC alarm counts as a wake source deep enough for
+S3; a power button, a lid, wake-on-LAN and USB wake do not exist as sources.
+A `freeze` with nothing armed still sleeps to its ten-second ceiling.
+
+**Frequency.** Two governors, and they are the two ends of the range:
+`performance` pins the top state and `powersave` the bottom. Nothing moves
+between them by itself, which is what `ondemand` and `schedutil` are for, so an
+idle machine runs at the frequency it was left at. `_PPC` — the ceiling the
+firmware asks for, which is how a laptop says "you are on battery" — is not
+read. `_PSS` is taken from one processor container and applied to the machine:
+there is no per-policy or per-core control, and no `policy*` directory layout,
+which is the shape `cpupower` and every tuning daemon expect. No boost or turbo
+knob, no energy-performance preference beyond the two presets, and no feedback
+from temperature or a power cap (no RAPL).
+
+**Idle.** The C-states come from CPUID leaf 5 — the MWAIT hints the processor
+advertises — and ACPI's `_CST`, which is where a platform declares the states
+it really has, is not read. There is no idle governor: `cpuidle_enter` takes
+the deepest state this CPU has, every time, rather than choosing from the
+predicted length of the idle period and the state's exit latency. On aarch64
+there is one state, WFI; PSCI `CPU_SUSPEND` is not used. And there is no
+runtime power management anywhere: an idle PCI device stays at full power
+until the whole machine sleeps, because nothing puts it in D3 and nothing gates
+a clock or a power domain.
+
+**Heat and charge, read but not acted on.** `/sys/class/thermal/thermal_zoneN`
+publishes a type and a temperature and nothing else: no trip points (`_PSV`,
+`_AC0`, `_CRT`), no cooling devices, no passive throttling, and no
+critical-temperature shutdown — a machine that overheats keeps going. The
+battery publishes `_BIF`/`_BST` and not `_BIX`, has no charge thresholds, and
+raises no event, so a desktop's indicator polls. Hotkeys and the idle-power
+comparison the M129 notes mention are untouched.
+
+**What the tests do not cover.** S3 is exercised in one lane and on x86_64
+only: one sleep per run, with the machine quiet. There is no repeated-cycle
+test and none with I/O in flight across the sleep, which is exactly where the
+missing quiesce callback would show. The five-level-paging lane
+(`SMOKE_LA57=1`) is flaky under TCG — it can trip the guest's own
+twenty-second console-silence watchdog on a slow test — so a wedge there is
+worth a second run before it is read as a regression.
 
 ## Transparent huge pages for anonymous memory (M128)
 

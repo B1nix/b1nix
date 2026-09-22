@@ -13,6 +13,7 @@
 #include <b1nix/uevent.h>
 #include <b1nix/errno.h>
 #include <string.h>
+#include <b1nix/suspend.h>
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
@@ -269,8 +270,83 @@ static void pci_assign_bars(u8 bus, u8 slot, u8 func)
 }
 #endif
 
+/* ── the configuration space, across a sleep that resets it (M129) ────────
+ *
+ * An S3 takes power from the bus as well as the processor, and every device
+ * comes back with its configuration header at reset: BARs unassigned, bus
+ * mastering off, memory and I/O decoding disabled, the interrupt line forgotten.
+ * A driver that resumes on top of that writes into a device that is not
+ * listening — the registers it mapped at boot decode to nothing — and reports
+ * success because nothing faults. That is the worst shape a resume can take, so
+ * the header is restored before any driver is asked to resume: the addresses
+ * this kernel assigned (or the firmware did) are written back and the decoding
+ * re-enabled, exactly as they were.
+ *
+ * The snapshot is taken during the scan, which is the last moment at which the
+ * header is known to be the one the drivers went on to use.
+ */
+#define PCI_SAVED_MAX 64
+
+struct pci_saved_dev {
+	u8 bus, slot, func, used;
+	u32 bar[6];
+	u16 command;
+	u8 cacheline, latency, irq_line;
+};
+
+static struct pci_saved_dev g_pci_saved[PCI_SAVED_MAX];
+static int g_pci_saved_count;
+
+static void pci_save_config(u8 bus, u8 slot, u8 func)
+{
+	struct pci_saved_dev *d;
+
+	if (g_pci_saved_count >= PCI_SAVED_MAX)
+		return;
+	d = &g_pci_saved[g_pci_saved_count++];
+	d->bus = bus;
+	d->slot = slot;
+	d->func = func;
+	for (int i = 0; i < 6; i++)
+		d->bar[i] = pci_config_read32(bus, slot, func, (u8)(0x10 + i * 4));
+	d->command = pci_config_read16(bus, slot, func, 0x04);
+	d->cacheline = pci_config_read8(bus, slot, func, 0x0C);
+	d->latency = pci_config_read8(bus, slot, func, 0x0D);
+	d->irq_line = pci_config_read8(bus, slot, func, 0x3C);
+	d->used = 1;
+}
+
+static int pci_resume_all(void *ctx)
+{
+	(void)ctx;
+	for (int i = 0; i < g_pci_saved_count; i++) {
+		struct pci_saved_dev *d = &g_pci_saved[i];
+
+		if (!d->used)
+			continue;
+		if (pci_config_read16(d->bus, d->slot, d->func, 0) == 0xFFFF)
+			continue;       /* the device is not there any more */
+		for (int b = 0; b < 6; b++)
+			pci_config_write32(d->bus, d->slot, d->func, (u8)(0x10 + b * 4),
+			                   d->bar[b]);
+		pci_config_write8(d->bus, d->slot, d->func, 0x0C, d->cacheline);
+		pci_config_write8(d->bus, d->slot, d->func, 0x0D, d->latency);
+		pci_config_write8(d->bus, d->slot, d->func, 0x3C, d->irq_line);
+		/* The command register last: the decoding is only turned on once the
+		 * addresses it decodes to are back. */
+		pci_config_write16(d->bus, d->slot, d->func, 0x04, d->command);
+	}
+	k_info("pci", "restored %d configuration headers after the sleep",
+	       g_pci_saved_count);
+	return 0;
+}
+
 void pci_init(void)
 {
+	/* First in the resume order, because every driver's resume writes to a
+	 * device that only decodes its registers once this has run. */
+	suspend_register_device("pci-config", pci_resume_all, 0);
+
 #ifdef __aarch64__
 	/* Nothing is scanned until the tree says there is something to scan. A
 	 * board with no host bridge — or one whose bridge this kernel cannot
@@ -319,6 +395,9 @@ void pci_init(void)
 #ifdef __aarch64__
 				pci_assign_bars((u8)bus, slot, func);
 #endif
+				/* The header as the drivers are about to find it: an S3
+				 * resets it, and this is what puts it back. */
+				pci_save_config((u8)bus, slot, func);
 				u8 cls = pci_config_read8((u8)bus, slot, func, 0x0B);
 				u8 sub = pci_config_read8((u8)bus, slot, func, 0x0A);
 				/* One line per function, addressed the way every other

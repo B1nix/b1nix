@@ -71,6 +71,27 @@ SMOKE_PROGRESS_MODE=full
 
 mkdir -p "$PROJECT_DIR/smoke_run"
 
+# The supplementary ACPI table the power-management lane boots with.
+#
+# QEMU declares no P-states, no battery, no AC adapter and no thermal zone,
+# because the machine it emulates has none -- so the kernel code that reads them
+# (M129's cpufreq through _PSS, M134's power_supply and thermal classes) had
+# nothing to read. This generates a table that declares them, the lane loads it
+# with -acpitable, and every check compares what the kernel publishes against
+# what tests/support/acpi/mk-ssdt.py declares. Skipped, with the checks recorded
+# as skipped too, on a host with no python3.
+ACPI_FIXTURE=""
+if command -v python3 >/dev/null 2>&1; then
+	ACPI_FIXTURE="$PROJECT_DIR/smoke_run/acpi-fixture-$ARCH.aml"
+	if python3 "$PROJECT_DIR/tests/support/acpi/mk-ssdt.py" "$ACPI_FIXTURE" \
+		2>"$PROJECT_DIR/smoke_run/acpi-fixture.log"; then
+		# shellcheck disable=SC1090
+		. "$ACPI_FIXTURE.env"
+	else
+		ACPI_FIXTURE=""
+	fi
+fi
+
 # Pause the KDE file indexer (baloo) for the duration of the run: under parallel
 # QEMU it competes for host CPU and is a documented source of smoke flakiness
 # (timeouts/spurious fails). Best-effort and guarded — a no-op where baloo isn't
@@ -494,6 +515,17 @@ run_qemu() {
 				${kernel_args} \
 				-serial stdio -display ${GPU_DISPLAY:-none} \
 				-monitor ${SMOKE_MONITOR:-none} -no-reboot
+		fi
+
+		# A QMP socket, where the lane needs one. This is how the S3 test is
+		# woken: a machine in S3 has its processor powered off, so nothing
+		# inside it can end the sleep — on real hardware the chipset does it
+		# (the RTC alarm, a power button), and in a guest the equivalent is
+		# QEMU's own system_wakeup. Without an external wake an S3 test is a
+		# machine that never comes back, which is exactly what it was before
+		# this socket existed.
+		if [ -n "${SMOKE_QMP_SOCK:-}" ]; then
+			set -- "$@" -qmp "unix:${SMOKE_QMP_SOCK},server=on,wait=off"
 		fi
 
 		if [ "$ARCH" = "aarch64" ]; then
@@ -1369,6 +1401,11 @@ launch_posix() {
 		# the lane m128_smoke runs in, and it is also the only place the
 		# per-node allocator is exercised by everything else the lane does.
 		# The memory is the lane's usual 1 GiB, split in half.
+		# The firmware fixture: P-states, a battery, an adapter and a
+		# thermal zone this machine would otherwise not have (M129/M134).
+		if [ -n "$ACPI_FIXTURE" ] && [ "$ARCH" = "x86_64" ]; then
+			EXTRA_QEMU_ARGS="${EXTRA_QEMU_ARGS:-} -acpitable file=$ACPI_FIXTURE"
+		fi
 		EXTRA_QEMU_ARGS="${EXTRA_QEMU_ARGS:-} \
 			-object memory-backend-ram,id=numa0,size=512M \
 			-object memory-backend-ram,id=numa1,size=512M \
@@ -1376,6 +1413,19 @@ launch_posix() {
 			-numa node,nodeid=1,memdev=numa1,cpus=1 \
 			-numa dist,src=0,dst=1,val=21"
 		export EXTRA_QEMU_ARGS
+		# The S3 test needs a wake from outside the guest: its processor is
+		# powered off, and QEMU's RTC does not drive the ACPI wake path the way
+		# a real chipset does. The waker watches this lane's log for the
+		# kernel's own "entering S3" line and then does what a power button
+		# would (see tests/support/acpi/s3-waker.py).
+		if [ "$ARCH" = "x86_64" ] && command -v python3 >/dev/null 2>&1; then
+			SMOKE_QMP_SOCK="$PROJECT_DIR/smoke_run/qmp-posix-$$.sock"
+			export SMOKE_QMP_SOCK
+			rm -f "$SMOKE_QMP_SOCK"
+			python3 "$PROJECT_DIR/tests/support/acpi/s3-waker.py" \
+				"$SMOKE_QMP_SOCK" "$POSIX_LOG" 3 300 \
+				>>"$POSIX_LOG" 2>&1 &
+		fi
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[posix] "
 		run_qemu "$POSIX_LOG"
@@ -3225,6 +3275,22 @@ check_output "$POSIX_LOG" "M129-SMOKE: ok idle-measured" "an idle second's timer
 check_output "$POSIX_LOG" "M129-SMOKE: ok busy-still-ticks" "a CPU with work to do still takes its timer interrupts, so nothing goes unpreempted"
 check_output "$POSIX_LOG" "M129-SMOKE: ok cpufreq-honest" "cpufreq names the driver the machine really has, offers only governors that driver can honour, and reports a frequency (a guest whose hypervisor hides the power-management leaves says \"none\" rather than offering a governor that moves nothing)"
 check_output "$POSIX_LOG" "M129-SMOKE: ok cpuidle-sysfs" "/sys/devices/system/cpu/cpu0/cpuidle/state0 names the idle state this machine really uses and its counters move"
+# ── M129: the P-states ACPI declared ──
+#
+# QEMU's own firmware declares none, so the lane boots a supplementary table
+# that does (tests/support/acpi/mk-ssdt.py, loaded with -acpitable). Every value
+# below is compared against what that table declares rather than against a range
+# of plausible numbers: the kernel has to have read the firmware, not guessed.
+if [ -n "$ACPI_FIXTURE" ] && [ "$ARCH" = "x86_64" ]; then
+	check_output "$POSIX_LOG" "M129-PSTATE: khz $ACPI_FIXTURE_PSS_KHZ" "the frequencies the kernel read out of _PSS are exactly the ones the firmware declared, in the order it declared them"
+	check_output "$POSIX_LOG" "M129-PSTATE: control $ACPI_FIXTURE_PSS_CONTROL" "so are the control values — the number written to the register _PCT names to ask for each state, which is the only part of a P-state the kernel cannot invent"
+	check_output "$POSIX_LOG" "M129-SMOKE: ok pstates-declared" "/sys/.../scaling_available_frequencies lists those states and scaling_max_freq/scaling_min_freq are their two ends"
+	check_output "$POSIX_LOG" "M129-SMOKE: ok pstates-selected" "writing scaling_setspeed picks the state the firmware declared for that frequency, the kernel writes its control value to the declared register, and /proc/b1nix-cpufreq reports that the write was accepted"
+else
+	skipped "M129-PSTATE: khz" "no ACPI fixture: this port has no ACPI at all (aarch64), or the host has no python3 to generate the table"
+	skipped "M129-SMOKE: ok pstates-declared" "same"
+	skipped "M129-SMOKE: ok pstates-selected" "same"
+fi
 check_output "$POSIX_LOG" "M129-SMOKE: done" "the power-management smoke completes"
 
 # ── M129: suspend (s2idle behind /sys/power/state) ──
@@ -3238,6 +3304,54 @@ check_output "$POSIX_LOG" "M129-SUSPEND: ok child-frozen" "a child that does not
 check_output "$POSIX_LOG" "M129-SUSPEND: ok child-runs-again" "the thaw puts it back: the same child is counting again after the resume"
 check_output "$POSIX_LOG" "M129-SUSPEND: ok rtc-irq-counted" "/proc/interrupts RTC row moved, so the alarm interrupt was really routed, taken and acknowledged (IRQ 8 on x86_64 interrupted nothing at all before M129)"
 check_output "$POSIX_LOG" "M129-SUSPEND: ok machine-alive" "after the resume a file round-trip, a fork that is waited for and a syscall all still work"
+# ── M129: ACPI S3, where the firmware declares it ──
+#
+# A different state from the freeze above and proved differently: the processor's
+# state is gone across S3, so the witness is the kernel's own S3 counter — which
+# an s2idle suspend never moves — plus a machine that still works afterwards.
+if grep -qa "M129-SUSPEND: no-s3" "$POSIX_LOG"; then
+	skipped "M129-SUSPEND: ok s3-slept" "this machine has no S3: the log line says which part of it is missing (no \\_S3 in the firmware, or no FADT register to enter it through)"
+	skipped "M129-SUSPEND: ok s3-alive" "same"
+	skipped "M129-SUSPEND: ok s3-devices" "same"
+else
+	check_output "$POSIX_LOG" "M129-SUSPEND: ok s3-slept" "writing mem to /sys/power/state really entered ACPI S3: the kernel's S3 counter moved (it counts only the path that writes SLP_TYP into PM1_CNT and returns through the real-mode wake-up trampoline), and the machine was down for about the interval the RTC alarm was armed for"
+	check_output "$POSIX_LOG" "M129-SUSPEND: ok s3-alive" "and the processor was rebuilt from what the kernel saved: a file round-trip, a fork that is waited for and a syscall all work after the resume"
+	check_output "$POSIX_LOG" "M129-SUSPEND: ok s3-devices" "and the devices came back with it: an evdev node answers, the display takes a whole modeset (create a dumb buffer, add it as a framebuffer, set the CRTC — the last of those sends a scanout command to the device, so a virtio-gpu whose queues did not come back fails it), and the audio device takes a buffer"
+	# USB, specifically: the host controller comes back halted and reset, and
+	# the keyboard's slot and address were the controller's — so a resume that
+	# only re-programmed the rings leaves a keyboard that is plugged in and
+	# reports nothing. The driver prints its enumeration markers whenever it
+	# addresses a device and configures an interrupt endpoint, so finding them
+	# AFTER the sleep is the proof that it happened again on the far side.
+	_s3_at="$(grep -an "s3: back from the sleep" "$POSIX_LOG" 2>/dev/null | head -1 | cut -d: -f1)"
+	if [ -n "$_s3_at" ]; then
+		_usb_after="$(awk -v n="$_s3_at" 'NR > n && /M37-USB: ok hid-config/ { c++ } END { print c + 0 }' "$POSIX_LOG")"
+		if [ "${_usb_after:-0}" -gt 0 ]; then
+			pass "the USB keyboard was addressed and its interrupt endpoint configured again after the resume — the controller and the device both came back, not just the driver's memory"
+		else
+			fail "s3-usb" "no xHCI enumeration after the resume (the keyboard would report nothing)"
+		fi
+	fi
+
+	# What the emulator actually played AFTER the resume. The tone is 880 Hz —
+	# nothing else in this lane plays that (the audio test's own is 440) — so
+	# finding it in the capture proves samples reached the card on the far side
+	# of the sleep rather than that a write returned a byte count.
+	_s3_wav="${POSIX_LOG%.log}-audio.wav"
+	if [ -f "$_s3_wav" ] && command -v python3 >/dev/null 2>&1; then
+		_s3_audio="$(python3 "$PROJECT_DIR/tests/support/verify-tone-wav.py" "$_s3_wav" 880 2>&1)"
+		case "$_s3_audio" in
+		"AUDIO-WAV: ok"*)
+			pass "the sound card played after the resume: the capture holds the 880 Hz tone the test wrote once the machine was back ($_s3_audio)"
+			;;
+		*)
+			fail "s3-audio" "$_s3_audio"
+			;;
+		esac
+	else
+		skipped "s3-audio" "no capture file for this lane, or no python3 to read it"
+	fi
+fi
 check_output "$POSIX_LOG" "M129-SUSPEND: done" "the suspend smoke completes"
 check_output "$POSIX_LOG" "power: freeze," "the kernel reports the freeze, how many tasks it is holding and which wake source is armed"
 
@@ -3259,8 +3373,16 @@ if [ "$ARCH" = "x86_64" ]; then
 	check_output "$POSIX_LOG" "M134-AML: ok method-with-args\|M134-AML: ok method-args-absent" "a firmware method called WITH AN ARGUMENT runs: CSTA(n) writes the CPU selector to its SystemIO operation region and reads the enabled bit back, answering 0x0F for a processor that exists and 0 for one that does not (or the marker saying this firmware has no such method)"
 	check_output "$POSIX_LOG" "M134-AML: ok pci-config-refused\|M134-AML: ok pci-config-absent" "an operation region in an address space this interpreter does not implement (PCI config, here the PIIX link devices' routing registers) is REFUSED: the evaluation fails with region-refused rather than answering a plausible number"
 	check_output "$POSIX_LOG" "M134-AML: ok refusal-recorded\|M134-AML: ok pci-config-absent" "the refusal is recorded in /proc/b1nix-acpi, so a machine whose firmware needs an address space this kernel lacks says which one"
-	check_output "$POSIX_LOG" "M134-AML: ok no-battery\|M134-AML: ok battery-sysfs" "the battery sysfs agrees with the firmware: QEMU declares no ACPI battery, so /sys/class/power_supply is empty rather than showing an invented one"
+	check_output "$POSIX_LOG" "M134-AML: ok no-battery\|M134-AML: ok battery-sysfs" "the battery sysfs agrees with the firmware: a machine whose firmware declares no ACPI battery has an empty /sys/class/power_supply rather than an invented one"
 	check_output "$POSIX_LOG" "M134-AML: ok no-thermal-zone\|M134-AML: ok thermal-sysfs" "the thermal sysfs agrees with the firmware: no thermal zone with a _TMP means no /sys/class/thermal/thermal_zone0"
+	if [ -n "$ACPI_FIXTURE" ]; then
+		# The other side of those two: with a battery and a zone DECLARED, the
+		# files must carry the firmware's own numbers. This is what the M129
+		# roadmap called unexercised — the code was written and no machine here
+		# declared anything for it to read.
+		check_output "$POSIX_LOG" "M134-AML: battery cap $ACPI_FIXTURE_BAT_CAPACITY_PCT full $ACPI_FIXTURE_BAT_FULL_UWH now $ACPI_FIXTURE_BAT_NOW_UWH volt $ACPI_FIXTURE_BAT_VOLTAGE_UV status Discharging" "/sys/class/power_supply/BAT0 reports the firmware's own _BIF and _BST numbers — capacity as the percentage of last-full, energy and voltage in the micro- units sysfs uses, and the state _BST's status word names"
+		check_output "$POSIX_LOG" "M134-AML: thermal_zone0 $ACPI_FIXTURE_TZ_TEMP_MC mC" "/sys/class/thermal/thermal_zone0/temp is the _TMP the firmware declared, converted from tenths of a kelvin to millidegrees Celsius"
+	fi
 else
 	check_output "$POSIX_LOG" "M134-AML: ok no-acpi-firmware" "a machine with no ACPI at all -- every board on this architecture -- reports exactly that: the interpreter is there, it built only the predefined roots, and it publishes no battery and no thermal zone rather than inventing either"
 fi

@@ -5,6 +5,15 @@
 #include <b1nix/types.h>
 
 void rtc_init(void);
+/* The hardware clock itself, in unix seconds, read out of CMOS rather than
+ * derived from the monotonic clock: the only clock that runs through a sleep
+ * whose processor is powered off, and so the only one that can measure it. */
+u64 rtc_hw_unix_seconds(void);
+
+/* Correct the wall clock from the hardware clock. The RTC counts through an S3
+ * sleep and the monotonic clock does not, so this is what a resume calls before
+ * anything asks what time it is. */
+void rtc_resync_wallclock(void);
 u64 rtc_now_unix_seconds(void);
 /* The same clock in nanoseconds. Every reader that wants a sub-second wall
  * time must take BOTH halves from here: composing seconds from one clock and

@@ -784,6 +784,20 @@ void scheduler_sleep_ticks(u64 ticks);
  * machine is worse than one that did not suspend. sched_thaw_userspace undoes
  * a freeze and is safe to call when nothing is frozen. */
 int sched_freeze_userspace(u64 timeout_ms);
+
+/* ── parking the secondary CPUs (M129) ────────────────────────────────────
+ *
+ * For a sleep that takes the processors' state away (ACPI S3): every CPU but
+ * the one sleeping has to be in its idle loop, holding nothing, before the
+ * machine goes down — and started afresh afterwards, because what it was is
+ * gone. sched_park_secondary_cpus returns 0 once they are all parked and -1
+ * when one would not get there in time, in which case the sleep must be
+ * refused rather than attempted. */
+int sched_park_secondary_cpus(u64 timeout_ms);
+void sched_unpark_secondary_cpus(void);
+/* Called from the AP idle path: parks this CPU if a park was asked for, and
+ * never returns when it does. */
+void sched_park_here_if_asked(void);
 void sched_thaw_userspace(void);
 /* How many tasks the last successful freeze is holding. */
 int sched_frozen_count(void);

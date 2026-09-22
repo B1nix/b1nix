@@ -27,6 +27,7 @@
 #include <b1nix/io.h>
 #include <b1nix/bootinfo.h>
 #include <string.h>
+#include <b1nix/suspend.h>
 
 /* ── Register offsets (byte offsets into MMIO BAR0) ──────────────────────── */
 #define E1000_CTRL    0x0000   /* Device Control            */
@@ -254,6 +255,11 @@ static int e1000_device_is_pch_i219(u16 device_id)
 	}
 }
 
+/* Which flavour of reset this controller wants, remembered for the resume: the
+ * PCH i219 parts need a longer one and a different sequence, and the probe is
+ * the only place the device id is known. */
+static int g_e1000_is_pch;
+
 static void e1000_reset(int pch_i219)
 {
 	/* Quiesce RX/TX first. Linux e1000e's PCH reset path allows pending MAC
@@ -284,15 +290,13 @@ static void e1000_reset(int pch_i219)
 	(void)e1000_read(E1000_ICR);
 }
 
-static void e1000_rx_init(void)
+/* Publish a ring to the controller: its address, its length, its head and tail,
+ * and the enable. Split out of the allocation because a resume from S3 has to do
+ * exactly this and must not allocate anything again — the controller forgot the
+ * ring, the driver did not. */
+static void e1000_rx_publish(void)
 {
-	u64 ring_phys = pmm_alloc_frames(1);
-	rx_ring = (struct e1000_rx_desc *)(usize)(ring_phys + vmm_direct_map_base());
-	memset((void *)rx_ring, 0, PAGE_SIZE);
-
-	usize buf_frames = (E1000_NUM_RX * E1000_BUF_SZ + PAGE_SIZE - 1) / PAGE_SIZE;
-	rx_buf_phys = pmm_alloc_frames(buf_frames);
-	rx_buf_virt = (u8 *)(usize)(rx_buf_phys + vmm_direct_map_base());
+	u64 ring_phys = (u64)(usize)rx_ring - vmm_direct_map_base();
 
 	for (u16 i = 0; i < E1000_NUM_RX; i++) {
 		rx_ring[i].addr = rx_buf_phys + (u64)i * E1000_BUF_SZ;
@@ -309,15 +313,9 @@ static void e1000_rx_init(void)
 	e1000_write(E1000_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2048);
 }
 
-static void e1000_tx_init(void)
+static void e1000_tx_publish(void)
 {
-	u64 ring_phys = pmm_alloc_frames(1);
-	tx_ring = (struct e1000_tx_desc *)(usize)(ring_phys + vmm_direct_map_base());
-	memset((void *)tx_ring, 0, PAGE_SIZE);
-
-	usize buf_frames = (E1000_NUM_TX * E1000_BUF_SZ + PAGE_SIZE - 1) / PAGE_SIZE;
-	tx_buf_phys = pmm_alloc_frames(buf_frames);
-	tx_buf_virt = (u8 *)(usize)(tx_buf_phys + vmm_direct_map_base());
+	u64 ring_phys = (u64)(usize)tx_ring - vmm_direct_map_base();
 
 	/* Pretend each descriptor is already "done" so the first reuse-wait in
 	 * e1000_xmit() passes immediately. */
@@ -334,6 +332,34 @@ static void e1000_tx_init(void)
 	e1000_write(E1000_TCTL, TCTL_EN | TCTL_PSP |
 	            (0x10u << TCTL_CT_SHIFT) | (0x40u << TCTL_COLD_SHIFT));
 	e1000_write(E1000_TIPG, 0x0060200A); /* IEEE 802.3 recommended IPG */
+}
+
+static void e1000_rx_init(void)
+{
+	u64 ring_phys = pmm_alloc_frames(1);
+
+	rx_ring = (struct e1000_rx_desc *)(usize)(ring_phys + vmm_direct_map_base());
+	memset((void *)rx_ring, 0, PAGE_SIZE);
+
+	usize buf_frames = (E1000_NUM_RX * E1000_BUF_SZ + PAGE_SIZE - 1) / PAGE_SIZE;
+	rx_buf_phys = pmm_alloc_frames(buf_frames);
+	rx_buf_virt = (u8 *)(usize)(rx_buf_phys + vmm_direct_map_base());
+
+	e1000_rx_publish();
+}
+
+static void e1000_tx_init(void)
+{
+	u64 ring_phys = pmm_alloc_frames(1);
+
+	tx_ring = (struct e1000_tx_desc *)(usize)(ring_phys + vmm_direct_map_base());
+	memset((void *)tx_ring, 0, PAGE_SIZE);
+
+	usize buf_frames = (E1000_NUM_TX * E1000_BUF_SZ + PAGE_SIZE - 1) / PAGE_SIZE;
+	tx_buf_phys = pmm_alloc_frames(buf_frames);
+	tx_buf_virt = (u8 *)(usize)(tx_buf_phys + vmm_direct_map_base());
+
+	e1000_tx_publish();
 }
 
 /* Low-level frame transmit. Returns 0 on success. Shared by the netdev op and
@@ -466,6 +492,43 @@ static void e1000_pci_set_d0(const struct pci_device_info *p)
 }
 
 /* ── Probe ──────────────────────────────────────────────────────────────── */
+/* Put the controller back after an S3 (M129).
+ *
+ * The rings and their buffers are this driver's memory and survived; the
+ * controller is at its reset state and has forgotten where they are, what its
+ * MAC address is and that it was ever asked to raise an interrupt. So it is
+ * reset, told again, and re-enabled — and nothing is allocated, because
+ * allocating a second set of rings per sleep is a leak the machine never
+ * recovers from. */
+static int e1000_resume(void *ctx) {
+	(void)ctx;
+	if (!rx_ring || !tx_ring)
+		return 0;               /* no controller was ever brought up */
+
+	e1000_reset(g_e1000_is_pch);
+	{
+		u32 ctrl = e1000_read(E1000_CTRL);
+
+		e1000_write(E1000_CTRL, ctrl | CTRL_SLU | CTRL_ASDE);
+	}
+	/* The address filter: a controller that comes back without it drops every
+	 * frame addressed to this machine. */
+	e1000_write(E1000_RAL, (u32)e1000_mac.bytes[0] |
+	            ((u32)e1000_mac.bytes[1] << 8) |
+	            ((u32)e1000_mac.bytes[2] << 16) |
+	            ((u32)e1000_mac.bytes[3] << 24));
+	e1000_write(E1000_RAH, (u32)e1000_mac.bytes[4] |
+	            ((u32)e1000_mac.bytes[5] << 8) | RAH_AV);
+	e1000_rx_publish();
+	e1000_tx_publish();
+	if (e1000_netdev.irq >= 0 && e1000_netdev.irq != 0xFF) {
+		e1000_write(E1000_IMS, E1000_INT_RXT0 | E1000_INT_RXDMT0 |
+		                           E1000_INT_RXO | E1000_INT_LSC);
+		irq_unmask((u8)e1000_netdev.irq);
+	}
+	return 0;
+}
+
 int e1000_probe(void)
 {
 	struct pci_device_info pci;
@@ -528,7 +591,9 @@ int e1000_probe(void)
 	console_write_hex64(mmio_phys);
 	console_write("\n");
 
-	e1000_reset(e1000_device_is_pch_i219(pci.device_id));
+	g_e1000_is_pch = e1000_device_is_pch_i219(pci.device_id);
+	e1000_reset(g_e1000_is_pch);
+	suspend_register_device("e1000", e1000_resume, 0);
 
 	/* Set link up + auto-speed. */
 	u32 ctrl = e1000_read(E1000_CTRL);

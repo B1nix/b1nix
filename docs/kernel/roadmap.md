@@ -167,6 +167,9 @@ answers which question, are in [../versioning.md](../versioning.md).
 | M125 io_uring | done | Every opcode this uapi names but `RECV_ZC`, SQPOLL/IOPOLL, provided buffers in both shapes, multishot, direct descriptors, personalities and restrictions; a completion thread per ring, so a request completes while its owner watches the ring from userspace. liburing 2.12: 89 → 129 pass over all 217. One rare panic in part 3 of that suite is unexplained — see [processes-and-system-calls.md](processes-and-system-calls.md). |
 | M126 Observability | done | `perf_event_open` with the CPU's own PMU, sampling, `inherit`, `enable_on_exec` and group reads — the distribution's `perf stat`/`record`/`report` run on it; `userfaultfd`; `fanotify` with permission events; eBPF as an interpreter with a path-walking verifier (`partial`: no JIT, BTF, CO-RE or kprobes). The ad-hoc `kprof` profiler is gone. |
 | M127 Resource control | done | cgroup v2 `memory`/`cpu`/`io`/`pids`, an OOM killer that ranks by RSS and `oom_score_adj`, PSI, zram and zswap, and reclaim inside a cgroup with every swapped page charged to its owner. Proved on Alpine and against Debian's own systemd units. |
+| M128 Large memory and NUMA | done | A 72 GiB guest on a 27 GiB host (the 64-bit PCI window above the direct map faulted every BAR access), five-level paging behind `b1nix.la57`, NUMA from SRAT/SLIT with per-node free lists and `mbind`/`set_mempolicy` that really place pages, and transparent huge pages for anonymous memory on both arches with khugepaged, huge COW at `fork` and cgroup-aware blocks. |
+| M129 Power management | done | cpuidle with MWAIT C-states and a tickless idle CPU (620 timer interrupts an idle second, not 1998), cpufreq over HWP, the ratio request or ACPI `_PSS`/`_PCT`, s2idle on both arches and ACPI S3 on x86_64 — CPU, clocks, secondaries and every device's PCI header and driver state brought back, proved by a modeset, an 880 Hz tone captured after the resume and a re-addressed USB keyboard — and a battery and thermal zone read from AML against a firmware that declares them. What manages power rather than merely performing it is M135. |
+| M134 ACPI methods | done | An AML interpreter and evaluator: DSDT and every SSDT loaded (354 objects on QEMU, no undecoded term), the opcodes, control flow, conversions, method calls and SystemMemory/SystemIO fields, a step budget instead of a hang, and a refused region (PCI config, EC, SMBus, CMOS) propagating an error rather than a zero. It is what `/sys/class/power_supply` and `/sys/class/thermal` read and what cpufreq and the S3 sleep run on. `_PRT` interrupt routing is the one consumer still unwritten. |
 
 ## M102b: amdgpu on RX 6600 (render-only) + radeonsi
 
@@ -177,23 +180,6 @@ answers which question, are in [../versioning.md](../versioning.md).
 ## M102c: nouveau
 
 - [ ] `planned` Pick generation (pre-Turing without signed firmware vs GSP); import unmodified, fix the shim.
-
-## M128: Large memory and NUMA
-
-Per-subject detail: [memory-and-scheduling.md](memory-and-scheduling.md).
-
-- [x] `done` A 72 GiB guest boots and runs the whole suite on a 27 GiB host (`SMOKE_BIGMEM=1`). It found the defect that mattered: with that much RAM the 64-bit PCI window sits above the direct map, and every driver reaching a BAR through it faulted in ring 0.
-- [x] `done` Five-level paging behind `b1nix.la57`: a PML5 whose entries 0 and 511 both name the PML4, so every existing four-level walk stays correct. Proved by the `la57` lane (TCG `-cpu max,la57=on`, 856 checks), which also found the APs booting with their caches disabled.
-- [x] `done` NUMA from SRAT and SLIT: per-node free lists in the buddy allocator, allocation from the running CPU's node, and a node lookup that costs one compare on a single-node machine.
-- [x] `done` `mbind`/`set_mempolicy`/`get_mempolicy`/`set_mempolicy_home_node` really place pages — MPOL_BIND enforced, MPOL_INTERLEAVE by page offset, MPOL_MF_MOVE migrating — with `/sys/devices/system/node` for `numactl`. Proved on a two-node guest, per page and by each node's free memory moving.
-- [x] `done` Transparent huge pages for anonymous memory, on both arches and off unless `b1nix.thp` asks: a 2 MiB directory entry on x86_64, a level-2 block descriptor on aarch64, installed only by the fault path — everything else splits a block first or handles all 512 pages. A `fork` shares a block copy-on-write and a whole-block `mprotect` keeps it, and khugepaged collapses the 4 KiB ranges the fault path can never reach. Twelve checks on bytes per arch, including the three that closed the last gaps: a recycled address range is block-backed again, a cgroup whose memory is all blocks is reclaimed rather than killed, and a collapsed range holds every byte it held before. Found on the way: a split copied the block's read-only flag into the page table's own directory entry, which overrules every leaf under it, and nothing on aarch64 had ever seeded the buddy allocator, so no contiguous block could be allocated at all.
-
-## M129: Power management
-
-- [x] `done` Idle: one `cpuidle_enter` for every park (MWAIT C-states where the CPU has them, HLT/WFI otherwise) with per-CPU counters under `/sys/devices/system/cpu/cpuN/cpuidle`, and a tickless idle CPU — an idle second costs 620 timer interrupts instead of 1998, a busy one still takes its thousand. `/proc/interrupts` gained `LOC`, `/proc/b1nix-tick` the rate and the cap.
-- [x] `partial` Frequency: HWP, or the older ratio request, read through faulting-safe MSR accessors, with a writable `scaling_governor` and an honest `none` on a guest whose hypervisor hides the leaves. Not yet run on hardware that has HWP; ACPI `_PSS` is not read.
-- [x] `partial` Suspend: s2idle end to end on both arches — `/sys/power/state`, a freezer that is not SIGSTOP, and the RTC alarm as a wake source — proved by eleven checks including a hole of the right length in a frozen child's own clock, and by util-linux's `rtcwake -m freeze` on the Debian lane. ACPI S3 is absent rather than broken (it needs device suspend/resume and a resume trampoline), and a plain `echo freeze` with no alarm armed sleeps to the ten-second ceiling because the input wake source counts as armed on a console nobody types at.
-- [x] `partial` Battery and thermals: no longer blocked — M134's interpreter reads `_BST`/`_BIF`/`_PSR`/`_TMP` and publishes `/sys/class/power_supply` and `/sys/class/thermal` for what the firmware declares. No machine here declares any, so those paths are unexercised; hotkeys and the idle-power comparison are untouched.
 
 ## M130: More hardware through linuxkpi
 
@@ -226,8 +212,8 @@ Every open row of [abi-gaps.md](abi-gaps.md) that no other milestone owns,
 collected as one piece of work because they share a definition of done: the
 Debian lane green with no workaround, and that table shorter. This is the
 milestone the distribution waits on — the phases in
-[../distro/roadmap.md](../distro/roadmap.md) trip over these, not over NUMA or
-Wi-Fi — so it runs before M128-M131.
+[../distro/roadmap.md](../distro/roadmap.md) trip over these, not over Wi-Fi or
+KVM — so it runs before M130-M132 and M135.
 
 - [ ] `planned` A relocatable kernel, so the distribution boots under UEFI: multiboot2 tag 10 and page tables that do not assume a load at 1 MiB. Every machine sold in the last fifteen years boots that way; today the ISO goes through Limine's BIOS path.
 - [ ] `planned` The four Debian units that still fail: `/proc/self/mountinfo` naming a mount by the path the caller used rather than the path it was recorded with (`tmp.mount`, `run-lock.mount`), `sched_setscheduler` accepting what `CPUSchedulingPolicy=` asks for (`e2scrub_reap.service` exits `214/SETSCHEDULER`), and `systemd-sysusers`.
@@ -237,13 +223,44 @@ Wi-Fi — so it runs before M128-M131.
 - [ ] `planned` The observability remainder: tracepoints and kprobes, and eBPF with a JIT, BTF and CO-RE, so a `bpftrace` script or a CO-RE toolchain's program loads instead of being refused with a reason.
 - [ ] `planned` Proof: the Debian and systemd lanes pass with no lane-side workaround, an ISO boots on a UEFI machine, and every row this milestone names is gone from the gap table.
 
-## M134: ACPI methods
+## M135: Power management, the rest
 
-Per-subject detail: [platforms.md](platforms.md).
+M129 made the machine sleep, wake and scale: s2idle and ACPI S3, the P-states
+the firmware declares, cpuidle with a tickless idle, and a battery and thermal
+zone read out of AML. What it did not make is a machine that manages its own
+power — nothing reacts to a closed lid, nothing lowers the clock because the
+machine is idle, and nothing acts on a temperature. This milestone is that
+remainder, collected because the pieces share one shape: the mechanisms exist
+and nothing drives them.
 
-- [x] `done` An AML interpreter: the DSDT and every SSDT are loaded and the object tree built — scopes, devices, methods, packages, fields, operation regions. On QEMU's own firmware that is 354 objects, 105 methods, 53 devices, with no term the loader could not decode.
-- [x] `done` An evaluator for what those objects need: the opcodes, control flow, conversions, method calls with arguments and locals, and field access through SystemMemory and SystemIO. A runaway method spends a step budget and errors rather than hanging.
-- [x] `done` A refusal is a refusal: PCI config, embedded-controller, SMBus and CMOS regions return an error that propagates out of the evaluation and is recorded in `/proc/b1nix-acpi`, never a zero.
-- [x] `partial` The consumers: `/sys/class/power_supply/{BAT0,AC0}` and `/sys/class/thermal/thermal_zoneN` from `_STA`/`_BIF`/`_BST`/`_PSR`/`_TMP`, published only for devices the firmware declares — and no machine here declares any, so the code is written and unexercised.
-- [ ] `planned` What it is not used for yet: powering the machine off through `\_S5`, `_PSS` for cpufreq, GPE dispatch and `Notify` handlers, `_PRT` for interrupt routing.
-- [x] `done` Proof: thirteen checks against QEMU's own DSDT — `\_S5_` a package of four, `_HID` exactly `PNP0A03`, a 156-byte `_CRS`, a method with an argument that writes a CPU selector to an I/O port and reads the enabled bit back (0x0F for CPU 0, 0 for CPU 200), and a region refusal recorded rather than faked. On aarch64: no tables, roots only, nothing published.
+Per-subject detail, item by item:
+[memory-and-scheduling.md](memory-and-scheduling.md).
+
+- [ ] `planned` ACPI events: the SCI handler, GPE dispatch and `Notify`, so the
+  power button, the lid, the adapter going in and out, a battery changing state
+  and a thermal trip reach the kernel at all — today none of them do, and the
+  battery is only ever read because somebody opened a sysfs file. `\_S5` with
+  it, so a power-off is the firmware's rather than three hard-coded QEMU ports
+  that print "poweroff unsupported, halting" on a real machine.
+- [ ] `planned` The resume remainder: a resume callback for the devices that
+  still have none (Intel HDA, virtio-input, virtio-console, the PS/2
+  controller, the IOMMUs), the MSI and MSI-X capability in the PCI snapshot —
+  restoring the BARs and the command register leaves an MSI-X device back with
+  no vectors — and a quiesce callback, so the queues are drained before the
+  power goes rather than trusted to be empty.
+- [ ] `planned` Frequency and idle that respond to the machine: a load-driven
+  governor (today `performance` and `powersave` are two ends of a range and
+  nothing moves between them), `_PPC` for the ceiling the firmware asks for,
+  per-policy control with Linux's `policy*` layout, ACPI `_CST` for the idle
+  states a platform declares, and an idle governor that picks a state from the
+  predicted idle length instead of always taking the deepest one.
+- [ ] `planned` Acting on heat and charge: trip points (`_PSV`, `_AC0`,
+  `_CRT`), cooling devices, passive throttling and a critical-temperature
+  shutdown; `_BIX`, charge thresholds and an event to userspace, so a desktop's
+  battery indicator does not have to poll.
+- [ ] `planned` The two states that are missing entirely: hibernate (S4, with
+  `/sys/power/disk`), and a deep sleep on aarch64 through PSCI
+  `SYSTEM_SUSPEND`; with them the `/sys/power` surface userspace expects —
+  `wakeup_count`, `mem_sleep`, `wakeup_sources` — and runtime PM, so an idle
+  PCI device can reach D3 instead of staying at full power until the machine
+  sleeps.

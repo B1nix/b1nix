@@ -270,6 +270,27 @@ int acpi_power_battery_attr(int idx, int which, char *buf, usize cap) {
         full = bif.elem_int[1];             /* fall back to the design value */
 
     switch (which) {
+    case ACPI_BAT_VOLTAGE: {
+        /* _BST's present voltage in mV, or _BIF's design voltage when the
+         * battery will not say. upower reads this and a laptop's battery
+         * indicator is wrong without it. */
+        u64 mv = bst.elem_int[3];
+
+        if (!mv || mv == 0xFFFFFFFFULL)
+            mv = bif.elems > 4 ? bif.elem_int[4] : 0;
+        if (!mv || mv == 0xFFFFFFFFULL)
+            return -1;
+        return snprintf(buf, cap, "%llu\n", (unsigned long long)(mv * 1000));
+    }
+    case ACPI_BAT_RATE: {
+        /* The present rate: mW when the battery reports in energy units, mA
+         * when it reports in charge units. Either way sysfs wants micro-. */
+        u64 rate = bst.elem_int[1];
+
+        if (rate == 0xFFFFFFFFULL)
+            return -1;
+        return snprintf(buf, cap, "%llu\n", (unsigned long long)(rate * 1000));
+    }
     case ACPI_BAT_CAPACITY:
         if (!full || remaining == 0xFFFFFFFFULL)
             return -1;

@@ -27,6 +27,8 @@
 #define ACPI_BAT_CAPACITY    3
 #define ACPI_BAT_NOW         4   /* energy_now or charge_now */
 #define ACPI_BAT_FULL        5   /* energy_full or charge_full */
+#define ACPI_BAT_VOLTAGE     6   /* voltage_now, in microvolts */
+#define ACPI_BAT_RATE        7   /* power_now or current_now */
 
 /* Thermal zone attributes. */
 #define ACPI_TZ_TYPE         0

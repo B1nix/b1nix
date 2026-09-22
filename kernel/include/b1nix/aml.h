@@ -112,6 +112,13 @@ struct aml_result {
 int aml_evaluate(const char *path, const u64 *args, int nargs,
                  struct aml_result *out);
 
+/* The same, but flattening ONE element of the package the evaluation returned
+ * — what reading a package of packages needs. `_PSS` is the case that made this
+ * exist: a package with one inner package per P-state, each of six integers.
+ * AML_EARG when the object is not a package or has no such element. */
+int aml_evaluate_element(const char *path, const u64 *args, int nargs,
+                         u32 index, struct aml_result *out);
+
 /* True when the namespace has an object at that path. */
 int aml_exists(const char *path);
 

@@ -327,6 +327,35 @@ static void lapic_icr_wait_idle(void) {
     }
 }
 
+/* The same wait with a deadline, for a path that must not hang on a target that
+ * never accepts.
+ *
+ * The unbounded wait above is right for every ordinary IPI: a shootdown or a
+ * reschedule that is not delivered is a correctness problem, and the machine is
+ * better stopped than left with a stale TLB. Waking a processor after an S3 is
+ * the opposite case — the target may be in a state that never accepts an INIT,
+ * and spending two minutes finding that out (measured, on this very path) turns
+ * a three-second sleep into a resume a test harness calls a hang. */
+static int lapic_icr_wait_idle_bounded(u64 timeout_ns) {
+    u64 deadline = ktime_monotonic_ns() + timeout_ns;
+
+    while (lapic_read(LAPIC_ICR_LOW) & (1 << 12)) {
+        if (ktime_monotonic_ns() >= deadline)
+            return 0;
+        __asm__ volatile("pause");
+        tlb_shootdown_poll();
+    }
+    return 1;
+}
+
+static int lapic_send_ipi_bounded(u32 apic_id, u32 icr_low, u64 timeout_ns) {
+    if (!lapic_icr_wait_idle_bounded(timeout_ns))
+        return 0;
+    lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
+    lapic_write(LAPIC_ICR_LOW, icr_low);
+    return lapic_icr_wait_idle_bounded(timeout_ns);
+}
+
 void lapic_send_ipi(u32 apic_id, u32 icr_low) {
     lapic_icr_wait_idle();
     /* xAPIC (MMIO) mode: the destination APIC ID lives in ICR_HIGH bits
@@ -380,6 +409,31 @@ void lapic_init_local(void) {
 
     /* TPR = 0 so every vector >= 0x10 is accepted. */
     lapic_write(LAPIC_TPR, 0);
+}
+
+/* Bring this CPU's local APIC back after a sleep that reset it (M129).
+ *
+ * Deliberately NOT lapic_init(): that one also re-measures the processor's
+ * clock and re-anchors the TSC (arch_tsc_clock_init sets the counter's origin
+ * to "now"), which on a resume throws away the anchor the suspend path had just
+ * computed — the kernel's clock then reads a constant, every deadline computed
+ * from it is in the future for ever, and a hundred-millisecond wait for the
+ * other processor spins for two minutes. Measured, twice.
+ *
+ * What a resume actually needs is the three things the reset took away: the
+ * enable bit in the APIC base MSR, this CPU's LAPIC state, and the periodic
+ * timer at the rate the scheduler was already running at. */
+void lapic_resume(void) {
+    u32 lo, hi;
+
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(IA32_APIC_BASE_MSR));
+    if (!(lo & IA32_APIC_BASE_ENABLE)) {
+        lo |= IA32_APIC_BASE_ENABLE;
+        __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(IA32_APIC_BASE_MSR));
+    }
+    lapic_init_local();
+    if (g_tick_period_ms)
+        lapic_timer_start_periodic_ms(g_tick_period_ms);
 }
 
 void lapic_init(void) {
@@ -708,7 +762,14 @@ void ap_main(u32 cpu_id) {
      * re-enters from the timer ISR — both already wired by M24b. */
     lapic_timer_start_periodic_ms(1000u / sched_tick_hz());
 
-    struct task *idle = scheduler_setup_ap_idle((int)cpu_id, pcpu->kernel_stack_virt);
+    /* This AP's idle task, made once. An AP that is starting for the SECOND
+     * time — after an S3, which took its processor state away and left
+     * everything in memory — already has one, and building a second would hand
+     * the scheduler two idle tasks for one CPU and leak the first. */
+    struct task *idle = pcpu->idle_task
+                            ? pcpu->idle_task
+                            : scheduler_setup_ap_idle((int)cpu_id,
+                                                      pcpu->kernel_stack_virt);
     pcpu->idle_task = idle;
     pcpu->cur_task = idle;       /* current_task = this AP's idle task */
     pcpu->sched_return_ctx = 0;
@@ -720,6 +781,11 @@ void ap_main(u32 cpu_id) {
         if (!switched) {
             extern u64 g_idle_halts;
 
+            /* An S3 sleep is about to take this processor's state away, and
+             * this is the one place an AP holds nothing: no lock, no task but
+             * its own idle context, nothing half-written. So the park request
+             * is answered here and nowhere else (M129). */
+            sched_park_here_if_asked();
             g_idle_halts++;
             cpuidle_enter();
         }
@@ -875,6 +941,10 @@ u64 ap_stack_peak(u64 *total_out) {
  * per miss. */
 #define SMP_INIT_HOLD_NS  (10ull * 1000 * 1000)
 #define SMP_SIPI_WAIT_NS  (100ull * 1000 * 1000)
+/* How long a wake-up path waits for the local APIC to report an IPI delivered.
+ * Generous for a message that normally completes in microseconds, and finite
+ * because the alternative was two minutes. */
+#define SMP_IPI_DELIVER_NS (20ull * 1000 * 1000)
 
 static void smp_delay_ns(u64 ns) {
     u64 deadline = ktime_monotonic_ns() + ns;
@@ -1164,6 +1234,76 @@ ap_done:
      * IPI fan-outs, etc.) so they don't always walk to MAX_CPUS. */
     g_max_cpus = ap_count + 1;
     return ap_count + 1;
+}
+
+/* Start the secondary CPUs again after a sleep that took their state away.
+ *
+ * Everything they need already exists — their per-CPU structures, their stacks,
+ * their idle tasks — because they were parked rather than torn down; what is
+ * gone is the processor state, so they are started the way they were started
+ * the first time and re-enter ap_main, which re-does the per-CPU set-up and
+ * drops straight into the idle loop. Returns how many came back. */
+int arch_relaunch_secondary_cpus(void) {
+    u64 paging_cr3_to_pml4(u64 cr3);
+    u64 cr3_val;
+    u64 pml4_phys;
+    u64 tv = 0xFFFF800000000000ULL + 0x8000;
+    int back = 0;
+
+    /* The PML4 the kernel is running on, as smp_boot_aps takes it: under
+     * five-level paging CR3 names a PML5, and paging_cr3_to_pml4 is what
+     * translates that to the table the trampoline expects. */
+    __asm__ volatile("movq %%cr3, %0" : "=r"(cr3_val));
+    pml4_phys = paging_cr3_to_pml4(cr3_val);
+
+    for (int cpu_id = 1; cpu_id < g_max_cpus && cpu_id < MAX_CPUS; cpu_id++) {
+        struct percpu *pcpu = ap_cpu_data[cpu_id];
+        u32 apic_id;
+
+        if (!pcpu)
+            continue;
+        apic_id = (u32)pcpu->apic_id;
+        pcpu->cpu_online = 0;
+        smp_setup_trampoline(pml4_phys, pcpu->kernel_stack_virt,
+                             (u64)(usize)pcpu, (u32)cpu_id);
+        arch_tsc_warp_prepare();
+        /* SIPI first, no INIT.
+         *
+         * The wake left this processor exactly where a reset leaves it: halted,
+         * waiting for a start-up message. It does not need to be INIT'd to get
+         * there, and sending one anyway is what turned this path into a
+         * two-minute wait — the INIT was never accepted and the delivery-status
+         * spin held the machine for it. An INIT is still the fallback below, for
+         * a processor that did not answer the message. */
+        lapic_send_ipi_bounded(apic_id, LAPIC_ICR_STARTUP | 0x08,
+                               SMP_IPI_DELIVER_NS);
+        if (!smp_wait_ready(tv + TRAMP_READY_OFF, SMP_SIPI_WAIT_NS)) {
+            /* The start-up message alone did not bring it back; the full
+             * INIT/SIPI sequence is the fallback, as at boot. */
+            lapic_send_ipi_bounded(apic_id,
+                                   LAPIC_ICR_INIT | LAPIC_ICR_LEVEL_ASSERT |
+                                       LAPIC_ICR_TRIGGER_LEVEL,
+                                   SMP_IPI_DELIVER_NS);
+            smp_delay_ns(SMP_INIT_HOLD_NS);
+            lapic_send_ipi_bounded(apic_id,
+                                   LAPIC_ICR_INIT | LAPIC_ICR_LEVEL_DEASSERT |
+                                       LAPIC_ICR_TRIGGER_LEVEL,
+                                   SMP_IPI_DELIVER_NS);
+            lapic_send_ipi_bounded(apic_id, LAPIC_ICR_STARTUP | 0x08,
+                                   SMP_IPI_DELIVER_NS);
+            if (!smp_wait_ready(tv + TRAMP_READY_OFF, SMP_SIPI_WAIT_NS)) {
+                console_write("smp: cpu ");
+                console_write_dec(cpu_id);
+                console_write(" did not come back from S3\n");
+                continue;
+            }
+        }
+        console_write("smp: cpu ");
+        console_write_dec(cpu_id);
+        console_write(" back after S3\n");
+        back++;
+    }
+    return back;
 }
 
 /* ── SMP percpu accessors (used by task stealing) ── */

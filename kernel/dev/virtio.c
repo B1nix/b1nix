@@ -71,6 +71,50 @@ void virtio_set_guest_features(struct virtio_device *dev, u32 features)
 	outl((u16)(dev->port_base + VIRTIO_PCI_GUEST_FEATURES), features);
 }
 
+/* Put a queue back after a sleep that reset the device (M129).
+ *
+ * The ring is this driver's memory and survived; what did not survive is the
+ * device's half of the agreement — the negotiated features, the queue address
+ * it was told, and its own idea of how far it had consumed the available ring.
+ * A device that comes back at reset believes it has consumed nothing, so a ring
+ * left where it stood would be replayed from the beginning: every request the
+ * driver ever posted, executed again. Both sides therefore start from zero, and
+ * the caller is responsible for whatever was in flight (which is why the resume
+ * path quiesces the queues before the machine sleeps).
+ */
+void virtq_resume(struct virtio_device *dev, struct virtqueue *vq)
+{
+	usize desc_size = 16u * vq->queue_size;
+
+	/* An empty ring, as the device believes it to be. */
+	memset(vq->desc, 0, desc_size);
+	vq->avail->idx = 0;
+	vq->avail->flags = 0;
+	vq->used->idx = 0;
+	vq->used->flags = 0;
+	vq->last_used_idx = 0;
+
+	outw((u16)(dev->port_base + VIRTIO_PCI_QUEUE_SEL), vq->queue_idx);
+	outl((u16)(dev->port_base + VIRTIO_PCI_QUEUE_PFN), vq->pfn);
+}
+
+/* The device-side handshake, from reset to the features the driver had. The
+ * queues are published by virtq_resume between the feature negotiation and
+ * DRIVER_OK, exactly as at boot. */
+void virtio_resume_begin(struct virtio_device *dev, u32 features)
+{
+	virtio_set_status(dev, 0);
+	virtio_set_status(dev, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+	virtio_set_guest_features(dev, features);
+	virtio_set_status(dev, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER |
+				       VIRTIO_STATUS_FEATURES_OK);
+}
+
+void virtio_resume_finish(struct virtio_device *dev)
+{
+	virtio_set_status(dev, virtio_get_status(dev) | VIRTIO_STATUS_DRIVER_OK);
+}
+
 int virtq_init(struct virtio_device *dev, u16 queue_idx, struct virtqueue *vq)
 {
 	// Select queue

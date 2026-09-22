@@ -17,6 +17,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/arch.h>
 #include <string.h>
+#include <b1nix/suspend.h>
 
 #define VIRTIO_VENDOR_ID     0x1AF4
 #define VIRTIO_NET_DEVICE_ID 0x1000
@@ -334,6 +335,35 @@ static int vnet_link_up(struct netdev *nd)
 
 /* ── probe ──────────────────────────────────────────────────────────────── */
 
+/* Put the interface back after an S3 (M129).
+ *
+ * The device is at its reset state: no features, no queues, nothing posted. The
+ * driver's buffers — the TX pool, the RX buffers, their frames — are all still
+ * here, so the agreement is re-stated and the receive ring re-filled from the
+ * buffers that already exist. The MAC is the device's own and comes back with
+ * it; the netdev registration above the driver never went away, so an address
+ * assigned before the sleep is still assigned after it. */
+static int virtio_net_resume(void *ctx) {
+	(void)ctx;
+	if (!vnet_ready || !net_dev.port_base)
+		return 0;
+
+	virtio_resume_begin(&net_dev, vnet_features);
+	virtq_resume(&net_dev, &net_rx_vq);
+	virtq_resume(&net_dev, &net_tx_vq);
+	net_tx_vq.avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
+	virtio_resume_finish(&net_dev);
+
+	/* Every receive buffer posted again: the ring the device is looking at is
+	 * empty, and an interface with nothing posted receives nothing. */
+	for (u16 i = 0; i < rx_buffer_count; i++)
+		fill_rx_buffer(i);
+	virtq_kick(&net_dev, &net_rx_vq);
+	if (net_dev.irq != 0xFF)
+		x86_pic_unmask(net_dev.irq);
+	return 0;
+}
+
 int virtio_net_probe(void)
 {
 	if (!virtio_init_device(&net_dev, VIRTIO_VENDOR_ID, VIRTIO_NET_DEVICE_ID)) {
@@ -446,5 +476,6 @@ int virtio_net_probe(void)
 	if (net_dev.irq != 0xFF) {
 		x86_pic_unmask(net_dev.irq);
 	}
+	suspend_register_device("virtio-net", virtio_net_resume, 0);
 	return 1;
 }

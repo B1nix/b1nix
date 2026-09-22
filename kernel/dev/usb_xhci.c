@@ -27,6 +27,7 @@
 #include <b1nix/blk.h>
 #include <b1nix/spinlock.h>
 #include <string.h>
+#include <b1nix/suspend.h>
 
 /* ── Capability registers ───────────────────────────────────────────────── */
 #define XHCI_CAP_CAPLENGTH   0x00  /* u8                                      */
@@ -156,6 +157,9 @@ static volatile u8 *rt_base;      /* runtime registers          */
 static volatile u32 *db_array;    /* doorbell array             */
 static u32 ctx_bytes;             /* 32 or 64 (CSZ)             */
 static u32 num_ports;
+/* MaxSlotsEnabled as programmed at bring-up: the resume has to program the same
+ * value into a controller that came back at reset. */
+static u32 xhci_max_slots;
 static int xhci_ready;
 static int xhci_msc_single_block_requested;
 
@@ -1411,6 +1415,104 @@ static void usb_enumerate_ports(void)
 	}
 }
 
+/* Put the host controller back after an S3 (M129).
+ *
+ * xHCI comes back halted and reset: no device context array, no command or
+ * event ring, no slots, and every port back at power-on. The rings and their
+ * buffers are this driver's memory and survived, so the controller is
+ * re-programmed over exactly those — nothing is allocated, because allocating a
+ * second set of rings per sleep is a leak the machine never recovers.
+ *
+ * The devices are a different matter: their slots and addresses were the
+ * controller's, and they are gone. So the ports are enumerated again, which is
+ * what re-addresses the keyboard and re-arms its interrupt endpoint; without it
+ * the machine resumes with a keyboard that is plugged in and reports nothing.
+ */
+static int xhci_resume(void *ctx)
+{
+	u64 dcbaa_phys;
+
+	(void)ctx;
+	if (!xhci_ready || !op_base || !dcbaa || !cmd_ring || !evt_ring)
+		return 0;
+
+	/* Halt, reset, and wait for the controller to say it is ready. */
+	wr32(op_base, XHCI_OP_USBCMD, rd32(op_base, XHCI_OP_USBCMD) & ~USBCMD_RUN);
+	for (int i = 0; i < 100000; i++) {
+		if (rd32(op_base, XHCI_OP_USBSTS) & USBSTS_HCH)
+			break;
+		udelay(1);
+	}
+	wr32(op_base, XHCI_OP_USBCMD, USBCMD_HCRST);
+	{
+		int reset_done = 0;
+
+		for (int i = 0; i < 100000; i++) {
+			if (!(rd32(op_base, XHCI_OP_USBCMD) & USBCMD_HCRST) &&
+			    !(rd32(op_base, XHCI_OP_USBSTS) & USBSTS_CNR)) {
+				reset_done = 1;
+				break;
+			}
+			udelay(10);
+		}
+		if (!reset_done)
+			return -1;
+	}
+
+	/* The same tables, told again. The device context array keeps its
+	 * scratchpad pointer in slot 0 — the pages are still ours — and the rest
+	 * of it describes slots that no longer exist, so it is cleared. */
+	dcbaa_phys = (u64)(usize)dcbaa - vmm_direct_map_base();
+	{
+		u64 scratchpad = dcbaa[0];
+
+		memset(dcbaa, 0, PAGE_SIZE);
+		dcbaa[0] = scratchpad;
+	}
+	wr32(op_base, XHCI_OP_CONFIG, xhci_max_slots);
+	wr64(op_base, XHCI_OP_DCBAAP, dcbaa_phys);
+
+	memset(cmd_ring, 0, PAGE_SIZE);
+	cmd_enq = 0;
+	cmd_cycle = 1;
+	wr64(op_base, XHCI_OP_CRCR, cmd_ring_phys | 1u /* RCS */);
+
+	memset(evt_ring, 0, PAGE_SIZE);
+	evt_deq = 0;
+	evt_cycle = 1;
+	erst[0] = evt_ring_phys;
+	erst[1] = RING_LEN;
+	wr32(rt_base, XHCI_IR0 + IR_ERSTSZ, 1);
+	wr32(rt_base, XHCI_IR0 + IR_IMAN, 0x00000001);
+	wr64(rt_base, XHCI_IR0 + IR_ERDP, evt_ring_phys);
+	wr64(rt_base, XHCI_IR0 + IR_ERSTBA, erst_phys);
+
+	/* Whatever was enumerated is not enumerated any more. */
+	kbd_slot = -1;
+	kbd_ep_dci = -1;
+	saved_events_head = saved_events_tail = 0;
+	memset(prev_report, 0, sizeof(prev_report));
+
+	wr32(op_base, XHCI_OP_USBCMD, rd32(op_base, XHCI_OP_USBCMD) | USBCMD_RUN);
+	{
+		int running = 0;
+
+		for (int i = 0; i < 100000; i++) {
+			if (!(rd32(op_base, XHCI_OP_USBSTS) & USBSTS_HCH)) {
+				running = 1;
+				break;
+			}
+			udelay(1);
+		}
+		if (!running)
+			return -1;
+	}
+
+	/* And the devices, from the ports up. */
+	usb_enumerate_ports();
+	return 0;
+}
+
 /* ── Probe ──────────────────────────────────────────────────────────────── */
 int xhci_probe(void)
 {
@@ -1522,6 +1624,8 @@ int xhci_probe(void)
 		num_ports = max_mapped_ports;
 	}
 	u32 max_slots = hcs1 & 0xff;
+
+	xhci_max_slots = max_slots;
 	console_write("xhci: max_slots=");
 	console_write_dec(max_slots);
 	console_write("\n");
@@ -1634,6 +1738,7 @@ int xhci_probe(void)
 	}
 
 	xhci_ready = 1;
+	suspend_register_device("xhci", xhci_resume, 0);
 	console_write("xhci: ");
 	console_write_hex32(pci.device_id);
 	console_write(" ports=");

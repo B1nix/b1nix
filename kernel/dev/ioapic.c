@@ -94,8 +94,39 @@ static void resolve_irq(u8 legacy_irq, int level_low,
     *out_flags = pol | trig;
 }
 
+/* Every route this kernel has installed, so it can install them again.
+ *
+ * An IOAPIC loses its redirection table across S3 — the chipset comes back at
+ * its reset state, every entry masked — and nothing else in the kernel knows
+ * what was in it: the routes are programmed from a dozen places as devices come
+ * up, and a resume cannot ask the devices to do it again. So the routes are
+ * remembered as they are made, and replayed on the way back (ioapic_resume).
+ */
+#define IOAPIC_MAX_SAVED 32
+
+struct ioapic_saved_route {
+    u8 legacy_irq, vector, dest_apic, level_low, used;
+};
+
+static struct ioapic_saved_route g_saved[IOAPIC_MAX_SAVED];
+
+static void ioapic_remember(u8 legacy_irq, u8 vector, u8 dest_apic,
+                            int level_low) {
+    for (int i = 0; i < IOAPIC_MAX_SAVED; i++) {
+        if (g_saved[i].used && g_saved[i].legacy_irq != legacy_irq)
+            continue;
+        g_saved[i].legacy_irq = legacy_irq;
+        g_saved[i].vector = vector;
+        g_saved[i].dest_apic = dest_apic;
+        g_saved[i].level_low = (u8)(level_low ? 1 : 0);
+        g_saved[i].used = 1;
+        return;
+    }
+}
+
 void ioapic_route_irq(u8 legacy_irq, u8 vector, u8 dest_apic, int level_low) {
     if (!g_ioapic_active) return;
+    ioapic_remember(legacy_irq, vector, dest_apic, level_low);
 
     u32 gsi, flags;
     resolve_irq(legacy_irq, level_low, &gsi, &flags);
@@ -124,6 +155,24 @@ static void ioapic_set_mask(u8 legacy_irq, int masked) {
 
 void ioapic_mask_irq(u8 legacy_irq)   { ioapic_set_mask(legacy_irq, 1); }
 void ioapic_unmask_irq(u8 legacy_irq) { ioapic_set_mask(legacy_irq, 0); }
+
+/* Put every route back after a sleep that reset the chip. Called with
+ * interrupts off, from the resume path, before anything is allowed to raise
+ * one: an unrouted line is a device that answers nothing for ever. */
+int ioapic_resume(void) {
+    int n = 0;
+
+    if (!g_ioapic_active)
+        return 0;
+    for (int i = 0; i < IOAPIC_MAX_SAVED; i++) {
+        if (!g_saved[i].used)
+            continue;
+        ioapic_route_irq(g_saved[i].legacy_irq, g_saved[i].vector,
+                         g_saved[i].dest_apic, g_saved[i].level_low);
+        n++;
+    }
+    return n;
+}
 
 int ioapic_active(void) { return g_ioapic_active; }
 

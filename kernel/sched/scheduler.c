@@ -1806,6 +1806,87 @@ void sched_thaw_userspace(void) {
 
 int sched_frozen_count(void) { return g_frozen_tasks; }
 
+/* ── parking the secondary CPUs for a sleep that takes their state (M129) ──
+ *
+ * An S3 sleep removes power from the processors, so every CPU but the one doing
+ * the sleeping has to be somewhere it can afford to be INIT'd: holding no lock,
+ * running no task's kernel half, with nothing half-written. The idle loop is
+ * that place and the only one, so the request is answered there
+ * (sched_park_here_if_asked, called from the AP idle path) and nowhere else.
+ *
+ * A parked CPU halts with interrupts off and never returns; the resume starts
+ * it again from its start-up vector, which re-enters ap_main and drops it back
+ * into the idle loop it was parked in. That is why nothing here has to save the
+ * AP's state: there is nothing in it worth saving.
+ */
+static volatile int g_park_request;
+static volatile int g_parked_cpus;
+
+void sched_park_here_if_asked(void) {
+  if (!__atomic_load_n(&g_park_request, __ATOMIC_ACQUIRE))
+    return;
+  __atomic_fetch_add(&g_parked_cpus, 1, __ATOMIC_RELEASE);
+  for (;;) {
+    interrupts_disable();
+    /* Not cpuidle_enter(): that one is counted as idle time and can be woken
+     * into the scheduler, and this CPU must not run anything again until it is
+     * started afresh. */
+#if defined(__x86_64__)
+    __asm__ volatile("hlt");
+#elif defined(__aarch64__)
+    __asm__ volatile("wfi");
+#else
+    cpu_relax();
+#endif
+  }
+}
+
+int sched_park_secondary_cpus(u64 timeout_ms) {
+  int want = (g_max_cpus > 1) ? g_max_cpus - 1 : 0;
+  u64 deadline = ktime_monotonic_ns() + timeout_ms * 1000000ull;
+
+  if (want == 0)
+    return 0; /* a machine with one CPU has nothing to park */
+  __atomic_store_n(&g_parked_cpus, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_park_request, 1, __ATOMIC_RELEASE);
+  /* A CPU deep in a kernel thread reaches its idle loop when that thread
+   * blocks; a kick shortens the wait for one that is merely running a task. */
+  ipi_reschedule_all();
+  while (__atomic_load_n(&g_parked_cpus, __ATOMIC_ACQUIRE) < want) {
+    if (ktime_monotonic_ns() >= deadline) {
+      __atomic_store_n(&g_park_request, 0, __ATOMIC_RELEASE);
+      return -1;
+    }
+    scheduler_sleep_ticks(1);
+  }
+  return 0;
+}
+
+void sched_unpark_secondary_cpus(void) {
+  int want = (g_max_cpus > 1) ? g_max_cpus - 1 : 0;
+
+  __atomic_store_n(&g_park_request, 0, __ATOMIC_RELEASE);
+  if (!want)
+    return;
+  if (__atomic_load_n(&g_parked_cpus, __ATOMIC_ACQUIRE) == 0)
+    return; /* nothing was parked: nothing to start */
+  __atomic_store_n(&g_parked_cpus, 0, __ATOMIC_RELEASE);
+  {
+    extern int arch_relaunch_secondary_cpus(void);
+    int back;
+
+    back = arch_relaunch_secondary_cpus();
+
+    if (back != want) {
+      console_write("power: ");
+      console_write_dec((u64)back);
+      console_write(" of ");
+      console_write_dec((u64)want);
+      console_write(" secondary CPU(s) came back\n");
+    }
+  }
+}
+
 int sched_freeze_userspace(u64 timeout_ms) {
   u64 deadline = ktime_monotonic_ns() + timeout_ms * 1000000ull;
 
