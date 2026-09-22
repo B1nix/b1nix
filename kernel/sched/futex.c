@@ -215,6 +215,18 @@ static u64 futex_key_word_for(u64 uaddr, int priv) {
   return uaddr;
 }
 
+/* The two halves of a futex key, for the one other subsystem that parks
+ * waiters on a futex word: io_uring's FUTEX_WAIT requests. They have to be
+ * computed the same way on both sides or a wake never finds its waiter, so the
+ * computation stays here and is called rather than copied. */
+u64 scheduler_futex_key_pml4(u64 uaddr, int priv) {
+  return futex_key_pml4_for(uaddr, priv);
+}
+
+u64 scheduler_futex_key_word(u64 uaddr, int priv) {
+  return futex_key_word_for(uaddr, priv);
+}
+
 /* Milliseconds per scheduler tick, from the timer that was actually armed.
  *
  * This was the literal 10, true only while the tick ran at 100 Hz. Programmed
@@ -664,9 +676,12 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
     } else {
       g_futex_wake_hit++;
     }
-    /* A ring may have a FUTEX_WAIT parked on this word; its waiter sleeps on
-     * the poll channel, which this wake does not otherwise touch. */
-    io_uring_futex_hint();
+    /* io_uring's FUTEX_WAIT requests are waiters on this word too: they park
+     * in their own FIFO, and what is left of this caller's budget is theirs.
+     * They count towards the number reported to userspace, because a waiter
+     * served is a waiter served whichever queue held it. */
+    if (woken < val)
+      woken += io_uring_futex_wake(key_pml4, key_word, val - woken);
     return woken;
   }
 

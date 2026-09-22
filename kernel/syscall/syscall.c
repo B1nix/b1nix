@@ -37,6 +37,7 @@ void tlb_shootdown_all(void);
 #include <b1nix/sysv_ipc.h>
 #include <b1nix/sock_filter.h>
 #include <b1nix/syscall.h>
+#include <b1nix/io_uring.h>
 #include "linux_modern.h"
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
@@ -3270,6 +3271,10 @@ static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
      * vfs_poll reads, so a racing waker either is seen by the scan or observes
      * our BLOCKED state. */
     scheduler_wait_prepare(vfs_poll_chan);
+
+    /* A ring whose completions the owner posts itself learns here that it has
+     * work: see io_uring_taskrun_refresh. */
+    io_uring_taskrun_refresh();
 
     int ready = 0;
     for (usize i = 0; i < nfds; i++) {

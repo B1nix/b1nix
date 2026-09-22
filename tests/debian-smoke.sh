@@ -134,45 +134,89 @@ elif [ "$(uname)" = "Darwin" ] && qemu-system-x86_64 -accel help 2>/dev/null | g
 	ACCEL_ARGS="-accel hvf -cpu host"
 fi
 
-echo "[RUN] Booting QEMU with $RUN_IMG as root (label $IMG_LABEL)..."
-: >"$LOG"
-qemu-system-x86_64 $ACCEL_ARGS -m "${DEBIAN_MEM_MB:-1024}" -smp "${DEBIAN_SMP:-2}" \
-	-cdrom "$ISO" \
-	-serial stdio -serial null -display none -monitor none -no-reboot \
-	-drive file="$RUN_IMG",if=none,id=debroot,format=raw \
-	-device virtio-blk-pci,drive=debroot \
-	-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-	${EXTRA_QEMU_ARGS:-} >"$LOG" 2>&1 &
-QEMU_PID=$!
+# One boot, appending to $LOG. $1 is added to the kernel command line, which is
+# how the liburing suite is split across boots: two hundred programs do not fit
+# in one boot's deadline, and a run that is cut off reports every test it never
+# reached as a failure -- thirty of them, none of them about the kernel.
+# $2 is that boot's deadline, because a part carrying fifty-odd programs that
+# may each burn their kill timeout needs more than the plain boot does.
+boot_once() { # extra-cmdline [deadline]
+	_extra="$1"
+	_deadline="${2:-$TIMEOUT}"
+	_blog="$PROJECT_DIR/smoke_run/debian-boot-part.log"
 
-DONE_PATTERN="${DEBIAN_DONE_PATTERN:-DEBIAN-SMOKE: done|KERNEL PANIC|\[PANIC\]}"
-start_ts=$(date +%s)
-reported=0
-while :; do
-	lines=$(wc -l <"$LOG" | tr -d ' ')
-	if [ "$lines" -gt "$reported" ]; then
-		sed -n "$((reported + 1)),${lines}p" "$LOG" | grep -a "DEBIAN-SMOKE:" || true
-		reported=$lines
-	fi
-	if grep -qa -E "$DONE_PATTERN" "$LOG" 2>/dev/null; then
-		break
-	fi
-	if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+	: >"$_blog"
+	echo "[RUN] Booting QEMU with $RUN_IMG as root (label $IMG_LABEL)${_extra:+ [$_extra]}..."
+	(cd "$PROJECT_DIR" && make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
+		KERNEL_CMDLINE="$CMDLINE $_extra" iso) >>"$BUILD_LOG" 2>&1 || {
+		printf "  ${RED}BUILD FAILED${NC} (log: %s)\n" "$BUILD_LOG"
+		return 1
+	}
+	cp "$BUILD_DIR/b1nix.iso" "$ISO"
+	sync
+	qemu-system-x86_64 $ACCEL_ARGS -m "${DEBIAN_MEM_MB:-1024}" -smp "${DEBIAN_SMP:-2}" \
+		-cdrom "$ISO" \
+		-serial stdio -serial null -display none -monitor none -no-reboot \
+		-drive file="$RUN_IMG",if=none,id=debroot,format=raw \
+		-device virtio-blk-pci,drive=debroot \
+		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+		${EXTRA_QEMU_ARGS:-} >"$_blog" 2>&1 &
+	QEMU_PID=$!
+
+	DONE_PATTERN="${DEBIAN_DONE_PATTERN:-DEBIAN-SMOKE: done|KERNEL PANIC|\[PANIC\]}"
+	start_ts=$(date +%s)
+	reported=0
+	while :; do
+		lines=$(wc -l <"$_blog" | tr -d ' ')
+		if [ "$lines" -gt "$reported" ]; then
+			sed -n "$((reported + 1)),${lines}p" "$_blog" | grep -a "DEBIAN-SMOKE:" || true
+			reported=$lines
+		fi
+		if grep -qa -E "$DONE_PATTERN" "$_blog" 2>/dev/null; then
+			break
+		fi
+		if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+			sleep 1
+			echo "[debian-smoke] QEMU exited before the done marker" >>"$_blog"
+			break
+		fi
+		now_ts=$(date +%s)
+		if [ $((now_ts - start_ts)) -ge "$_deadline" ]; then
+			echo "[debian-smoke] timeout after ${_deadline}s" >>"$_blog"
+			break
+		fi
 		sleep 1
-		echo "[debian-smoke] QEMU exited before the done marker" >>"$LOG"
-		break
+	done
+	# Kill BY PID — never pkill -f, which would match this script's own command line.
+	kill -9 "$QEMU_PID" 2>/dev/null || true
+	wait "$QEMU_PID" 2>/dev/null || true
+	QEMU_PID=""
+	cat "$_blog" >>"$LOG"
+	# The scratch image carries whatever the last boot wrote; every boot starts
+	# from the pristine one so the parts are independent.
+	cp "$IMG" "$RUN_IMG"
+	if [ -f "$STAGE" ] && command -v debugfs >/dev/null 2>&1; then
+		debugfs -w -R "rm /b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1
+		debugfs -w -R "write $STAGE b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1
 	fi
-	now_ts=$(date +%s)
-	if [ $((now_ts - start_ts)) -ge "$TIMEOUT" ]; then
-		echo "[debian-smoke] timeout after ${TIMEOUT}s" >>"$LOG"
-		break
-	fi
-	sleep 1
-done
-# Kill BY PID — never pkill -f, which would match this script's own command line.
-kill -9 "$QEMU_PID" 2>/dev/null || true
-wait "$QEMU_PID" 2>/dev/null || true
-QEMU_PID=""
+	return 0
+}
+
+: >"$LOG"
+# The first boot runs everything but liburing; the parts that follow run the
+# suite a slice at a time. LIBURING_PARTS=0 keeps the old single-boot behaviour.
+LIBURING_PARTS="${LIBURING_PARTS:-4}"
+if [ "$LIBURING_PARTS" -gt 0 ]; then
+	boot_once "b1nix.liburing=__none__" || exit 1
+	_p=1
+	while [ "$_p" -le "$LIBURING_PARTS" ]; do
+		boot_once "b1nix.liburing-part=$_p/$LIBURING_PARTS b1nix.liburing-timeout=${LIBURING_TIMEOUT:-20}" \
+			"${LIBURING_PART_TIMEOUT:-600}" || exit 1
+		_p=$((_p + 1))
+	done
+else
+	boot_once "" || exit 1
+fi
 
 # ── Check ──────────────────────────────────────────────────────────────────
 echo ""
@@ -280,7 +324,10 @@ if grep -qa "DEBIAN-SMOKE: liburing suite starts" "$LOG" 2>/dev/null; then
 		eventfd-reg eventfd-disable drop-submit link_drain connect socket \
 		submit-and-wait submit-reuse truncate rename symlink thread-exit \
 		teardowns fixed-buf-iter fixed-buf-merge fpos; do
-		grep -qa "DEBIAN-SMOKE: liburing-pass $t\$" "$LOG" 2>/dev/null &&
+		# The guest's console ends its lines with CR, so anchoring on `$`
+		# alone matched nothing and every test in this list was reported as
+		# failed however well it had done. Allow the carriage return.
+		grep -qa "DEBIAN-SMOKE: liburing-pass $t[[:space:]]*\$" "$LOG" 2>/dev/null &&
 			pass "liburing $t" ||
 			fail "liburing $t" "the test did not pass"
 	done

@@ -15,6 +15,10 @@ int io_uring_syscall(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
 /* The futex layer telling io_uring that a word was woken, so a ring with a
  * FUTEX_WAIT armed re-checks it now rather than at its next event. Cheap when
  * nothing is waiting: one relaxed load. */
-void io_uring_futex_hint(void);
+/* Hand `nr` wakes to the FUTEX_WAIT requests parked on this key; returns how
+ * many were served. Called from the futex layer's wake path. */
+int io_uring_futex_wake(u64 key_pml4, u64 key_word, int nr);
+/* Bring the IORING_SQ_TASKRUN flag of this task's deferred rings up to date. */
+void io_uring_taskrun_refresh(void);
 
 #endif /* B1NIX_IO_URING_H */

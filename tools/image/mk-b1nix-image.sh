@@ -270,6 +270,17 @@ done
 
 # The boot state, as the machine sees it: which entry booted, how many tries it
 # has left, and whether the unit that marks a boot good has run.
+# Why /boot is not mounted, when it is not: the ESP carries the boot state, and
+# the unit that marks a boot good writes it there. systemd generates boot.mount
+# from fstab and orders it after the device unit for /dev/vda2, so the answer is
+# either "no unit" (the generator skipped the line) or "no device" (udev never
+# announced the partition to systemd).
+say "boot-unit=$(timeout 15 systemctl show -p LoadState -p ActiveState -p Result boot.mount 2>&1 | tr '\n' ' ')"
+say "boot-device=$(timeout 15 systemctl show -p LoadState -p ActiveState dev-vda2.device 2>&1 | tr '\n' ' ')"
+say "boot-fstab=$(grep -a boot /etc/fstab 2>/dev/null | tr '\n' ' ')"
+timeout 15 journalctl -u boot.mount -n 5 --no-pager 2>&1 |
+	while read -r bl; do say "boot-log=$bl"; done
+
 if [ -r /boot/b1nix/boot-state ]; then
 	while read -r l; do say "boot-state=$l"; done </boot/b1nix/boot-state
 else

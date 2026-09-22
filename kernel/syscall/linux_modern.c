@@ -855,7 +855,15 @@ static isize lm_openat2(u64 dirfd, u64 upath, u64 uhow, u64 usize_) {
     return cs;
   if (kpath[0] == '\0')
     return -ENOENT;
-  if ((int)dirfd == -100 /* AT_FDCWD */) {
+  /* An absolute path does not need a directory to start from, and Linux does
+   * not look at `dirfd` when it gets one -- not even to check that it names
+   * anything. Validating it first turned an ordinary open of an absolute path
+   * with dirfd -1 into EBADF, which is what liburing's openat2 submits. */
+  if (kpath[0] == '/' &&
+      !(how.resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT))) {
+    base[0] = '/';
+    base[1] = '\0';
+  } else if ((int)dirfd == -100 /* AT_FDCWD */) {
     const char *cwd = scheduler_get_cwd();
 
     if (!cwd || strlen(cwd) >= sizeof(base))

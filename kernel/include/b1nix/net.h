@@ -271,6 +271,10 @@ void tcp_set_rcvbuf(struct tcp_conn *conn, u32 bytes);
  * setsockopt(2) takes them. */
 void tcp_set_keepalive(struct tcp_conn *conn, int on);
 int tcp_set_keepalive_param(struct tcp_conn *conn, int which, u32 seconds);
+/* TCP_SYNCNT: how many SYN retransmits a connect may spend. */
+int tcp_set_syncnt(struct tcp_conn *conn, u32 count);
+/* TCP_USER_TIMEOUT: how long, in milliseconds, data may stay unacknowledged. */
+int tcp_set_user_timeout(struct tcp_conn *conn, u32 ms);
 u32 tcp_get_keepalive_param(struct tcp_conn *conn, int which);
 int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags);
 int tcp_close(struct tcp_conn *conn);

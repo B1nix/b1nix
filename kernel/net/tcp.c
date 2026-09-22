@@ -61,7 +61,7 @@ struct tcp_header {
  * sit in TIME_WAIT for ~2s, so the M32b SSH smoke's three back-to-back logins
  * plus the white-box kernel TCP tests that run right after would otherwise
  * exhaust a 16-slot table and fail to allocate (tcp_accept -> NULL). */
-#define MAX_TCP_CONNS_CEIL 256
+#define MAX_TCP_CONNS_CEIL 512
 /* Receive buffer / advertised window. Sized to hold several TLS records so
  * HTTPS handshakes don't have to be drained in small chunks. Combined with the
  * window-update ACK in tcp_recv() (see recv_window_update), this keeps the peer
@@ -250,6 +250,14 @@ struct tcp_conn {
   u32 keepidle;
   u32 keepintvl;
   u32 keepcnt;
+  /* TCP_SYNCNT: how many times a SYN may be retransmitted before the connect
+   * gives up. 0 means the default. A program that asks for two does not want
+   * to wait out five. */
+  u8 syncnt;
+  /* TCP_USER_TIMEOUT, in milliseconds: how long data may stay unacknowledged
+   * before the connection is declared dead, whatever the retransmit count says.
+   * 0 means only the retransmit count decides. */
+  u32 user_timeout_ms;
   u64 last_activity;    /* uptime ticks of the last segment either way */
   u8 family; /* B1NIX_AF_INET or B1NIX_AF_INET6 */
   struct ipv4_addr remote_ip;
@@ -1272,6 +1280,33 @@ void tcp_set_keepalive(struct tcp_conn *conn, int on) {
   }
   tcp_unlock();
   irq_restore(irq);
+}
+
+/* TCP_SYNCNT and TCP_USER_TIMEOUT, which bound how long a connection attempt
+ * and an unacknowledged transfer may last. Both are set on the connection
+ * because that is where the retransmit timer reads them. */
+int tcp_set_syncnt(struct tcp_conn *conn, u32 count) {
+  if (!conn || count == 0 || count > 255)
+    return -1;
+  u64 irq = irq_save();
+  tcp_lock();
+  if (conn->used)
+    conn->syncnt = (u8)count;
+  tcp_unlock();
+  irq_restore(irq);
+  return 0;
+}
+
+int tcp_set_user_timeout(struct tcp_conn *conn, u32 ms) {
+  if (!conn)
+    return -1;
+  u64 irq = irq_save();
+  tcp_lock();
+  if (conn->used)
+    conn->user_timeout_ms = ms;
+  tcp_unlock();
+  irq_restore(irq);
+  return 0;
 }
 
 int tcp_set_keepalive_param(struct tcp_conn *conn, int which, u32 seconds) {
@@ -2713,8 +2748,37 @@ void tcp_timer_tick(void) {
         rp = rp->next;
         continue;
       }
-      if (now - rp->timestamp >= 50) { // 500ms
-        if (rp->retries >= 5) {
+      /* How long to wait before trying again.
+       *
+       * A SYN gets a full second, which is the initial RTO Linux uses and the
+       * scale TCP_SYNCNT is expressed in: at fifty milliseconds a caller that
+       * allowed two SYNs had its connect declared dead a tenth of a second
+       * after it started, before anything it did next could matter --
+       * liburing's conn-unreach aborts the attempt at 200 ms and expects to
+       * find it still in flight. Data keeps the short interval: it is ACKed in
+       * milliseconds on a working path. */
+      u64 retry_after = (conn->state == TCP_SYN_SENT)
+                            ? TCP_TICKS_PER_SEC
+                            : (TCP_TICKS_PER_SEC / 20u ? TCP_TICKS_PER_SEC / 20u
+                                                       : 1u);
+
+      if (now - rp->timestamp >= retry_after) {
+        /* How many tries this connection is allowed, and how long it may spend
+         * unacknowledged: TCP_SYNCNT bounds the first while the handshake is
+         * still open, TCP_USER_TIMEOUT bounds the whole attempt. A caller that
+         * asked for two SYNs and half a second must not wait out five tries. */
+        int max_tries = 5;
+        int spent_too_long = 0;
+
+        if (conn->state == TCP_SYN_SENT && conn->syncnt)
+          max_tries = conn->syncnt;
+        if (conn->user_timeout_ms) {
+          u64 ticks = (u64)conn->user_timeout_ms * SCHED_TICKS_PER_SEC / 1000u;
+
+          if (ticks && now - rp->timestamp >= ticks)
+            spent_too_long = 1;
+        }
+        if (rp->retries >= max_tries || spent_too_long) {
           if (conn->state == TCP_SYN_SENT)
             conn->connect_error = ETIMEDOUT;
           conn->state = TCP_CLOSED;

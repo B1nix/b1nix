@@ -803,6 +803,12 @@ if [ -d /opt/liburing ] && ls /opt/liburing/*.t >/dev/null 2>&1; then
 	lu_to=$(sed -n 's/.*b1nix\.liburing-timeout=\([0-9]*\).*/\1/p' \
 		/proc/cmdline 2>/dev/null)
 	lu_to=${lu_to:-${LIBURING_TIMEOUT:-20}}
+	# b1nix.liburing-strace=<comma-separated names> runs those tests under
+	# strace. A liburing test prints the value it got and not the call that
+	# produced it, so "write returned something other than nine" needs the
+	# syscall log to say which write and what it answered.
+	lu_strace=$(sed -n 's/.*b1nix\.liburing-strace=\([^ ]*\).*/\1/p' \
+		/proc/cmdline 2>/dev/null | tr ',' ' ')
 	lu_pn=${lu_part%%/*}
 	lu_pm=${lu_part##*/}
 	lu_idx=0
@@ -825,7 +831,14 @@ if [ -d /opt/liburing ] && ls /opt/liburing/*.t >/dev/null 2>&1; then
 			continue
 			;;
 		esac
-		timeout -s KILL "$lu_to" "$t" >/tmp/liburing-run/out 2>&1
+		_pfx=""
+		case " $lu_strace " in
+		*" $n "*)
+			command -v strace >/dev/null 2>&1 &&
+				_pfx="strace -f -y -s 96"
+			;;
+		esac
+		timeout -s KILL "$lu_to" $_pfx "$t" >/tmp/liburing-run/out 2>&1
 		rc=$?
 		case $rc in
 		0)

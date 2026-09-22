@@ -25,17 +25,29 @@ void resource_caps_init(void) {
   u64 ram_bytes = pmm_total_usable_memory();
   u64 ram_gb = ram_bytes / (1024ULL * 1024ULL * 1024ULL);
 
-  /* TCP connection slots: 64 at 1 GiB, +32 per extra GiB, clamped to [64, 256].
-   * Backing is a compile-time array sized to CAP_TCP_CEIL; only this many are
-   * used. */
-  u32 tcp = 64 + (u32)(ram_gb * 32);
-  if (tcp < 64) tcp = 64;
+  /* TCP connection slots: 192 at 1 GiB, +64 per extra GiB. Backing is a
+   * compile-time array sized to CAP_TCP_CEIL; only this many are used.
+   *
+   * 192 and not 64: a single test can hold a hundred at once -- liburing's
+   * accept opens 32 clients and accepts 32 of them on one listener, twice over,
+   * while the previous round's connections are still in TIME_WAIT -- and a table
+   * that runs out does not fail the accept, it simply stops handing connections
+   * over, which reads as a hang rather than as an error. */
+  u32 tcp = 192 + (u32)(ram_gb * 64);
+  if (tcp < 192) tcp = 192;
   if (tcp > CAP_TCP_CEIL) tcp = CAP_TCP_CEIL;
   g_resource_caps.tcp_max_conns = tcp;
 
-  /* VFS pipe buffers: 128 at 1 GiB, +64 per extra GiB, clamped to [128, 1024]. */
-  u32 pipes = 128 + (u32)(ram_gb * 64);
-  if (pipes < 128) pipes = 128;
+  /* VFS pipe buffers: 1024 at 1 GiB, +512 per extra GiB, clamped to
+   * [1024, 4096].
+   *
+   * The old floor was 128, which is below what a program is entitled to ask
+   * for: Linux's own soft limit is fs.pipe-user-pages-soft, 16384 pages, i.e.
+   * 1024 pipes of the default 64 KiB -- and liburing's poll-mshot-update opens
+   * exactly that many, so a thousand-and-first pipe is where this kernel used
+   * to answer ENFILE while Linux answers with a pipe. */
+  u32 pipes = 1024 + (u32)(ram_gb * 512);
+  if (pipes < 1024) pipes = 1024;
   if (pipes > CAP_PIPES_CEIL) pipes = CAP_PIPES_CEIL;
   g_resource_caps.max_pipes = pipes;
 

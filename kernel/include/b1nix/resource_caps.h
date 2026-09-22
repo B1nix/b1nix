@@ -28,8 +28,8 @@
 
 /* Initial ceilings (the compiled-in #defines that previously governed these).
  * A sysctl call cannot raise a cap above the corresponding ceiling. */
-#define CAP_TCP_CEIL        256   /* was: 64, but scaling allows more on big hosts */
-#define CAP_PIPES_CEIL      1024  /* was: 128 */
+#define CAP_TCP_CEIL        512   /* was: 256; one test can hold a hundred at once */
+#define CAP_PIPES_CEIL      4096  /* was: 1024, and 128 before that */
 #define CAP_SHMMAX_CEIL_MB  256   /* upper bound for SHMMAX in MiB */
 #define CAP_COREDUMP_CEIL   (8ULL * 1024 * 1024) /* 8 MiB */
 

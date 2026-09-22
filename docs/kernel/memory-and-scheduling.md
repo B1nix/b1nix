@@ -87,6 +87,22 @@ its quota has its tasks passed over until the period rolls over — except a tas
 inside a system call, which may hold a lock the rest of the machine is waiting
 behind.
 
+**A candidate the picker cannot take stops being a candidate.** The scan
+settles on the lowest-pass READY task and then asks whether it may be resumed:
+is its kernel-stack lease published, and is it some other CPU's current task?
+If the answer is no it took NOTHING -- it did not fall through to the
+runner-up -- so one task stuck in that state starved the whole machine while
+every other task sat READY and every pick answered "nothing runnable". Two ways
+into that state were found by liburing's futex test: a switch that was DECLINED
+handed the task back with the lease still down (claiming it had cleared the
+lease, and declining never put it back), and a recycled task slot inherited the
+previous occupant's switch-out marker, which `sched_handoff_recover` refuses to
+help by design. Both are fixed at the source; on top of them the scan now drops
+a candidate it has refused sixty-four times in a row, so no single stuck task can
+take the machine down again. A switch into a task whose saved stack pointer is
+zero is declined for the same reason: the next interrupt would push its frame at
+address −8, which is a double fault with no backtrace worth reading.
+
 **io** counts the bytes and device commands that really reach a device on a
 member's behalf, charged where the block layer serialises them, per device as
 `io.stat` prints them. `io.max` is a ceiling on those rates, enforced by making

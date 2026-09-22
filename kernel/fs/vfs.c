@@ -4097,7 +4097,12 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
           nh->node = rnode;
           nh->ops = &node_file_ops;
           nh->flags = flags;
-          nh->offset = (flags & B1NIX_O_APPEND) ? rnode->inode->size : 0;
+          /* O_APPEND moves each WRITE to the end; it does not move the
+           * descriptor's initial offset. Starting at EOF made the first read
+           * of a freshly opened append-mode file return nothing -- which is
+           * how liburing's across-fork saw an empty file after writing four
+           * lines into it. */
+          nh->offset = 0;
           if (h->open_path) {
             usize pl = strlen(h->open_path);
             char *op = kmalloc(pl + 1);
@@ -4504,7 +4509,9 @@ make_handle:;
   extern const struct vfs_file_ops node_file_ops;
   h->ops = &node_file_ops;
   h->flags = flags;
-  h->offset = (flags & B1NIX_O_APPEND) ? node->inode->size : 0;
+  /* See the note in the reopen path above: O_APPEND is a write rule, not a
+   * starting position. */
+  h->offset = 0;
 
   if (node->inode->open_cb && !path_only) {
     int orc = node->inode->open_cb(node, h);
@@ -4743,6 +4750,15 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
   if (!posp && (h->flags & B1NIX_O_APPEND))
     h->offset = node->inode->size;
   u64 offset = posp ? *posp : h->offset;
+  /* A POSITIONED write to an append-mode file appends too.
+   *
+   * POSIX says pwrite(2) ignores O_APPEND; Linux appends anyway, and it is
+   * Linux that programs are written against. io_uring's writes are all
+   * positioned, so without this every write through a ring to an append-mode
+   * file landed at the offset the SQE carried -- four writes to offset 0, each
+   * overwriting the last. */
+  if (posp && (h->flags & B1NIX_O_APPEND))
+    offset = node->inode->size;
   isize res = 0;
   if (node->inode->type == VFS_FILE && node->inode->write_cb &&
       node->inode->write_through_cb && node->inode->write_through_cb(node)) {
@@ -5078,6 +5094,26 @@ struct vfs_handle *vfs_handle_acquire(int fd) {
 isize vfs_handle_write(struct vfs_handle *h, const void *buf, usize size) {
   if (!h || !h->ops || !h->ops->write)
     return -EBADF;
+
+  /* RLIMIT_FSIZE: a write that would take a regular file past the caller's
+   * file-size limit is refused with EFBIG, and the caller is signalled. The
+   * limit was carried, reported in /proc/<pid>/limits and never enforced, so a
+   * program that set it -- a build system bounding a runaway log, liburing's
+   * read-write test -- watched the file grow past it. */
+  if (h->kind == VFS_HANDLE_NODE && h->node && h->node->inode &&
+      h->node->inode->type == VFS_FILE && size) {
+    struct rlimit lim;
+
+    if (scheduler_getrlimit(RLIMIT_FSIZE, &lim) == 0 &&
+        lim.rlim_cur != RLIM_INFINITY) {
+      u64 start = (h->flags & B1NIX_O_APPEND) ? h->node->inode->size : h->offset;
+
+      if (start >= lim.rlim_cur || size > lim.rlim_cur - start) {
+        scheduler_kill(scheduler_get_pid(), SIGXFSZ);
+        return -EFBIG;
+      }
+    }
+  }
 
   /* A read-only mount refuses the write here rather than in vfs_write, because
    * a caller that holds the open file and not its descriptor number — io_uring

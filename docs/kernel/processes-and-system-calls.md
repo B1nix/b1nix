@@ -384,6 +384,81 @@ filter that refuses the clock calls, and the Debian lane's `vdso-glibc` probe
 does the same for glibc.
 
 
+### What liburing's suite found (M133)
+
+The suite is the proof for this uapi, and running it a slice at a time per boot
+-- two hundred programs do not fit in one boot's deadline -- turned thirty
+reported failures into a handful of real ones. Each was a rule about the
+interface rather than a missing feature:
+
+- A registered file is looked up when a request is ISSUED, not when it is
+  prepared. A link chain is prepared whole and run a member at a time, so the
+  file a later member uses is put in the slot by an earlier one: a chain that
+  opens a socket into slot 0 and then configures, binds and listens on it is
+  ordinary, and resolving the slot at prep time refused three of its four
+  members with EBADF -- and a chain fails as a unit, so the socket was never
+  opened either.
+- `close` with a slot index closes the SLOT. Without that form the request fell
+  through to the ordinary path with descriptor 0 and closed the caller's
+  standard input while leaving the registered file in place.
+- A connect that has not finished yet is armed on writability and completes with
+  the connect's real result. Reporting EINPROGRESS is not an option for a
+  completion, and a non-blocking connect that SUCCEEDED did not even make the
+  socket writable, so nothing woke.
+- A request woken by readiness that finds no work waits for the next sweep. Three
+  accepts armed on one listener and one connection arriving is the ordinary
+  case: one takes it, and the other two were being handed EAGAIN as though they
+  had been refused.
+- An option set through `URING_CMD` takes its length from `optlen`, which is its
+  own field. Read from `len` it was always the zero `io_uring_prep_rw` leaves
+  there, so every setsockopt through a ring was refused.
+- `IORING_SETUP_SINGLE_ISSUER` is enforced: the promise is what lets the kernel
+  skip locking, so another thread gets EEXIST rather than being believed.
+- `IORING_SETUP_DEFER_TASKRUN` defers: the sweeping thread announces readiness
+  through the registered eventfd and the completion is posted by the owning task
+  when it enters the ring.
+- `O_APPEND` is a write rule, not a starting position, and a positioned write to
+  an append-mode file appends -- which is what Linux does and what a ring's
+  writes, all of them positioned, depend on.
+- A `FUTEX_WAIT` request is a waiter, not a poller. Re-reading the word on every
+  sweep and completing whenever the value had moved is a different primitive: a
+  wake meant for one request woke every request parked on the address, and a
+  wake for zero waiters woke them all. These requests queue in one
+  machine-wide FIFO, and `futex(2)`'s wake hands its budget out over both
+  queues -- the tasks parked in the syscall and the requests parked here -- in
+  arrival order, and counts what it served in either.
+- A futex of a shape this kernel does not serve is refused at submission. The
+  `FUTEX2_*` flags say how wide the word is; arming a request that names a
+  64-bit word or a NUMA policy leaves it waiting for a wake that can never name
+  it, which is a hang where the program asked for an error.
+- A ring whose completions its owner posts must say so. `IORING_SQ_TASKRUN` is
+  the only way a deferred completion reaches a program that reads the completion
+  queue without entering the kernel -- liburing enters on that bit and on the
+  overflow bit, and on nothing else -- so a ring that never raises it looks
+  permanently empty. The sweeping thread raises it, and so does any readiness
+  question the owner asks the kernel, because a program that triggers the
+  readiness itself and reads the flag in the next instruction beats a thread.
+- A ring is a pollable file, and a completion posted to it is reported to the
+  rings polling it at that moment rather than at their next sweep. One ring
+  watching another and reading its completion queue in the next instruction is
+  an ordinary shape.
+- A multishot poll reports an event that was not in its last report. A latch
+  that only remembers "reported" cannot tell readiness that has not changed from
+  readiness that has grown: a poll for POLLIN|POLLOUT on a socket that is
+  readable and not yet writable swallowed the socket becoming writable for ever.
+- A link chain that asks for its successes to be skipped skips its
+  cancellations too. One `IOSQE_CQE_SKIP_SUCCESS` anywhere in a chain means the
+  chain reports only what actually went wrong, which is the single completion a
+  five-deep link with a failing middle produces.
+- An unregistered personality is an error, not a request that runs as the
+  submitter, and `MSG_DONTWAIT` is answered rather than armed: both are cases
+  where doing the reasonable thing instead of the exact thing is undetectable
+  from outside.
+- The ring sizes are the ABI's: 32768 submission and 65536 completion entries,
+  and the in-flight guard is far above what any of it invites. A program that
+  walks the documented depths reads -EINVAL as "this kernel is broken", where
+  -ENOMEM is the answer it stops on.
+
 ## Observability: perf, userfaultfd, fanotify and eBPF (M126)
 
 Four ways for a program to see what the kernel is doing, and in two of the four

@@ -150,6 +150,24 @@ static void *g_task_xsave[TASK_SLOTS];
  * the M29 note on g_task_is_thread and friends), and the idle tasks have slots
  * above MAX_TASKS which TASK_SLOTS already covers. */
 static volatile int g_task_switching_out[TASK_SLOTS];
+/* A task the scan keeps choosing and keeps having to refuse.
+ *
+ * The scan settles on the lowest-pass READY task and, if that task's
+ * kernel-stack lease has not been published, takes nothing at all -- it does
+ * not fall through to the runner-up. One task stuck with an unpublished lease
+ * therefore starves the whole machine: every other task stays READY, every
+ * pick answers "nothing runnable", and the guest wedges with a full runqueue.
+ * That is what liburing's futex.t produced (a dying `pthread` with rel=0 and
+ * the switch-out marker still up, which sched_handoff_recover refuses to help
+ * by design).
+ *
+ * So a candidate that cannot be taken stops being a candidate. The flag is set
+ * only after the scan has refused the same task several times in a row, and is
+ * cleared the moment the task is claimed or resumes -- so a task in the
+ * ordinary, brief mid-switch window is unaffected. */
+static volatile u8 g_task_lease_stuck[TASK_SLOTS];
+static volatile u32 g_task_lease_rejects[TASK_SLOTS];
+#define SCHED_LEASE_STUCK_REJECTS 64u
 
 /* The task this CPU was running just before the one it is switching to. Only
  * meaningful between scheduler_yield's cur_task publish and the SP load inside
@@ -1425,6 +1443,17 @@ static struct task *find_unused_task(int user) {
       g_task_stop_quiet[i] = 0;
       g_task_pass[i] = sched_birth_pass();
       g_task_vfork_pending[i] = 0;
+      /* Nor the switch-out marker, the lease site or the scan's verdict about
+       * the previous occupant. The marker is only ever taken down where a task
+       * is claimed or resumes, so a slot freed while it was up hands it to the
+       * newcomer -- and sched_handoff_recover refuses, by design, to publish a
+       * lease for a task that is marked mid-switch. The new owner is then
+       * unresumable for its whole life, which is how a fresh `pthread` came to
+       * be reported as a dying one whose lease was never published. */
+      __atomic_store_n(&g_task_switching_out[i], 0, __ATOMIC_RELEASE);
+      g_task_lease_stuck[i] = 0;
+      g_task_lease_rejects[i] = 0;
+      g_task_lease_site[i] = 0;
       for (int r = 0; r < 16; r++) {
         g_task_rlimits[i][r].rlim_cur = RLIM_INFINITY;
         g_task_rlimits[i][r].rlim_max = RLIM_INFINITY;
@@ -2127,6 +2156,8 @@ static struct task *pick_next_task(void) {
       continue; /* its cgroup has spent this period's cpu.max */
     if (sched_task_frozen(index))
       continue; /* frozen for a suspend (M129) */
+    if (g_task_lease_stuck[index] && t != current_task)
+      continue; /* cannot be taken here; see g_task_lease_stuck */
 
     int priority = t->priority;
     u64 pass = g_task_pass[index];
@@ -2250,10 +2281,57 @@ static struct task *pick_next_task(void) {
     /* Same gate as the runqueue path: a task that is some CPU's current task
      * is executing, whatever its state and lease say. */
     if (best_task != current_task &&
-        !__atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE))
+        !__atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE)) {
+      usize bi = task_index(best_task);
+
       g_scan_rej_lease++;
-    else if (best_task != current_task && task_running_somewhere(best_task))
+      if (++g_task_lease_rejects[bi] >= SCHED_LEASE_STUCK_REJECTS &&
+          !g_task_lease_stuck[bi]) {
+        static int reported;
+
+        g_task_lease_stuck[bi] = 1;
+        if (!reported) {
+          reported = 1;
+          console_write("sched: pid ");
+          console_write_dec((u64)best_task->id);
+          console_write(" (");
+          console_write(best_task->name ? best_task->name : "(none)");
+          console_write(") cannot be resumed -- lease never published,"
+                        " switching_out=");
+          console_write_dec((u64)__atomic_load_n(&g_task_switching_out[bi],
+                                                __ATOMIC_ACQUIRE));
+          console_write(" last_clear=");
+          console_write(g_task_lease_site[bi] ? g_task_lease_site[bi]
+                                              : "(never)");
+          console_write("; taking it out of the scan\n");
+        }
+      }
+    }
+    else if (best_task != current_task && task_running_somewhere(best_task)) {
+      usize bi = task_index(best_task);
+
       g_scan_rej_running++;
+      /* Same starvation, other reason: a task another CPU still records as its
+       * current one cannot be taken here, and the scan that keeps choosing it
+       * keeps taking nothing -- with a dozen runnable kernel threads behind it
+       * in the same list. Stop choosing it; whichever CPU really owns it will
+       * run it, and the claim path clears this the moment anyone does. */
+      if (++g_task_lease_rejects[bi] >= SCHED_LEASE_STUCK_REJECTS &&
+          !g_task_lease_stuck[bi]) {
+        static int reported_run;
+
+        g_task_lease_stuck[bi] = 1;
+        if (!reported_run) {
+          reported_run = 1;
+          console_write("sched: pid ");
+          console_write_dec((u64)best_task->id);
+          console_write(" (");
+          console_write(best_task->name ? best_task->name : "(none)");
+          console_write(") is another CPU's current task and stays READY;"
+                        " taking it out of the scan\n");
+        }
+      }
+    }
     if ((best_task == current_task ||
          __atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE)) &&
         (best_task == current_task || !task_running_somewhere(best_task))) {
@@ -2270,6 +2348,8 @@ static struct task *pick_next_task(void) {
         __atomic_store_n(&best_task->stack_released, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&g_task_switching_out[task_index(best_task)], 0,
                          __ATOMIC_RELEASE);
+        g_task_lease_rejects[task_index(best_task)] = 0;
+        g_task_lease_stuck[task_index(best_task)] = 0;
         /* The lowest pass this CPU may run, so virtual time. Forward only:
          * two CPUs publishing their own minimum must not move it back. */
         if (g_task_pass[task_index(best_task)] > g_min_pass)
@@ -5476,6 +5556,44 @@ static int scheduler_yield_inner(void) {
    * outgoing task is touched any further. */
   sched_acct_on_switch(old_task);
 
+  /* A saved stack pointer of zero is not resumable.
+   *
+   * arch_context_switch loads it into RSP and then returns through the word it
+   * points at, so a zero means the very next interrupt pushes its frame at
+   * address -8: a page fault on a null stack, delivered on a null stack, which
+   * is a double fault with a wild backtrace and no name attached. It happened
+   * for real -- liburing's futex.t, one unkillable request and a teardown --
+   * and cost a run to identify from the dump alone.
+   *
+   * Zero is the value a context has before anything ran on it, which is where
+   * the per-CPU idle tasks stay (see scheduler_setup_ap_idle: they are entered
+   * by the SMP bring-up, never resumed through here). So this is a decline,
+   * not a panic: declining is always safe, and the task goes back into
+   * circulation the same way a task claimed by another CPU does. */
+  if (new_task != old_task && TASK_CTX_SP(new_task) == 0) {
+    static unsigned reported;
+
+    if (reported < 8) {
+      reported++;
+      console_write("sched: declined to switch to pid ");
+      console_write_dec((u64)new_task->id);
+      console_write(" (");
+      console_write(new_task->name ? new_task->name : "(none)");
+      console_write("): no saved stack pointer, state=");
+      console_write_dec((u64)__atomic_load_n(&new_task->state,
+                                             __ATOMIC_ACQUIRE));
+      console_write("\n");
+    }
+    __atomic_store_n(&new_task->stack_released, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&new_task->state, TASK_READY, __ATOMIC_RELEASE);
+    if (old_task->state == TASK_READY)
+      sched_rq_remove_task(old_task);
+    old_task->state = TASK_RUNNING;
+    if (restore_irqs)
+      interrupts_enable();
+    return 0;
+  }
+
   /* Nobody else may be running it — and if somebody is, do not switch.
    *
    * The switcher resumes a task by loading its saved RSP and returning through
@@ -5566,6 +5684,15 @@ static int scheduler_yield_inner(void) {
        * That is suggestive of a racy scan but does not prove it -- the dump is
        * taken several console writes after the decision, so the owner may
        * simply have moved on. It is recorded, not concluded.) */
+      /* Republish the stack lease this CPU took when it claimed the task.
+       *
+       * pick_next_task stores stack_released = 0 as part of claiming, meaning
+       * "this CPU owns that stack now". Declining gives the task back without
+       * ever touching its stack, and a task handed back with the lease down is
+       * one no CPU can ever resume: the scan settles on it, refuses it for the
+       * lease, and takes nothing -- which starves every other runnable task and
+       * wedges the machine with a full runqueue. */
+      __atomic_store_n(&new_task->stack_released, 1, __ATOMIC_RELEASE);
       __atomic_store_n(&new_task->state, TASK_READY, __ATOMIC_RELEASE);
       /* The outgoing task keeps running: this CPU simply did not switch. It
        * was marked READY a moment ago and may have been enqueued; reclaim it
@@ -5882,6 +6009,8 @@ static int scheduler_yield_inner(void) {
    * and this is that point. */
   __atomic_store_n(&g_task_switching_out[task_index(old_task)], 0,
                    __ATOMIC_RELEASE);
+  g_task_lease_rejects[task_index(old_task)] = 0;
+  g_task_lease_stuck[task_index(old_task)] = 0;
 #ifdef __aarch64__
   /* arch_context_switch returns only when this task is resumed. The outgoing
    * task was published before the switch so other CPUs cannot claim it while

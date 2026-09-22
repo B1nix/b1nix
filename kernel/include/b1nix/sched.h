@@ -656,6 +656,10 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
  * (10 ms granularity); the call returns -ETIMEDOUT if it elapses before a wake.
  * timeout_ms == 0 means block indefinitely. */
 int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms);
+/* The two halves of the key a futex wake looks a waiter up by. Exposed for
+ * io_uring, which parks FUTEX_WAIT requests in a queue of its own. */
+u64 scheduler_futex_key_pml4(u64 uaddr, int priv);
+u64 scheduler_futex_key_word(u64 uaddr, int priv);
 /* FUTEX_REQUEUE: wake nr_wake waiters on uaddr1, move nr_requeue of the rest
  * to uaddr2's queue. Returns the number woken. */
 int scheduler_futex_requeue(u64 uaddr1, u64 uaddr2, int nr_wake, int nr_requeue,

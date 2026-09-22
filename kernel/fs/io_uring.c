@@ -77,6 +77,7 @@
 #include <b1nix/linux_abi.h>
 #include <b1nix/posix.h>
 #include <b1nix/sched.h>
+#include <b1nix/spinlock.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/vfs.h>
@@ -88,16 +89,36 @@
 
 extern void *vfs_poll_chan;
 
+/* FUTEX2_* flags, from Linux's <linux/futex.h>: the size of the word and
+ * whether it is private to one address space. Only a 32-bit word is served,
+ * which is all io_uring itself accepts upstream. */
+#define IOU_FUTEX2_SIZE_MASK 0x03u
+#define IOU_FUTEX2_SIZE_U32 0x02u
+#define IOU_FUTEX2_NUMA 0x04u
+#define IOU_FUTEX2_PRIVATE 0x80u
+
+struct iou_req;
+struct io_ring_ctx;
+static void iou_taskrun_flag(struct io_ring_ctx *ctx, int on);
+static void iou_futex_disarm(struct iou_req *req);
+static int iou_futex_flags_ok(u32 flags);
+
+
 /* ---- limits ------------------------------------------------------------- */
 
-/* Linux's own ceilings are 32768 SQ / 65536 CQ entries. The rings here are
- * physically contiguous (one pmm_alloc_frames run each), so the ceiling is set
- * by what a contiguous allocation can be expected to satisfy rather than by the
- * ABI: 4096 SQEs is 256 KiB, the largest single run this asks for. A request
- * above the cap is clamped when IORING_SETUP_CLAMP is set and refused with
- * -EINVAL otherwise, which is what Linux does. */
-#define IOU_MAX_SQ_ENTRIES 4096u
-#define IOU_MAX_CQ_ENTRIES 8192u
+/* Linux's own ceilings, and now this kernel's: 32768 SQ / 65536 CQ entries. A
+ * request above them is clamped when IORING_SETUP_CLAMP is set and refused with
+ * -EINVAL otherwise, which is what Linux does.
+ *
+ * The cap used to be 4096/8192, on the reasoning that the rings are physically
+ * contiguous and a 2 MiB run is a lot to ask of the frame allocator. That is a
+ * reason to FAIL a large ring, not to refuse one the ABI allows: a program that
+ * walks the depths up to the documented maximum -- liburing's nop-all-sizes
+ * does exactly that -- reads -EINVAL as "this kernel is broken", while -ENOMEM
+ * is the answer it is written to stop on. So the ceiling is the ABI's and the
+ * allocator answers for what it cannot satisfy. */
+#define IOU_MAX_SQ_ENTRIES 32768u
+#define IOU_MAX_CQ_ENTRIES 65536u
 /* A registered file set and a registered buffer set. Linux allows far more;
  * these are what a table of pointers costs here. */
 #define IOU_MAX_FIXED_FILES 8192u
@@ -109,7 +130,12 @@ extern void *vfs_poll_chan;
 /* Live requests per ring. A ring cannot have more outstanding than it has SQ
  * entries in flight plus the timeouts and poll registrations it added, so this
  * only bounds a pathological submitter. */
-#define IOU_MAX_INFLIGHT 8192u
+/* How many requests one ring may have in flight at once. Linux has no such
+ * number: a request is a small allocation and the bound is memory. This is a
+ * guard against a runaway, not a policy -- liburing's poll test arms two
+ * thousand polls thirty-two times over on one ring and expects every submission
+ * to be accepted, so the guard has to sit above what the ABI invites. */
+#define IOU_MAX_INFLIGHT 131072u
 
 /* ---- the ring ----------------------------------------------------------- */
 
@@ -162,6 +188,17 @@ struct iou_iovec {
   u64 len;
 };
 
+/* A futex wait's words: the address as the waiter sees it, the value it is
+ * waiting for, and the two halves of the key a wake looks it up by -- computed
+ * once, in the context of the task that submitted the request, because a
+ * virtual address only names a futex inside the address space that holds it. */
+struct iou_futex_state {
+  u64 addr[8];
+  u32 expect[8];
+  u64 key_pml4[8];
+  u64 key_word[8];
+};
+
 /* A completion that had nowhere to go. IORING_FEAT_NODROP promises a CQE is
  * never lost, so an overflow is parked here and flushed into the ring the
  * moment userspace consumes one. */
@@ -193,13 +230,19 @@ struct iou_req {
   u8 state;
   u8 hardlink;    /* IOSQE_IO_HARDLINK: the chain survives a failure */
   u8 cqe_skip;    /* IOSQE_CQE_SKIP_SUCCESS */
+  /* Some member of this link chain asked for its successful completion to be
+   * skipped. Linux then skips the -ECANCELED completions of the whole chain as
+   * well -- one flag anywhere in a chain means the chain reports only what
+   * actually went wrong, which is the single CQE liburing's skip-cqe expects
+   * from a five-deep link whose middle request fails. */
+  u8 skip_link_cqes;
   u8 has_deadline;
   u8 is_timeout;  /* IORING_OP_TIMEOUT */
   u8 is_linktmo;  /* IORING_OP_LINK_TIMEOUT */
   /* IORING_OP_FUTEX_WAIT / FUTEX_WAITV: the words this request is parked on.
    * A futex is not a file, so there is no readiness to arm against -- the
-   * request is ARMED and the progress sweep re-reads the words, and a wake
-   * anywhere in the machine nudges the sweep (io_uring_futex_hint). */
+   * request joins the machine-wide queue of futex waiters and a wake marks it,
+   * which the progress sweep then reports (see io_uring_futex_wake). */
   /* IOSQE_IO_DRAIN: this request does not start until everything submitted
    * before it has completed. A backup that must see every write, or a close
    * that must follow the writes to the file it closes, is why the flag
@@ -208,8 +251,19 @@ struct iou_req {
   u8 is_drain;
   u8 is_futex;
   u8 futex_nr;                /* 1 for WAIT, n for WAITV */
-  u64 futex_addr[8];
-  u32 futex_expect[8];
+  u8 futex_woken;             /* a wake handed this request its turn */
+  u8 futex_which;             /* which word of a WAITV the wake named */
+  u8 futex_priv;              /* FUTEX2_PRIVATE: keyed inside this mm alone */
+  /* The words a futex wait is parked on, allocated only for the requests that
+   * are futex waits. It used to be four arrays inside every request, 224 bytes
+   * that the other few dozen opcodes never touched -- and a request is the unit
+   * a program can have tens of thousands of in flight (liburing's poll test
+   * arms sixty-five thousand polls), so the size of this structure is a memory
+   * budget, not a detail. */
+  struct iou_futex_state *fx;
+
+  u64 futex_mask;              /* the bitset this wait accepts */
+  struct iou_req *futex_qnext; /* the machine-wide FIFO of parked waits */
   u8 timeout_etime_success;
   /* A request that was already doomed when it was built — a bad descriptor, a
    * flag combination this kernel refuses, a timespec that would not copy in.
@@ -217,6 +271,28 @@ struct iou_req {
    * failure is one of the two things a chain reacts to: completing it out of
    * band left the rest of the chain running as if nothing had gone wrong. */
   u8 failed;
+  /* The file this request names is a REGISTERED one, and it is looked up when
+   * the request is issued rather than when it is prepared.
+   *
+   * A link chain is prepared whole and then run one member at a time, so an
+   * earlier member is what puts the file in the slot a later member uses:
+   * liburing's bind-listen opens a socket into slot 0 and then configures,
+   * binds and listens on it, all in one chain. Resolving the slot at prep time
+   * found it empty and refused three of the four with EBADF -- and since a
+   * chain fails as a unit, the socket was never opened either. */
+  u8 file_deferred;
+  /* A connect whose handshake was still in flight when it was first issued:
+   * the next run asks how it ended rather than starting another one. */
+  u8 connect_armed;
+  /* The sweep in which this request looked and found nothing.
+   *
+   * Three accepts armed on one listener and one connection arriving is the
+   * ordinary case: one takes it and the other two must wait. They cannot wait
+   * for the readiness LEVEL to drop -- with three connections queued it never
+   * does until all three are taken, which is the thing they are waiting to do
+   * -- so they wait for the next sweep instead. That bounds the retry to one
+   * per pass rather than spinning inside one. */
+  u32 eagain_sweep;
   i32 fail_res;
 
   u16 poll_mask; /* what readiness this request is armed on; 0 = none */
@@ -230,6 +306,12 @@ struct iou_req {
    * which for an unconsumed readiness is once. This flag is what remembers
    * that the current readiness has already been reported. */
   u8 mshot_reported;
+  /* WHICH events that report carried. A latch that only remembers "reported"
+   * cannot tell a readiness that has not changed from one that has grown: a
+   * multishot poll for POLLIN|POLLOUT on a socket that is readable and not yet
+   * writable reports POLLIN, and the socket becoming writable afterwards is a
+   * new edge that the plain latch swallowed for ever. */
+  u16 mshot_seen;
   u8 buf_select; /* IOSQE_BUFFER_SELECT: the buffer comes from a group */
   u8 is_poll_update; /* IORING_POLL_UPDATE_*: change a poll already armed */
   u16 buf_group;
@@ -268,6 +350,23 @@ struct io_ring_ctx {
   u32 sq_entries, cq_entries;
   u32 sq_mask, cq_mask;
   int enabled; /* cleared by IORING_SETUP_R_DISABLED until ENABLE_RINGS */
+  /* IORING_SETUP_SINGLE_ISSUER: the ONE thread allowed to submit.
+   *
+   * The promise the flag makes is what lets the kernel skip locking on the
+   * submission path, so it has to be enforced rather than believed: Linux
+   * answers EEXIST to any other task, and liburing's defer-taskrun asserts
+   * exactly that after the thread that enabled the ring has exited. Recorded
+   * at setup, or at ENABLE_RINGS for a ring created disabled -- which is how
+   * a ring can be set up by one thread and owned by another. */
+  usize submitter_tid;
+  /* IORING_REGISTER_MEM_REGION with IORING_MEM_REGION_REG_WAIT_ARG: a piece of
+   * the caller's own memory holding an array of struct io_uring_reg_wait, so a
+   * wait can name its arguments by offset instead of passing a pointer every
+   * time. The memory stays the caller's; the ring only remembers where it is. */
+  u64 regwait_addr;
+  u64 regwait_size;
+  /* Bumped once per sweep; see iou_req::eagain_sweep. */
+  u32 sweep_gen;
 
   /* the two physically contiguous regions */
   u64 ring_phys;
@@ -293,6 +392,17 @@ struct io_ring_ctx {
   u64 cq_timeouts;
 
   struct iou_req *live;
+  struct iou_req *live_tail; /* submission order: see iou_req_link */
+  /* One sweeper at a time, and who it is.
+   *
+   * Two sweepers -- the owner inside io_uring_enter and the ring's own thread
+   * -- each take a different ready request and then perform them at the same
+   * time, so five reads armed on one pipe in order executed in whatever order
+   * the two CPUs happened to run. The order requests are served in is part of
+   * the interface, so the serving is serialised even though the picking is
+   * already safe. */
+  volatile int sweeping;
+  volatile usize sweeper;
   u32 nr_live;
 
   struct iou_overflow *ovfl_head, *ovfl_tail;
@@ -628,6 +738,16 @@ static void iou_post_cqe_locked(struct io_ring_ctx *ctx, u64 user_data,
                    __ATOMIC_RELEASE);
 }
 
+/* Whether anything on this machine has ever polled a ring's own descriptor.
+ * A ring is pollable -- readable once its completion queue is not empty -- and
+ * a program that watches one ring from another relies on the completion being
+ * reported the moment the watched ring gets a CQE, without entering the kernel
+ * again. A machine with none of these pays one load per completion. */
+static volatile int g_iou_ringpoll_armed;
+static volatile int g_iou_crossring_busy;
+
+static void iou_crossring_kick(struct io_ring_ctx *ctx);
+
 static void iou_post_cqe_n(struct io_ring_ctx *ctx, u64 user_data, i32 res,
                            u32 cflags, int counts) {
   iou_trace("cqe", user_data, (u64)(u32)cflags, res);
@@ -636,6 +756,8 @@ static void iou_post_cqe_n(struct io_ring_ctx *ctx, u64 user_data, i32 res,
   iou_unlock(ctx);
   iou_signal_eventfd(ctx);
   scheduler_wake_all(ctx);
+  if (__atomic_load_n(&g_iou_ringpoll_armed, __ATOMIC_RELAXED) > 0)
+    iou_crossring_kick(ctx);
 }
 
 /* A completion for a request whose own kind decides whether it counts. */
@@ -655,25 +777,41 @@ static u32 iou_cq_ready(struct io_ring_ctx *ctx) {
 
 /* ---- request bookkeeping ------------------------------------------------ */
 
+/* The live list is in SUBMISSION order, oldest first.
+ *
+ * It used to push onto the head, which made the progress sweep serve the
+ * newest ready request first: five one-byte reads armed on one pipe came back
+ * in the reverse order the program submitted them, so the fourth read held the
+ * fifth byte. Requests that are ready at the same moment are served in the
+ * order they were asked for, which is what liburing's read-write requires and
+ * what any queue means by "queue". */
 static void iou_req_link(struct io_ring_ctx *ctx, struct iou_req *req) {
   iou_lock(ctx);
-  req->next = ctx->live;
-  ctx->live = req;
+  req->next = 0;
+  if (ctx->live_tail)
+    ctx->live_tail->next = req;
+  else
+    ctx->live = req;
+  ctx->live_tail = req;
   ctx->nr_live++;
   iou_unlock(ctx);
 }
 
 static void iou_req_unlink(struct io_ring_ctx *ctx, struct iou_req *req) {
   struct iou_req **pp = &ctx->live;
+  struct iou_req *prev = 0;
 
   while (*pp) {
     if (*pp == req) {
       *pp = req->next;
+      if (ctx->live_tail == req)
+        ctx->live_tail = prev;
       req->next = 0;
       if (ctx->nr_live)
         ctx->nr_live--;
       return;
     }
+    prev = *pp;
     pp = &(*pp)->next;
   }
 }
@@ -681,10 +819,16 @@ static void iou_req_unlink(struct io_ring_ctx *ctx, struct iou_req *req) {
 static void iou_req_free(struct iou_req *req) {
   if (!req)
     return;
+  /* A request cancelled or torn down without going through iou_complete is
+   * still in the futex queue, and that queue must never hold a freed
+   * request. Idempotent, so the completion path may have done it already. */
+  iou_futex_disarm(req);
   if (req->file)
     vfs_handle_release(req->file);
   if (req->iov)
     kfree(req->iov);
+  if (req->fx)
+    kfree(req->fx);
   kfree(req);
 }
 
@@ -1253,7 +1397,12 @@ static i32 iou_install_direct(struct io_ring_ctx *ctx, struct vfs_handle *h,
   iou_lock(ctx);
   if (!ctx->files || !ctx->nr_files) {
     iou_unlock(ctx);
-    return -ENXIO;
+    /* No table at all. A request that asked for a slot to be CHOSEN is told
+     * there is no room -- ENFILE, the same answer a full table gives, because
+     * from the request's side the two are one thing: no slot was available.
+     * ENXIO (the register interface's answer to "this ring has no table") is
+     * not a result a completion can carry usefully. */
+    return file_index == IORING_FILE_INDEX_ALLOC ? -ENFILE : -ENXIO;
   }
   if (file_index == IORING_FILE_INDEX_ALLOC) {
     u32 lo = ctx->falloc_len ? ctx->falloc_off : 0;
@@ -1281,6 +1430,30 @@ static i32 iou_install_direct(struct io_ring_ctx *ctx, struct vfs_handle *h,
   ctx->files[file_index - 1].file = h;
   iou_unlock(ctx);
   return rc;
+}
+
+/* Take a registered file back out of its slot and close it.
+ *
+ * This is what close(2) is for a direct descriptor: the slot holds the only
+ * reference, so releasing it IS the close. Answering ENXIO for an empty slot is
+ * what Linux does -- the caller asked to close something that is not there. */
+static i32 iou_remove_direct(struct io_ring_ctx *ctx, u32 file_index) {
+  struct vfs_handle *h;
+
+  if (file_index == 0)
+    return -EINVAL;
+  iou_lock(ctx);
+  if (!ctx->files || file_index - 1 >= ctx->nr_files) {
+    iou_unlock(ctx);
+    return -ENXIO;
+  }
+  h = ctx->files[file_index - 1].file;
+  ctx->files[file_index - 1].file = 0;
+  iou_unlock(ctx);
+  if (!h)
+    return -EBADF;
+  vfs_close_handle(h, current_task ? (int)task_tgid(current_task) : 0);
+  return 0;
 }
 
 /* An opcode that produced an ordinary descriptor was asked for a direct one
@@ -1517,7 +1690,23 @@ static i32 iou_perform_op(struct iou_req *req) {
       return -EINVAL;
     if (syscall_copyin(addrbuf, (const void *)(usize)sqe->addr, alen) < 0)
       return -EFAULT;
-    return (i32)vfs_connect_h(h, addrbuf, alen);
+    /* Asked again after the socket became writable: the answer is the
+     * connect's, not another attempt. */
+    if (req->connect_armed)
+      return (i32)vfs_socket_connect_result_h(h);
+    r = vfs_connect_h(h, addrbuf, alen);
+    /* A connect that has not finished is not an answer io_uring may post: it
+     * arms on writability and completes with the real result. Reported as
+     * EAGAIN so the one re-arm rule in iou_run_once covers this too. */
+    if (r == -EINPROGRESS || r == -EALREADY) {
+      /* The mask is set HERE and not at prep: a connect has to be started
+       * before there is anything to wait for, and a request that carries a
+       * poll mask is armed before it is ever issued. */
+      req->connect_armed = 1;
+      req->poll_mask = B1NIX_POLLOUT;
+      return -EAGAIN;
+    }
+    return (i32)r;
   }
 
   case IORING_OP_SEND: {
@@ -1563,7 +1752,18 @@ static i32 iou_perform_op(struct iou_req *req) {
     struct vfs_handle *victim;
 
     if (sqe->flags & IOSQE_FIXED_FILE)
-      return -EINVAL; /* Linux uses file_index for that; not supported here */
+      return -EINVAL; /* Linux uses file_index for that, handled below */
+    /* The DIRECT form: `file_index` names a registered slot and `fd` must be
+     * zero. Without this the request fell through to the ordinary path with
+     * fd 0 and closed the caller's STANDARD INPUT while leaving the slot
+     * occupied -- after which liburing's fd-install read the pipe it had just
+     * been told to close, and fd-pass got EBADF from a close of a descriptor
+     * the test had never opened. */
+    if (req->file_index) {
+      if (sqe->fd)
+        return -EINVAL;
+      return iou_remove_direct(ctx, req->file_index);
+    }
     if (sqe->fd < 0)
       return -EBADF;
     /* Not the ring this request is running on. Closing it here drops its last
@@ -1710,6 +1910,11 @@ static i32 iou_perform_op(struct iou_req *req) {
 
     if (!h)
       return -EBADF;
+    /* The fields this opcode does not use must be zero. A caller that set one
+     * meant something by it, and answering as if it had not is how a program
+     * ends up believing in a guarantee it never got. */
+    if (sqe->rw_flags || sqe->buf_index || sqe->file_index)
+      return -EINVAL;
     if (!sqe->addr || alen == 0 || alen > sizeof(addrbuf))
       return -EINVAL;
     if (syscall_copyin(addrbuf, (const void *)(usize)sqe->addr, alen) < 0)
@@ -1727,6 +1932,12 @@ static i32 iou_perform_op(struct iou_req *req) {
 
     if (!h)
       return -EBADF;
+    /* Same rule as BIND: `len` carries the backlog and nothing else is used.
+     * liburing's bind-listen submits a listen with addr2 set to a nonsense
+     * value and requires EINVAL for it. */
+    if (sqe->addr || sqe->addr2 || sqe->rw_flags || sqe->buf_index ||
+        sqe->file_index)
+      return -EINVAL;
     tfd = iou_tmp_fd(h);
     if (tfd < 0)
       return (i32)tfd;
@@ -1870,18 +2081,24 @@ static i32 iou_perform_op(struct iou_req *req) {
       iou_tmp_fd_put(sfd);
       return (i32)val;
     }
+    /* The length is in `optlen` and the value in `optval` -- their own fields,
+     * aliasing splice_fd_in and addr3. Reading it from `len` instead found the
+     * zero io_uring_prep_rw() leaves there, so every setsockopt through a
+     * command was refused with EINVAL: liburing's bind-listen could not even
+     * set SO_REUSEADDR, and since it does so inside a link chain the socket it
+     * had just opened went with it. */
     case SOCKET_URING_OP_GETSOCKOPT: {
-      usize optlen = sqe->len;
+      usize optlen = sqe->optlen;
 
       r = vfs_getsockopt(sfd, (int)sqe->level, (int)sqe->optname,
-                         (void *)(usize)sqe->addr3, &optlen);
+                         (void *)(usize)sqe->optval, &optlen);
       iou_tmp_fd_put(sfd);
       /* Linux reports the length it wrote as the result. */
       return (r < 0) ? (i32)r : (i32)optlen;
     }
     case SOCKET_URING_OP_SETSOCKOPT:
       r = vfs_setsockopt(sfd, (int)sqe->level, (int)sqe->optname,
-                         (const void *)(usize)sqe->addr3, sqe->len);
+                         (const void *)(usize)sqe->optval, sqe->optlen);
       iou_tmp_fd_put(sfd);
       return (i32)r;
     default:
@@ -1899,9 +2116,22 @@ static i32 iou_perform_op(struct iou_req *req) {
     if (!sqe->addr || (sqe->addr & 3))
       return -EINVAL;
     /* Linux's layout for these opcodes: addr is the word, off the value (how
-     * many to wake), addr3 the bitset mask. */
-    woken = scheduler_futex(sqe->addr, B1NIX_FUTEX_WAKE,
-                            (int)(sqe->off ? sqe->off : 1), 0);
+     * many to wake), addr3 the bitset mask, fd the FUTEX2_* flags. */
+    if (sqe->futex_flags || !iou_futex_flags_ok((u32)sqe->fd) || !sqe->addr3 ||
+        sqe->len)
+      return -EINVAL;
+    /* Waking zero waiters wakes zero waiters. The count used to be coerced to
+     * one, so a program that asked for none (liburing's test_wake_zero does,
+     * and so does any lock that hands its budget out gradually) woke a waiter
+     * it had not released yet. */
+    if ((i64)sqe->off < 0)
+      return -EINVAL;
+    woken = scheduler_futex(sqe->addr,
+                            B1NIX_FUTEX_WAKE |
+                                (((u32)sqe->fd & IOU_FUTEX2_PRIVATE)
+                                     ? B1NIX_FUTEX_PRIVATE
+                                     : 0),
+                            (int)sqe->off, 0);
     return (i32)woken;
   }
 
@@ -2167,8 +2397,16 @@ static i32 iou_perform_op(struct iou_req *req) {
         vfs_handle_release(src);
         return rc;
       }
-      if (!(sqe->msg_ring_flags & IORING_MSG_RING_CQE_SKIP))
-        iou_post_cqe_n(target, sqe->off, 0, 0, 1);
+      if (!(sqe->msg_ring_flags & IORING_MSG_RING_CQE_SKIP)) {
+        /* When the slot was CHOSEN by the kernel, the target learns which one
+         * from the result of its own completion -- there is nowhere else for it
+         * to come from. Posting a flat zero told liburing's fd-pass that the
+         * file had landed in slot 0, which is a slot the test had deliberately
+         * excluded from the allocation range. */
+        i32 res = ((u32)sqe->file_index == IORING_FILE_INDEX_ALLOC) ? rc : 0;
+
+        iou_post_cqe_n(target, sqe->off, res, 0, 1);
+      }
       return 0;
     }
     if (sqe->addr != IORING_MSG_DATA)
@@ -2189,8 +2427,18 @@ static i32 iou_perform_op(struct iou_req *req) {
     /* Turn a registered file back into an ordinary descriptor. */
     int fd;
 
+    /* Only a REGISTERED file can be installed; without the flag the request
+     * names an ordinary descriptor, and there is nothing to install. EBADF,
+     * not EINVAL: the file is what is wrong, not the request's shape, and
+     * liburing's fd-install checks for exactly that. */
     if (!(sqe->flags & IOSQE_FIXED_FILE))
-      return -EINVAL;
+      return -EBADF;
+    /* And not under borrowed credentials. The descriptor this installs lands
+     * in the CALLER's table, so running the request as somebody else would
+     * hand the caller a file opened with another identity's rights. Linux
+     * refuses it for that reason, and liburing's fd-install checks it. */
+    if (sqe->personality)
+      return -EPERM;
     if (sqe->install_fd_flags & ~(u32)IORING_FIXED_FD_NO_CLOEXEC)
       return -EINVAL;
     if (!h)
@@ -2301,6 +2549,21 @@ static i32 iou_perform(struct iou_req *req, u32 *cflags) {
     req->sqe.addr = b.addr;
     req->sqe.len = (!req->sel_len || req->sel_len > b.len) ? b.len
                                                            : req->sel_len;
+    /* A vectored read reads its segments from the list copied in at prep, and
+     * never looks at sqe->addr -- so the chosen buffer was ignored and the
+     * read filled the caller's own iovec, the full length of it. Linux allows
+     * exactly one segment with a chosen buffer and replaces it; more than one
+     * is -EINVAL, because there is one buffer to put them in. */
+    if ((req->sqe.opcode == IORING_OP_READV) && req->iov) {
+      if (req->iovcnt != 1) {
+        iou_buf_recycle(req->ctx, req->buf_group); /* not ours to keep */
+        return -EINVAL;
+      }
+      req->iov[0].base = b.addr;
+      req->iov[0].len = (req->iov[0].len && req->iov[0].len < b.len)
+                            ? req->iov[0].len
+                            : b.len;
+    }
   }
   res = iou_perform_op(req);
   if (selected) {
@@ -2318,7 +2581,8 @@ static void iou_cancel_chain(struct iou_req *req) {
   while (req) {
     struct iou_req *next = req->link_next;
 
-    iou_post_req_cqe(req, -ECANCELED, 0);
+    if (!req->skip_link_cqes)
+      iou_post_req_cqe(req, -ECANCELED, 0);
     if (req->tmo_armed) {
       struct iou_req *t = req->tmo_armed;
 
@@ -2515,11 +2779,40 @@ static void iou_creds_return(struct cred *saved) {
 
 static int iou_run_once(struct iou_req *req) {
   u32 cflags = 0;
-  struct cred *saved = iou_creds_borrow(req);
-  i32 res = iou_perform(req, &cflags);
+  struct cred *saved;
+  i32 res;
   int last;
 
+  /* A personality this ring never registered is an error, not a request that
+   * quietly runs as the submitter. The whole point of naming one is that the
+   * request runs as somebody else; running it as the caller instead is the one
+   * answer that cannot be detected, and Linux answers -EINVAL. */
+  if (req->sqe.personality &&
+      !iou_personality_cred(req->ctx, req->sqe.personality)) {
+    iou_complete(req, -EINVAL, 0);
+    return 1;
+  }
+  saved = iou_creds_borrow(req);
+  res = iou_perform(req, &cflags);
+
   iou_creds_return(saved);
+
+  /* "Not ready after all" is not an answer, it is a reason to wait again.
+   *
+   * Readiness is reported for the DESCRIPTOR, and several requests can be
+   * waiting on the same one: three accepts armed on one listening socket all
+   * run when a connection arrives, the first takes it and the other two find
+   * nothing. Linux re-arms them; posting EAGAIN instead hands the caller an
+   * error for a request that was never refused -- which is what liburing's
+   * accept saw as "Got cqe res -11" with three accepts queued before the
+   * connects. Only a request that waits on readiness can be re-armed; anything
+   * else would spin. */
+  if ((res == -EAGAIN || res == -EWOULDBLOCK) && req->poll_mask &&
+      iou_pollable(req->file)) {
+    req->state = IOU_ST_ARMED;
+    req->eagain_sweep = req->ctx->sweep_gen;
+    return 1;
+  }
   last = res < 0;
 
   if (!last && res == 0)
@@ -2630,6 +2923,7 @@ static i32 iou_poll_update(struct io_ring_ctx *ctx,
       if (!r->poll_mask)
         r->poll_mask = B1NIX_POLLIN;
       r->mshot_reported = 0;
+      r->mshot_seen = 0;
     }
     if (sqe->len & IORING_POLL_UPDATE_USER_DATA)
       r->sqe.user_data = sqe->off;
@@ -2653,6 +2947,17 @@ static int iou_issue(struct iou_req *req) {
   if (req->failed) {
     iou_complete(req, req->fail_res, 0);
     return 0;
+  }
+
+  /* The registered file, now that everything ahead of this request has run. */
+  if (req->file_deferred && !req->file) {
+    int ferr = 0;
+
+    req->file = iou_get_file(ctx, sqe, &ferr);
+    if (ferr) {
+      iou_complete(req, ferr, 0);
+      return 0;
+    }
   }
 
   if (req->is_poll_update) {
@@ -2708,18 +3013,10 @@ static int iou_issue(struct iou_req *req) {
 }
 
 /* Is anything older than `req` still live on this ring? That is the whole of
- * what IOSQE_IO_DRAIN waits for. Requests are pushed onto ctx->live, so
- * "older" means "further along the list". */
+ * what IOSQE_IO_DRAIN waits for. ctx->live is in submission order, so "older"
+ * means "before us in the list". */
 static int iou_older_live(struct io_ring_ctx *ctx, struct iou_req *req) {
-  int seen_self = 0;
-
-  for (struct iou_req *r = ctx->live; r; r = r->next) {
-    if (r == req) {
-      seen_self = 1;
-      continue;
-    }
-    if (!seen_self)
-      continue; /* newer than us */
+  for (struct iou_req *r = ctx->live; r && r != req; r = r->next) {
     if (r->state == IOU_ST_ARMED || r->state == IOU_ST_QUEUED)
       return 1;
   }
@@ -2728,9 +3025,35 @@ static int iou_older_live(struct io_ring_ctx *ctx, struct iou_req *req) {
 
 /* ---- futex waits -------------------------------------------------------- */
 
-/* How many futex waits are armed, machine-wide. The wake side reads it to
- * decide whether to nudge the rings: a machine with none pays one load. */
-static volatile int g_iou_futex_armed;
+/* A FUTEX_WAIT request is a waiter on the word, not a poller of it.
+ *
+ * The first version of this re-read the word on every progress sweep and
+ * completed the request whenever the value had moved. That is a different
+ * primitive: a wake for one waiter woke every request parked on the address
+ * (liburing's test_order submits two waits and one wake and requires the
+ * second wait to stay pending), and a FUTEX_WAKE for zero waiters woke them
+ * all even though it is defined to wake nobody.
+ *
+ * So these requests queue like any other futex waiter, in one machine-wide
+ * FIFO, and the wake side hands out its budget over both queues -- the tasks
+ * parked in futex(2) and the requests parked here. The order is arrival order,
+ * which is what "wake one" has to mean for it to be useful. */
+static struct iou_req *g_iou_futex_q;
+static struct iou_req *g_iou_futex_q_tail;
+static spinlock_t g_iou_futex_lock = SPINLOCK_INIT;
+
+/* Whether this kernel serves a futex of this shape. A program that asks for a
+ * size or a policy that is not implemented has to hear -EINVAL at submission:
+ * arming the request instead leaves it waiting for a wake that can never name
+ * it, which is a hang rather than an error. */
+static int iou_futex_flags_ok(u32 flags) {
+  if (flags & ~(u32)(IOU_FUTEX2_SIZE_MASK | IOU_FUTEX2_NUMA |
+                     IOU_FUTEX2_PRIVATE))
+    return 0;
+  if (flags & IOU_FUTEX2_NUMA)
+    return 0;
+  return (flags & IOU_FUTEX2_SIZE_MASK) == IOU_FUTEX2_SIZE_U32;
+}
 
 /* Read a futex word out of the submitting task's memory. */
 static int iou_futex_word(u64 uaddr, u32 *out) {
@@ -2741,6 +3064,49 @@ static int iou_futex_word(u64 uaddr, u32 *out) {
   return 0;
 }
 
+/* The key a wake will look this waiter up by. Computed in the waiter's own
+ * context, because that is where the address means something. */
+static void iou_futex_key(struct iou_req *req, u8 i, u64 uaddr) {
+  req->fx->addr[i] = uaddr;
+  req->fx->key_pml4[i] = scheduler_futex_key_pml4(uaddr, req->futex_priv);
+  req->fx->key_word[i] = scheduler_futex_key_word(uaddr, req->futex_priv);
+}
+
+static void iou_futex_queue_add(struct iou_req *req) {
+  u64 flags;
+
+  spin_lock_irqsave(&g_iou_futex_lock, &flags);
+  req->futex_qnext = 0;
+  if (g_iou_futex_q_tail)
+    g_iou_futex_q_tail->futex_qnext = req;
+  else
+    g_iou_futex_q = req;
+  g_iou_futex_q_tail = req;
+  spin_unlock_irqrestore(&g_iou_futex_lock, flags);
+}
+
+static void iou_futex_queue_remove(struct iou_req *req) {
+  u64 flags;
+
+  spin_lock_irqsave(&g_iou_futex_lock, &flags);
+  struct iou_req **pp = &g_iou_futex_q;
+
+  while (*pp) {
+    if (*pp == req) {
+      *pp = req->futex_qnext;
+      break;
+    }
+    pp = &(*pp)->futex_qnext;
+  }
+  /* Re-find the tail rather than guess at it: the list is short (one entry per
+   * parked wait in the machine) and a stale tail appends to a freed request. */
+  g_iou_futex_q_tail = 0;
+  for (struct iou_req *r = g_iou_futex_q; r; r = r->futex_qnext)
+    g_iou_futex_q_tail = r;
+  req->futex_qnext = 0;
+  spin_unlock_irqrestore(&g_iou_futex_lock, flags);
+}
+
 /* Prepare a FUTEX_WAIT or FUTEX_WAITV. Returns 1 to arm it, or the result to
  * complete it with straight away -- which is -EAGAIN when the word already
  * differs, the same answer futex(2) gives, and the case a lock's fast path
@@ -2748,21 +3114,40 @@ static int iou_futex_word(u64 uaddr, u32 *out) {
 static i32 iou_futex_arm(struct iou_req *req) {
   const struct io_uring_sqe *sqe = &req->sqe;
 
+  if (!req->fx) {
+    req->fx = kzalloc(sizeof(*req->fx));
+    if (!req->fx)
+      return -ENOMEM;
+  }
   req->futex_nr = 0;
+  req->futex_woken = 0;
+  req->futex_which = 0;
+  /* The io_uring-level flags field of these opcodes has no defined bits yet. */
+  if (sqe->futex_flags)
+    return -EINVAL;
   if (sqe->opcode == IORING_OP_FUTEX_WAIT) {
     u32 cur = 0;
-    int rc = iou_futex_word(sqe->addr, &cur);
+    int rc;
 
+    /* liburing puts the FUTEX2_* flags in `fd` and the bitset in `addr3`;
+     * `off` is the value to compare against. A bitset of zero matches no wake
+     * and is refused, as futex(2) refuses it. */
+    if (!iou_futex_flags_ok((u32)sqe->fd) || !sqe->addr3 || sqe->len)
+      return -EINVAL;
+    req->futex_priv = ((u32)sqe->fd & IOU_FUTEX2_PRIVATE) ? 1 : 0;
+    req->futex_mask = sqe->addr3;
+    rc = iou_futex_word(sqe->addr, &cur);
     if (rc < 0)
       return rc;
     if (cur != (u32)sqe->off)
       return -EAGAIN;
-    req->futex_addr[0] = sqe->addr;
-    req->futex_expect[0] = (u32)sqe->off;
+    iou_futex_key(req, 0, sqe->addr);
+    req->fx->expect[0] = (u32)sqe->off;
     req->futex_nr = 1;
   } else {
     /* FUTEX_WAITV: an array of struct futex_waitv {u64 val; u64 uaddr;
-     * u32 flags; u32 reserved}, `len` of them. */
+     * u32 flags; u32 reserved}, `len` of them. Each entry carries its own
+     * FUTEX2_* flags, and one unserviceable entry refuses the whole request. */
     struct {
       u64 val;
       u64 uaddr;
@@ -2772,6 +3157,7 @@ static i32 iou_futex_arm(struct iou_req *req) {
 
     if (!sqe->len || sqe->len > 8 || !sqe->addr)
       return -EINVAL;
+    req->futex_mask = ~(u64)0; /* a waitv entry has no bitset of its own */
     for (u32 i = 0; i < sqe->len; i++) {
       u32 cur = 0;
       int rc;
@@ -2779,52 +3165,77 @@ static i32 iou_futex_arm(struct iou_req *req) {
       if (syscall_copyin(&wv, (const void *)(usize)(sqe->addr + i * sizeof(wv)),
                          sizeof(wv)) < 0)
         return -EFAULT;
-      if (wv.reserved)
+      if (wv.reserved || !iou_futex_flags_ok(wv.flags))
+        return -EINVAL;
+      /* Every entry has to agree about privacy: one key scheme per request. */
+      if (i == 0)
+        req->futex_priv = (wv.flags & IOU_FUTEX2_PRIVATE) ? 1 : 0;
+      else if (req->futex_priv != ((wv.flags & IOU_FUTEX2_PRIVATE) ? 1 : 0))
         return -EINVAL;
       rc = iou_futex_word(wv.uaddr, &cur);
       if (rc < 0)
         return rc;
       if (cur != (u32)wv.val)
         return -EAGAIN;
-      req->futex_addr[i] = wv.uaddr;
-      req->futex_expect[i] = (u32)wv.val;
+      iou_futex_key(req, (u8)i, wv.uaddr);
+      req->fx->expect[i] = (u32)wv.val;
     }
     req->futex_nr = (u8)sqe->len;
   }
   req->is_futex = 1;
-  __atomic_add_fetch(&g_iou_futex_armed, 1, __ATOMIC_ACQ_REL);
+  iou_futex_queue_add(req);
   return 1;
 }
 
-/* Has one of the words this request waits on changed? Returns the index that
- * changed (which is what FUTEX_WAITV reports), or -1. */
+/* Has this request been woken? Returns the index of the word a wake named
+ * (which is what FUTEX_WAITV reports), or -1 while it is still parked. */
 static int iou_futex_ready(struct iou_req *req) {
-  for (u8 i = 0; i < req->futex_nr; i++) {
-    u32 cur = 0;
-
-    if (iou_futex_word(req->futex_addr[i], &cur) < 0)
-      return (int)i; /* the memory went away: report it rather than hang */
-    if (cur != req->futex_expect[i])
-      return (int)i;
-  }
-  return -1;
+  if (!__atomic_load_n(&req->futex_woken, __ATOMIC_ACQUIRE))
+    return -1;
+  return (int)req->futex_which;
 }
 
 static void iou_futex_disarm(struct iou_req *req) {
   if (req->is_futex) {
     req->is_futex = 0;
-    __atomic_sub_fetch(&g_iou_futex_armed, 1, __ATOMIC_ACQ_REL);
+    iou_futex_queue_remove(req);
   }
 }
 
-/* The futex layer telling io_uring that a word was woken. A ring's waiter
- * sleeps on vfs_poll_chan, which a futex wake does not otherwise touch, so
- * without this a FUTEX_WAIT would only complete the next time something else
- * woke the ring. */
-void io_uring_futex_hint(void) {
-  if (__atomic_load_n(&g_iou_futex_armed, __ATOMIC_RELAXED) > 0)
+/* The futex layer handing out a wake to the requests parked on a word. Called
+ * from scheduler_futex's FUTEX_WAKE with whatever is left of the caller's
+ * budget after the tasks parked in futex(2) have had theirs, and returns how
+ * many requests it woke -- which the caller adds to the number it reports to
+ * userspace, because these are waiters like any other.
+ *
+ * The ring's own waiter sleeps on vfs_poll_chan, which a futex wake does not
+ * otherwise touch, so the wake has to nudge it as well. */
+int io_uring_futex_wake(u64 key_pml4, u64 key_word, int nr) {
+  int woken = 0;
+  u64 flags;
+
+  if (nr <= 0)
+    return 0;
+  spin_lock_irqsave(&g_iou_futex_lock, &flags);
+  for (struct iou_req *r = g_iou_futex_q; r && woken < nr; r = r->futex_qnext) {
+    if (__atomic_load_n(&r->futex_woken, __ATOMIC_RELAXED))
+      continue;
+    for (u8 i = 0; i < r->futex_nr; i++) {
+      if (!r->fx || r->fx->key_pml4[i] != key_pml4 ||
+          r->fx->key_word[i] != key_word)
+        continue;
+      r->futex_which = i;
+      __atomic_store_n(&r->futex_woken, 1, __ATOMIC_RELEASE);
+      woken++;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&g_iou_futex_lock, flags);
+  if (woken)
     scheduler_wake_all(vfs_poll_chan);
+  return woken;
 }
+
 
 /* ---- the progress sweep ------------------------------------------------- */
 
@@ -2833,7 +3244,22 @@ void io_uring_futex_hint(void) {
  * vfs_poll_chan wakes land. Returns 1 if anything completed. */
 static int iou_progress(struct io_ring_ctx *ctx) {
   int did = 0;
-  u64 now = ktime_monotonic_ns();
+  u64 now;
+  usize me = current_task ? current_task->id : 0;
+
+  /* Already sweeping this ring, one frame down: nothing to do here, and
+   * certainly not a second pass over the same list. */
+  if (__atomic_load_n(&ctx->sweeping, __ATOMIC_ACQUIRE) &&
+      __atomic_load_n(&ctx->sweeper, __ATOMIC_ACQUIRE) == me)
+    return 0;
+  while (__atomic_test_and_set(&ctx->sweeping, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  __atomic_store_n(&ctx->sweeper, me, __ATOMIC_RELEASE);
+  now = ktime_monotonic_ns();
+
+  /* One pass over the ring. A request that finds nothing waits for the next
+   * pass rather than being run again inside this one. */
+  ctx->sweep_gen++;
 
   for (;;) {
     struct iou_req *victim = 0;
@@ -2920,8 +3346,10 @@ static int iou_progress(struct io_ring_ctx *ctx) {
         if (rev) {
           /* A multishot poll reports once per readiness edge; see
            * iou_req::mshot_reported for why a level-triggered ->poll cannot be
-           * reported on every sweep. */
-          if (r->multishot && r->mshot_reported)
+           * reported on every sweep. An event that was not in the last report
+           * is a new edge, whatever the rest of the mask is still doing. */
+          if (r->multishot && r->mshot_reported &&
+              !(rev & (u16)~r->mshot_seen))
             continue;
           victim = r;
           res = (i32)rev;
@@ -2929,6 +3357,7 @@ static int iou_progress(struct io_ring_ctx *ctx) {
           break;
         }
         r->mshot_reported = 0;
+        r->mshot_seen = 0;
         continue;
       }
 
@@ -2936,6 +3365,10 @@ static int iou_progress(struct io_ring_ctx *ctx) {
         u16 rev = iou_poll_now(r->file, r->poll_mask);
 
         if (rev & (r->poll_mask | B1NIX_POLLERR | B1NIX_POLLHUP)) {
+          /* Ready, but this one already looked in THIS sweep and found
+           * nothing: it waits for the next one. See eagain_sweep. */
+          if (r->eagain_sweep == ctx->sweep_gen)
+            continue;
           victim = r;
           res = 1; /* marker: run it below */
           break;
@@ -2992,6 +3425,9 @@ static int iou_progress(struct io_ring_ctx *ctx) {
 
     if (is_poll_report && victim->multishot) {
       victim->mshot_reported = 1;
+      /* Only what is still ready stays remembered: an event that goes away and
+       * comes back is a new edge too. */
+      victim->mshot_seen = (u16)res;
       victim->state = IOU_ST_ARMED; /* it reports again on the next edge */
       iou_post_req_cqe(victim, res, IORING_CQE_F_MORE);
       continue;
@@ -3011,8 +3447,13 @@ static int iou_progress(struct io_ring_ctx *ctx) {
     iou_run_once(victim);
   }
 
+  __atomic_store_n(&ctx->sweeper, 0, __ATOMIC_RELEASE);
+  __atomic_clear(&ctx->sweeping, __ATOMIC_RELEASE);
   if (did)
     scheduler_wake_all(ctx);
+  /* The owner has just done the work the flag was asking for. */
+  if (ctx->flags & (IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_TASKRUN_FLAG))
+    iou_taskrun_flag(ctx, 0);
   return did;
 }
 
@@ -3077,6 +3518,23 @@ static int iou_cancel_by(struct io_ring_ctx *ctx, u64 user_data, int by_fd,
 
 /* Which readiness, if any, a request has to wait for. */
 static u16 iou_op_poll_mask(const struct io_uring_sqe *sqe) {
+  /* MSG_DONTWAIT is the caller saying "answer now, even if the answer is
+   * EAGAIN". A request carrying it is never armed on readiness: arming it
+   * turns a question into a wait, and liburing's socket-nb submits exactly
+   * this and then peeks for the completion that has to already be there. */
+  switch (sqe->opcode) {
+  case IORING_OP_RECV:
+  case IORING_OP_RECVMSG:
+  case IORING_OP_SEND:
+  case IORING_OP_SENDMSG:
+  case IORING_OP_SEND_ZC:
+  case IORING_OP_SENDMSG_ZC:
+    if (sqe->msg_flags & B1NIX_MSG_DONTWAIT)
+      return 0;
+    break;
+  default:
+    break;
+  }
   switch (sqe->opcode) {
   case IORING_OP_READ:
   case IORING_OP_READV:
@@ -3331,10 +3789,15 @@ static int iou_submit_one(struct io_ring_ctx *ctx,
 
   if (!req->failed &&
       (iou_op_needs_file(sqe->opcode) || sqe->opcode == IORING_OP_POLL_ADD)) {
-    req->file = iou_get_file(ctx, sqe, &err);
-    if (err) {
-      req->failed = 1;
-      req->fail_res = err;
+    if (sqe->flags & IOSQE_FIXED_FILE) {
+      /* Looked up at issue time; see file_deferred. */
+      req->file_deferred = 1;
+    } else {
+      req->file = iou_get_file(ctx, sqe, &err);
+      if (err) {
+        req->failed = 1;
+        req->fail_res = err;
+      }
     }
   }
 
@@ -3356,6 +3819,10 @@ linked:
 
     (*chain_tail)->link_next = req;
     *chain_tail = req;
+    if (req->cqe_skip || (*chain_head)->skip_link_cqes) {
+      for (struct iou_req *m = *chain_head; m; m = m->link_next)
+        m->skip_link_cqes = 1;
+    }
     if (!(sqe->flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK))) {
       struct iou_req *head = *chain_head;
 
@@ -3368,6 +3835,8 @@ linked:
   if (sqe->flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK)) {
     *chain_head = req;
     *chain_tail = req;
+    if (req->cqe_skip)
+      req->skip_link_cqes = 1;
     return req->failed ? 1 : 0;
   }
   {
@@ -3731,6 +4200,131 @@ static void iou_sq_thread_stop(struct io_ring_ctx *ctx) {
  * never arm anything and never pay for one.
  */
 
+/* Is any armed request ready, without completing anything?
+ *
+ * IORING_SETUP_DEFER_TASKRUN says the completions of a ring are posted by the
+ * task that owns it and by nobody else: a program relies on that to read the
+ * completion queue with no memory barriers of its own. The sweeping thread may
+ * still NOTICE that something is ready and say so through the registered
+ * eventfd -- that is how a task learns it is worth entering the ring -- but it
+ * may not write the CQE. liburing's defer-taskrun checks both halves: the
+ * eventfd fires, and the completion queue stays empty until it calls
+ * io_uring_get_events(). */
+static int iou_defer_ready(struct io_ring_ctx *ctx) {
+  u64 now = ktime_monotonic_ns();
+  int ready = 0;
+
+  iou_lock(ctx);
+  for (struct iou_req *r = ctx->live; r; r = r->next) {
+    if (r->state != IOU_ST_ARMED)
+      continue;
+    if (r->is_timeout || r->is_linktmo) {
+      if (r->has_deadline && now >= r->deadline_ns)
+        ready = 1;
+      else if (r->is_timeout && r->timeout_count &&
+               ctx->cq_posted >= r->timeout_target)
+        ready = 1;
+    } else if (r->has_deadline && now >= r->deadline_ns) {
+      ready = 1;
+    } else if (r->is_futex) {
+      if (iou_futex_ready(r) >= 0)
+        ready = 1;
+    } else if (r->poll_mask) {
+      u16 rev = iou_poll_now(r->file, r->poll_mask);
+
+      if (rev & (r->poll_mask | B1NIX_POLLERR | B1NIX_POLLHUP))
+        ready = 1;
+    }
+    if (ready)
+      break;
+  }
+  iou_unlock(ctx);
+  return ready;
+}
+
+/* IORING_SQ_TASKRUN: "there is work for the owner of this ring, enter the
+ * kernel". It is the only way a deferred completion can reach a program that
+ * peeks at the completion queue without entering: liburing's peek enters only
+ * when this bit (or the overflow bit) is up, so a ring whose completions are
+ * deferred and whose flag is never raised looks permanently empty. That is
+ * what left liburing's poll test with one of its two events. */
+static void iou_taskrun_flag(struct io_ring_ctx *ctx, int on) {
+  u32 f;
+
+  if (!ctx->hdr)
+    return;
+  f = __atomic_load_n(&ctx->hdr->sq_flags, __ATOMIC_RELAXED);
+  __atomic_store_n(&ctx->hdr->sq_flags,
+                   on ? (f | IORING_SQ_TASKRUN)
+                      : (f & ~(u32)IORING_SQ_TASKRUN),
+                   __ATOMIC_RELEASE);
+}
+
+/* This ring has just become readable, so report it to the rings watching it.
+ *
+ * The sweeping thread would get there within its own timeout, and that is too
+ * late for a program that submits to one ring and reads the other's completion
+ * queue in the next instruction -- liburing's poll test does exactly that, and
+ * called the result "polling stuck". So the completion drives the watchers
+ * directly. The busy flag keeps two rings watching each other from recursing.
+ */
+static void iou_crossring_kick(struct io_ring_ctx *ctx) {
+  struct io_ring_ctx *want[8];
+  int n = 0;
+
+  if (__atomic_exchange_n(&g_iou_crossring_busy, 1, __ATOMIC_ACQ_REL))
+    return;
+  iou_list_lock();
+  for (struct io_ring_ctx *c = g_ctx_list; c && n < 8; c = c->next) {
+    if (c == ctx)
+      continue;
+    for (struct iou_req *r = c->live; r; r = r->next) {
+      if (r->state != IOU_ST_ARMED || !r->file)
+        continue;
+      if (!iou_is_ring_handle(r->file) ||
+          (struct io_ring_ctx *)r->file->private_data != ctx)
+        continue;
+      iou_ctx_get(c); /* it must outlive the list lock */
+      want[n++] = c;
+      break;
+    }
+  }
+  iou_list_unlock();
+  for (int i = 0; i < n; i++) {
+    iou_progress(want[i]);
+    iou_ctx_put(want[i]);
+  }
+  __atomic_store_n(&g_iou_crossring_busy, 0, __ATOMIC_RELEASE);
+}
+
+/* Refresh the TASKRUN flag of every deferred-completion ring this task owns.
+ *
+ * With IORING_SETUP_DEFER_TASKRUN the completion is written by the owner, so
+ * something else has to tell the owner there is a completion waiting: Linux
+ * raises the flag in the context of whoever made the ring ready. Here the
+ * sweeping thread raises it, which is right but not immediate -- a program that
+ * triggers the readiness itself and looks at the flag in the next instruction
+ * beats it. So the flag is also brought up to date wherever the owner asks the
+ * kernel about readiness at all, which is where a program in that shape looks
+ * (liburing's defer-taskrun triggers an eventfd, polls it, and then requires
+ * the ring's flag to be up). */
+void io_uring_taskrun_refresh(void) {
+  usize me = current_task ? task_tgid(current_task) : 0;
+
+  if (!me)
+    return;
+  iou_list_lock();
+  for (struct io_ring_ctx *c = g_ctx_list; c; c = c->next) {
+    if (c->owner_tgid != me)
+      continue;
+    if (!(c->flags & (IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_TASKRUN_FLAG)))
+      continue;
+    if (iou_defer_ready(c))
+      iou_taskrun_flag(c, 1);
+  }
+  iou_list_unlock();
+}
+
 static int iou_any_armed(struct io_ring_ctx *ctx) {
   int armed = 0;
 
@@ -3759,8 +4353,17 @@ static void iou_cq_thread(void *arg) {
      * can start on it, exactly as the submission thread does. */
     if (!scheduler_owner_context_alive(ctx->owner_tgid))
       break;
-    if (__atomic_load_n(&ctx->enabled, __ATOMIC_ACQUIRE))
-      iou_progress(ctx);
+    if (__atomic_load_n(&ctx->enabled, __ATOMIC_ACQUIRE)) {
+      if (ctx->flags & IORING_SETUP_DEFER_TASKRUN) {
+        /* Announce, do not post: see iou_defer_ready. */
+        if (iou_defer_ready(ctx)) {
+          iou_taskrun_flag(ctx, 1);
+          iou_signal_eventfd(ctx);
+        }
+      } else {
+        iou_progress(ctx);
+      }
+    }
     /* The bound is what keeps an armed deadline honest on a machine where
      * nothing else happens to wake the channel. */
     scheduler_wait_prepare_timeout(vfs_poll_chan, SCHED_MS_TO_TICKS(10));
@@ -3808,6 +4411,7 @@ static void iou_quiesce(struct io_ring_ctx *ctx) {
   iou_lock(ctx);
   r = ctx->live;
   ctx->live = 0;
+  ctx->live_tail = 0;
   ctx->nr_live = 0;
   iou_unlock(ctx);
 
@@ -3873,6 +4477,9 @@ static void iou_handle_release(struct vfs_handle *h) {
 static int iou_handle_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   struct io_ring_ctx *ctx = (struct io_ring_ctx *)h->private_data;
 
+  /* Somebody is watching a ring. Sticky, and read once per completion: see
+   * g_iou_ringpoll_armed. */
+  __atomic_store_n(&g_iou_ringpoll_armed, 1, __ATOMIC_RELAXED);
   pfd->revents = 0;
   if (!ctx)
     return -EBADF;
@@ -3921,8 +4528,13 @@ static isize iou_setup(u32 entries, u64 uparams) {
       return -EINVAL;
   if (p.flags & ~(u32)IOU_SETUP_SUPPORTED)
     return -EINVAL;
+  /* IORING_SETUP_TASKRUN_FLAG asks the kernel to say, in the ring's own flags,
+   * that the owner should enter. That only means something when completions
+   * are not posted from wherever the work finished -- which is true of
+   * COOP_TASKRUN and equally true of DEFER_TASKRUN. Requiring the first of the
+   * two refused the combination liburing's defer-taskrun is built on. */
   if ((p.flags & IORING_SETUP_TASKRUN_FLAG) &&
-      !(p.flags & IORING_SETUP_COOP_TASKRUN))
+      !(p.flags & (IORING_SETUP_COOP_TASKRUN | IORING_SETUP_DEFER_TASKRUN)))
     return -EINVAL;
   /* Linux couples these two: deferred task work only means anything when one
    * task owns the ring. */
@@ -3972,6 +4584,8 @@ static isize iou_setup(u32 entries, u64 uparams) {
   ctx->sq_mask = sq_entries - 1;
   ctx->cq_mask = cq_entries - 1;
   ctx->enabled = (p.flags & IORING_SETUP_R_DISABLED) ? 0 : 1;
+  if ((p.flags & IORING_SETUP_SINGLE_ISSUER) && ctx->enabled)
+    ctx->submitter_tid = current_task ? (usize)current_task->id : 0;
   ctx->owner_tgid = current_task ? task_tgid(current_task) : 0;
   ctx->cqe_size = (p.flags & IORING_SETUP_CQE32) ? 32u
                                                  : sizeof(struct io_uring_cqe);
@@ -4297,17 +4911,70 @@ static isize iou_enter(int fd, u32 to_submit, u32 min_complete, u32 flags,
     return ctxerr;
   iou_trace("enter-in", to_submit, min_complete, (isize)flags);
   if (flags & ~(u32)(IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG |
-                     IORING_ENTER_ABS_TIMER | IORING_ENTER_NO_IOWAIT |
-                     IORING_ENTER_SQ_WAKEUP | IORING_ENTER_SQ_WAIT |
-                     IORING_ENTER_REGISTERED_RING))
+                     IORING_ENTER_EXT_ARG_REG | IORING_ENTER_ABS_TIMER |
+                     IORING_ENTER_NO_IOWAIT | IORING_ENTER_SQ_WAKEUP |
+                     IORING_ENTER_SQ_WAIT | IORING_ENTER_REGISTERED_RING))
     return -EINVAL;
   if ((flags & (IORING_ENTER_SQ_WAKEUP | IORING_ENTER_SQ_WAIT)) &&
       !(ctx->flags & IORING_SETUP_SQPOLL))
     return -EINVAL;
   if (!ctx->enabled)
     return -EBADFD;
+  /* One issuer means one: see submitter_tid. */
+  if ((ctx->flags & IORING_SETUP_SINGLE_ISSUER) && ctx->submitter_tid &&
+      current_task && (usize)current_task->id != ctx->submitter_tid)
+    return -EEXIST;
 
-  if (flags & IORING_ENTER_EXT_ARG) {
+  if (flags & IORING_ENTER_EXT_ARG_REG) {
+    /* The wait arguments live in the region registered with
+     * IORING_REGISTER_MEM_REGION, and `argp` is a BYTE OFFSET into it rather
+     * than a pointer: that is the whole point -- a waiter that fills one of
+     * these in advance passes no pointer and the kernel copies nothing from an
+     * address it has to validate afresh each time. */
+    struct io_uring_reg_wait rw;
+    u64 off = argp;
+
+    if (argsz != sizeof(rw))
+      return -EINVAL;
+    if (!ctx->regwait_addr)
+      return -EFAULT;
+    if (off & (sizeof(u64) - 1))
+      return -EFAULT;
+    if (off + sizeof(rw) < off || off + sizeof(rw) > ctx->regwait_size)
+      return -EFAULT;
+    if (syscall_copyin(&rw, (const void *)(usize)(ctx->regwait_addr + off),
+                       sizeof(rw)) < 0)
+      return -EFAULT;
+    for (int i = 0; i < 3; i++)
+      if (rw.pad[i])
+        return -EINVAL;
+    if (rw.pad2[0] || rw.pad2[1])
+      return -EINVAL;
+    if (rw.flags & ~(u32)IORING_REG_WAIT_TS)
+      return -EINVAL;
+    /* A signal mask is validated even when it is not used: a caller that got
+     * the size wrong has made a mistake worth hearing about, and one that
+     * passed an unreadable pointer gets EFAULT rather than silence. */
+    if (rw.sigmask || rw.sigmask_sz) {
+      char probe;
+
+      if (rw.sigmask_sz != 8)
+        return -EINVAL;
+      if (!rw.sigmask ||
+          syscall_copyin(&probe, (const void *)(usize)rw.sigmask, 1) < 0)
+        return -EFAULT;
+      return -EINVAL; /* no signal-mask swap here; say so rather than ignore */
+    }
+    if (rw.flags & IORING_REG_WAIT_TS) {
+      u64 ns = (u64)rw.ts.tv_sec * 1000000000ull + (u64)rw.ts.tv_nsec;
+
+      if (rw.ts.tv_sec < 0 || rw.ts.tv_nsec < 0 || rw.ts.tv_nsec >= 1000000000)
+        return -EINVAL;
+      deadline = (flags & IORING_ENTER_ABS_TIMER) ? iou_abs_deadline_ns(ns)
+                                                  : ktime_monotonic_ns() + ns;
+      have_deadline = 1;
+    }
+  } else if (flags & IORING_ENTER_EXT_ARG) {
     struct iou_getevents_arg arg;
 
     if (argsz != sizeof(arg))
@@ -4490,6 +5157,56 @@ static isize iou_register_files2(struct io_ring_ctx *ctx, u64 uaddr,
 
 /* IORING_REGISTER_FILES_UPDATE: replace a run of slots. Returns how many were
  * updated, which is what the ABI says and what liburing checks. */
+/* The choose-your-own-slot form of a files update: for each descriptor, take a
+ * free slot inside the allocation range, install the file and write the index
+ * back where the descriptor was. -ENFILE when the range is full, which is what
+ * a caller uses to know it has to give slots back. */
+static isize iou_files_update_alloc(struct io_ring_ctx *ctx, u64 uaddr, u32 nr) {
+  i32 *fds;
+  u32 done = 0;
+
+  fds = kmalloc(sizeof(i32) * nr);
+  if (!fds)
+    return -ENOMEM;
+  if (syscall_copyin(fds, (const void *)(usize)uaddr, sizeof(i32) * nr) < 0) {
+    kfree(fds);
+    return -EFAULT;
+  }
+  for (u32 i = 0; i < nr; i++) {
+    struct vfs_handle *nh;
+    i32 slot;
+
+    if (fds[i] < 0) {
+      kfree(fds);
+      return done ? (isize)done : -EBADF;
+    }
+    nh = scheduler_fd_get_retain(fds[i]);
+    if (nh && iou_is_ring_handle(nh)) {
+      vfs_handle_release(nh);
+      nh = 0;
+    }
+    if (!nh) {
+      kfree(fds);
+      return done ? (isize)done : -EBADF;
+    }
+    slot = iou_install_direct(ctx, nh, IORING_FILE_INDEX_ALLOC);
+    if (slot < 0) {
+      vfs_handle_release(nh);
+      kfree(fds);
+      return done ? (isize)done : (isize)slot;
+    }
+    fds[i] = slot;
+    done++;
+  }
+  if (done && syscall_copyout((void *)(usize)uaddr, fds,
+                              sizeof(i32) * done) < 0) {
+    kfree(fds);
+    return -EFAULT;
+  }
+  kfree(fds);
+  return (isize)done;
+}
+
 static isize iou_files_update(struct io_ring_ctx *ctx, u32 off, u64 uaddr,
                               u32 nr) {
   i32 *fds;
@@ -4499,6 +5216,13 @@ static isize iou_files_update(struct io_ring_ctx *ctx, u32 off, u64 uaddr,
     return -ENXIO;
   if (nr == 0)
     return -EINVAL;
+  /* IORING_FILE_INDEX_ALLOC as the offset means "choose the slots", inside the
+   * range IORING_REGISTER_FILE_ALLOC_RANGE named if there is one, and write
+   * each chosen index back over the descriptor it came from. Without it a
+   * program that never picks its own slots -- the shape the allocation range
+   * exists for -- had no way to fill the table from inside the ring. */
+  if (off == IORING_FILE_INDEX_ALLOC)
+    return iou_files_update_alloc(ctx, uaddr, nr);
   if (off > ctx->nr_files || nr > ctx->nr_files - off)
     return -EINVAL;
   fds = kmalloc(sizeof(i32) * nr);
@@ -4913,7 +5637,11 @@ static isize iou_sync_cancel(struct io_ring_ctx *ctx, u64 uaddr, u32 nr_args) {
     scheduler_wait_prepare_timeout(vfs_poll_chan, 1);
     scheduler_wait_commit();
   }
-  return 0;
+  /* How many requests were cancelled, not merely "it worked". A caller that
+   * cancels one pending request by user_data and is told 0 cannot tell that
+   * from a cancel that found nothing -- and liburing's futex test reads this
+   * number to decide whether its second futex wait was still parked. */
+  return total;
 }
 
 static isize iou_register_probe(struct io_ring_ctx *ctx, u64 uaddr,
@@ -5023,11 +5751,26 @@ static isize iou_register_probe(struct io_ring_ctx *ctx, u64 uaddr,
   return 0;
 }
 
+static isize iou_register_mem_region(struct io_ring_ctx *ctx, u64 uaddr,
+                                    u32 nr_args);
+static isize iou_clone_buffers(struct io_ring_ctx *ctx, u64 uaddr, u32 nr_args);
+static isize iou_register_send_msg_ring(u64 uaddr, u32 nr_args);
+
 static isize iou_register(int fd, u32 opcode, u64 arg, u32 nr_args) {
   int ctxerr = 0;
-  struct io_ring_ctx *ctx = iou_ctx_from_fd(fd, &ctxerr);
+  struct io_ring_ctx *ctx;
   isize rc;
 
+  /* One registration has no ring of its own: sending a message into another
+   * ring is done with `fd` set to -1, because the whole point is not to need a
+   * ring to send from. It is resolved before the descriptor is. */
+  if ((opcode & ~IORING_REGISTER_USE_REGISTERED_RING) ==
+      IORING_REGISTER_SEND_MSG_RING) {
+    rc = iou_register_send_msg_ring(arg, nr_args);
+    iou_trace("register", opcode, nr_args, rc);
+    return rc;
+  }
+  ctx = iou_ctx_from_fd(fd, &ctxerr);
   if (!ctx)
     return ctxerr;
   /* IORING_REGISTER_USE_REGISTERED_RING would take a registered ring index
@@ -5038,7 +5781,8 @@ static isize iou_register(int fd, u32 opcode, u64 arg, u32 nr_args) {
   /* Every operation but ENABLE_RINGS needs the ring to be running. */
   if (!ctx->enabled && opcode != IORING_REGISTER_ENABLE_RINGS &&
       opcode != IORING_REGISTER_RESTRICTIONS &&
-      opcode != IORING_REGISTER_FILES && opcode != IORING_REGISTER_BUFFERS)
+      opcode != IORING_REGISTER_FILES && opcode != IORING_REGISTER_BUFFERS &&
+      opcode != IORING_REGISTER_MEM_REGION)
     return -EBADFD;
   /* A restricted ring only answers the register opcodes its restriction list
    * named. */
@@ -5201,7 +5945,12 @@ static isize iou_register(int fd, u32 opcode, u64 arg, u32 nr_args) {
       return -EINVAL;
     if (!ctx->files)
       return -ENXIO;
-    if (range.off > ctx->nr_files || range.len > ctx->nr_files - range.off)
+    /* An overflowing pair is EOVERFLOW, a pair that simply does not fit is
+     * EINVAL: a caller computing a range from two numbers wants to know which
+     * of the two mistakes it made. */
+    if (range.off + range.len < range.off)
+      return -EOVERFLOW;
+    if (range.off >= ctx->nr_files || range.len > ctx->nr_files - range.off)
       return -EINVAL;
     ctx->falloc_off = range.off;
     ctx->falloc_len = range.len;
@@ -5273,19 +6022,191 @@ static isize iou_register(int fd, u32 opcode, u64 arg, u32 nr_args) {
     if (ctx->enabled)
       return -EBADFD;
     ctx->enabled = 1;
+    /* The thread that enables a disabled ring is the one that owns it from
+     * here: a ring set up disabled is set up by one thread precisely so
+     * another can take it over. */
+    if (ctx->flags & IORING_SETUP_SINGLE_ISSUER)
+      ctx->submitter_tid = current_task ? (usize)current_task->id : 0;
     rc = 0;
     break;
+  case IORING_REGISTER_MEM_REGION:
+    rc = iou_register_mem_region(ctx, arg, nr_args);
+    break;
+
+  case IORING_REGISTER_CLONE_BUFFERS:
+    rc = iou_clone_buffers(ctx, arg, nr_args);
+    break;
+
+  case IORING_REGISTER_SEND_MSG_RING:
+    rc = iou_register_send_msg_ring(arg, nr_args);
+    break;
+
   default:
-    /* io-wq affinity, NAPI busy-poll, the clock selection, buffer cloning,
-     * ring resizing, memory regions and the query interface: none of them
-     * exist here. -EINVAL is what a kernel without the opcode answers, which
-     * is what liburing tests for, and IORING_REGISTER_PROBE plus the absent
-     * feature bits say so in advance. */
+    /* io-wq affinity, NAPI busy-poll, the clock selection, ring resizing and
+     * the query interface: none of them exist here. -EINVAL is what a kernel
+     * without the opcode answers, which is what liburing tests for, and
+     * IORING_REGISTER_PROBE plus the absent feature bits say so in advance. */
     rc = -EINVAL;
     break;
   }
   iou_trace("register", opcode, nr_args, rc);
   return rc;
+}
+
+/* IORING_REGISTER_MEM_REGION: remember a region of the caller's memory that
+ * holds wait arguments. Only the wait-argument use exists here, which is the
+ * one liburing's reg-wait exercises; anything else is refused. */
+static isize iou_register_mem_region(struct io_ring_ctx *ctx, u64 uaddr,
+                                    u32 nr_args) {
+  struct io_uring_mem_region_reg mr;
+  struct io_uring_region_desc rd;
+  char probe;
+
+  if (nr_args != 1)
+    return -EINVAL;
+  if (syscall_copyin(&mr, (const void *)(usize)uaddr, sizeof(mr)) < 0)
+    return -EFAULT;
+  if (mr.__resv[0] || mr.__resv[1])
+    return -EINVAL;
+  if (mr.flags != IORING_MEM_REGION_REG_WAIT_ARG)
+    return -EINVAL;
+  if (!mr.region_uptr)
+    return -EFAULT;
+  if (syscall_copyin(&rd, (const void *)(usize)mr.region_uptr, sizeof(rd)) < 0)
+    return -EFAULT;
+  for (int i = 0; i < 4; i++)
+    if (rd.__resv[i])
+      return -EINVAL;
+  if (rd.flags != IORING_MEM_REGION_TYPE_USER || rd.id || rd.mmap_offset)
+    return -EINVAL;
+  if (!rd.size || (rd.size & (u64)(PAGE_SIZE - 1)) || rd.size > (1u << 20))
+    return -EINVAL;
+  if (!rd.user_addr || (rd.user_addr & (u64)(PAGE_SIZE - 1)))
+    return -EFAULT;
+  if (rd.user_addr + rd.size < rd.user_addr)
+    return -EOVERFLOW;
+  /* It has to be memory this process can really reach, or every wait that
+   * names it would fault somewhere less explicable. */
+  if (syscall_copyin(&probe, (const void *)(usize)rd.user_addr, 1) < 0 ||
+      syscall_copyin(&probe,
+                     (const void *)(usize)(rd.user_addr + rd.size - 1), 1) < 0)
+    return -EFAULT;
+  if (ctx->regwait_addr)
+    return -EBUSY;
+  /* A wait region belongs to a ring that has not started yet: it is part of how
+   * the ring is set up, and Linux refuses it on a running one -- the memory is
+   * the caller's and a waiter may already be reading it. */
+  if (ctx->enabled)
+    return -EINVAL;
+  ctx->regwait_addr = rd.user_addr;
+  ctx->regwait_size = rd.size;
+  return 0;
+}
+
+/* IORING_REGISTER_CLONE_BUFFERS: take another ring's registered buffers. The
+ * two rings are in one address space, so the addresses mean the same thing on
+ * both sides and the clone is a copy of the table. */
+static isize iou_clone_buffers(struct io_ring_ctx *ctx, u64 uaddr, u32 nr_args) {
+  struct io_uring_clone_buffers cb;
+  struct io_ring_ctx *src;
+  struct vfs_handle *sh;
+  u32 nr, need;
+
+  if (nr_args != 1)
+    return -EINVAL;
+  if (syscall_copyin(&cb, (const void *)(usize)uaddr, sizeof(cb)) < 0)
+    return -EFAULT;
+  for (int i = 0; i < 3; i++)
+    if (cb.pad[i])
+      return -EINVAL;
+  if (cb.flags & ~(u32)(IORING_REGISTER_SRC_REGISTERED |
+                        IORING_REGISTER_DST_REPLACE))
+    return -EINVAL;
+  sh = (cb.flags & IORING_REGISTER_SRC_REGISTERED)
+           ? iou_reg_ring_get(cb.src_fd)
+           : scheduler_fd_get((int)cb.src_fd);
+  if (!sh)
+    return -EBADF;
+  if (!iou_is_ring_handle(sh) || !sh->private_data)
+    return -EBADFD;
+  src = (struct io_ring_ctx *)sh->private_data;
+  if (src == ctx)
+    return -EINVAL;
+  if (!src->bufs || !src->nr_bufs)
+    return -ENXIO;
+  if (cb.src_off >= src->nr_bufs)
+    return -EINVAL;
+  /* Zero means "all of it from src_off", which is what the plain
+   * io_uring_clone_buffers() asks for. */
+  nr = cb.nr ? cb.nr : (src->nr_bufs - cb.src_off);
+  if (nr > src->nr_bufs - cb.src_off)
+    return -EINVAL;
+  if (cb.dst_off > IOU_MAX_FIXED_BUFS || nr > IOU_MAX_FIXED_BUFS)
+    return -E2BIG;
+  need = cb.dst_off + nr;
+  if (need > IOU_MAX_FIXED_BUFS)
+    return -E2BIG;
+  if (ctx->bufs && !(cb.flags & IORING_REGISTER_DST_REPLACE))
+    return -EBUSY;
+  iou_lock(ctx);
+  if (!ctx->bufs || ctx->nr_bufs < need) {
+    struct iou_fixed_buf *nb = kzalloc(sizeof(*nb) * need);
+
+    if (!nb) {
+      iou_unlock(ctx);
+      return -ENOMEM;
+    }
+    if (ctx->bufs) {
+      for (u32 i = 0; i < ctx->nr_bufs; i++)
+        nb[i] = ctx->bufs[i];
+      kfree(ctx->bufs);
+    }
+    ctx->bufs = nb;
+    ctx->nr_bufs = need;
+  }
+  for (u32 i = 0; i < nr; i++)
+    ctx->bufs[cb.dst_off + i] = src->bufs[cb.src_off + i];
+  iou_unlock(ctx);
+  return 0;
+}
+
+/* IORING_REGISTER_SEND_MSG_RING: post a message into another ring without
+ * having one of your own to submit from. The argument is a single SQE, and the
+ * only opcode it may carry is IORING_OP_MSG_RING. */
+static isize iou_register_send_msg_ring(u64 uaddr, u32 nr_args) {
+  struct io_uring_sqe sqe;
+  struct io_ring_ctx *target;
+  struct vfs_handle *h;
+  u32 tflags = 0;
+
+  if (nr_args != 1)
+    return -EINVAL;
+  if (syscall_copyin(&sqe, (const void *)(usize)uaddr, sizeof(sqe)) < 0)
+    return -EFAULT;
+  if (sqe.opcode != IORING_OP_MSG_RING)
+    return -EINVAL;
+  if (sqe.flags)
+    return -EINVAL;
+  if (sqe.msg_ring_flags & ~(u32)(IORING_MSG_RING_CQE_SKIP |
+                                  IORING_MSG_RING_FLAGS_PASS))
+    return -EINVAL;
+  /* Only data, not a descriptor: passing a file needs a ring to take it from,
+   * and this path has none. */
+  if (sqe.addr != IORING_MSG_DATA)
+    return -EINVAL;
+  h = scheduler_fd_get((int)sqe.fd);
+  if (!h)
+    return -EBADF;
+  if (!iou_is_ring_handle(h) || !h->private_data)
+    return -EBADFD;
+  target = (struct io_ring_ctx *)h->private_data;
+  if (sqe.msg_ring_flags & IORING_MSG_RING_FLAGS_PASS)
+    tflags = sqe.file_index;
+  /* The target's completion carries `off` as its user_data -- `user_data` is
+   * the SENDER's, and in this form there is no sender ring for it to land in. */
+  if (!(sqe.msg_ring_flags & IORING_MSG_RING_CQE_SKIP))
+    iou_post_cqe_n(target, sqe.off, (i32)sqe.len, tflags, 1);
+  return 0;
 }
 
 /* ---- the dispatcher hook ------------------------------------------------ */

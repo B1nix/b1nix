@@ -482,7 +482,13 @@ usize unix_bytes_available(struct vfs_socket_state *s) {
     return 0;
   unix_lock(u);
   usize n = u->rb_count;
-  if (s->type == B1NIX_SOCK_SEQPACKET && u->msg_count)
+  /* A datagram socket answers with the size of the FIRST message, which is
+   * what one read(2) will hand over -- the same rule SEQPACKET follows, and
+   * what Linux's SIOCINQ answers for both. Reading the ring's total told a
+   * caller sizing a buffer to expect one read of everything queued, and a
+   * datagram queue keeps its bytes outside the ring, so the answer was zero. */
+  if ((s->type == B1NIX_SOCK_SEQPACKET || s->type == B1NIX_SOCK_DGRAM) &&
+      u->msg_count)
     n = u->msg_len[u->msg_head];
   unix_unlock(u);
   return n;

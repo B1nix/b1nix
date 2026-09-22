@@ -3,6 +3,7 @@
 #include <b1nix/namespace.h>
 #include <b1nix/user_namespace.h>
 #include <b1nix/bootinfo.h>
+#include <b1nix/console.h>
 #include <b1nix/klog.h>
 #include <stdio.h>
 #include <b1nix/errno.h>
@@ -538,7 +539,37 @@ static isize socket_read(struct vfs_handle *h, char *buf, usize size) {
 }
 
 static isize socket_write(struct vfs_handle *h, const char *buf, usize size) {
-  return vfs_socket_send_h(h, buf, size, 0);
+  isize rc = vfs_socket_send_h(h, buf, size, 0);
+
+  /* b1nix.trace-sock: name a write on a socket that did not transfer what was
+   * asked of it. A test program prints the number it got and not the socket it
+   * got it from, so the shape of the socket is the missing half. */
+  {
+    static int on = -1;
+
+    if (on < 0)
+      on = bootinfo_has_flag("b1nix.trace-sock") ? 1 : 0;
+    if (on) {
+      struct vfs_socket_state *st = (struct vfs_socket_state *)h->private_data;
+
+      console_write("sock: write domain=");
+      console_write_dec(st ? (u64)st->domain : 0);
+      console_write(" type=");
+      console_write_dec(st ? (u64)st->type : 0);
+      console_write(" connected=");
+      console_write_dec(st ? (u64)st->connected : 0);
+      console_write(" peerport=");
+      console_write_dec(st ? (u64)ntoh16(st->peer.in.sin_port) : 0);
+      console_write(" localport=");
+      console_write_dec(st ? (u64)ntoh16(st->local.in.sin_port) : 0);
+      console_write(" len=");
+      console_write_dec((u64)size);
+      console_write(" -> ");
+      console_write_dec((u64)(i64)rc);
+      console_write("\n");
+    }
+  }
+  return rc;
 }
 
 /* sendto()/recvfrom() wrappers: temporarily override the peer address for
@@ -823,14 +854,30 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
           pfd->revents |= B1NIX_POLLHUP;
         }
       }
+    } else if (s->so_error && !s->listening) {
+      /* An error left on the socket -- an aborted connect, for one -- is a
+       * readiness event even after the connection object has gone. Without
+       * this a waiter armed on writability waits for ever for an answer that
+       * is already sitting there. */
+      pfd->revents |= B1NIX_POLLOUT | B1NIX_POLLERR | B1NIX_POLLHUP;
     } else if (s->tcp_conn && !s->listening) {
-      /* A non-blocking connect that failed is writable with an error, as on
-       * Linux: the caller learns why from SO_ERROR. */
+      /* A non-blocking connect, still in flight. Both of its endings are a
+       * readiness event: the caller polls for writability and then asks
+       * SO_ERROR which one it was.
+       *
+       * Only the failure was reported before, so a connect that SUCCEEDED
+       * never made the socket writable and nothing woke the waiter -- which is
+       * why io_uring could not arm a connect at all and had to hand back
+       * EINPROGRESS. */
       int err = tcp_connect_error((struct tcp_conn *)s->tcp_conn);
+
       if (err) {
         pfd->revents |= B1NIX_POLLOUT | B1NIX_POLLERR | B1NIX_POLLHUP;
         if (!s->so_error)
           s->so_error = err;
+      } else if (tcp_is_established((struct tcp_conn *)s->tcp_conn)) {
+        s->connected = 1;
+        pfd->revents |= B1NIX_POLLOUT;
       }
     } else if (s->listening) {
       u16 port = ntoh16(s->local.in.sin_port);
@@ -1005,6 +1052,16 @@ int vfs_socket_bytes_available(struct vfs_handle *h, int outgoing) {
 
   if (!s)
     return -ENOTSOCK;
+  /* Anything this machine sent to itself is queued for the net task, not
+   * delivered yet. "How much is waiting for me?" asked right after a send on
+   * the other end therefore answered zero, where Linux -- which delivers a
+   * loopback datagram inside the sender's own send -- answers with the
+   * datagram. Drain what is pending before counting. */
+  {
+    extern void net_loopback_drain(void);
+
+    net_loopback_drain();
+  }
   if (outgoing) {
     /* Nothing here queues on the send side beyond what the driver has
      * already taken, so the outgoing queue is empty by construction. */
@@ -1994,7 +2051,11 @@ int vfs_connect_h(struct vfs_handle *h, const void *addr, usize addrlen) {
   if (!h) return -EBADF;
   if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
-  if (s->connected) return -EISCONN;
+  /* Only a stream socket is already connected for good. A datagram socket's
+   * connect just names a default peer, and Linux lets it be named again -- so
+   * refusing the second connect with EISCONN would break the pair of sockets
+   * that point at each other, each connected after the other. */
+  if (s->connected && s->type == B1NIX_SOCK_STREAM) return -EISCONN;
   if (s->tcp_conn && !s->connected) {
     if (tcp_is_established((struct tcp_conn *)s->tcp_conn)) {
       s->connected = 1;
@@ -2015,6 +2076,20 @@ int vfs_connect_h(struct vfs_handle *h, const void *addr, usize addrlen) {
     s->connected = 0;
     struct in6_addr_k dst;
     memcpy(dst.bytes, s->peer.in6.sin6_addr.s6_addr, 16);
+    /* :: means this machine, for the same reason 0.0.0.0 does. */
+    {
+      int unspecified = 1;
+
+      for (int i = 0; i < 16; i++)
+        if (dst.bytes[i]) {
+          unspecified = 0;
+          break;
+        }
+      if (unspecified) {
+        dst.bytes[15] = 1;
+        memcpy(s->peer.in6.sin6_addr.s6_addr, dst.bytes, 16);
+      }
+    }
     if (s->ipv6_v6only && in6_is_v4mapped(&dst))
       return -EAFNOSUPPORT;
     if (s->type == B1NIX_SOCK_STREAM) {
@@ -2024,12 +2099,29 @@ int vfs_connect_h(struct vfs_handle *h, const void *addr, usize addrlen) {
         return -ECONNREFUSED;
       s->connected = 1;
     }
-    /* Datagram connect just records the default peer for subsequent send()s. */
+    /* Datagram connect records the default peer for subsequent send()s -- and
+     * binds a local port if the socket has none. Linux assigns it in connect,
+     * and a program is entitled to read it back with getsockname right after:
+     * two UDP sockets pointed at each other are made exactly that way, and a
+     * local port that only appears at the first send reported zero, which the
+     * peer then "connected" to and could never send anything. */
+    if (s->local.in6.sin6_port == 0)
+      s->local.in6.sin6_port = udp_autobind(h);
+    s->connected = 1;
     return 0;
   }
 
   if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in)) return -EINVAL;
   s->peer.in = *(const struct b1nix_sockaddr_in *)addr;
+  /* Connecting to 0.0.0.0 means this machine.
+   *
+   * Linux maps the wildcard address to the loopback one on connect, and
+   * programs rely on it: anything that binds the address getaddrinfo() returns
+   * for AI_PASSIVE and then dials the same sockaddr -- liburing's accept-reuse
+   * does exactly that -- is dialling 0.0.0.0, and answering ECONNREFUSED makes
+   * its own listener unreachable. */
+  if (s->peer.in.sin_addr == 0)
+    s->peer.in.sin_addr = 0x0100007fu; /* 127.0.0.1, network order */
   s->connected = 0;
   if (s->type == B1NIX_SOCK_STREAM) {
     struct ipv4_addr dst_ip;
@@ -2052,6 +2144,12 @@ int vfs_connect_h(struct vfs_handle *h, const void *addr, usize addrlen) {
     }
     s->connected = 1;
     sock_apply_tcp_opts(s);
+  } else if (s->type == B1NIX_SOCK_DGRAM) {
+    /* A connected datagram socket has a local port from this moment, not from
+     * its first send: see the note on the IPv6 side above. */
+    if (s->local.in.sin_port == 0)
+      s->local.in.sin_port = udp_autobind(h);
+    s->connected = 1;
   }
   return 0;
 }
@@ -2072,6 +2170,11 @@ static void sock_apply_tcp_opts(struct vfs_socket_state *s) {
     tcp_set_keepalive((struct tcp_conn *)s->tcp_conn, 1);
   if (s->so_rcvbuf > 0)
     tcp_set_rcvbuf((struct tcp_conn *)s->tcp_conn, (u32)s->so_rcvbuf);
+  if (s->tcp_syncnt > 0)
+    tcp_set_syncnt((struct tcp_conn *)s->tcp_conn, (u32)s->tcp_syncnt);
+  if (s->tcp_user_timeout_ms > 0)
+    tcp_set_user_timeout((struct tcp_conn *)s->tcp_conn,
+                         (u32)s->tcp_user_timeout_ms);
 }
 
 isize vfs_socket_send(int fd, const void *buf, usize len, int flags) {
@@ -2272,6 +2375,7 @@ int vfs_socket_wants_peer_pidfd(int fd) {
  * dbus-broker identifies every client this way. */
 #define SOCK_SO_PEERPIDFD 77
 #define SOCK_SO_ACCEPTCONN 30
+#define SOCK_SO_PEERNAME  28
 /* What KIND of socket this is, as three separate questions. A program handed a
  * descriptor it did not create asks them before trusting it: dbus-broker
  * validates the controller socket systemd passes it and exits with "Protocol
@@ -2288,6 +2392,8 @@ int vfs_socket_wants_peer_pidfd(int fd) {
 #define SOCK_SO_DETACH_FILTER 27
 #define SOCK_SO_LOCK_FILTER   44
 #define SOCK_TCP_NODELAY  1
+#define SOCK_TCP_SYNCNT   7
+#define SOCK_TCP_USER_TIMEOUT 18
 #define SOCK_TCP_KEEPIDLE  4
 #define SOCK_TCP_KEEPINTVL 5
 #define SOCK_TCP_KEEPCNT   6
@@ -2489,6 +2595,31 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
         return -EINVAL;
       return 0;
     }
+    /* The two options that say how long a connection attempt may last. Both
+     * are honoured on the connection's retransmit timer rather than recorded
+     * and ignored: liburing's conn-unreach asks for two SYNs and a 500 ms
+     * user timeout precisely so its unreachable-peer test finishes quickly,
+     * and it dies on the setsockopt if the kernel refuses. */
+    if (optname == SOCK_TCP_SYNCNT) {
+      if (v <= 0 || v > 255)
+        return -EINVAL;
+      if (s->type != B1NIX_SOCK_STREAM)
+        return -ENOPROTOOPT;
+      s->tcp_syncnt = v;
+      if (s->tcp_conn)
+        tcp_set_syncnt((struct tcp_conn *)s->tcp_conn, (u32)v);
+      return 0;
+    }
+    if (optname == SOCK_TCP_USER_TIMEOUT) {
+      if (v < 0)
+        return -EINVAL;
+      if (s->type != B1NIX_SOCK_STREAM)
+        return -ENOPROTOOPT;
+      s->tcp_user_timeout_ms = v;
+      if (s->tcp_conn)
+        tcp_set_user_timeout((struct tcp_conn *)s->tcp_conn, (u32)v);
+      return 0;
+    }
     if (optname == SOCK_TCP_NODELAY) {
       /* b1nix TCP already sends each segment promptly (no Nagle), so this is
        * a stored, honoured-by-construction flag. */
@@ -2521,6 +2652,16 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
    * exactly that) and treats anything else as fatal. */
   if (level == SOCK_SOL_SOCKET && optname == SOCK_SO_PEERSEC)
     return -ENOPROTOOPT;
+
+  /* SO_PEERNAME: the same answer as getpeername(2), asked through getsockopt.
+   * It is the one address-valued socket option, and liburing's
+   * socket-getsetsock-cmd reads a connected socket's peer this way before it
+   * asks the ring the same question. */
+  if (level == SOCK_SOL_SOCKET && optname == SOCK_SO_PEERNAME) {
+    if (!optval || !optlen)
+      return -EINVAL;
+    return vfs_getpeername(fd, optval, optlen);
+  }
 
   if (!optval || !optlen) return -EINVAL;
 
@@ -2664,6 +2805,10 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
     case SOCK_SO_BROADCAST: v = s->so_broadcast; break;
     default:                return -ENOPROTOOPT;
     }
+  } else if (level == SOCK_IPPROTO_TCP && optname == SOCK_TCP_SYNCNT) {
+    v = s->tcp_syncnt > 0 ? s->tcp_syncnt : 5; /* the default the timer uses */
+  } else if (level == SOCK_IPPROTO_TCP && optname == SOCK_TCP_USER_TIMEOUT) {
+    v = s->tcp_user_timeout_ms;
   } else if (level == SOCK_IPPROTO_TCP && optname == SOCK_TCP_NODELAY) {
     v = s->tcp_nodelay;
   } else if (level == SOCK_IPPROTO_TCP &&
@@ -2730,6 +2875,40 @@ int vfs_getpeername(int fd, void *addr, usize *addrlen) {
   return sock_copy_local_peer(s, 1, addr, addrlen);
 }
 
+/* Where an in-flight connect has got to, for a caller that armed it and is
+ * being asked again: 0 once the handshake is done, the error once it has
+ * failed, and EINPROGRESS while it is still going. io_uring needs this because
+ * it may not block and may not report EINPROGRESS either -- the completion it
+ * posts has to be the connect's real answer. */
+int vfs_socket_connect_result_h(struct vfs_handle *h) {
+  struct vfs_socket_state *s;
+
+  if (!h || h->kind != VFS_HANDLE_SOCKET)
+    return -ENOTSOCK;
+  s = (struct vfs_socket_state *)h->private_data;
+  if (!s)
+    return -ENOTSOCK;
+  if (s->so_error) {
+    int e = s->so_error;
+
+    s->so_error = 0;
+    return -e;
+  }
+  if (s->connected)
+    return 0;
+  if (s->tcp_conn) {
+    int err = tcp_connect_error((struct tcp_conn *)s->tcp_conn);
+
+    if (err)
+      return -err;
+    if (tcp_is_established((struct tcp_conn *)s->tcp_conn)) {
+      s->connected = 1;
+      return 0;
+    }
+  }
+  return -EINPROGRESS;
+}
+
 int vfs_shutdown(int fd, int how) {
   int err;
   struct vfs_socket_state *s = socket_state_for_fd(fd, &err);
@@ -2738,6 +2917,16 @@ int vfs_shutdown(int fd, int how) {
     return -EINVAL;
   if (how == SOCK_SHUT_RD || how == SOCK_SHUT_RDWR) s->shut_rd = 1;
   if (how == SOCK_SHUT_WR || how == SOCK_SHUT_RDWR) s->shut_wr = 1;
+  /* Shutting down a socket whose connect is still in flight ABORTS that
+   * connect, and the connect reports ECONNRESET -- it is how a program cancels
+   * an attempt to an address that is not answering. liburing's conn-unreach
+   * does exactly this, and waits for the connect's completion to say so. */
+  if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn && !s->connected &&
+      !s->listening) {
+    s->so_error = ECONNRESET;
+    tcp_close((struct tcp_conn *)s->tcp_conn);
+    s->tcp_conn = 0;
+  }
   /* Half-close is a statement to the PEER, not only a local flag: closing the
    * write half must make the other end's read return 0. Recording it here and
    * nowhere else left every AF_UNIX half-close invisible to the reader. */

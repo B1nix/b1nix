@@ -887,6 +887,9 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
 int vfs_getsockname(int fd, void *addr, usize *addrlen);
 int vfs_getpeername(int fd, void *addr, usize *addrlen);
 int vfs_shutdown(int fd, int how);
+/* Where an armed connect has got to: 0 when it is done, -errno when it failed,
+ * -EINPROGRESS while it is still going. */
+int vfs_socket_connect_result_h(struct vfs_handle *h);
 /* The FIONREAD/TIOCOUTQ counts, returned rather than copied out to a user
  * address: io_uring's SOCKET_URING_OP_SIOCINQ needs the number itself. */
 int vfs_socket_bytes_available(struct vfs_handle *h, int outgoing);
@@ -991,7 +994,7 @@ struct vfs_file_ops {
 /* Compile-time ceiling of the pipes[] pool. The pool search (pipe_pool_claim)
  * only walks g_resource_caps.max_pipes slots (M77), so the runtime cap is
  * adjustable via /proc/sys/kernel/pipe-max-count without reallocating. */
-#define MAX_VFS_PIPES_CEIL 1024
+#define MAX_VFS_PIPES_CEIL 4096
 /* Mount-table capacity.
  *
  * MAX_MOUNTS is now only the CEILING; the table is allocated at vfs_init() to a
@@ -1083,6 +1086,10 @@ struct vfs_socket_state {
   /* TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT, in seconds, as the socket
    * would apply them; the live values belong to the connection. */
   int tcp_keepalive_param[3];
+  /* TCP_SYNCNT and TCP_USER_TIMEOUT, recorded here because a program may set
+   * them before connect(2) and the connection does not exist yet. */
+  int tcp_syncnt;
+  int tcp_user_timeout_ms;
   /* SO_PASSCRED: the receiver asked for the sender's credentials to be attached
    * to every message it gets, instead of only to messages whose sender chose to
    * send SCM_CREDENTIALS. Crashpad's handler relies on this to learn, from the
