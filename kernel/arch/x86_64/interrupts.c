@@ -12,6 +12,8 @@
 #include <b1nix/ioapic.h>
 #include <b1nix/irq.h>
 #include <b1nix/klog.h>
+#include <b1nix/kprobe.h>
+#include <b1nix/tracepoint.h>
 
 /* M35: ELF core dump on fatal fault (kernel/arch/x86_64/coredump.c). */
 void coredump_write(struct interrupt_frame *frame, int sig);
@@ -1061,6 +1063,13 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     }
   }
 
+  /* A kprobe's int3, and the single step that follows it. Before the debugging
+   * stub, because a probe planted by userspace is not a request to stop. */
+  if (frame->vector == 3 && kprobe_handle_bp(frame))
+    return;
+  if (frame->vector == 1 && kprobe_handle_db(frame))
+    return;
+
   if ((frame->vector == 3 || frame->vector == 1) &&
       bootinfo_has_flag("b1nix.gdb")) {
     gdb_stub_enter(frame);
@@ -1112,6 +1121,9 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
                               current_task->id);
     }
 
+    if (error_code & 4) /* PF_USER: a fault a program took, not the kernel */
+      TRACEPOINT_FIRE(TP_PAGE_FAULT_USER, fault_addr, error_code,
+                      current_task ? current_task->id : 0);
     u64 pf_t0 = pf_prof_enabled() ? pf_prof_now() : 0;
     int pf_rc = vmm_handle_page_fault(fault_addr, error_code);
     int handled = pf_rc == 0;

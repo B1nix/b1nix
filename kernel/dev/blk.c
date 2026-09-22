@@ -4,6 +4,7 @@
 #include <b1nix/lapic.h>
 #include <b1nix/arch.h>
 #include <b1nix/blk.h>
+#include <b1nix/tracepoint.h>
 #include <b1nix/cgroup.h>
 #include <b1nix/psi.h>
 #include <b1nix/bootinfo.h>
@@ -1672,11 +1673,13 @@ static int blk_dev_read(struct block_device *dev, u64 lba, u32 count,
   u64 bytes = blk_bytes_of(dev, count);
 
   blk_cgroup_throttle(devno, bytes, 0);
+  TRACEPOINT_FIRE(TP_BLOCK_RQ_ISSUE, devno, lba, count);
   psi_stall_begin(PSI_IO);
   blk_io_begin(dev);
   int rc = dev->read_blocks(dev, lba, count, buf);
   blk_io_end(dev);
   psi_stall_end(PSI_IO);
+  TRACEPOINT_FIRE(TP_BLOCK_RQ_COMPLETE, devno, lba, rc < 0 ? (u64)rc : 0);
   /* Any non-negative answer is a completed command. A driver is free to
    * return the sector count instead of zero and virtio-blk does exactly that,
    * so a check for zero counted nothing at all on the one device every lane
@@ -1693,11 +1696,13 @@ static int blk_dev_write(struct block_device *dev, u64 lba, u32 count,
   u64 bytes = blk_bytes_of(dev, count);
 
   blk_cgroup_throttle(devno, bytes, 1);
+  TRACEPOINT_FIRE(TP_BLOCK_RQ_ISSUE, devno, lba, count);
   psi_stall_begin(PSI_IO);
   blk_io_begin(dev);
   int rc = dev->write_blocks(dev, lba, count, buf);
   blk_io_end(dev);
   psi_stall_end(PSI_IO);
+  TRACEPOINT_FIRE(TP_BLOCK_RQ_COMPLETE, devno, lba, rc < 0 ? (u64)rc : 0);
   if (rc >= 0)
     cgroup_io_account(devno, bytes, 1);
   return rc;

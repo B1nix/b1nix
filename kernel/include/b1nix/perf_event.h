@@ -22,6 +22,10 @@ void perf_event_tick_sample(u64 pc, u64 fp, int in_user, int cpu);
  * report` can close the map of a process that has gone. */
 void perf_event_task_exit(struct task *t);
 
+/* A static tracepoint or a kprobe fired. Charges every PERF_TYPE_TRACEPOINT
+ * event opened on that site, and writes a sample when one asked for them. */
+void perf_tracepoint_hit(u16 id, u64 a, u64 b, u64 c);
+
 /* A task has just replaced its image. Events opened on it with
  * attr.enable_on_exec start counting here -- which is what perf stat means by
  * "count this command" and not the fork that led to it. */

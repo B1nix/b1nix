@@ -144,6 +144,47 @@ void ksym_index_init(void)
 	__atomic_store_n(&ksym_index, idx, __ATOMIC_RELEASE);
 }
 
+/* The reverse lookup: a name to an address.
+ *
+ * kprobes need it -- a probe is asked for by symbol -- and so does anything else
+ * that has to name a place in the kernel from userspace. Linear over the index,
+ * which is fine for the one-off a probe registration is. */
+u64 ksym_addr_of(const char *name)
+{
+	struct ksym_entry *idx = __atomic_load_n(&ksym_index, __ATOMIC_ACQUIRE);
+
+	if (!name || !*name)
+		return 0;
+	if (idx) {
+		for (usize i = 0; i < ksym_index_n; i++) {
+			if (idx[i].name && strcmp(idx[i].name, name) == 0)
+				return idx[i].addr;
+		}
+		return 0;
+	}
+	/* Before the index is built (and after a heap failure), walk the blob --
+	 * the same fallback ksym_lookup keeps. */
+	{
+		const unsigned char *p = __kallsyms_start;
+		const unsigned char *end = __kallsyms_end;
+
+		while (p + 8 < end) {
+			u64 a;
+
+			memcpy(&a, p, 8);
+			p += 8;
+			const char *sym = (const char *)p;
+
+			while (p < end && *p)
+				p++;
+			p++;
+			if (strcmp(sym, name) == 0)
+				return a;
+		}
+	}
+	return 0;
+}
+
 const char *ksym_lookup(u64 addr, u64 *off)
 {
 	struct ksym_entry *idx = __atomic_load_n(&ksym_index, __ATOMIC_ACQUIRE);

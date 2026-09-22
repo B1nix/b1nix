@@ -54,6 +54,8 @@ void ksym_index_init(void);
  * symbol name (or NULL) and sets *off to the byte offset into it. ksym_print
  * emits " <name+0xoff>" to console+serial when the address resolves. */
 const char *ksym_lookup(u64 addr, u64 *off);
+/* A kernel symbol's address by name, or 0. See the definition. */
+u64 ksym_addr_of(const char *name);
 
 /* A hardware data breakpoint on one kernel address, armed on every CPU.
  * Writes to it are reported with the instruction pointer that made them.

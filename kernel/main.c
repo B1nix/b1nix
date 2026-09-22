@@ -46,6 +46,7 @@
 #include <b1nix/fuse.h>
 #include <b1nix/fwcfgfs.h>
 #include <b1nix/debugfs.h>
+#include <b1nix/tracepoint.h>
 #include <b1nix/tarfs.h>
 #include <b1nix/procfs.h>
 #include <b1nix/ahci.h>
@@ -792,6 +793,9 @@ void kernel_main(usize arg0, usize arg1)
 	p9_fs_init();
 	fwcfgfs_init();
 	b1nix_debugfs_init();
+	/* /sys/kernel/tracing: after sysfs (it lives under /sys/kernel) and after
+	 * debugfs (the older path is a symlink into it). */
+	tracefs_init();
 	tarfs_init();
 #ifdef B1NIX_FS_IMPORT
 	/*

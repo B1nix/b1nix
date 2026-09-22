@@ -29,9 +29,13 @@
  * PERF_TYPE_HARDWARE, PERF_TYPE_HW_CACHE and PERF_TYPE_RAW are -EOPNOTSUPP
  * because there is no PMU driver here (no IA32_PERFEVTSELx programming, no
  * counter-overflow NMI), and a counter that read zero for ever would be worse
- * than an honest refusal. PERF_TYPE_TRACEPOINT is -EOPNOTSUPP because there is
- * no tracepoint registry to attach to. A sample_type bit whose field this does
- * not produce is -EOPNOTSUPP at open for the same reason.
+ * than an honest refusal. A sample_type bit whose field this does not produce
+ * is -EOPNOTSUPP at open for the same reason.
+ *
+ * PERF_TYPE_TRACEPOINT is real: attr.config is an id from
+ * /sys/kernel/tracing/events/<group>/<event>/id, opening the event arms the
+ * site, and every hit at that site is counted where it happens (see
+ * perf_tracepoint_hit and kernel/trace/tracepoint.c).
  *
  * HOW A SAMPLE IS TAKEN
  *
@@ -51,6 +55,7 @@
  */
 
 #include <b1nix/perf_event.h>
+#include <b1nix/tracepoint.h>
 
 #include <b1nix/arch.h>
 #include <b1nix/bpf.h>
@@ -124,6 +129,14 @@ struct perf_ev {
    * us, or -1 for a software counter. */
   int pmu_slot;
 
+  /* A tracepoint event's own tally: every hit at the site this event named,
+   * counted where the site fires. The site keeps a total of its own, but two
+   * events on one site must each count from where they started, so the count
+   * lives on the event. */
+  u64 tp_hits;
+  /* Whether this event holds the site on (dropped when the event closes). */
+  int tp_referenced;
+
   /* An eBPF program attached with PERF_EVENT_IOC_SET_BPF. It runs on every
    * sample this event takes, and its return value decides whether the sample
    * is kept -- which is how a profiler turns a firehose of records into a
@@ -165,6 +178,12 @@ static int perf_attr_supported(const struct perf_event_attr *a) {
     u64 evsel;
 
     return perf_pmu_map(a, &evsel) == 0;
+  }
+  if (a->type == PERF_TYPE_TRACEPOINT) {
+    /* config is the id read from
+     * /sys/kernel/tracing/events/<group>/<event>/id, which is the only way a
+     * tool learns it. An id no site owns is refused. */
+    return tracepoint_by_id((u16)a->config) != 0;
   }
   if (a->type != PERF_TYPE_SOFTWARE)
     return 0;
@@ -221,6 +240,8 @@ static int perf_in_subtree(struct task *t, usize target) {
 
 /* The same, summed over every task when the event watches the machine. */
 static u64 perf_raw(const struct perf_ev *ev) {
+  if (ev->attr.type == PERF_TYPE_TRACEPOINT)
+    return __atomic_load_n(&ev->tp_hits, __ATOMIC_RELAXED);
   if (ev->pmu_slot >= 0)
     return perf_pmu_slot_count(ev->pmu_slot);
   if (ev->attr.config == PERF_COUNT_SW_CPU_CLOCK)
@@ -485,6 +506,54 @@ static int perf_watches(const struct perf_ev *ev, struct task *t, int cpu) {
   return t->id == ev->target || task_tgid(t) == ev->target;
 }
 
+/* A tracepoint fired. Charge every event that named this site and watches the
+ * task that reached it, and take a sample when the event asked for one.
+ *
+ * Called from wherever the site is -- a system call, the scheduler, an
+ * interrupt handler -- so it allocates nothing and never waits. The lock is
+ * taken with a trylock: a site inside a region that already holds it would
+ * otherwise deadlock, and losing a hit is the right trade against wedging the
+ * CPU that took it. */
+void perf_tracepoint_hit(u16 id, u64 a, u64 b, u64 c) {
+  struct task *t = current_task;
+  u64 flags;
+  int cpu;
+
+  (void)b;
+  (void)c;
+  if (!g_events)
+    return;
+  cpu = get_percpu() ? (int)get_percpu()->cpu_id : 0;
+  if (!spin_trylock_irqsave(&g_perf_lock, &flags))
+    return;
+  for (struct perf_ev *ev = g_events; ev; ev = ev->next) {
+    if (ev->attr.type != PERF_TYPE_TRACEPOINT)
+      continue;
+    if ((u16)ev->attr.config != id)
+      continue;
+    if (!perf_watches(ev, t, cpu))
+      continue;
+    ev->tp_hits++;
+    if (!ev->data)
+      continue; /* counting only: `perf stat` maps no buffer */
+    if (ev->attr.sample_period > 1 &&
+        (ev->tp_hits % ev->attr.sample_period) != 0)
+      continue;
+    /* The instruction pointer a tracepoint sample carries: for a kprobe it is
+     * the probed address, which is a real place in the kernel. A static site
+     * has no address to offer, so the sample reports zero rather than the
+     * address of this function, which would name the tracer and not the
+     * traced. */
+    perf_emit_sample(ev, id >= TP_KPROBE_BASE ? a : 0, 0, 0, cpu,
+                     ev->attr.sample_period ? ev->attr.sample_period : 1);
+  }
+  spin_unlock_irqrestore(&g_perf_lock, flags);
+  /* No wake of the poll queue here, deliberately: sched:sched_switch fires
+   * inside the scheduler's own critical section, and waking a reader from there
+   * would re-enter it. A reader on a tracepoint event polls or reads its
+   * buffer; the tick sampler still wakes them for everything else. */
+}
+
 void perf_event_tick_sample(u64 pc, u64 fp, int in_user, int cpu) {
   struct task *t = current_task;
   u64 flags;
@@ -674,6 +743,10 @@ void perf_event_task_exit(struct task *t) {
 static const struct vfs_file_ops perf_file_ops;
 
 static void perf_free(struct perf_ev *ev) {
+  if (ev->tp_referenced) {
+    tracepoint_ref_put((u16)ev->attr.config);
+    ev->tp_referenced = 0;
+  }
   if (ev->bpf_prog) {
     bpf_prog_put(ev->bpf_prog);
     ev->bpf_prog = 0;
@@ -1055,6 +1128,19 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
     }
     ev->pmu_slot = rc;
   }
+  if (attr.type == PERF_TYPE_TRACEPOINT) {
+    /* Turn the site on for as long as this event is open. A tool that opens a
+     * tracepoint event never writes tracefs `enable`, so this is the only
+     * thing that arms the site -- and a dynamic probe's instruction is patched
+     * here. */
+    int rc = tracepoint_ref_get((u16)attr.config);
+
+    if (rc < 0) {
+      kfree(ev);
+      return rc;
+    }
+    ev->tp_referenced = 1;
+  }
   ev->enabled = attr.disabled ? 0 : 1;
   ev->since = ktime_monotonic_ns();
   ev->base = perf_raw(ev);
@@ -1068,6 +1154,9 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
     if (!ev->ticks_per_sample)
       ev->ticks_per_sample = 1;
     ev->ticks_left = ev->ticks_per_sample;
+  } else if (attr.sample_period && attr.type == PERF_TYPE_TRACEPOINT) {
+    /* A tracepoint's period is in hits, and the site itself is the interrupt:
+     * every Nth hit writes a sample, counted where the site fires. */
   } else if (attr.sample_period) {
     /* A period in counter units. For the two clock counters that is
      * nanoseconds, which the tick can charge directly. For an event counter

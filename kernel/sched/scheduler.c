@@ -12,6 +12,7 @@
 #include <b1nix/user_namespace.h>
 #include <b1nix/panic.h>
 #include <b1nix/perf_event.h>
+#include <b1nix/tracepoint.h>
 #include <b1nix/userfaultfd.h>
 #include <b1nix/posix.h>
 #include <b1nix/runqueue.h>
@@ -3663,6 +3664,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
   }
 
   int child_id = (int)child->id;
+  TRACEPOINT_FIRE(TP_SCHED_PROCESS_FORK, parent->id, child->id, 0);
   /* M80: PTRACE_O_TRACEFORK — attach the child to the same tracer and stop it
    * before it runs, then report the event on the parent. */
   ptrace_event_child(parent, child, PTRACE_EVENT_FORK);
@@ -6085,6 +6087,9 @@ static int scheduler_yield_inner(void) {
   /* M126: read this CPU's hardware counters before the switch, so the interval
    * just ended is credited to the task that ran it and not to its successor. */
   perf_pmu_switch(old_task ? old_task->id : 0);
+  TRACEPOINT_FIRE(TP_SCHED_SWITCH, old_task ? old_task->id : 0,
+                  new_task ? new_task->id : 0,
+                  old_task ? (u64)old_task->state : 0);
   if (wakelat_enabled())
     wakelat_switch_in(new_task);
   arch_context_switch(&old_task->context, &new_task->context,
@@ -8283,6 +8288,8 @@ static void acct_release_to_group(struct task *t) {
 void scheduler_exit_current(int exit_code) {
   /* M126: tell any perf ring watching this task that it is going, so a
    * `perf report` can close its map of the process. */
+  TRACEPOINT_FIRE(TP_SCHED_PROCESS_EXIT, current_task ? current_task->id : 0,
+                  current_task ? (u64)current_task->exit_code : 0, 0);
   perf_event_task_exit(current_task);
   /* M126: a userfaultfd monitor that dies must not leave the threads it was
    * serving asleep on a descriptor nobody will read again. */

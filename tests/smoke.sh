@@ -3529,6 +3529,14 @@ check_output "$POSIX_LOG" "M126-SMOKE: ok disable-stops" "PERF_EVENT_IOC_DISABLE
 check_output "$POSIX_LOG" "M126-SMOKE: ok page-faults" "PERF_COUNT_SW_PAGE_FAULTS counts the faults of touching 256 fresh pages"
 check_output "$POSIX_LOG" "M126-SMOKE: ok context-switches" "PERF_COUNT_SW_CONTEXT_SWITCHES counts twenty sleeps"
 check_output "$POSIX_LOG" "M126-SMOKE: ok read-format" "read(2) returns value, time_enabled, time_running and id, and IOC_ID agrees"
+check_output "$POSIX_LOG" "M126-SMOKE: ok tracefs-available-events" "/sys/kernel/tracing/available_events names the sites this kernel has"
+check_output "$POSIX_LOG" "M126-SMOKE: ok tracefs-event-id" "each event's id file gives the number perf puts in attr.config"
+check_output "$POSIX_LOG" "M126-SMOKE: ok tracefs-format" "the format file is the shape a tool parses"
+check_output "$POSIX_LOG" "M126-SMOKE: ok tracepoint-counts" "a PERF_TYPE_TRACEPOINT counter on raw_syscalls:sys_enter counts 200 system calls"
+check_output "$POSIX_LOG" "M126-SMOKE: ok tracepoint-sched-switch" "sched:sched_switch counts the switches twenty sleeps cause"
+check_output "$POSIX_LOG" "M126-SMOKE: ok kprobe" "a kprobe asked for by symbol through kprobe_events counts the calls of the function it names"
+check_output "$POSIX_LOG" "M126-SMOKE: ok kprobe-remove" "removing the probe takes its event away"
+check_output "$POSIX_LOG" "M126-SMOKE: ok kprobe-unpatched" "the probed instruction is back: the function runs fifty more times after the probe is gone"
 # The hardware counters exist only where the CPU has an architectural PMU: a
 # KVM guest on x86_64 has one, a TCG guest and this kernel's aarch64 port (no
 # PMUv3 driver) have none, and the test says so rather than inventing numbers.

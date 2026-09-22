@@ -607,7 +607,11 @@ KERNEL_SOURCES := \
 	kernel/sched/scheduler.c \
 	kernel/perf/perf_event.c \
 	kernel/perf/pmu_x86.c \
+	kernel/trace/tracepoint.c \
+	kernel/trace/tracefs.c \
+	kernel/trace/kprobe.c \
 	kernel/bpf/bpf_core.c \
+	kernel/bpf/bpf_jit_x86.c \
 	kernel/syscall/syscall.c \
 	kernel/syscall/linux_abi.c \
 	kernel/syscall/linux_modern.c \

@@ -67,6 +67,7 @@
  */
 
 #include <b1nix/io_uring.h>
+#include <b1nix/tracepoint.h>
 
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
@@ -762,6 +763,7 @@ static void iou_crossring_kick(struct io_ring_ctx *ctx);
 static void iou_post_cqe_n(struct io_ring_ctx *ctx, u64 user_data, i32 res,
                            u32 cflags, int counts) {
   iou_trace("cqe", user_data, (u64)(u32)cflags, res);
+  TRACEPOINT_FIRE(TP_IO_URING_COMPLETE, user_data, (u64)(u32)res, cflags);
   iou_lock(ctx);
   iou_post_cqe_locked(ctx, user_data, res, cflags, counts);
   iou_unlock(ctx);
@@ -3969,7 +3971,10 @@ static int iou_submit_sqes(struct io_ring_ctx *ctx, u32 to_submit) {
     }
 
     struct io_uring_sqe sqe = *iou_sqe_at(ctx, idx);
-    int rc = iou_submit_one(ctx, &sqe, &chain_head, &chain_tail);
+    int rc;
+
+    TRACEPOINT_FIRE(TP_IO_URING_SUBMIT, sqe.opcode, sqe.user_data, sqe.flags);
+    rc = iou_submit_one(ctx, &sqe, &chain_head, &chain_tail);
 
     if (rc < 0) {
       if (submitted == 0)

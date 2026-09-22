@@ -684,6 +684,200 @@ static void check_refresh(void) {
   close(fd);
 }
 
+
+/* ── tracepoints and kprobes ──────────────────────────────────────────────
+ *
+ * The tools do not ask the kernel what it can trace: they read
+ * /sys/kernel/tracing. So the checks here are the ones perf makes -- find the
+ * event in available_events, read its id, open a PERF_TYPE_TRACEPOINT counter
+ * on that id -- and then prove the counter by making the traced thing happen.
+ */
+
+#define TRACEFS "/sys/kernel/tracing"
+
+static int read_file(const char *path, char *buf, size_t len) {
+  int fd = open(path, O_RDONLY);
+  ssize_t n;
+
+  if (fd < 0)
+    return -1;
+  n = read(fd, buf, len - 1);
+  close(fd);
+  if (n < 0)
+    return -1;
+  buf[n] = '\0';
+  return (int)n;
+}
+
+static int write_file(const char *path, const char *text) {
+  int fd = open(path, O_WRONLY);
+  ssize_t n;
+
+  if (fd < 0)
+    return -1;
+  n = write(fd, text, strlen(text));
+  close(fd);
+  return n < 0 ? -1 : (int)n;
+}
+
+/* The id perf would put in attr.config, or -1. */
+static long tp_id(const char *group, const char *event) {
+  char path[256];
+  char buf[32];
+
+  snprintf(path, sizeof(path), TRACEFS "/events/%s/%s/id", group, event);
+  if (read_file(path, buf, sizeof(buf)) <= 0)
+    return -1;
+  return strtol(buf, NULL, 10);
+}
+
+static long long counter_read(int fd) {
+  long long v = 0;
+
+  if (read(fd, &v, sizeof(v)) != (ssize_t)sizeof(v))
+    return -1;
+  return v;
+}
+
+static void check_tracefs_layout(void) {
+  char buf[4096];
+
+  if (read_file(TRACEFS "/available_events", buf, sizeof(buf)) <= 0) {
+    bad("tracefs", "no " TRACEFS "/available_events to read", 0);
+    return;
+  }
+  judge("tracefs-available-events",
+        strstr(buf, "sched:sched_switch") && strstr(buf, "raw_syscalls:sys_enter") &&
+            strstr(buf, "block:block_rq_issue"),
+        "available_events does not name the sites this kernel has", 0);
+  judge("tracefs-event-id",
+        tp_id("sched", "sched_switch") > 0 && tp_id("raw_syscalls", "sys_enter") > 0 &&
+            tp_id("sched", "sched_switch") != tp_id("raw_syscalls", "sys_enter"),
+        "events/<group>/<event>/id does not give each site its own number", 0);
+  if (read_file(TRACEFS "/events/raw_syscalls/sys_enter/format", buf,
+                sizeof(buf)) <= 0) {
+    bad("tracefs-format", "no format file for raw_syscalls/sys_enter", 0);
+    return;
+  }
+  judge("tracefs-format",
+        strstr(buf, "ID:") && strstr(buf, "common_pid") && strstr(buf, "print fmt:"),
+        "format is not the shape a tool parses", 0);
+}
+
+/* A counter on raw_syscalls:sys_enter, proved by making system calls. */
+static void check_tracepoint_counter(void) {
+  struct perf_event_attr a;
+  long id = tp_id("raw_syscalls", "sys_enter");
+  long long before, after;
+  int fd;
+
+  if (id <= 0) {
+    bad("tracepoint-counts", "raw_syscalls:sys_enter has no id", id);
+    return;
+  }
+  attr_init(&a, PERF_TYPE_TRACEPOINT, (unsigned long long)id);
+  a.disabled = 0;
+  fd = perf_open(&a, 0, -1, -1, 0);
+  if (fd < 0) {
+    bad("tracepoint-counts", "perf_event_open on a tracepoint id", fd);
+    return;
+  }
+  before = counter_read(fd);
+  for (int i = 0; i < 200; i++)
+    (void)getppid();
+  after = counter_read(fd);
+  judge("tracepoint-counts", before >= 0 && after >= before + 200,
+        "200 system calls did not move the sys_enter counter by 200",
+        (long)(after - before));
+
+  /* And the site goes quiet for a counter that watches another task: this one
+   * counts what its own task did, not the machine. */
+  close(fd);
+
+  id = tp_id("sched", "sched_switch");
+  attr_init(&a, PERF_TYPE_TRACEPOINT, (unsigned long long)id);
+  a.disabled = 0;
+  fd = perf_open(&a, 0, -1, -1, 0);
+  if (fd < 0) {
+    bad("tracepoint-sched-switch", "perf_event_open on sched:sched_switch", fd);
+    return;
+  }
+  before = counter_read(fd);
+  for (int i = 0; i < 20; i++) {
+    struct timespec ts = {0, 2000000};
+
+    nanosleep(&ts, NULL);
+  }
+  after = counter_read(fd);
+  judge("tracepoint-sched-switch", before >= 0 && after > before,
+        "twenty sleeps produced no sched_switch hits for this task",
+        (long)(after - before));
+  close(fd);
+}
+
+/* A kprobe: asked for by symbol through kprobe_events, counted through perf. */
+static void check_kprobe(void) {
+  static const char *candidates[] = {"vfs_find_node", "find_child",
+                                     "scheduler_task_by_pid", NULL};
+  const char *symbol = NULL;
+  char line[128];
+  struct perf_event_attr a;
+  long id;
+  long long before, after;
+  int fd;
+
+  /* Probe a symbol this kernel really has: a name it does not know is refused
+   * by kprobe_events (ENOENT), so the first write that is accepted names one.
+   * Each candidate is reached by the path lookup the check performs below. */
+  for (int i = 0; candidates[i]; i++) {
+    snprintf(line, sizeof(line), "p:b1smoke %s\n", candidates[i]);
+    if (write_file(TRACEFS "/kprobe_events", line) >= 0) {
+      symbol = candidates[i];
+      break;
+    }
+  }
+  if (!symbol) {
+    bad("kprobe", "kprobe_events accepted none of the candidate symbols", 0);
+    return;
+  }
+  id = tp_id("kprobes", "b1smoke");
+  if (id <= 0) {
+    bad("kprobe", "the probe has no event directory", id);
+    (void)write_file(TRACEFS "/kprobe_events", "-:b1smoke\n");
+    return;
+  }
+  attr_init(&a, PERF_TYPE_TRACEPOINT, (unsigned long long)id);
+  a.disabled = 0;
+  fd = perf_open(&a, -1, 0, -1, 0); /* the probe fires wherever it fires */
+  if (fd < 0) {
+    /* Machine-wide needs privilege; fall back to this task's own hits. */
+    fd = perf_open(&a, 0, -1, -1, 0);
+  }
+  if (fd < 0) {
+    bad("kprobe", "perf_event_open on the probe's id", fd);
+    (void)write_file(TRACEFS "/kprobe_events", "-:b1smoke\n");
+    return;
+  }
+  before = counter_read(fd);
+  for (int i = 0; i < 50; i++)
+    (void)access("/proc/self/stat", F_OK);
+  after = counter_read(fd);
+  judge("kprobe", before >= 0 && after > before,
+        "the probed function ran fifty times and the probe counted nothing",
+        (long)(after - before));
+  close(fd);
+
+  /* Removing it takes the event away again, which is what proves the
+   * instruction went back: a kernel still executing an int3 here would not
+   * survive the next lookup, and everything after this line is one. */
+  judge("kprobe-remove", write_file(TRACEFS "/kprobe_events", "-:b1smoke\n") >= 0 &&
+                             tp_id("kprobes", "b1smoke") < 0,
+        "-:b1smoke left the event behind", 0);
+  for (int i = 0; i < 50; i++)
+    (void)access("/proc/self/stat", F_OK);
+  ok("kprobe-unpatched");
+}
+
 int main(void) {
   struct perf_event_attr probe;
   int fd;
@@ -715,6 +909,9 @@ int main(void) {
   check_refusals();
   check_sampling();
   check_refresh();
+  check_tracefs_layout();
+  check_tracepoint_counter();
+  check_kprobe();
 
   printf("M126-SMOKE: done\n");
   fflush(stdout);

@@ -145,4 +145,25 @@ void bpf_prog_put(void *prog);
  * it sleeps. */
 u64 bpf_run_perf(void *prog, u64 ip, u64 pid_tgid, u64 cpu);
 
+/* ── the JIT (kernel/bpf/bpf_jit_x86.c) ─────────────────────────────────────
+ *
+ * Translates a verified program to machine code once, at load time. A program
+ * containing an instruction the translator does not emit is not compiled and
+ * runs on the interpreter, so the JIT changes how fast a program runs and
+ * never whether it loads.
+ */
+struct bpf_insn;
+
+struct bpf_jit_req {
+  const struct bpf_insn *insns;
+  u32 insn_cnt;
+  void *const *maps; /* map pointers by index, for the wide map load */
+  int nmaps;
+  u64 helper_fn; /* u64 (*)(u32 id, u64, u64, u64, u64) */
+};
+
+/* The compiled function, callable as u64 (*)(void *ctx), or NULL. */
+void *bpf_jit_compile(const struct bpf_jit_req *req, usize *out_len);
+void bpf_jit_free(void *code);
+
 #endif

@@ -37,6 +37,7 @@ void tlb_shootdown_all(void);
 #include <b1nix/sysv_ipc.h>
 #include <b1nix/sock_filter.h>
 #include <b1nix/syscall.h>
+#include <b1nix/tracepoint.h>
 #include <b1nix/io_uring.h>
 #include "linux_modern.h"
 #include <b1nix/uidgid.h>
@@ -6115,10 +6116,12 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     entry->comm[0] = '\0';
   }
 
+  TRACEPOINT_FIRE(TP_SYS_ENTER, number, arg0, arg1);
   /* The user-time interval was closed by the arch entry, before interrupts were
    * enabled (M86). */
   u64 r = syscall_dispatch_traced(number, arg0, arg1, arg2, arg3, arg4, arg5,
                                   frame);
+  TRACEPOINT_FIRE(TP_SYS_EXIT, number, r, 0);
   sched_acct_leave_kernel();
 
   entry->ret = r;
