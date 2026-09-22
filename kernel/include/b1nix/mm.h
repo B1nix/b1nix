@@ -16,6 +16,16 @@
  * x86_64 uses the canonical -2GB window. */
 #ifdef __x86_64__
 #define KERNEL_VMA 0xFFFFFFFF80000000ULL
+/* Where the loader actually put the image, minus where it was linked.
+ *
+ * The x86_64 kernel is relocatable (a multiboot2 tag says so, because under
+ * UEFI the address it is linked at is not necessarily free), so "physical
+ * address of a kernel symbol" is its virtual address minus KERNEL_VMA PLUS
+ * this. Zero on a machine that loaded it where it was linked, which is the
+ * ordinary BIOS case. Set by boot.S before anything else runs. */
+extern volatile u32 kernel_load_offset;
+static inline u64 kernel_phys_offset(void) { return (u64)kernel_load_offset; }
+#define KSYM_TO_PHYS(v) (((u64)(usize)(v)) - KERNEL_VMA + kernel_phys_offset())
 #elif defined(__aarch64__)
 #define KERNEL_VMA 0x0ULL
 #else

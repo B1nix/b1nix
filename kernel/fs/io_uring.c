@@ -72,6 +72,7 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
+#include <b1nix/kprof.h>
 #include <b1nix/ktime.h>
 #include <b1nix/mm.h>
 #include <b1nix/linux_abi.h>
@@ -434,6 +435,7 @@ struct io_ring_ctx {
   volatile int cq_started;
 
   /* IORING_REGISTER_FILE_ALLOC_RANGE: where IORING_FILE_INDEX_ALLOC looks. */
+  u8 falloc_set; /* a range was named, even if it is empty */
   u32 falloc_off, falloc_len;
 
   /* IORING_REGISTER_RESTRICTIONS, which only has meaning before
@@ -1405,8 +1407,11 @@ static i32 iou_install_direct(struct io_ring_ctx *ctx, struct vfs_handle *h,
     return file_index == IORING_FILE_INDEX_ALLOC ? -ENFILE : -ENXIO;
   }
   if (file_index == IORING_FILE_INDEX_ALLOC) {
-    u32 lo = ctx->falloc_len ? ctx->falloc_off : 0;
-    u32 hi = ctx->falloc_len ? ctx->falloc_off + ctx->falloc_len
+    /* A range that was SET is honoured even when it is empty: "seven, none of
+     * them" means no slot may be chosen, and reading it as "no range was set"
+     * handed out the whole table instead. */
+    u32 lo = ctx->falloc_set ? ctx->falloc_off : 0;
+    u32 hi = ctx->falloc_set ? ctx->falloc_off + ctx->falloc_len
                              : ctx->nr_files;
 
     if (hi > ctx->nr_files)
@@ -3909,9 +3914,16 @@ struct iou_getevents_arg {
   u64 ts;
 };
 
+/* A wait inside io_uring_enter is a wait for I/O, and the time a CPU spends
+ * idle while one is outstanding belongs in /proc/stat's iowait column --
+ * IORING_ENTER_NO_IOWAIT is how a caller says it would rather not be counted
+ * that way (a ring used for timers, say). Without the accounting the column was
+ * always zero, which reads as "nothing ever waited for a device". */
 static isize iou_wait_cqes(struct io_ring_ctx *ctx, u32 min_complete,
-                           const u64 *deadline_ns) {
+                           const u64 *deadline_ns, int no_iowait) {
   u64 timeouts0 = __atomic_load_n(&ctx->cq_timeouts, __ATOMIC_ACQUIRE);
+  u64 wait_t0 = 0;
+  isize rc;
 
   for (;;) {
     iou_progress(ctx);
@@ -3920,18 +3932,23 @@ static isize iou_wait_cqes(struct io_ring_ctx *ctx, u32 min_complete,
     iou_flush_overflow_locked(ctx);
     iou_unlock(ctx);
 
-    if (iou_cq_ready(ctx) >= min_complete)
-      return 0;
+    if (iou_cq_ready(ctx) >= min_complete) {
+      rc = 0;
+      goto done;
+    }
     /* A timeout fired: go back to userspace whatever min_complete said. */
-    if (__atomic_load_n(&ctx->cq_timeouts, __ATOMIC_ACQUIRE) != timeouts0)
-      return 0;
+    if (__atomic_load_n(&ctx->cq_timeouts, __ATOMIC_ACQUIRE) != timeouts0) {
+      rc = 0;
+      goto done;
+    }
     if (deadline_ns && ktime_monotonic_ns() >= *deadline_ns) {
       /* The deadline is only an error when the wait produced nothing. Linux
        * ends io_cqring_wait with "return cq empty ? ret : 0", and a caller
        * relies on it: liburing's io_uring_wait_cqes asks for two completions
        * with one already in the ring, and a bare -ETIME there loses the
        * completion that WAS ready. */
-      return iou_cq_ready(ctx) ? 0 : -ETIME;
+      rc = iou_cq_ready(ctx) ? 0 : -ETIME;
+      goto done;
     }
 
     /* Publish BLOCKED before the last look, the way sys_poll and epoll_wait do:
@@ -3952,18 +3969,29 @@ static isize iou_wait_cqes(struct io_ring_ctx *ctx, u32 min_complete,
     if (ticks == 0)
       ticks = 1;
 
+    if (!wait_t0 && !no_iowait)
+      wait_t0 = ktime_monotonic_ns();
     scheduler_wait_prepare_timeout(vfs_poll_chan, ticks);
     if (iou_cq_ready(ctx) >= min_complete ||
         __atomic_load_n(&ctx->cq_timeouts, __ATOMIC_ACQUIRE) != timeouts0) {
       scheduler_wait_cancel();
-      return 0;
+      rc = 0;
+      goto done;
     }
     if (scheduler_signal_pending()) {
       scheduler_wait_cancel();
-      return -EINTR;
+      rc = -EINTR;
+      goto done;
     }
     scheduler_wait_commit();
   }
+done:
+  if (wait_t0) {
+    u64 now2 = ktime_monotonic_ns();
+
+    kprof_iowait_add(now2 > wait_t0 ? now2 - wait_t0 : 0);
+  }
+  return rc;
 }
 
 /* ---- setup -------------------------------------------------------------- */
@@ -5039,7 +5067,8 @@ static isize iou_enter(int fd, u32 to_submit, u32 min_complete, u32 flags,
   }
 
   if (flags & IORING_ENTER_GETEVENTS) {
-    isize rc = iou_wait_cqes(ctx, min_complete, have_deadline ? &deadline : 0);
+    isize rc = iou_wait_cqes(ctx, min_complete, have_deadline ? &deadline : 0,
+                             (flags & IORING_ENTER_NO_IOWAIT) ? 1 : 0);
 
     if (rc == -EINTR && submitted == 0)
       return -EINTR;
@@ -5952,6 +5981,7 @@ static isize iou_register(int fd, u32 opcode, u64 arg, u32 nr_args) {
       return -EOVERFLOW;
     if (range.off >= ctx->nr_files || range.len > ctx->nr_files - range.off)
       return -EINVAL;
+    ctx->falloc_set = 1;
     ctx->falloc_off = range.off;
     ctx->falloc_len = range.len;
     rc = 0;
@@ -6090,6 +6120,10 @@ static isize iou_register_mem_region(struct io_ring_ctx *ctx, u64 uaddr,
   if (syscall_copyin(&probe, (const void *)(usize)rd.user_addr, 1) < 0 ||
       syscall_copyin(&probe,
                      (const void *)(usize)(rd.user_addr + rd.size - 1), 1) < 0)
+    return -EFAULT;
+  /* The descriptor is handed back to the caller -- which is also how a region
+   * in memory the caller cannot write is refused, as it must be. */
+  if (syscall_copyout((void *)(usize)mr.region_uptr, &rd, sizeof(rd)) < 0)
     return -EFAULT;
   if (ctx->regwait_addr)
     return -EBUSY;

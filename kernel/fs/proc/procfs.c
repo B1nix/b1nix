@@ -701,9 +701,12 @@ static int r_stat(usize pid, struct sbuf *s) {
    * had never run anything. */
   {
     extern void kprof_tick_cpu(unsigned cpu, u64 *user, u64 *kernel, u64 *idle);
+    extern u64 kprof_iowait_ns(unsigned cpu);
     usize n = (g_max_cpus > 0) ? (usize)g_max_cpus : 1;
     u32 hz = sched_tick_hz() ? sched_tick_hz() : 100;
     u64 tu = 0, tk = 0, ti = 0;
+
+    u64 tw = 0;
 
     for (usize c = 0; c < n; c++) {
       u64 u, k, i;
@@ -712,16 +715,19 @@ static int r_stat(usize pid, struct sbuf *s) {
       tu += u;
       tk += k;
       ti += i;
+      tw += kprof_iowait_ns((unsigned)c) / 10000000ull; /* ns -> USER_HZ */
     }
-    sb_addf(s, "cpu  %lu 0 %lu %lu 0 0 0 0 0 0\n", (unsigned long)(tu * 100 / hz),
-            (unsigned long)(tk * 100 / hz), (unsigned long)(ti * 100 / hz));
+    sb_addf(s, "cpu  %lu 0 %lu %lu %lu 0 0 0 0 0\n",
+            (unsigned long)(tu * 100 / hz), (unsigned long)(tk * 100 / hz),
+            (unsigned long)(ti * 100 / hz), (unsigned long)tw);
     for (usize c = 0; c < n; c++) {
       u64 u, k, i;
 
       kprof_tick_cpu((unsigned)c, &u, &k, &i);
-      sb_addf(s, "cpu%lu %lu 0 %lu %lu 0 0 0 0 0 0\n", (unsigned long)c,
+      sb_addf(s, "cpu%lu %lu 0 %lu %lu %lu 0 0 0 0 0\n", (unsigned long)c,
               (unsigned long)(u * 100 / hz), (unsigned long)(k * 100 / hz),
-              (unsigned long)(i * 100 / hz));
+              (unsigned long)(i * 100 / hz),
+              (unsigned long)(kprof_iowait_ns((unsigned)c) / 10000000ull));
     }
   }
   sb_addf(s, "ctxt %lu\n", (unsigned long)ticks);

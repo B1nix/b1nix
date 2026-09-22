@@ -23,6 +23,28 @@ framebuffer_tag_start:
 	.long 32
 framebuffer_tag_end:
 
+	/* Relocatable tag (type 10). The firmware decides where this image goes.
+	 *
+	 * Under UEFI the 2 MiB the kernel is linked at is not necessarily free --
+	 * Limine answered "multiboot2: Could not find viable load address for
+	 * executable" and the machine never started -- and an image that cannot be
+	 * moved cannot be booted on such a machine at all. The alignment matches
+	 * the 2 MiB pages the early tables use for the kernel's own window, so the
+	 * distance between where this is linked and where it lands is always a
+	 * whole number of those pages. `preference = 1` asks for the lowest
+	 * address that fits, so a machine with room at the linked address loads
+	 * there and the offset is zero. */
+	.align 8
+relocatable_tag_start:
+	.short 10
+	.short 0
+	.long 24
+	.long 0x200000    /* min_addr */
+	.long 0x40000000  /* max_addr */
+	.long 0x200000    /* align */
+	.long 1           /* preference: lowest possible address */
+relocatable_tag_end:
+
 	/* End tag. */
 	.align 8
 	.short 0
@@ -47,6 +69,15 @@ pd2:
 	.skip 4096
 pd3:
 	.skip 4096
+/* The page directory for the kernel's OWN window (0xFFFFFFFF80000000).
+ *
+ * The low windows are an identity map and do not care where the kernel was
+ * loaded; this one does -- it has to map the kernel's linked addresses onto the
+ * physical pages the loader actually put it at -- so it cannot be shared with
+ * pd0 any more. */
+pdk:
+	.skip 4096
+
 /* The 5-level top table (M128). Used only when the CPU has LA57 and the
  * command line asks for it; see enable_long_mode. */
 .global pml5
@@ -110,56 +141,84 @@ stack_top:
 .type _start, @function
 _start:
 	cli
-	/* Physical stack: stack_top is a high symbol; reach it via -KERNEL_VMA. */
-	movl $(stack_top - KERNEL_VMA), %esp
+	/* Where we actually are, minus where we were linked.
+	 *
+	 * The image is relocatable (see the header tag), so every absolute address
+	 * in this file -- the boot stack, the page tables, the GDT pointer, the
+	 * far-jump target -- is a LINK-time address and the loader may have put the
+	 * image somewhere else entirely. %ebp carries the difference for the whole
+	 * of the 32-bit boot, and every absolute reference below is written
+	 * relative to it. It is derived from the program counter rather than from a
+	 * Multiboot tag: a call/pop tells us where this instruction really is, and
+	 * we know where it was linked, which needs no cooperation from anybody. */
+	call 1f
+1:
+	popl %ebp
+	subl $1b, %ebp
 
-	movl %eax, (multiboot_magic_saved - KERNEL_VMA)
-	movl %ebx, (multiboot_info_saved - KERNEL_VMA)
+	/* Physical stack: stack_top is a high symbol; reach it via -KERNEL_VMA. */
+	leal (stack_top - KERNEL_VMA)(%ebp), %esp
+
+	movl %eax, (multiboot_magic_saved - KERNEL_VMA)(%ebp)
+	movl %ebx, (multiboot_info_saved - KERNEL_VMA)(%ebp)
+	/* The C side needs the same offset: a kernel symbol's physical address is
+	 * its virtual address minus KERNEL_VMA plus this. */
+	movl %ebp, (kernel_load_offset - KERNEL_VMA)(%ebp)
 
 	call setup_page_tables
-	lgdt gdt64_pointer_low      /* .boot-local: low VMA = physical */
+
+	/* The lgdt operand holds a 32-bit physical base, which moved with us. */
+	leal (gdt64 - KERNEL_VMA)(%ebp), %eax
+	movl %eax, (gdt64_pointer_low + 2)(%ebp)
+	lgdt (gdt64_pointer_low)(%ebp)
+
 	call enable_long_mode
 
 	/* A 32-bit far jump can't encode the 64-bit high target, so jump to a
-	 * 64-bit trampoline still in the low identity window, then leap to high. */
-	ljmp $0x08, $long_mode_low
+	 * 64-bit trampoline still in the low identity window, then leap to high.
+	 * The trampoline moved with us too, so the far pointer is built rather
+	 * than encoded. */
+	leal (long_mode_low)(%ebp), %eax
+	movl %eax, (long_mode_far_ptr)(%ebp)
+	ljmpl *(long_mode_far_ptr)(%ebp)
 
 setup_page_tables:
-	/* Clear pml4 + pdpt + pd0..pd3 + pml5 = 7 pages = 28672 bytes (7168
+	/* Clear pml4 + pdpt + pd0..pd3 + pdk + pml5 = 8 pages = 32768 bytes (8192
 	 * dwords). They are contiguous in .bss, in that order. */
-	movl $(pml4 - KERNEL_VMA), %edi
+	leal (pml4 - KERNEL_VMA)(%ebp), %edi
 	xorl %eax, %eax
-	movl $7168, %ecx
+	movl $8192, %ecx
 	rep stosl
 
 	/* pml4[0]   -> pdpt : low identity window (this code + physical access)
 	 * pml4[256] -> pdpt : direct-map window (0xFFFF800000000000)
 	 * pml4[511] -> pdpt : kernel high window (0xFFFFFFFF80000000) */
-	movl $(pdpt - KERNEL_VMA), %eax
+	leal (pdpt - KERNEL_VMA)(%ebp), %eax
 	orl $0x003, %eax
-	movl %eax, (pml4 - KERNEL_VMA)
-	movl %eax, (pml4 - KERNEL_VMA + 256*8)
-	movl %eax, (pml4 - KERNEL_VMA + 511*8)
+	movl %eax, (pml4 - KERNEL_VMA)(%ebp)
+	movl %eax, (pml4 - KERNEL_VMA + 256*8)(%ebp)
+	movl %eax, (pml4 - KERNEL_VMA + 511*8)(%ebp)
 
 	/* pdpt[0..3] -> pd0..pd3 : first 4 GiB (identity + direct map). */
-	movl $(pd0 - KERNEL_VMA), %eax
+	leal (pd0 - KERNEL_VMA)(%ebp), %eax
 	orl $0x003, %eax
-	movl %eax, (pdpt - KERNEL_VMA)
-	movl $(pd1 - KERNEL_VMA), %eax
+	movl %eax, (pdpt - KERNEL_VMA)(%ebp)
+	leal (pd1 - KERNEL_VMA)(%ebp), %eax
 	orl $0x003, %eax
-	movl %eax, (pdpt - KERNEL_VMA + 8)
-	movl $(pd2 - KERNEL_VMA), %eax
+	movl %eax, (pdpt - KERNEL_VMA + 8)(%ebp)
+	leal (pd2 - KERNEL_VMA)(%ebp), %eax
 	orl $0x003, %eax
-	movl %eax, (pdpt - KERNEL_VMA + 16)
-	movl $(pd3 - KERNEL_VMA), %eax
+	movl %eax, (pdpt - KERNEL_VMA + 16)(%ebp)
+	leal (pd3 - KERNEL_VMA)(%ebp), %eax
 	orl $0x003, %eax
-	movl %eax, (pdpt - KERNEL_VMA + 24)
+	movl %eax, (pdpt - KERNEL_VMA + 24)(%ebp)
 
-	/* pdpt[510] -> pd0 : maps 0xFFFFFFFF80000000-0xFFFFFFFFC0000000 onto phys
-	 * 0-1GiB, i.e. the kernel's high VA window onto its physical load. */
-	movl $(pd0 - KERNEL_VMA), %eax
+	/* pdpt[510] -> pdk : maps 0xFFFFFFFF80000000-0xFFFFFFFFC0000000 onto the
+	 * gigabyte the kernel was LOADED at, which is where its linked addresses
+	 * have to resolve. */
+	leal (pdk - KERNEL_VMA)(%ebp), %eax
 	orl $0x003, %eax
-	movl %eax, (pdpt - KERNEL_VMA + 510*8)
+	movl %eax, (pdpt - KERNEL_VMA + 510*8)(%ebp)
 
 	/* Fill pd0..pd3 with 2 MiB pages covering phys 0-4 GiB. */
 	movl $0, %ecx
@@ -167,11 +226,27 @@ setup_page_tables:
 	movl %ecx, %eax
 	shll $21, %eax
 	orl $0x083, %eax
-	movl %eax, (pd0 - KERNEL_VMA)(,%ecx,8)
-	movl $0, (pd0 - KERNEL_VMA + 4)(,%ecx,8)
+	movl %eax, (pd0 - KERNEL_VMA)(%ebp,%ecx,8)
+	movl $0, (pd0 - KERNEL_VMA + 4)(%ebp,%ecx,8)
 	incl %ecx
 	cmpl $2048, %ecx
 	jne .map_pd
+
+	/* Fill pdk with 2 MiB pages covering the first gigabyte FROM THE LOAD
+	 * ADDRESS: entry i maps the kernel window's i-th 2 MiB onto physical
+	 * (i << 21) + offset. The load offset is a whole number of 2 MiB pages
+	 * (the header tag asks for that alignment), so this is exact. */
+	movl $0, %ecx
+.map_pdk:
+	movl %ecx, %eax
+	shll $21, %eax
+	addl %ebp, %eax
+	orl $0x083, %eax
+	movl %eax, (pdk - KERNEL_VMA)(%ebp,%ecx,8)
+	movl $0, (pdk - KERNEL_VMA + 4)(%ebp,%ecx,8)
+	incl %ecx
+	cmpl $512, %ecx
+	jne .map_pdk
 	ret
 
 /* ── 5-level paging (M128) ──────────────────────────────────────────────
@@ -212,7 +287,7 @@ decide_la57:
 	/* The command line has to ask. Walk the Multiboot2 tag list for the
 	 * boot-command-line tag (type 1) and look for "b1nix.la57" in it. */
 	xorl %edx, %edx
-	movl (multiboot_info_saved - KERNEL_VMA), %esi
+	movl (multiboot_info_saved - KERNEL_VMA)(%ebp), %esi
 	testl %esi, %esi
 	jz 8f
 	addl $8, %esi              /* first tag, past total_size + reserved */
@@ -233,7 +308,7 @@ decide_la57:
 	jz 3f
 	pushl %esi
 	pushl %edi
-	movl $(la57_flag_string - KERNEL_VMA), %esi
+	leal (la57_flag_string - KERNEL_VMA)(%ebp), %esi
 4:
 	movb (%esi), %al
 	testb %al, %al
@@ -264,22 +339,22 @@ decide_la57:
 
 enable_long_mode:
 	call decide_la57
-	movl %edx, (la57_enabled - KERNEL_VMA)
+	movl %edx, (la57_enabled - KERNEL_VMA)(%ebp)
 	testl %edx, %edx
 	jz 7f
 	/* PML5[0] and PML5[511] -> the PML4 built above. */
-	movl $(pml4 - KERNEL_VMA), %eax
+	leal (pml4 - KERNEL_VMA)(%ebp), %eax
 	orl $0x003, %eax
-	movl %eax, (pml5 - KERNEL_VMA)
-	movl %eax, (pml5 - KERNEL_VMA + 511*8)
-	movl $(pml5 - KERNEL_VMA), %eax
+	movl %eax, (pml5 - KERNEL_VMA)(%ebp)
+	movl %eax, (pml5 - KERNEL_VMA + 511*8)(%ebp)
+	leal (pml5 - KERNEL_VMA)(%ebp), %eax
 	movl %eax, %cr3
 	movl %cr4, %eax
 	orl $(1 << 5) | (1 << 12), %eax  /* PAE + LA57 */
 	movl %eax, %cr4
 	jmp 6f
 7:
-	movl $(pml4 - KERNEL_VMA), %eax
+	leal (pml4 - KERNEL_VMA)(%ebp), %eax
 	movl %eax, %cr3
 
 	movl %cr4, %eax
@@ -320,11 +395,20 @@ enable_long_mode:
 	movl %eax, %cr0
 	ret
 
-	/* Early 32-bit lgdt operand: limit + 32-bit PHYSICAL base of the GDT. */
+	/* Early 32-bit lgdt operand: limit + 32-bit PHYSICAL base of the GDT. The
+	 * base is patched with the load offset before use. */
 .align 16
 gdt64_pointer_low:
 	.word gdt64_end - gdt64 - 1
 	.long gdt64 - KERNEL_VMA
+
+	/* The far pointer the 32-bit code jumps through to reach the 64-bit
+	 * trampoline. The offset is filled in at run time, because the trampoline
+	 * is wherever the image was loaded. */
+.align 8
+long_mode_far_ptr:
+	.long 0
+	.short 0x08
 
 	/* 64-bit trampoline, still at a low identity address. Leap to the high VA. */
 .code64
@@ -388,6 +472,12 @@ multiboot_info_saved:
  * build a 5-level top table for every address space it creates. */
 .global la57_enabled
 la57_enabled:
+	.long 0
+/* Where the loader put this image, minus where it was linked. Zero when the
+ * two agree. Every conversion of a kernel symbol's address to a physical one
+ * has to add it: see kernel_phys_offset() in mm.h. */
+.global kernel_load_offset
+kernel_load_offset:
 	.long 0
 la57_flag_string:
 	.asciz "b1nix.la57"

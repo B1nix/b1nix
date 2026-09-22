@@ -5011,6 +5011,28 @@ isize vfs_pread(int fd, char *buf, usize size, u64 offset) {
   return vfs_pread_h(get_handle(fd), buf, size, offset);
 }
 
+/* RLIMIT_FSIZE: a write that would take a regular file past the caller's
+ * file-size limit is refused with EFBIG, and the caller is signalled. The limit
+ * was carried, reported in /proc/<pid>/limits and never enforced, so a program
+ * that set it -- a build system bounding a runaway log, liburing's read-write
+ * test -- watched the file grow past it. `start` is where the write begins,
+ * which for a positional write is not the descriptor's offset. */
+static int write_past_fsize_limit(struct vfs_handle *h, u64 start, usize size) {
+  struct rlimit lim;
+
+  if (!size || h->kind != VFS_HANDLE_NODE || !h->node || !h->node->inode ||
+      h->node->inode->type != VFS_FILE)
+    return 0;
+  if (scheduler_getrlimit(RLIMIT_FSIZE, &lim) != 0 ||
+      lim.rlim_cur == RLIM_INFINITY)
+    return 0;
+  if (start >= lim.rlim_cur || size > lim.rlim_cur - start) {
+    scheduler_kill(scheduler_get_pid(), SIGXFSZ);
+    return 1;
+  }
+  return 0;
+}
+
 isize vfs_pwrite_h(struct vfs_handle *h, const char *buf, usize size,
                    u64 offset) {
   if (!h)
@@ -5020,6 +5042,8 @@ isize vfs_pwrite_h(struct vfs_handle *h, const char *buf, usize size,
   struct vfs_mount_entry *mnt = vfs_get_mount_for_node(h->node);
   if (mnt && (mnt->flags & MS_RDONLY))
     return -EROFS;
+  if (write_past_fsize_limit(h, offset, size))
+    return -EFBIG;
   u64 pos = offset;
   return node_write_impl(h, buf, size, &pos);
 }
@@ -5095,25 +5119,12 @@ isize vfs_handle_write(struct vfs_handle *h, const void *buf, usize size) {
   if (!h || !h->ops || !h->ops->write)
     return -EBADF;
 
-  /* RLIMIT_FSIZE: a write that would take a regular file past the caller's
-   * file-size limit is refused with EFBIG, and the caller is signalled. The
-   * limit was carried, reported in /proc/<pid>/limits and never enforced, so a
-   * program that set it -- a build system bounding a runaway log, liburing's
-   * read-write test -- watched the file grow past it. */
-  if (h->kind == VFS_HANDLE_NODE && h->node && h->node->inode &&
-      h->node->inode->type == VFS_FILE && size) {
-    struct rlimit lim;
-
-    if (scheduler_getrlimit(RLIMIT_FSIZE, &lim) == 0 &&
-        lim.rlim_cur != RLIM_INFINITY) {
-      u64 start = (h->flags & B1NIX_O_APPEND) ? h->node->inode->size : h->offset;
-
-      if (start >= lim.rlim_cur || size > lim.rlim_cur - start) {
-        scheduler_kill(scheduler_get_pid(), SIGXFSZ);
-        return -EFBIG;
-      }
-    }
-  }
+  if (write_past_fsize_limit(
+          h, (h->flags & B1NIX_O_APPEND) && h->node && h->node->inode
+                 ? h->node->inode->size
+                 : h->offset,
+          size))
+    return -EFBIG;
 
   /* A read-only mount refuses the write here rather than in vfs_write, because
    * a caller that holds the open file and not its descriptor number — io_uring

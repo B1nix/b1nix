@@ -47,7 +47,17 @@
 #define KPROF_MAX_CPUS 64
 
 /* Tick distribution: [cpu][0]=user [cpu][1]=kernel [cpu][2]=idle. */
-static u64 g_tick_mode[KPROF_MAX_CPUS][3];
+/* user, kernel, idle, iowait. The fourth is idle time a CPU spent while at
+ * least one task on it was waiting for I/O: /proc/stat reports it separately,
+ * and a program that measures a stall -- liburing's iowait test, and every
+ * monitor that shows an I/O bar -- reads that column and not the idle one. */
+static u64 g_tick_mode[KPROF_MAX_CPUS][4];
+/* Nanoseconds each CPU has spent with a task on it waiting for I/O.
+ *
+ * Measured rather than sampled: an idle CPU takes no timer ticks here (the
+ * tickless idle of M129), so a tick-counted iowait column would stay at zero
+ * however long anything waited. */
+static u64 g_iowait_ns[KPROF_MAX_CPUS];
 static u64 g_tick_total;
 
 static int kprof_enabled(void) {
@@ -342,8 +352,25 @@ void kprof_tick_cpu(unsigned cpu, u64 *user, u64 *kernel, u64 *idle) {
   *idle = __atomic_load_n(&g_tick_mode[cpu][2], __ATOMIC_RELAXED);
 }
 
+/* The iowait column, in nanoseconds. */
+u64 kprof_iowait_ns(unsigned cpu) {
+  if (cpu >= KPROF_MAX_CPUS)
+    return 0;
+  return __atomic_load_n(&g_iowait_ns[cpu], __ATOMIC_RELAXED);
+}
+
+/* A task has finished waiting for I/O on this CPU, having waited `ns`. */
+void kprof_iowait_add(u64 ns) {
+  struct percpu *p = get_percpu();
+  int cpu = p ? (int)p->cpu_id : 0;
+
+  if (cpu >= 0 && cpu < KPROF_MAX_CPUS)
+    __atomic_fetch_add(&g_iowait_ns[cpu], ns, __ATOMIC_RELAXED);
+}
+
 void kprof_tick(u64 rip, int in_user, int in_idle, int cpu) {
   int mode = in_user ? 0 : (in_idle ? 2 : 1);
+
   u64 weight = kprof_weight(cpu);
 
   (void)rip; /* the instruction pointer is perf's business now: see the top */

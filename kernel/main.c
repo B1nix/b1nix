@@ -559,6 +559,19 @@ void kernel_main(usize arg0, usize arg1)
 	console_write("cmdline: ");
 	console_write(bootinfo_cmdline() ? bootinfo_cmdline() : "(none)");
 	console_write("\n");
+#if defined(__x86_64__)
+	/* Where the loader put the image. Zero is the ordinary case (loaded where
+	 * it was linked); anything else means the firmware had other plans for that
+	 * memory and the relocatable header tag was taken up on its offer, which is
+	 * what makes a UEFI boot possible at all. */
+	{
+		char buf[64];
+
+		snprintf(buf, sizeof(buf), "kernel: loaded at +0x%llx\n",
+		         (unsigned long long)kernel_phys_offset());
+		console_write(buf);
+	}
+#endif
 
 	/* Initialize the BSP per-CPU area (sets the GS base) FIRST: current_task is
 	 * now a per-CPU accessor (get_percpu()->cur_task), and pmm/kheap diagnostics

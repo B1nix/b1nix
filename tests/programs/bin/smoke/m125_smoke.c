@@ -2495,7 +2495,10 @@ static void check_register_extras(void) {
       while (cq_get(&r, &c))
         if (c.user_data == 0x515 && c.res == -ECANCELED)
           got = 1;
-      judge("sync-cancel", rc == 0 && got,
+      /* The register call answers with the NUMBER of requests it cancelled,
+       * which is what a caller cancelling by user_data reads to tell "one" from
+       * "there was nothing to cancel". */
+      judge("sync-cancel", rc == 1 && got,
             "IORING_REGISTER_SYNC_CANCEL did not cancel the armed poll",
             (long)rc);
       close(pfd[0]);
@@ -2906,55 +2909,102 @@ static void check_futex_opcodes(void) {
     return;
   }
 
+  /* The FUTEX2_* flags travel in `fd` and the bitset in `addr3`, which is the
+   * layout liburing's prep helpers use. A request that names a word size this
+   * kernel does not serve is refused at submission rather than parked for a
+   * wake that can never name it. */
+#define F2_SIZE_U32 2u
+#define F2_ANY (~0ULL)
+
   /* A wait whose word already differs is EAGAIN, exactly as futex(2) says --
    * and it is the case a lock's fast path takes. */
   word = 5;
   sqe = sq_get(&r);
   sqe->opcode = IORING_OP_FUTEX_WAIT;
+  sqe->fd = (int)F2_SIZE_U32;
   sqe->addr = (unsigned long long)(uintptr_t)&word;
   sqe->off = 99; /* expect 99, the word holds 5 */
+  sqe->addr3 = F2_ANY;
   sqe->user_data = 1;
   rc = submit_wait(&r, 1, &cqe);
   judge("op-futex-eagain", rc == 0 && cqe.res == -EAGAIN,
         "a futex wait on a word that had already moved did not report EAGAIN",
         rc == 0 ? (long)cqe.res : (long)rc);
 
-  /* A real wait: submit it, change the word from this thread, and the ring
-   * completes it. */
+  /* A shape this kernel cannot serve -- a 64-bit word -- is an error at
+   * submission, not a wait. */
+  word = 7;
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_FUTEX_WAIT;
+  sqe->fd = 3; /* FUTEX2_SIZE_U64 */
+  sqe->addr = (unsigned long long)(uintptr_t)&word;
+  sqe->off = 7;
+  sqe->addr3 = F2_ANY;
+  sqe->user_data = 5;
+  rc = submit_wait(&r, 1, &cqe);
+  judge("op-futex-badsize", rc == 0 && cqe.res == -EINVAL,
+        "a futex wait on a word size this kernel does not serve was accepted",
+        rc == 0 ? (long)cqe.res : (long)rc);
+
+  /* A real wait: submit it, then WAKE it. Changing the word is not enough and
+   * must not be: a wait is a queued waiter, and a wake for one waiter wakes
+   * one -- which is the whole of what makes the primitive useful. */
   word = 1;
   sqe = sq_get(&r);
   sqe->opcode = IORING_OP_FUTEX_WAIT;
+  sqe->fd = (int)F2_SIZE_U32;
   sqe->addr = (unsigned long long)(uintptr_t)&word;
   sqe->off = 1;
+  sqe->addr3 = F2_ANY;
   sqe->user_data = 2;
   if (io_uring_enter_(r.fd, 1, 0, 0, 0, 0) != 1) {
     bad("op-futex", "submitting the wait", -1);
     ring_free(&r);
     return;
   }
-  /* Nothing has changed yet: the ring must have nothing to report. */
+  /* Nothing has woken it yet: the ring must have nothing to report. */
   int early = cq_get(&r, &cqe); /* 1 if something was already there */
 
-  word = 2; /* the wake condition */
-  rc = io_uring_enter_(r.fd, 0, 1, IORING_ENTER_GETEVENTS, 0, 0);
-  int got = cq_get(&r, &cqe);
-
-  judge("op-futex-wait",
-        early == 0 && rc >= 0 && got == 1 && cqe.user_data == 2 &&
-            cqe.res == 0,
-        "a futex wait did not complete when its word changed",
-        got == 1 ? (long)cqe.res : (long)got);
-
-  /* FUTEX_WAKE reports how many it woke -- zero here, because nothing is
-   * parked on that word, and that is a number not an error. */
+  word = 2; /* the condition the waiter will re-read */
   sqe = sq_get(&r);
   sqe->opcode = IORING_OP_FUTEX_WAKE;
+  sqe->fd = (int)F2_SIZE_U32;
+  sqe->addr = (unsigned long long)(uintptr_t)&word;
+  sqe->off = 1; /* wake one */
+  sqe->addr3 = F2_ANY;
+  sqe->user_data = 3;
+  rc = io_uring_enter_(r.fd, 1, 2, IORING_ENTER_GETEVENTS, 0, 0);
+  int woke_res = -1;
+  int wait_res = -1;
+  for (int i = 0; i < 2; i++) {
+    if (cq_get(&r, &cqe) != 1)
+      break;
+    if (cqe.user_data == 2)
+      wait_res = cqe.res;
+    else if (cqe.user_data == 3)
+      woke_res = cqe.res;
+  }
+
+  judge("op-futex-wait", early == 0 && rc >= 0 && wait_res == 0,
+        "a futex wait did not complete when it was woken", (long)wait_res);
+
+  /* The wake reports how many it woke, and the waiter above is one. */
+  judge("op-futex-wake", woke_res == 1,
+        "FUTEX_WAKE did not report the waiter it woke", (long)woke_res);
+
+  /* Waking nobody wakes nobody, and says so with a count of zero rather than
+   * an error. */
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_FUTEX_WAKE;
+  sqe->fd = (int)F2_SIZE_U32;
   sqe->addr = (unsigned long long)(uintptr_t)&word;
   sqe->off = 1;
-  sqe->user_data = 3;
+  sqe->addr3 = F2_ANY;
+  sqe->user_data = 6;
   rc = submit_wait(&r, 1, &cqe);
-  judge("op-futex-wake", rc == 0 && cqe.res >= 0,
-        "FUTEX_WAKE did not report a count", rc == 0 ? (long)cqe.res : (long)rc);
+  judge("op-futex-wake-none", rc == 0 && cqe.res == 0,
+        "a wake with nothing parked did not report zero",
+        rc == 0 ? (long)cqe.res : (long)rc);
 
   /* WAITV over two words, completing with the INDEX that moved. */
   static volatile unsigned int w2[2];
@@ -2970,8 +3020,10 @@ static void check_futex_opcodes(void) {
   memset(wv, 0, sizeof(wv));
   wv[0].val = 10;
   wv[0].uaddr = (unsigned long long)(uintptr_t)&w2[0];
+  wv[0].flags = F2_SIZE_U32;
   wv[1].val = 20;
   wv[1].uaddr = (unsigned long long)(uintptr_t)&w2[1];
+  wv[1].flags = F2_SIZE_U32;
 
   sqe = sq_get(&r);
   sqe->opcode = IORING_OP_FUTEX_WAITV;
@@ -2983,12 +3035,26 @@ static void check_futex_opcodes(void) {
     ring_free(&r);
     return;
   }
-  w2[1] = 21; /* the second one moves */
-  io_uring_enter_(r.fd, 0, 1, IORING_ENTER_GETEVENTS, 0, 0);
-  got = cq_get(&r, &cqe);
-  judge("op-futex-waitv", got == 1 && cqe.user_data == 4 && cqe.res == 1,
-        "FUTEX_WAITV did not report which word moved",
-        got == 1 ? (long)cqe.res : (long)got);
+  /* Wake the SECOND word: the completion reports which of the two it was, and
+   * that index is the whole point of the vectored form. */
+  w2[1] = 21;
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_FUTEX_WAKE;
+  sqe->fd = (int)F2_SIZE_U32;
+  sqe->addr = (unsigned long long)(uintptr_t)&w2[1];
+  sqe->off = 1;
+  sqe->addr3 = F2_ANY;
+  sqe->user_data = 7;
+  io_uring_enter_(r.fd, 1, 2, IORING_ENTER_GETEVENTS, 0, 0);
+  int waitv_res = -1;
+  for (int i = 0; i < 2; i++) {
+    if (cq_get(&r, &cqe) != 1)
+      break;
+    if (cqe.user_data == 4)
+      waitv_res = cqe.res;
+  }
+  judge("op-futex-waitv", waitv_res == 1,
+        "FUTEX_WAITV did not report which word moved", (long)waitv_res);
   ring_free(&r);
 }
 
@@ -3038,7 +3104,9 @@ static void check_uring_cmd(void) {
    * distribution's header is older than those names. */
   sqe->addr = ((unsigned long long)SO_TYPE << 32) | (unsigned)SOL_SOCKET;
   sqe->addr3 = (unsigned long long)(uintptr_t)&bufsz;
-  sqe->len = bl;
+  /* The length has a field of its own, which aliases splice_fd_in; `len` is the
+   * zero io_uring_prep_rw() leaves there and is not where the ABI keeps it. */
+  sqe->splice_fd_in = (int)bl;
   sqe->user_data = 2;
   rc = submit_wait(&r, 1, &cqe);
   judge("op-uring-cmd-getsockopt",

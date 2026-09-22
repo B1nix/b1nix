@@ -59,6 +59,25 @@ deadline says what it was waiting for when it fired.
 The rule behind all three: when an experiment can only tell you something by
 finishing, make it finish quickly or say why it did not.
 
+## The kernel may be loaded anywhere, and says where it was
+
+The x86_64 image carries a multiboot2 relocatable tag: the firmware may place it
+wherever it likes, subject to a 2 MiB alignment, and it asks for the lowest
+address that fits so an ordinary BIOS boot still lands where the image was
+linked. The reason is UEFI: the address the kernel is linked at is not
+necessarily free there, and Limine answered `multiboot2: Could not find viable
+load address for executable` and stopped.
+
+Two consequences for anything that touches physical addresses. The early boot
+derives its own offset from the program counter (a `call`/`pop`), so every
+absolute reference in `.boot` is written relative to `%ebp`; and a kernel
+symbol's physical address is `virtual - KERNEL_VMA + kernel_phys_offset()`,
+which is what `KSYM_TO_PHYS()` in `<b1nix/mm.h>` is for. The page-table window
+for the kernel's own gigabyte follows the offset; every other window is an
+identity map and does not care. The boot prints `kernel: loaded at +0x...` so a
+log says which case it was, and `tests/uefi-smoke.sh` boots the ISO under OVMF
+to keep the firmware path honest.
+
 ## The build tree, and who owns what is in it
 
 Everything this repository produces goes into one directory, `build/`, and

@@ -424,6 +424,18 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
   if (s->shut_rd)
     return 0;
 
+  /* A datagram this machine sent to itself is queued for the net task, not
+   * delivered yet, so "nothing to read" was a race rather than an answer: a
+   * program that sends to its own bound port and reads without blocking got
+   * EAGAIN for a datagram that was already in the kernel. Drain what is
+   * pending before saying there is nothing. */
+  if (s->type == B1NIX_SOCK_DGRAM && s->udp_q_count == 0 &&
+      (s->domain == B1NIX_AF_INET || s->domain == B1NIX_AF_INET6)) {
+    extern void net_loopback_drain(void);
+
+    net_loopback_drain();
+  }
+
   if (s->domain == B1NIX_AF_UNIX) {
     /* Both the per-call MSG_DONTWAIT and the descriptor's own O_NONBLOCK.
      * Neither reached the unix receive path, so read(2) on a non-blocking
@@ -2095,8 +2107,22 @@ int vfs_connect_h(struct vfs_handle *h, const void *addr, usize addrlen) {
     if (s->type == B1NIX_SOCK_STREAM) {
       s->tcp_conn = tcp_connect6(dst, ntoh16(s->peer.in6.sin6_port));
       sock_apply_tcp_opts(s);
-      if (!s->tcp_conn)
+      if (!s->tcp_conn) {
+        static int on = -1;
+
+        if (on < 0)
+          on = bootinfo_has_flag("b1nix.trace-sock") ? 1 : 0;
+        if (on) {
+          console_write("sock: connect6 refused port=");
+          console_write_dec((u64)ntoh16(s->peer.in6.sin6_port));
+          console_write(" dst=");
+          for (int i = 0; i < 16; i++) {
+            console_write_hex64((u64)dst.bytes[i]);
+            console_write(i == 15 ? "\n" : ":");
+          }
+        }
         return -ECONNREFUSED;
+      }
       s->connected = 1;
     }
     /* Datagram connect records the default peer for subsequent send()s -- and
@@ -2376,6 +2402,11 @@ int vfs_socket_wants_peer_pidfd(int fd) {
 #define SOCK_SO_PEERPIDFD 77
 #define SOCK_SO_ACCEPTCONN 30
 #define SOCK_SO_PEERNAME  28
+/* IPPROTO_IP is level 0, and IP_RECVORIGDSTADDR (also spelled IP_ORIGDSTADDR)
+ * is option 20: a datagram socket that sets it is told, per message, which
+ * local address the datagram was addressed to. */
+#define SOCK_SOL_IP 0
+#define SOCK_IP_RECVORIGDSTADDR 20
 /* What KIND of socket this is, as three separate questions. A program handed a
  * descriptor it did not create asks them before trusting it: dbus-broker
  * validates the controller socket systemd passes it and exits with "Protocol
@@ -2409,6 +2440,30 @@ static struct vfs_socket_state *socket_state_for_fd(int fd, int *err) {
   *err = 0;
   return (struct vfs_socket_state *)h->private_data;
 }
+
+/* The local address a datagram was addressed to, for a socket that asked for
+ * it with IP_RECVORIGDSTADDR. Returns the length written, or 0 when the socket
+ * did not ask or cannot answer. The answer is the socket's own bound address:
+ * that IS the address the datagram was addressed to, for every socket that
+ * named one. */
+usize vfs_socket_origdstaddr(int fd, void *addr, usize cap) {
+  int err;
+  struct vfs_socket_state *s = socket_state_for_fd(fd, &err);
+
+  if (!s || !s->ip_recvorigdst || s->domain != B1NIX_AF_INET)
+    return 0;
+  if (cap < sizeof(struct b1nix_sockaddr_in))
+    return 0;
+  struct b1nix_sockaddr_in sa;
+
+  memset(&sa, 0, sizeof(sa));
+  sa.sin_family = B1NIX_AF_INET;
+  sa.sin_port = s->local.in.sin_port;
+  sa.sin_addr = s->local.in.sin_addr ? s->local.in.sin_addr : 0x0100007fu;
+  memcpy(addr, &sa, sizeof(sa));
+  return sizeof(sa);
+}
+
 
 /* struct timeval as userspace passes it (x86_64: two 64-bit fields). */
 struct sock_timeval {
@@ -2492,8 +2547,18 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
     return 0;
   }
 
-  if (optlen < sizeof(int)) return -EINVAL;
-  int v = *(const int *)optval;
+  /* An int-valued option may be given fewer than four bytes, and Linux takes
+   * what it is given: a program that passes a `bool` (liburing's
+   * recv-multishot does, for IP_RECVORIGDSTADDR) would otherwise be refused an
+   * option it set correctly. A zero-length value is still nothing to read. */
+  if (optlen == 0)
+    return -EINVAL;
+  int v = 0;
+
+  if (optlen >= sizeof(int))
+    v = *(const int *)optval;
+  else
+    memcpy(&v, optval, optlen);
 
   if (level == SOCK_SOL_SOCKET) {
     switch (optname) {
@@ -2628,6 +2693,13 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
     }
     return -ENOPROTOOPT;
   }
+  if (level == SOCK_SOL_IP && optname == SOCK_IP_RECVORIGDSTADDR) {
+    if (s->type != B1NIX_SOCK_DGRAM)
+      return -ENOPROTOOPT;
+    s->ip_recvorigdst = v ? 1 : 0;
+    return 0;
+  }
+
   if (level == SOCK_IPPROTO_IPV6 && optname == SOCK_IPV6_V6ONLY) {
     if (s->domain != B1NIX_AF_INET6)
       return -ENOPROTOOPT;

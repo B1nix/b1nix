@@ -3819,6 +3819,33 @@ u64 syscall_recvmsg_user(int fd, struct syscall_msghdr *user_msg, int flags) {
       }
     }
   }
+  /* IP_RECVORIGDSTADDR: which of this machine's addresses the datagram was
+   * addressed to. A program that listens on several and answers from the right
+   * one needs it, and liburing's recv-multishot reads it to check that a
+   * multishot receive carries its control data through. */
+  {
+    u8 odst[32];
+    usize olen = vfs_socket_origdstaddr(fd, odst, sizeof(odst));
+
+    if (olen) {
+      usize cmsg_len = header_space + olen;
+      usize space = header_space + K_CMSG_ALIGN(olen);
+
+      if (control_len + space <= msg.msg_controllen &&
+          control_len + space <= sizeof(control)) {
+        struct syscall_cmsghdr *c =
+            (struct syscall_cmsghdr *)(control + control_len);
+
+        c->cmsg_len = cmsg_len;
+        c->cmsg_level = 0; /* IPPROTO_IP */
+        c->cmsg_type = 20; /* IP_RECVORIGDSTADDR */
+        memcpy((u8 *)c + sizeof(*c), odst, olen);
+        control_len += space;
+      } else {
+        ctrunc = 1;
+      }
+    }
+  }
   if (has_cred) {
     usize cmsg_len = header_space + sizeof(cred);
     usize space = header_space + K_CMSG_ALIGN(sizeof(cred));

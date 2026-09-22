@@ -2156,8 +2156,20 @@ static struct task *pick_next_task(void) {
       continue; /* its cgroup has spent this period's cpu.max */
     if (sched_task_frozen(index))
       continue; /* frozen for a suspend (M129) */
-    if (g_task_lease_stuck[index] && t != current_task)
-      continue; /* cannot be taken here; see g_task_lease_stuck */
+    /* A task the scan gave up on stays skipped only while the reason holds.
+     *
+     * The flag alone was a life sentence: a task flagged during a moment when
+     * it could not be taken was then never chosen again, so it was never
+     * claimed, so nothing ever cleared the flag -- and the posix lane wedged
+     * with five runnable tasks nobody would pick. The verdict is re-checked
+     * here, and forgotten the moment the task is takeable again. */
+    if (g_task_lease_stuck[index] && t != current_task) {
+      if (!__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE) ||
+          task_running_somewhere(t))
+        continue; /* still cannot be taken; see g_task_lease_stuck */
+      g_task_lease_stuck[index] = 0;
+      g_task_lease_rejects[index] = 0;
+    }
 
     int priority = t->priority;
     u64 pass = g_task_pass[index];

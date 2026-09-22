@@ -489,6 +489,18 @@ if [ "${LIBURING:-auto}" != "0" ] && [ -d "$LIBURING_DIR" ] &&
 	chmod 0755 "$ROOTFS/opt/liburing"/*.t
 fi
 
+# The kernel's own loadable modules, at the path the kernel looks in. Debian's
+# /lib/modules holds Debian kernels' modules and never ours, so on this image
+# the kernel asked for ipv6.ko and ndp.ko at boot and was told there is no such
+# file -- which is a machine with no IPv6 stack at all, and three liburing tests
+# that dial ::1 read that as "connection refused".
+MODULE_SRC="$BUILD_DIR/rootfs/lib/modules"
+if [ -d "$MODULE_SRC" ]; then
+	log "staging the kernel's modules from $MODULE_SRC"
+	mkdir -p "$ROOTFS/lib/modules"
+	cp -a "$MODULE_SRC"/* "$ROOTFS/lib/modules/"
+fi
+
 # /etc/inittab is OUR harness configuration for the case where the kernel boots
 # the distro's /sbin/init instead of the stage script directly. sysvinit-core
 # ships one; keep it beside ours for reference rather than losing it.

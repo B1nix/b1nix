@@ -1411,7 +1411,10 @@ void vmm_init(void) {
     u64 virt = KERNEL_VMA + physical;
     u64 *pdpt_k = ensure_child_table(pml4, pml4_index(virt));
     u64 *pd_k = ensure_child_table(pdpt_k, pdpt_index(virt));
-    pd_k[pd_index(virt)] = physical | VMM_PRESENT | VMM_WRITABLE | (1ULL << 7);
+    /* Onto the gigabyte the kernel was LOADED at, which is only physical zero
+     * when the loader put it where it was linked: see kernel_phys_offset. */
+    pd_k[pd_index(virt)] = (physical + kernel_phys_offset()) | VMM_PRESENT |
+                           VMM_WRITABLE | (1ULL << 7);
   }
 
   /* Pre-allocate page tables for the kernel heap in the higher half */
@@ -5296,8 +5299,11 @@ static void hide_all_aliases(u64 base, int hide) {
 
   /* The kernel half: shared by every address space. */
   op(kernel_pml4_virt, DIRECT_MAP_BASE + base, base, 1);
-  if (base + HIDE_BLOCK <= 0x40000000ULL)
-    op(kernel_pml4_virt, KERNEL_VMA + base, base, 1);
+  /* The kernel window maps its gigabyte from the load address, so a frame's
+   * alias in it is that much lower. */
+  if (base >= kernel_phys_offset() &&
+      base - kernel_phys_offset() + HIDE_BLOCK <= 0x40000000ULL)
+    op(kernel_pml4_virt, KERNEL_VMA + base - kernel_phys_offset(), base, 1);
 
   /* The identity window: the kernel's own copy, and every process's. A
    * process's split tables are only cleared, never refilled — a hole where a
@@ -5340,8 +5346,10 @@ static int alias_survives(u64 *pml4, u64 va, u64 base) {
  * assumed. Returns the number of tables still holding one. */
 static int hidden_block_survivors(u64 base) {
   int n = alias_survives(kernel_pml4_virt, DIRECT_MAP_BASE + base, base);
-  if (base + HIDE_BLOCK <= 0x40000000ULL)
-    n += alias_survives(kernel_pml4_virt, KERNEL_VMA + base, base);
+  if (base >= kernel_phys_offset() &&
+      base - kernel_phys_offset() + HIDE_BLOCK <= 0x40000000ULL)
+    n += alias_survives(kernel_pml4_virt, KERNEL_VMA + base - kernel_phys_offset(),
+                        base);
   n += alias_survives(kernel_pml4_virt, base, base);
   u64 flags;
   spin_lock_irqsave(&g_spaces_lock, &flags);

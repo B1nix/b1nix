@@ -22,6 +22,10 @@ void kprof_irqoff_end(void);
 void kprof_wait_site(void *site);
 /* Ticks one CPU spent in user, kernel and idle since boot. */
 void kprof_tick_cpu(unsigned cpu, u64 *user, u64 *kernel, u64 *idle);
+/* Nanoseconds this CPU spent with a task on it waiting for I/O, and the call
+ * that adds to it. */
+u64 kprof_iowait_ns(unsigned cpu);
+void kprof_iowait_add(u64 ns);
 /* Count a wake of the shared poll channel against its caller (b1nix.sysprof). */
 void kprof_pollwake_site(void *site);
 /* Count a block-cache lock acquisition against its caller (b1nix.sysprof). */

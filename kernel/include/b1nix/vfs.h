@@ -896,6 +896,8 @@ int vfs_socket_bytes_available(struct vfs_handle *h, int outgoing);
 int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len,
                         const void *src_ip, int src_is_v6, u16 src_port_net);
 usize vfs_socket_last_srcaddr(int fd, void *addr, usize cap);
+/* IP_RECVORIGDSTADDR: the local address a datagram was addressed to. */
+usize vfs_socket_origdstaddr(int fd, void *addr, usize cap);
 /* SO_TIMESTAMP: 0 = off, 1 = SO_TIMESTAMP, 2 = SO_TIMESTAMPNS. */
 int vfs_socket_timestamp_enabled(int fd);
 u64 vfs_socket_last_timestamp_usec(int fd);
@@ -1189,6 +1191,7 @@ struct vfs_socket_state {
   u16 udp_last_src_port;
   u8 udp_last_src_is6;
   u8 udp_last_src_valid;
+  u8 ip_recvorigdst; /* IP_RECVORIGDSTADDR */
   u8 udp_q_head;
   u8 udp_q_tail;
   u8 udp_q_count;
