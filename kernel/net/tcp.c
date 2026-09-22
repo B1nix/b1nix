@@ -61,7 +61,9 @@ struct tcp_header {
  * sit in TIME_WAIT for ~2s, so the M32b SSH smoke's three back-to-back logins
  * plus the white-box kernel TCP tests that run right after would otherwise
  * exhaust a 16-slot table and fail to allocate (tcp_accept -> NULL). */
-#define MAX_TCP_CONNS_CEIL 512
+/* The compile-time size of the connection table; resource_caps decides how much
+ * of it a given machine uses. See CAP_TCP_CEIL. */
+#define MAX_TCP_CONNS_CEIL 4096
 /* Receive buffer / advertised window. Sized to hold several TLS records so
  * HTTPS handshakes don't have to be drained in small chunks. Combined with the
  * window-update ACK in tcp_recv() (see recv_window_update), this keeps the peer

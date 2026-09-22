@@ -25,16 +25,18 @@ void resource_caps_init(void) {
   u64 ram_bytes = pmm_total_usable_memory();
   u64 ram_gb = ram_bytes / (1024ULL * 1024ULL * 1024ULL);
 
-  /* TCP connection slots: 192 at 1 GiB, +64 per extra GiB. Backing is a
+  /* TCP connection slots: 1024 at 1 GiB, +512 per extra GiB. Backing is a
    * compile-time array sized to CAP_TCP_CEIL; only this many are used.
    *
-   * 192 and not 64: a single test can hold a hundred at once -- liburing's
+   * A thousand and not a hundred: a single test can hold a thousand at once --
+   * liburing's accept opens 128 listeners and then connects 32 clients through
+   * one of them per round, and
    * accept opens 32 clients and accepts 32 of them on one listener, twice over,
    * while the previous round's connections are still in TIME_WAIT -- and a table
    * that runs out does not fail the accept, it simply stops handing connections
    * over, which reads as a hang rather than as an error. */
-  u32 tcp = 192 + (u32)(ram_gb * 64);
-  if (tcp < 192) tcp = 192;
+  u32 tcp = 1024 + (u32)(ram_gb * 512);
+  if (tcp < 1024) tcp = 1024;
   if (tcp > CAP_TCP_CEIL) tcp = CAP_TCP_CEIL;
   g_resource_caps.tcp_max_conns = tcp;
 

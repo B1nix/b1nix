@@ -541,6 +541,70 @@ static void test_waitid(void) {
   }
 }
 
+/* WNOHANG on a child that is still running: zero, with an empty siginfo. Not
+ * ECHILD -- the child exists, it just has nothing to report yet, and a caller
+ * that polls for a child's death (io_uring's WAITID does) cannot tell the two
+ * apart otherwise. */
+static void test_waitid_nohang(void) {
+  pid_t pid = fork();
+
+  if (pid == 0) {
+    usleep(200000);
+    _exit(7);
+  }
+  siginfo_t info;
+
+  memset(&info, 0, sizeof(info));
+  int rc = waitid(P_PID, pid, &info, WEXITED | WNOHANG);
+
+  if (rc != 0 || info.si_pid != 0) {
+    fail("waitid-nohang-live", rc == 0 ? (long)info.si_pid : (long)rc, 0);
+    waitid(P_PID, pid, &info, WEXITED);
+    return;
+  }
+  memset(&info, 0, sizeof(info));
+  rc = waitid(P_PID, pid, &info, WEXITED);
+  if (rc != 0 || info.si_pid != pid || info.si_status != 7) {
+    fail("waitid-nohang-then-wait", rc, 0);
+    return;
+  }
+  ok("waitid-nohang");
+}
+
+/* Polling for a child's death with WNOHANG must eventually report the death --
+ * never ECHILD. A zombie is still that parent's child until it is reaped, and a
+ * poller that is told "no such child" has lost the exit status for good. This
+ * is the shape io_uring's WAITID has: it asks once per sweep. */
+static void test_waitid_poll_until_exit(void) {
+  pid_t pid = fork();
+
+  if (pid == 0) {
+    usleep(200000);
+    _exit(9);
+  }
+  for (int i = 0; i < 400; i++) {
+    siginfo_t info;
+
+    memset(&info, 0, sizeof(info));
+    int rc = waitid(P_PID, pid, &info, WEXITED | WNOHANG);
+
+    if (rc != 0) {
+      fail("waitid-poll-until-exit", rc, 0);
+      return;
+    }
+    if (info.si_pid == pid) {
+      if (info.si_status != 9) {
+        fail("waitid-poll-status", info.si_status, 9);
+        return;
+      }
+      ok("waitid-poll-until-exit");
+      return;
+    }
+    usleep(5000);
+  }
+  fail("waitid-poll-until-exit", -1, 0);
+}
+
 static void test_times_rusage(void) {
   struct tms t;
   clock_t clk = times(&t);
@@ -1155,8 +1219,55 @@ static void test_signal_ends_sleep(void) {
   }
 }
 
+/* An unlinked file is still a file: the descriptor that holds it open can be
+ * truncated, written and read, and only the name is gone. liburing's
+ * rw_merge_test opens a file, unlinks it and calls ftruncate on it before doing
+ * anything else, which is an ordinary way to get a scratch file with no name to
+ * clean up. */
+static void test_unlinked_file_ops(void) {
+  char path[] = "/tmp/m46-unlinked";
+  int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+
+  if (fd < 0) {
+    fail("unlinked-open", fd, 0);
+    return;
+  }
+  if (unlink(path) != 0) {
+    fail("unlinked-unlink", -1, 0);
+    close(fd);
+    return;
+  }
+  if (ftruncate(fd, 4096) != 0) {
+    fail("unlinked-ftruncate", errno, 0);
+    close(fd);
+    return;
+  }
+  struct stat st;
+
+  if (fstat(fd, &st) != 0 || st.st_size != 4096) {
+    fail("unlinked-size", (long)st.st_size, 4096);
+    close(fd);
+    return;
+  }
+  if (pwrite(fd, "abcd", 4, 0) != 4) {
+    fail("unlinked-write", errno, 4);
+    close(fd);
+    return;
+  }
+  char buf[4] = {0};
+
+  if (pread(fd, buf, 4, 0) != 4 || memcmp(buf, "abcd", 4) != 0) {
+    fail("unlinked-read", errno, 4);
+    close(fd);
+    return;
+  }
+  close(fd);
+  ok("unlinked-file-ops");
+}
+
 int main(void) {
   marker("M46-SMOKE: start");
+  test_unlinked_file_ops();
   test_exit_status();
   test_kill_zero();
   test_kill_all_probe();
@@ -1173,6 +1284,8 @@ int main(void) {
   test_exit_group();
   test_resuid_resgid();
   test_waitid();
+  test_waitid_nohang();
+  test_waitid_poll_until_exit();
   test_times_rusage();
   test_orphaned_pgrp();
   test_nice_biasing();

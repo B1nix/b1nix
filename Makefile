@@ -2109,10 +2109,16 @@ kernel-dist: $(KERNEL_ELF)
 	@llvm-strip -o $(KERNEL_DIST) $(KERNEL_ELF)
 	@ls -l $(KERNEL_DIST) $(KERNEL_DIST_DEBUG) | awk '{printf "  %-40s %6.1f MB\n", $$9, $$5/1048576}'
 
-iso: check-b1cc-sync root-image check-dynamic $(KERNEL_ELF)
+# A lane that boots from a DISK does not need the embedded root image in the
+# ISO -- and building it is most of the time an `iso` takes (a 274 MiB filesystem
+# assembled and a 600 MiB image written, against a 60 MiB kernel-only one).
+# ISO_NO_ROOT_MODULE=1 leaves it out, which is what the Debian and systemd lanes
+# want: they pass root=LABEL=... and never look at the module.
+iso: check-b1cc-sync check-dynamic $(KERNEL_ELF) $(if $(ISO_NO_ROOT_MODULE),,root-image)
 	@$(MKISO) --stage $(BUILD_DIR)/iso --out $(BUILD_DIR)/b1nix.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "$(KERNEL_CMDLINE)" --module $(ROOT_IMAGE):rootfs.img
+	    --cmdline "$(KERNEL_CMDLINE)" \
+	    $(if $(ISO_NO_ROOT_MODULE),,--module $(ROOT_IMAGE):rootfs.img)
 	@echo "============================================================"
 	@echo " b1nix build summary ($(ARCH))"
 	@echo " ISO: $(BUILD_DIR)/b1nix.iso"

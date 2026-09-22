@@ -28,7 +28,12 @@
 
 /* Initial ceilings (the compiled-in #defines that previously governed these).
  * A sysctl call cannot raise a cap above the corresponding ceiling. */
-#define CAP_TCP_CEIL        512   /* was: 256; one test can hold a hundred at once */
+/* was: 512, and 256 before that. A single liburing test opens 128 listening
+ * sockets and 32 connections through each of several of them, and every closed
+ * connection then sits in TIME_WAIT for two seconds -- so "how many at once" is
+ * in the thousands for a few seconds at a time, and a table that cannot hold
+ * them answers "no free connection slots" to an ordinary accept. */
+#define CAP_TCP_CEIL        4096
 #define CAP_PIPES_CEIL      4096  /* was: 1024, and 128 before that */
 #define CAP_SHMMAX_CEIL_MB  256   /* upper bound for SHMMAX in MiB */
 #define CAP_COREDUMP_CEIL   (8ULL * 1024 * 1024) /* 8 MiB */

@@ -821,6 +821,9 @@ void scheduler_exit_group(int exit_code) __attribute__((noreturn));
 void scheduler_exit_thread(int exit_code) __attribute__((noreturn));
 int scheduler_wait(usize pid, int *status);
 int scheduler_waitpid(usize pid, int *status, int options);
+/* Is there anything for a waitid to collect, without collecting it? See the
+ * definition. */
+int scheduler_waitid_probe(idtype_t idtype, usize id, int options);
 int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options);
 usize scheduler_task_count(void);
 void scheduler_dump_tasks(void);

@@ -22,6 +22,11 @@ struct vfs_pipe pipes[MAX_VFS_PIPES_CEIL];
  * mutual exclusion. */
 static spinlock_t pipe_pool_lock = SPINLOCK_INIT;
 
+/* How many pipe data buffers are allocated, and how many are kept when their
+ * pipes close. See pipe_release. */
+static volatile int g_pipe_buffers_held;
+#define PIPE_BUFFER_CACHE 64
+
 static isize pipe_read(struct vfs_handle *h, char *buf, usize size) {
   struct vfs_pipe *pipe = (struct vfs_pipe *)h->private_data;
   if (!pipe || !pipe->used) return -EIO;
@@ -196,8 +201,30 @@ static void pipe_release(struct vfs_handle *h) {
     if (pipe->writers > 0) pipe->writers--;
   }
   int free_pipe = (pipe->readers <= 0 && pipe->writers <= 0);
-  if (free_pipe) pipe->used = 0;
+  char *doomed = 0;
+
+  if (free_pipe) {
+    /* Give the 64 KiB data buffer back beyond a small cache.
+     *
+     * Keeping it attached to the slot for ever is a fine trade while a machine
+     * uses a handful of pipes, and a quarter of a gigabyte of pinned kernel
+     * heap once a program has used a thousand of them: liburing's
+     * poll-mshot-update opens exactly that many, and the boot that followed it
+     * died in the page-table allocator with no memory left. The first
+     * PIPE_BUFFER_CACHE slots keep theirs, so the churn the cache exists to
+     * avoid is still avoided for everything but a burst. */
+    if (__atomic_load_n(&g_pipe_buffers_held, __ATOMIC_RELAXED) >
+        PIPE_BUFFER_CACHE) {
+      doomed = pipe->buffer;
+      pipe->buffer = 0;
+    }
+    pipe->used = 0;
+  }
   __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
+  if (doomed) {
+    __atomic_sub_fetch(&g_pipe_buffers_held, 1, __ATOMIC_ACQ_REL);
+    kfree(doomed); /* outside the pipe lock: kfree can grow the heap */
+  }
   
   /* Wake up anyone waiting on the pipe */
   scheduler_wake_all(pipe);
@@ -261,6 +288,8 @@ static struct vfs_pipe *pipe_pool_claim(void) {
    * kmalloc can grow the heap, which must not happen with a spinlock held. */
   if (!pipe->buffer) {
     pipe->buffer = kmalloc(PIPE_BUFFER_SIZE);
+    if (pipe->buffer)
+      __atomic_add_fetch(&g_pipe_buffers_held, 1, __ATOMIC_ACQ_REL);
     if (!pipe->buffer) {
       pipe->used = 0;
       return 0;

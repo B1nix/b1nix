@@ -722,7 +722,26 @@ static int lkpifs_mknod(struct vfs_node *dir, const char *name, u32 mode)
  * The node stays; it materialises its handle again through lookup_cb if the
  * name comes back.
  */
-static void lkpifs_drop_child(struct vfs_node *dir, const char *name)
+/*
+ * `keep_if_held` is for unlink and nothing else.
+ *
+ * An unlinked file is still a file: the descriptor holding it open can be
+ * truncated, written and read, and only the name is gone. Dropping the handle
+ * there left the node with nothing to reach the filesystem through, so it tried
+ * to look the name up again -- and the name is exactly what unlink removed, so
+ * every operation on that descriptor answered EINVAL (liburing's rw_merge_test
+ * opens a scratch file, unlinks it and ftruncates it, which is an ordinary
+ * shape). So the handle survives while anything still holds the node, and
+ * release_cb drops it when the last holder goes, which is also when the
+ * filesystem should evict the inode.
+ *
+ * Rename must NOT do that. The name is gone there too, but the node behind the
+ * OLD name has to re-materialise under the new one, and a node that kept its
+ * old dentry read the wrong inode: `cp a b; mv b c` and the churn test's
+ * rename-over-a-previous-version both came back with the wrong contents.
+ */
+static void lkpifs_drop_child(struct vfs_node *dir, const char *name,
+                              int keep_if_held)
 {
 	struct vfs_node *child;
 	struct lkpifs_node *info;
@@ -732,6 +751,14 @@ static void lkpifs_drop_child(struct vfs_node *dir, const char *name)
 	child = find_child(dir, name);
 	if (!child)
 		return;
+	/* Still open? Then the handle stays. The node's refcount cannot answer
+	 * that -- the page cache and the name cache hold references of their own,
+	 * and treating those as "open" delayed the eviction the churn test waits
+	 * for. The count of open file descriptions can. */
+	if (keep_if_held && vfs_inode_is_open(child->inode)) {
+		vfs_node_put(child);
+		return;
+	}
 	info = node_info(child);
 	if (info && info->handle) {
 		lkpi_bridge_put(info->handle);
@@ -750,7 +777,7 @@ static int lkpifs_unlink(struct vfs_node *dir, const char *name)
 		return -EINVAL;
 	ret = lkpi_bridge_unlink(info->handle, name);
 	if (ret == 0)
-		lkpifs_drop_child(dir, name);
+		lkpifs_drop_child(dir, name, 1);
 	return ret;
 }
 
@@ -764,7 +791,7 @@ static int lkpifs_rmdir(struct vfs_node *dir, const char *name)
 		return -EINVAL;
 	ret = lkpi_bridge_rmdir(info->handle, name);
 	if (ret == 0)
-		lkpifs_drop_child(dir, name);
+		lkpifs_drop_child(dir, name, 0);
 	return ret;
 }
 
@@ -793,8 +820,8 @@ static int lkpifs_rename(struct vfs_node *old_dir, const char *old_name,
 	if (ret == 0) {
 		/* Both names change hands: the source stops existing, and anything
 		 * that was at the destination has been replaced. */
-		lkpifs_drop_child(old_dir, old_name);
-		lkpifs_drop_child(new_dir, new_name);
+		lkpifs_drop_child(old_dir, old_name, 0);
+		lkpifs_drop_child(new_dir, new_name, 0);
 	}
 	return ret;
 }

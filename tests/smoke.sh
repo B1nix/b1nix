@@ -3096,6 +3096,9 @@ check_output "$LOG" "M42-W5PRE: ok kill-sleeping-child" "a signal sent to a task
 check_output "$LOG" "M42-W5PRE: done" "M42 wave-5 prerequisite suite completes"
 # ── M46: VFS integrity + POSIX process conformance ──
 check_output "$LOG" "M46-SMOKE: start" "M46 conformance suite starts"
+check_output "$LOG" "M46-SMOKE: ok waitid-poll-until-exit" "polling a live child with waitid(WNOHANG) reports its death rather than ECHILD"
+check_output "$LOG" "M46-SMOKE: ok waitid-nohang" "waitid(WNOHANG) on a child that is still running answers zero with an empty siginfo, not ECHILD"
+check_output "$LOG" "M46-SMOKE: ok unlinked-file-ops" "an unlinked file can still be truncated, written and read through the descriptor that holds it open"
 check_output "$LOG" "M46-SMOKE: ok exit-status-139" "exit(139) reports as a normal exit, not a signal death"
 check_output "$LOG" "M46-SMOKE: ok signal-death" "SIGKILL death reports WIFSIGNALED with the right signal"
 check_output "$LOG" "M46-SMOKE: ok kill-zero-pgrp" "kill(0, sig) signals the caller's process group"

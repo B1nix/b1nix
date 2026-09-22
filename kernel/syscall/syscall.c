@@ -1101,6 +1101,17 @@ isize syscall_waitid_linux(u64 idtype, u64 id, u64 user_info, int options) {
              !(wid = namespace_pid_from_user((usize)id))) {
     return -ECHILD;
   }
+  /* Clear the caller's siginfo first. A WNOHANG wait that finds nothing
+   * returns 0 and is expected to leave si_pid zero -- Linux zeroes the
+   * structure for exactly that reason, and a caller that reads back whatever
+   * was on its stack cannot tell "no child yet" from "reaped one". */
+  if (user_info) {
+    u8 zero[128];
+
+    memset(zero, 0, sizeof(zero));
+    if (syscall_copyout((void *)(usize)user_info, zero, sizeof(zero)) < 0)
+      return -EFAULT;
+  }
   int wr = scheduler_waitid((idtype_t)widtype, wid,
                             (siginfo_t *)(usize)user_info, options);
   if (wr < 0)

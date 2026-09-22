@@ -70,11 +70,13 @@
 
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
+#include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
 #include <b1nix/kprof.h>
 #include <b1nix/ktime.h>
 #include <b1nix/mm.h>
+#include <b1nix/namespace.h>
 #include <b1nix/linux_abi.h>
 #include <b1nix/posix.h>
 #include <b1nix/sched.h>
@@ -251,6 +253,7 @@ struct iou_req {
    * worse than refusing it. */
   u8 is_drain;
   u8 is_futex;
+  u8 is_waitid; /* IORING_OP_WAITID: armed until the child it names exits */
   u8 futex_nr;                /* 1 for WAIT, n for WAITV */
   u8 futex_woken;             /* a wake handed this request its turn */
   u8 futex_which;             /* which word of a WAITV the wake named */
@@ -745,6 +748,12 @@ static void iou_post_cqe_locked(struct io_ring_ctx *ctx, u64 user_data,
  * a program that watches one ring from another relies on the completion being
  * reported the moment the watched ring gets a CQE, without entering the kernel
  * again. A machine with none of these pays one load per completion. */
+/* Whether the LAST cancel cancelled a request whose cancel counts what it
+ * cancelled. Linux's io_try_cancel returns 0 for most operations and the number
+ * for waitid and the futex waits, and both the cancel opcode and a link timeout
+ * over such a request report that number. */
+static int g_iou_cancel_counted;
+
 static volatile int g_iou_ringpoll_armed;
 static volatile int g_iou_crossring_busy;
 
@@ -1793,10 +1802,13 @@ static i32 iou_perform_op(struct iou_req *req) {
 
     if (!n)
       return -ENOENT;
-    /* Linux reports 0 for the ordinary "one request cancelled" case and the
-     * count only when the caller asked for all of them. */
-    return (sqe->cancel_flags & (IORING_ASYNC_CANCEL_ALL |
-                                 IORING_ASYNC_CANCEL_ANY))
+    /* Linux reports 0 for the ordinary "one request cancelled" case, the count
+     * when the caller asked for all of them, and the count for the operations
+     * whose own cancel counts (see g_iou_cancel_counted) -- liburing's waitid
+     * requires the 1 it gets from cancelling a wait. */
+    return ((sqe->cancel_flags &
+             (IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_ANY)) ||
+            g_iou_cancel_counted)
                ? n
                : 0;
   }
@@ -2422,11 +2434,34 @@ static i32 iou_perform_op(struct iou_req *req) {
     return 0;
   }
 
-  case IORING_OP_WAITID:
+  case IORING_OP_WAITID: {
     /* io_uring is a Linux interface, so the siginfo it writes is Linux's —
-     * the same rewrite the waitid(2) system call does, from the same place. */
-    return (i32)syscall_waitid_linux(sqe->len, (u64)(u32)sqe->fd, sqe->addr2,
-                                     (int)sqe->file_index);
+     * the same rewrite the waitid(2) system call does, from the same place.
+     *
+     * The wait is never allowed to block the submitting thread: a ring's whole
+     * promise is that submission returns. So the question is asked first --
+     * "is there anything to collect?" -- and the request is armed when there
+     * is not. That also makes it cancellable, and a link timeout over it then
+     * reports the cancel instead of completing a wait that never happened
+     * (liburing's waitid checks both halves). Asking through the siginfo would
+     * not do: a caller may pass none at all. */
+    int opts = (int)sqe->file_index;
+    int ready = scheduler_waitid_probe((idtype_t)sqe->len,
+                                       (usize)namespace_pid_from_user(
+                                           (usize)(u32)sqe->fd),
+                                       opts);
+    isize wr;
+
+    if (ready == 0 && !(opts & B1NIX_WNOHANG))
+      return -EAGAIN; /* children, but nothing to report yet */
+    wr = syscall_waitid_linux(sqe->len, (u64)(u32)sqe->fd, sqe->addr2,
+                              opts | B1NIX_WNOHANG);
+    iou_trace("waitid", (u64)sqe->len | ((u64)(u32)sqe->fd << 16), (u64)opts,
+              wr);
+    if (ready < 0)
+      return (i32)ready; /* no such child: that is the answer */
+    return (i32)wr;
+  }
 
   case IORING_OP_FIXED_FD_INSTALL: {
     /* Turn a registered file back into an ordinary descriptor. */
@@ -2812,8 +2847,8 @@ static int iou_run_once(struct iou_req *req) {
    * accept saw as "Got cqe res -11" with three accepts queued before the
    * connects. Only a request that waits on readiness can be re-armed; anything
    * else would spin. */
-  if ((res == -EAGAIN || res == -EWOULDBLOCK) && req->poll_mask &&
-      iou_pollable(req->file)) {
+  if ((res == -EAGAIN || res == -EWOULDBLOCK) &&
+      ((req->poll_mask && iou_pollable(req->file)) || req->is_waitid)) {
     req->state = IOU_ST_ARMED;
     req->eagain_sweep = req->ctx->sweep_gen;
     return 1;
@@ -2987,6 +3022,14 @@ static int iou_issue(struct iou_req *req) {
   if (sqe->opcode == IORING_OP_POLL_ADD) {
     req->state = IOU_ST_ARMED;
     return 1; /* the sweep below reports it, ready or not */
+  }
+  if (sqe->opcode == IORING_OP_WAITID) {
+    /* Armed, and tried on every sweep: the first one runs before this
+     * io_uring_enter returns, so a child that has already exited is reaped
+     * without a second entry. */
+    req->is_waitid = 1;
+    req->state = IOU_ST_ARMED;
+    return 1;
   }
   if (sqe->opcode == IORING_OP_FUTEX_WAIT ||
       sqe->opcode == IORING_OP_FUTEX_WAITV) {
@@ -3326,6 +3369,27 @@ static int iou_progress(struct io_ring_ctx *ctx) {
         break;
       }
 
+      if (r->is_waitid) {
+        /* There is nothing to poll for a child's death, so it is asked -- once
+         * per sweep. Asking again inside the same sweep would keep this one
+         * request at the head of the queue for ever, and the link timeout
+         * watching it would never be looked at.
+         *
+         * And asked only by the task that owns the ring. "Is this my child?"
+         * is answered against whoever is asking, and the ring's own sweeping
+         * thread is nobody's parent: it was told ECHILD for a child that was
+         * alive and well, which completed the wait with an error and cancelled
+         * the link timeout watching it. */
+        if (current_task && ctx->sq_tid > 0 &&
+            (int)current_task->id == ctx->sq_tid)
+          continue;
+        if (r->eagain_sweep == ctx->sweep_gen)
+          continue;
+        victim = r;
+        res = 1; /* marker: run it below */
+        break;
+      }
+
       if (r->is_futex) {
         int which = iou_futex_ready(r);
 
@@ -3411,7 +3475,20 @@ static int iou_progress(struct io_ring_ctx *ctx) {
       iou_lock(ctx);
       iou_req_unlink(ctx, victim);
       iou_unlock(ctx);
-      iou_post_req_cqe(victim, -ETIME, 0);
+      /* The timeout reports what its cancel DID, and -ETIME only when the
+       * cancel had nothing to say. For the operations whose cancel counts what
+       * it cancelled -- waitid and the futex waits -- that is the count, which
+       * is what liburing's waitid reads to tell "the timeout cancelled my wait"
+       * from "the timeout fired and found nothing". */
+      {
+        i32 tres = -ETIME;
+
+        if (target && (target->sqe.opcode == IORING_OP_WAITID ||
+                       target->sqe.opcode == IORING_OP_FUTEX_WAIT ||
+                       target->sqe.opcode == IORING_OP_FUTEX_WAITV))
+          tres = 1;
+        iou_post_req_cqe(victim, tres, 0);
+      }
       iou_req_free(victim);
       if (target) {
         struct iou_req *rest = target->link_next;
@@ -3468,6 +3545,8 @@ static int iou_cancel_by(struct io_ring_ctx *ctx, u64 user_data, int by_fd,
                          int fd, u32 cancel_flags) {
   int found = 0;
 
+  g_iou_cancel_counted = 0;
+
   for (;;) {
     struct iou_req *victim = 0;
 
@@ -3499,6 +3578,10 @@ static int iou_cancel_by(struct io_ring_ctx *ctx, u64 user_data, int by_fd,
       break;
     found++;
 
+    if (victim->sqe.opcode == IORING_OP_WAITID ||
+        victim->sqe.opcode == IORING_OP_FUTEX_WAIT ||
+        victim->sqe.opcode == IORING_OP_FUTEX_WAITV)
+      g_iou_cancel_counted = 1;
     if (victim->tmo_target)
       victim->tmo_target->tmo_armed = 0;
     struct iou_req *rest = victim->link_next;
@@ -3679,6 +3762,14 @@ static int iou_submit_one(struct io_ring_ctx *ctx,
              (sqe->opcode == IORING_OP_RECV ||
               sqe->opcode == IORING_OP_RECVMSG) &&
              !(sqe->flags & IOSQE_BUFFER_SELECT)) {
+    req->failed = 1;
+    req->fail_res = -EINVAL;
+  } else if (req->multishot && sqe->opcode == IORING_OP_ACCEPT &&
+             sqe->file_index && sqe->file_index != IORING_FILE_INDEX_ALLOC) {
+    /* A multishot accept that installs its results directly has to let the
+     * kernel choose the slots: it produces many connections and there is one
+     * `file_index` to name. Arming it instead left the caller waiting for a
+     * completion that was never going to come. */
     req->failed = 1;
     req->fail_res = -EINVAL;
   } else if (sqe->opcode == IORING_OP_TIMEOUT) {
@@ -4323,6 +4414,51 @@ static void iou_crossring_kick(struct io_ring_ctx *ctx) {
     iou_ctx_put(want[i]);
   }
   __atomic_store_n(&g_iou_crossring_busy, 0, __ATOMIC_RELEASE);
+}
+
+/* What every ring on the machine is waiting for.
+ *
+ * Called from the watchdog's task dump. A program blocked in io_uring_enter is
+ * waiting for a completion that has not come, and the question is always which
+ * request owes it: without this the answer took a run per guess. */
+void io_uring_dump_state(void) {
+  int nctx = 0;
+
+  iou_list_lock();
+  for (struct io_ring_ctx *c = g_ctx_list; c; c = c->next) {
+    int armed = 0;
+
+    nctx++;
+    console_write("io_uring: ring owner=");
+    console_write_dec((u64)c->owner_tgid);
+    console_write(" flags=0x");
+    console_write_hex64((u64)c->flags);
+    console_write(" cq_ready=");
+    console_write_dec((u64)iou_cq_ready(c));
+    console_write(" live=");
+    console_write_dec((u64)c->nr_live);
+    console_write("\n");
+    for (struct iou_req *r = c->live; r && armed < 8; r = r->next) {
+      if (r->state != IOU_ST_ARMED)
+        continue;
+      armed++;
+      console_write("  armed op=");
+      console_write_dec((u64)r->sqe.opcode);
+      console_write(" data=");
+      console_write_dec(r->sqe.user_data);
+      console_write(" mask=0x");
+      console_write_hex64((u64)r->poll_mask);
+      console_write(r->is_futex ? " futex" : "");
+      console_write(r->is_waitid ? " waitid" : "");
+      console_write(r->is_timeout ? " timeout" : "");
+      console_write(r->is_linktmo ? " linktmo" : "");
+      console_write(r->multishot ? " multishot" : "");
+      console_write("\n");
+    }
+  }
+  iou_list_unlock();
+  if (!nctx)
+    console_write("io_uring: no rings\n");
 }
 
 /* Refresh the TASKRUN flag of every deferred-completion ring this task owns.

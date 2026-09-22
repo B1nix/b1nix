@@ -1473,10 +1473,52 @@ static struct task *find_unused_task(int user) {
   /* 2) Slow path: extend the high-water mark, allocating a new chunk if the
    *    next slot crosses a chunk boundary. */
   if (g_task_hwm >= MAX_TASKS) {
+    /* The table is full, and "full" has several shapes: live tasks, zombies
+     * nobody has waited for, threads waiting to be reaped. A clone that fails
+     * here surfaces as EAGAIN in userspace ("Thread create failed: 11"), and
+     * which shape it was decides where to look. */
+    static int reported;
+
+    if (!reported) {
+      usize live = 0, dead = 0, blocked = 0, ready = 0;
+
+      reported = 1;
+      for (usize k = 0; k < g_task_hwm; k++) {
+        switch (__atomic_load_n(&T(k)->state, __ATOMIC_RELAXED)) {
+        case TASK_UNUSED: break;
+        case TASK_DEAD: dead++; break;
+        case TASK_BLOCKED: blocked++; live++; break;
+        case TASK_READY: ready++; live++; break;
+        default: live++; break;
+        }
+      }
+      console_write("sched: task table full (");
+      console_write_dec((u64)MAX_TASKS);
+      console_write(" slots): live=");
+      console_write_dec((u64)live);
+      console_write(" dead=");
+      console_write_dec((u64)dead);
+      console_write(" blocked=");
+      console_write_dec((u64)blocked);
+      console_write(" ready=");
+      console_write_dec((u64)ready);
+      console_write("\n");
+    }
     tasks_unlock(flags);
     return 0;
   }
   if (!ensure_task_chunk(g_task_hwm >> 6)) {
+    /* A chunk of the table is a single allocation of sixty-four task rows, so
+     * this is the heap saying no -- which a caller sees as EAGAIN from clone or
+     * io_uring_setup, with no hint of where the memory went. */
+    static int reported_chunk;
+
+    if (!reported_chunk) {
+      reported_chunk = 1;
+      console_write("sched: cannot grow the task table past ");
+      console_write_dec((u64)g_task_hwm);
+      console_write(" rows: the heap has no room for another chunk\n");
+    }
     tasks_unlock(flags);
     return 0;
   }
@@ -4739,13 +4781,29 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
     return -EFAULT;
   {
     int cg_err = cgroup_fork_allowed(parent->id);
-    if (cg_err < 0)
+    if (cg_err < 0) {
+      static int reported_cg;
+
+      if (!reported_cg) {
+        reported_cg = 1;
+        console_write("sched: a thread was refused by its cgroup's pids limit"
+                      " (clone -> EAGAIN)\n");
+      }
       return cg_err;
+    }
   }
   {
     int ns_err = namespace_fork_allowed();
-    if (ns_err < 0)
+    if (ns_err < 0) {
+      static int reported_ns;
+
+      if (!reported_ns) {
+        reported_ns = 1;
+        console_write("sched: a thread was refused by its pid namespace"
+                      " (clone -> EAGAIN)\n");
+      }
       return ns_err;
+    }
   }
 
   struct clone_thread_args *cta = kzalloc(sizeof(*cta));
@@ -4772,7 +4830,18 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   interrupts_disable();
   struct task *child = find_unused_task(0);
   interrupts_enable();
-  if (!child) { kfree(kstack); kfree(cta); return -EAGAIN; }
+  if (!child) {
+    static int reported_slot;
+
+    if (!reported_slot) {
+      reported_slot = 1;
+      console_write("sched: a thread was refused for want of a task slot"
+                    " (clone -> EAGAIN)\n");
+    }
+    kfree(kstack);
+    kfree(cta);
+    return -EAGAIN;
+  }
 
   /* Bootstrap kernel context — same shape as kthread_create_impl, including
    * the headroom slot below the end of the allocation (see the note there:
@@ -5239,12 +5308,30 @@ void scheduler_reap_orphan_zombies(void) {
     }
 
     int has_live_parent = 0;
-    for (usize p = 0; p < task_hwm; p++) {
-      struct task *pt = T(p);
-      if (pt->id == t->parent_id && pt->state != TASK_UNUSED &&
-          pt->state != TASK_DEAD && pt->state != TASK_REAPING) {
-        has_live_parent = 1;
-        break;
+
+    /* A kernel thread has no parent that could wait for it. Its parent_id is
+     * zero -- deliberately, so a process whose syscall spawned a worker does
+     * not have that worker turn up in waitpid(-1) -- and the boot task, which
+     * also has id zero, is not a waiter: it never calls waitpid. Reading zero
+     * as "the boot task is alive, it will collect this" meant no dead kernel
+     * thread was EVER reaped, so its 128 KiB stack and its table row leaked for
+     * the life of the machine. io_uring gives a ring with armed requests a
+     * sweeping thread of its own, so a program that opens and closes rings in a
+     * loop -- liburing's pollfree does, for two and a half seconds -- leaked
+     * hundreds of stacks and the next thread creation failed with EAGAIN.
+     *
+     * Only for a task with no user address space: a userspace orphan's
+     * parent_id is 1 (init) after reparenting, never 0. */
+    if (t->parent_id == 0 && t->pml4_phys == 0 && !t->user_image) {
+      has_live_parent = 0;
+    } else {
+      for (usize p = 0; p < task_hwm; p++) {
+        struct task *pt = T(p);
+        if (pt->id == t->parent_id && pt->state != TASK_UNUSED &&
+            pt->state != TASK_DEAD && pt->state != TASK_REAPING) {
+          has_live_parent = 1;
+          break;
+        }
       }
     }
     if (has_live_parent) continue; /* its parent will waitpid it */
@@ -6939,6 +7026,13 @@ static void serial_silence_watchdog(void) {
       extern void nvme_debug_dump(void);
       nvme_debug_dump();
     }
+  }
+  /* What every io_uring is waiting for: a task blocked in io_uring_enter is
+   * owed a completion, and this says by which request. */
+  {
+    extern void io_uring_dump_state(void);
+
+    io_uring_dump_state();
   }
   console_write("SMOKE-GUEST-WATCHDOG: alive tasks (pid state chan comm):\n");
   for (usize i = 0; i < g_task_hwm; i++) {
@@ -8725,11 +8819,52 @@ int scheduler_waitpid(usize pid, int *status, int options) {
   }
 }
 
+/* Is there anything for a waitid to collect, without collecting it?
+ *
+ * 1 yes, 0 the children exist but none is in a reportable state, -ECHILD there
+ * is no such child. io_uring's WAITID needs the question separated from the
+ * answer: it may only reap in the owning task's context, and it has to decide
+ * whether to wait without a siginfo to read the outcome from (a caller may pass
+ * none at all). */
+int scheduler_waitid_probe(idtype_t idtype, usize id, int options) {
+  int has_children = 0;
+
+  if (!current_task)
+    return -ECHILD;
+  u64 flags = interrupts_save();
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *child = T(i);
+
+    if (child->state == TASK_UNUSED || child->parent_id != current_task->id)
+      continue;
+    if (idtype == P_PID) {
+      if (child->id != id)
+        continue;
+    } else if (idtype == P_PGID) {
+      if (child->process_group_id != id)
+        continue;
+    }
+    has_children = 1;
+    if ((options & B1NIX_WEXITED) && child->state == TASK_DEAD) {
+      interrupts_restore(flags);
+      return 1;
+    }
+    if ((options & B1NIX_WSTOPPED) && child->state == TASK_STOPPED) {
+      interrupts_restore(flags);
+      return 1;
+    }
+  }
+  interrupts_restore(flags);
+  return has_children ? 0 : -ECHILD;
+}
+
 int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
   if (current_task == 0)
     return -ECHILD;
-  if (!infop)
-    return -EFAULT;
+  /* A caller may pass no siginfo: it is then a wait for the event and nothing
+   * else, which is what io_uring's WAITID does when the program only wants to
+   * know that the child is gone. Refusing it with EFAULT refused a perfectly
+   * good wait. */
   if (idtype != P_ALL && idtype != P_PID && idtype != P_PGID)
     return -EINVAL;
   if (idtype == P_PID && id == 0)
@@ -8858,7 +8993,7 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
                 free_task_slot(child);
 
                 if (infop) {
-                  if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+                  if (infop && syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
                     return -EFAULT;
                   }
                 }
@@ -8871,7 +9006,7 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
                 scheduler_waitpid_fast_return();
               interrupts_enable();
               if (infop) {
-                if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+                if (infop && syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
                   return -EFAULT;
                 }
               }
@@ -8896,7 +9031,7 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
               scheduler_waitpid_fast_return();
             interrupts_enable();
             if (infop) {
-              if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+              if (infop && syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
                 return -EFAULT;
               }
             }
@@ -8920,7 +9055,7 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
               scheduler_waitpid_fast_return();
             interrupts_enable();
             if (infop) {
-              if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+              if (infop && syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
                 return -EFAULT;
               }
             }
@@ -8944,7 +9079,7 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
       if (infop) {
         siginfo_t info;
         memset(&info, 0, sizeof(info));
-        if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+        if (infop && syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
           return -EFAULT;
         }
       }

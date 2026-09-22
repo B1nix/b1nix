@@ -2936,6 +2936,26 @@ struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type,
   return add_node(path, type, data, size, flags);
 }
 
+/* An open file description arrived at, or left, this inode. See
+ * vfs_inode::nr_open. */
+static void handle_note_open(struct vfs_handle *h) {
+  if (h && h->kind == VFS_HANDLE_NODE && h->node && h->node->inode)
+    __atomic_add_fetch(&h->node->inode->nr_open, 1, __ATOMIC_ACQ_REL);
+}
+
+static void handle_note_close(struct vfs_handle *h) {
+  if (h && h->kind == VFS_HANDLE_NODE && h->node && h->node->inode) {
+    int n = __atomic_sub_fetch(&h->node->inode->nr_open, 1, __ATOMIC_ACQ_REL);
+
+    if (n < 0)
+      __atomic_store_n(&h->node->inode->nr_open, 0, __ATOMIC_RELEASE);
+  }
+}
+
+int vfs_inode_is_open(const struct vfs_inode *inode) {
+  return inode ? __atomic_load_n(&inode->nr_open, __ATOMIC_ACQUIRE) : 0;
+}
+
 struct vfs_handle *alloc_raw_handle(enum vfs_handle_kind kind) {
   struct vfs_handle *h = vfs_alloc_handle();
   if (!h)
@@ -2961,6 +2981,7 @@ int vfs_fd_for_node(struct vfs_node *node, int flags) {
     return -ENFILE;
   vfs_node_get(node);
   h->node = node;
+  handle_note_open(h);
   h->ops = &node_file_ops;
   h->flags = flags;
   h->offset = 0;
@@ -3008,6 +3029,7 @@ void vfs_handle_release(struct vfs_handle *h) {
 
 
   h->used = 0;
+  handle_note_close(h);
   if (h->ops && h->ops->release) {
     h->ops->release(h);
   } else if (h->kind == VFS_HANDLE_NODE && h->node) {
@@ -4095,6 +4117,7 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
             return -ENFILE;
           }
           nh->node = rnode;
+          handle_note_open(nh);
           nh->ops = &node_file_ops;
           nh->flags = flags;
           /* O_APPEND moves each WRITE to the end; it does not move the
@@ -4494,6 +4517,7 @@ make_handle:;
     goto out;
   }
   h->node = node; /* Already has ref from find_node */
+  handle_note_open(h);
   h->mnt_flags = open_mnt.flags;
   h->mnt_flags_set = (u8)open_mnt.known;
   /* The name this descriptor was opened under (see vfs_handle::open_path).
@@ -9416,6 +9440,12 @@ int vfs_ftruncate(int fd, u64 length) {
   if ((h->flags & 3) == B1NIX_O_RDONLY)
     return -EINVAL;
 
+  /* RLIMIT_FSIZE bounds the SIZE of a file, however it is reached: a truncate
+   * or a fallocate that would take it past the caller's limit is EFBIG with a
+   * SIGXFSZ, exactly as a write there would be. */
+  if (write_past_fsize_limit(h, length ? length - 1 : 0, length ? 1 : 0))
+    return -EFBIG;
+
   /* M109 chattr: truncation changes the contents and shortens the file, which
    * both immutable and append-only forbid. */
   if (inode->attr & (VFS_ATTR_IMMUTABLE | VFS_ATTR_APPEND))
@@ -9781,6 +9811,7 @@ int vfs_memfd_create(const char *name, u32 flags) {
     return -ENFILE;
   }
   h->node = node;
+  handle_note_open(h);
   h->ops = &node_file_ops;
   h->flags = B1NIX_O_RDWR;
 
@@ -9820,6 +9851,7 @@ int vfs_memfd_secret(int cloexec) {
     return -ENFILE;
   }
   h->node = node;
+  handle_note_open(h);
   h->ops = &node_file_ops;
   h->flags = B1NIX_O_RDWR;
 

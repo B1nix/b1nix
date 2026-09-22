@@ -87,6 +87,7 @@ if [ "${SKIP_BUILD:-0}" = "1" ]; then
 else
 	echo "[BUILD] Building kernel ISO for the Debian boot..."
 	if ! (cd "$PROJECT_DIR" && make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
+		ISO_NO_ROOT_MODULE="${ISO_NO_ROOT_MODULE:-1}" \
 		KERNEL_CMDLINE="$CMDLINE" iso) >"$BUILD_LOG" 2>&1; then
 		printf "  ${RED}BUILD FAILED${NC} (log: %s)\n" "$BUILD_LOG"
 		tail -60 "$BUILD_LOG"
@@ -148,6 +149,7 @@ boot_once() { # extra-cmdline [deadline]
 	: >"$_blog"
 	echo "[RUN] Booting QEMU with $RUN_IMG as root (label $IMG_LABEL)${_extra:+ [$_extra]}..."
 	(cd "$PROJECT_DIR" && make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
+		ISO_NO_ROOT_MODULE="${ISO_NO_ROOT_MODULE:-1}" \
 		KERNEL_CMDLINE="$CMDLINE $_extra" iso) >>"$BUILD_LOG" 2>&1 || {
 		printf "  ${RED}BUILD FAILED${NC} (log: %s)\n" "$BUILD_LOG"
 		return 1

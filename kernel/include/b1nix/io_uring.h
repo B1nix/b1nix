@@ -20,5 +20,7 @@ int io_uring_syscall(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
 int io_uring_futex_wake(u64 key_pml4, u64 key_word, int nr);
 /* Bring the IORING_SQ_TASKRUN flag of this task's deferred rings up to date. */
 void io_uring_taskrun_refresh(void);
+/* Print what every ring is waiting for; called from the watchdog dump. */
+void io_uring_dump_state(void);
 
 #endif /* B1NIX_IO_URING_H */

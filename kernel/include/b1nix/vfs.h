@@ -239,6 +239,12 @@ struct vfs_inode {
   volatile u64 rw_owner;
   const void *rw_site;
   int refcount;         /* Internal references (e.g. open handles) */
+  /* How many open file descriptions point at this inode. Counted because
+   * "still open" is a question with a right answer: an unlinked file has to
+   * keep working for whoever holds it open, and the filesystem has to be told
+   * to evict it the moment nobody does. A node's refcount cannot answer it --
+   * the page cache and the name cache hold references of their own. */
+  int nr_open;
   int nlink; /* Number of hard links (names pointing to this inode) */
   usize size;
   usize capacity;
@@ -895,6 +901,8 @@ int vfs_socket_connect_result_h(struct vfs_handle *h);
 int vfs_socket_bytes_available(struct vfs_handle *h, int outgoing);
 int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len,
                         const void *src_ip, int src_is_v6, u16 src_port_net);
+/* Does any open file description point at this inode? */
+int vfs_inode_is_open(const struct vfs_inode *inode);
 usize vfs_socket_last_srcaddr(int fd, void *addr, usize cap);
 /* IP_RECVORIGDSTADDR: the local address a datagram was addressed to. */
 usize vfs_socket_origdstaddr(int fd, void *addr, usize cap);
