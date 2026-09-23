@@ -38,6 +38,11 @@ DEADLINE="${DEADLINE:-420}"
 SILENCE="${SILENCE:-45}"
 MEM="${MEM:-2048}"
 CPUS="${CPUS:-4}"
+# A caller that needs the disk to remember one boot in the next -- the boot
+# counting lane, whose whole subject is what the last boot wrote -- passes its
+# own writable copy (usually a qcow2 overlay) with SNAPSHOT=off.
+IMG_FORMAT="${IMG_FORMAT:-raw}"
+SNAPSHOT="${SNAPSHOT:-on}"
 
 log() { printf '\033[1;34m[run-distro]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[run-distro] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -60,7 +65,7 @@ VIRTFS=""
 log "booting $(basename "$IMG") (deadline ${DEADLINE}s, silence ${SILENCE}s)"
 # shellcheck disable=SC2086
 qemu-system-x86_64 -machine pc $ACCEL -m "$MEM" -smp "$CPUS" \
-	-drive file="$IMG",format=raw,if=virtio,snapshot=on \
+	-drive file="$IMG",format="$IMG_FORMAT",if=virtio,snapshot="$SNAPSHOT" \
 	$VIRTFS -display none -serial file:"$LOG" -no-reboot "$@" &
 QEMU=$!
 trap 'kill "$QEMU" 2>/dev/null || true' EXIT INT TERM

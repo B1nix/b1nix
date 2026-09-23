@@ -382,6 +382,32 @@ void uffd_task_exit(struct task *t) {
   spin_unlock_irqrestore(&g_ctx_lock, flags);
 }
 
+/* The address space `pml4_phys` is gone (the last task using it exited or
+ * exec'd). Its contexts watch nothing any more, and must stop matching: the
+ * page-table frame is about to be freed and handed to some other process,
+ * whose ordinary faults then landed on this context -- a boot where a
+ * unit's first page fault waited 100 s for a monitor that belonged to a
+ * program long since replaced by exec. Linux ties the context to the mm, which
+ * dies with it; this is the same rule. */
+void uffd_mm_release(u64 pml4_phys) {
+  u64 flags;
+
+  if (!pml4_phys)
+    return;
+  spin_lock_irqsave(&g_ctx_lock, &flags);
+  for (int i = 0; i < UFFD_MAX_CTX; i++) {
+    struct uffd_ctx *c = g_ctx[i];
+
+    if (c && c->pml4_phys == pml4_phys) {
+      c->pml4_phys = 0;
+      c->dead = 1;
+      scheduler_wake_all(&c->fault_chan);
+      scheduler_wake_all(&c->msg_chan);
+    }
+  }
+  spin_unlock_irqrestore(&g_ctx_lock, flags);
+}
+
 /* ── the descriptor ──────────────────────────────────────────────────────── */
 
 static isize uffd_read(struct vfs_handle *h, char *buf, usize len) {

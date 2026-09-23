@@ -98,11 +98,21 @@ if [ "$left" -le 0 ]; then
 	if [ -n "$fallback" ] && [ "$fallback" != "$entry" ]; then
 		log "entry $entry is out of tries -- the default becomes $fallback"
 		sed -i "s/^default=.*/default=$fallback/" "$state" 2>/dev/null || true
-		# The configuration itself is regenerated from the state on the
-		# next successful boot; ordering here would mean parsing Limine's
-		# format in an initramfs. What matters now is that the state says
-		# which kernel is good, and that the user can pick it from the menu
-		# -- the entry is already there.
+		# And Limine's default with it: the good kernel's entry is already
+		# in the menu ("(previous)"), so pointing default_entry at it is the
+		# whole change. The file is regenerated in full from the state on
+		# the next successful boot (b1nix-boot-good).
+		conf="$ESP_MNT/limine.conf"
+		idx=$(awk -v r="$fallback" '
+			/^\/b1nix / { n++; if ($2 == r && !found) found = n }
+			END { print found + 0 }
+		' "$conf" 2>/dev/null)
+		if [ "${idx:-0}" -gt 0 ]; then
+			sed -i "s/^default_entry:.*/default_entry: $idx/" "$conf" 2>/dev/null &&
+				log "limine.conf: default_entry is now $idx ($fallback)"
+		else
+			log "limine.conf has no entry for $fallback -- pick it from the menu"
+		fi
 		: >"$ESP_MNT/b1nix/fallback-pending" 2>/dev/null || true
 	else
 		log "entry $entry is out of tries and there is no known-good kernel"

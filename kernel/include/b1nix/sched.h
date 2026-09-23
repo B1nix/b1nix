@@ -735,6 +735,9 @@ void scheduler_wait_prepare(void *chan);
 void scheduler_wait_prepare_timeout(void *chan, u64 timeout_ticks);
 void scheduler_wait_commit(void);
 void scheduler_wait_cancel(void);
+/* The same, leaving the interrupt state alone (for a caller that runs with
+ * interrupts saved and restores them itself). */
+void scheduler_wait_cancel_keep_irqs(void);
 /* True between scheduler_wait_prepare() and the commit or cancel that ends it:
  * the task is marked blocked and giving up the CPU now would park it rather
  * than reschedule it. Imported code needs to tell those two apart — see

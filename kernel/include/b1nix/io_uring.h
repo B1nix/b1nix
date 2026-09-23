@@ -22,5 +22,10 @@ int io_uring_futex_wake(u64 key_pml4, u64 key_word, int nr);
 void io_uring_taskrun_refresh(void);
 /* Print what every ring is waiting for; called from the watchdog dump. */
 void io_uring_dump_state(void);
+/* Is this descriptor an io_uring instance? */
+struct vfs_handle;
+int io_uring_is_ring_handle(const struct vfs_handle *h);
+/* Run the ready work of the calling process's rings (syscall exit). */
+void io_uring_task_work(void);
 
 #endif /* B1NIX_IO_URING_H */

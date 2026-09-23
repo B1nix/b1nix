@@ -39,6 +39,11 @@ int in_egroup_p(kgid_t grp);
 
 #define current_fsuid() current_fsuid_val()
 #define current_fsgid() current_fsgid_val()
+/* The real ids: FAT stamps them into a mount as its default owner. */
+kuid_t current_uid_val(void);
+kgid_t current_gid_val(void);
+#define current_uid() current_uid_val()
+#define current_gid() current_gid_val()
 
 static inline const struct cred *get_current_cred(void) { return current_cred(); }
 static inline const struct cred *get_cred(const struct cred *cred)

@@ -1193,6 +1193,8 @@ endif
 # The b1nix side of the bridge (kernel/fs/lkpifs.c) calls into the imported
 # filesystem, so it is only built when that filesystem is in the link.
 KERNEL_SOURCES += kernel/fs/lkpifs.c
+# The boot loader's initramfs is unpacked with the imported zlib and zstd.
+KERNEL_SOURCES += kernel/fs/initrd_cpio.c
 # The release it came from, for the registration message.
 $(BUILD_DIR)/kernel/fs/lkpifs.o: COMMON_CFLAGS += -DLKPI_FS_LINUX_VERSION='"$(FS_LINUX_VERSION)"'
 # btrfs is in the image rather than a .ko, which modules.builtin records.
@@ -1201,7 +1203,7 @@ FS_IMPORT_ALL_NAMES := $(shell cat $(FS_IMPORT_DIR)/B1NIX-OBJECTS 2>/dev/null)
 ifeq ($(B1NIX_FS_IMPORT),btrfs)
 # lib/maple_tree.c stays: btrfs uses it too, so it is not part of what ext4
 # brings with it.
-FS_IMPORT_NAMES := $(filter-out fs/ext4/% fs/jbd2/% fs/mbcache.c,$(FS_IMPORT_ALL_NAMES))
+FS_IMPORT_NAMES := $(filter-out fs/ext4/% fs/jbd2/% fs/mbcache.c fs/fat/% fs/nls/%,$(FS_IMPORT_ALL_NAMES))
 else
 FS_IMPORT_NAMES := $(FS_IMPORT_ALL_NAMES)
 endif
@@ -1218,6 +1220,7 @@ FS_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(FS_IMPORT_SOURCES))
 # generator derived from the pinned source, and the forward declarations for
 # structs the imported headers name before defining.
 FS_IMPORT_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
+	-fshort-wchar \
 	-fno-stack-protector -fno-pic -w -g -MMD -MP $(KERNEL_OPT) \
 	-Wno-incompatible-pointer-types -Wno-incompatible-function-pointer-types \
 	$(FILE_PREFIX_MAP) \
@@ -1226,6 +1229,10 @@ FS_IMPORT_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
 	-DCONFIG_PRINTK=1 \
 	-DCONFIG_QUOTA=1 -DCONFIG_QUOTA_TREE=1 -DCONFIG_QFMT_V2=1 \
 	-DCONFIG_QUOTACTL=1 \
+	-DCONFIG_FAT_DEFAULT_CODEPAGE=437 \
+	-DCONFIG_FAT_DEFAULT_IOCHARSET='"iso8859-1"' \
+	-DCONFIG_FAT_DEFAULT_UTF8=1 \
+	-DCONFIG_NLS_DEFAULT='"iso8859-1"' \
 	-DB1NIX_FS_IMPORT=1 \
 	-DCONFIG_CPU_LITTLE_ENDIAN=1 -D__LITTLE_ENDIAN=1234 \
 	-D__BYTE_ORDER=1234 \
@@ -1288,7 +1295,8 @@ FS_LKPI_SOURCES := \
 	kernel/lkpi/fs_mount_test.c \
 	kernel/lkpi/fs_bridge.c \
 	kernel/lkpi/fs_buffer.c \
-	kernel/lkpi/fs_params.c
+	kernel/lkpi/fs_params.c \
+	kernel/lkpi/initrd_decompress.c
 
 FS_LKPI_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(FS_LKPI_SOURCES))
 FS_IMPORT_OBJECTS += $(FS_LKPI_OBJECTS)
@@ -2786,10 +2794,24 @@ endif
 	@# moment the roots were re-staged, leaving every pam module and
 	@# /sbin/unix_chkpwd in the image with nothing to link against.
 	@mkdir -p $(BUILD_DIR)/rootfs/lib/security $(BUILD_DIR)/rootfs/etc/pam.d $(BUILD_DIR)/rootfs/include/security
+	@# A versioned link (libpam.so.0 -> libpam.so.0.85.1) is staged as the link
+	@# it is. Copied through, it became a file here and the package root's copy
+	@# below put the link back: two writers flipping five names on every build,
+	@# and the root image repacked behind them. A bare *.so stays a copy, as
+	@# the package root has it.
 	@if [ -d build/$(ARCH)/pkg/pam/lib ]; then \
 		for f in build/$(ARCH)/pkg/pam/lib/lib*.so*; do \
 			[ -e "$$f" ] || continue; \
-			$(CIC) "$$f" $(BUILD_DIR)/rootfs/lib/; \
+			d=$(BUILD_DIR)/rootfs/lib/$$(basename "$$f"); \
+			case "$$f" in \
+			*.so) $(CIC) "$$f" "$$d" ;; \
+			*) if [ -L "$$f" ]; then \
+				t=$$(readlink "$$f"); \
+				[ "$$(readlink "$$d" 2>/dev/null)" = "$$t" ] || ln -sfn "$$t" "$$d"; \
+			   else \
+				$(CIC) "$$f" "$$d"; \
+			   fi ;; \
+			esac; \
 		done; \
 	fi
 	@if [ -d build/$(ARCH)/pkg/pam/lib/security ]; then \

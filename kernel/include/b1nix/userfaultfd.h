@@ -187,5 +187,7 @@ int uffd_handle_fault(u64 fault_addr, int write, int present);
 /* A task is going away: release anything it was blocked on. */
 struct task;
 void uffd_task_exit(struct task *t);
+/* The last task using address space `pml4_phys` released it. */
+void uffd_mm_release(u64 pml4_phys);
 
 #endif

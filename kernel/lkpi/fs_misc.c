@@ -143,6 +143,22 @@ struct lkpi_kuid current_euid_val(void)
 	return uid;
 }
 
+struct lkpi_kuid current_uid_val(void)
+{
+	const struct cred *cred = scheduler_get_current_cred();
+	struct lkpi_kuid uid = { .val = cred ? (u32)cred->uid : 0u };
+
+	return uid;
+}
+
+struct lkpi_kgid current_gid_val(void)
+{
+	const struct cred *cred = scheduler_get_current_cred();
+	struct lkpi_kgid gid = { .val = cred ? (u32)cred->gid : 0u };
+
+	return gid;
+}
+
 /* Linux's in_egroup_p: the effective group or a supplementary one. Unlike
  * in_group_p below, being root does not make the caller a member. */
 int in_egroup_p(struct lkpi_kgid grp)

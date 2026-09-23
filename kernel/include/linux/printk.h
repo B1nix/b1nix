@@ -92,6 +92,9 @@ void print_hex_dump(const char *level, const char *prefix, int prefix_type,
 #define DUMP_PREFIX_OFFSET 2
 
 #define no_printk(fmt, ...) ((void)0)
+/* Upstream records each format in a section for printk indexing; there is no
+ * such index here, and the message itself is printed by the call beside it. */
+#define printk_index_subsys_emit(subsys_fmt_prefix, level, fmt, ...) ((void)0)
 
 
 /* Print once and never again, however many times the call is reached. The flag

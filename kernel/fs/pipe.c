@@ -27,6 +27,14 @@ static spinlock_t pipe_pool_lock = SPINLOCK_INIT;
 static volatile int g_pipe_buffers_held;
 #define PIPE_BUFFER_CACHE 64
 
+u32 vfs_handle_event_gen(struct vfs_handle *h) {
+  if (h && (h->kind == VFS_HANDLE_PIPE_READ || h->kind == VFS_HANDLE_PIPE_WRITE) &&
+      h->private_data)
+    return __atomic_load_n(&((struct vfs_pipe *)h->private_data)->event_gen,
+                           __ATOMIC_ACQUIRE);
+  return 0;
+}
+
 static isize pipe_read(struct vfs_handle *h, char *buf, usize size) {
   struct vfs_pipe *pipe = (struct vfs_pipe *)h->private_data;
   if (!pipe || !pipe->used) return -EIO;
@@ -97,6 +105,8 @@ static isize pipe_write(struct vfs_handle *h, const char *buf, usize size) {
     pipe->buffer[pipe->write_pos] = buf[i];
     pipe->write_pos = (pipe->write_pos + 1) % PIPE_BUFFER_SIZE;
   }
+  if (to_w)
+    pipe->event_gen++;
   pipe->size += to_w;
   __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
   
@@ -123,6 +133,11 @@ isize vfs_pipe_tee(struct vfs_handle *in, struct vfs_handle *out, usize len) {
     return -EIO;
   if (src == dst)
     return -EINVAL;
+  /* A zero-length tee is answered before anything is looked at, as Linux
+   * does: it is how a caller asks whether tee works at all, and an empty
+   * source pipe must not turn that question into EAGAIN. */
+  if (len == 0)
+    return 0;
 
   struct vfs_pipe *first = src < dst ? src : dst;
   struct vfs_pipe *second = src < dst ? dst : src;
@@ -157,6 +172,8 @@ isize vfs_pipe_tee(struct vfs_handle *in, struct vfs_handle *out, usize len) {
     dst->write_pos = (dst->write_pos + 1) % PIPE_BUFFER_SIZE;
     rp = (rp + 1) % PIPE_BUFFER_SIZE;
   }
+  if (n)
+    dst->event_gen++;
   dst->size += n; /* src->size deliberately untouched — tee does not consume */
   res = (isize)n;
 

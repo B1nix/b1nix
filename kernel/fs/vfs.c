@@ -2137,6 +2137,45 @@ static int mount_flags_of_seq(u64 seq, u32 *flags) {
   return 0;
 }
 
+/*
+ * Where detached mounts live (DETACHED_MOUNT_DIR, see the new mount API
+ * below): a directory tree that belongs to no filesystem and is mounted
+ * nowhere. A walk whose path starts with that prefix starts here instead of
+ * at "/". The places used to be real directories on the root filesystem --
+ * every installed system grew a /.b1nix-detached on its disk, and while the
+ * root was still read-only, as it is between an initramfs and
+ * systemd-remount-fs, fsmount() failed with ENOENT and took every mount unit
+ * built on it down (sys-kernel-tracing.mount).
+ */
+static struct vfs_node *g_detached_root;
+
+static struct vfs_node *detached_root(void) {
+  struct vfs_node *r = __atomic_load_n(&g_detached_root, __ATOMIC_ACQUIRE);
+
+  if (!r) {
+    struct vfs_node *n = vfs_create_node(VFS_DIRECTORY);
+
+    if (!n)
+      return 0;
+    n->inode->mode = 0700;
+    if (!__atomic_compare_exchange_n(&g_detached_root, &r, n, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+      vfs_node_put(n); /* another CPU made it first; r is theirs */
+    else
+      r = n;
+  }
+  return r;
+}
+
+/* If `path` names the detached tree, the node to start from and how much of
+ * the path that node already accounts for. */
+static struct vfs_node *walk_detached_start(const char *path, usize *skip) {
+  if (!mount_is_detached(path))
+    return 0;
+  *skip = sizeof("/.b1nix-detached") - 1;
+  return detached_root();
+}
+
 static struct vfs_node *
 vfs_find_node_walk(const char *path, int follow_final, int symlink_depth,
                    struct vfs_walk_mount *mnt_out) {
@@ -2173,15 +2212,23 @@ vfs_find_node_walk(const char *path, int follow_final, int symlink_depth,
   /* Flags a magic link handed on, for a walk that ends on its target. */
   u32 link_flags = 0;
   int link_flags_known = 0;
-  if (!task_root)
+  usize detached_skip = 0;
+  struct vfs_node *dstart = walk_detached_start(curr_path, &detached_skip);
+  if (dstart) {
+    vfs_node_get(dstart);
+    vfs_node_put(current);
+    current = dstart;
+    copy_path(parent_path, VFS_MAX_PATH, "/.b1nix-detached");
+  } else if (!task_root) {
     current = vfs_cross_root_mount(current, &cur_mnt);
+  }
   vfs_inode_lock_read(current->inode);
 
   /* One component, at the size a name may actually be. This was 64 while
    * VFS_NAME_MAX is 256, so every name of 64 characters or more resolved to
    * something that does not exist -- see split_path. */
   char part[VFS_NAME_MAX];
-  const char *rest = curr_path;
+  const char *rest = curr_path + detached_skip;
 
 restart_traversal:
   while (1) {
@@ -2458,15 +2505,32 @@ restart_traversal:
       curr_path = new_path;
       rest = curr_path;
 
-      /* Restart traversal from root because new_path is absolute */
+      /* Restart from the root, because new_path is absolute -- the task's
+       * root, not the machine's. Restarting from the machine's root let every
+       * symlink lead out of a chroot: run-init's check of /sbin/init inside
+       * the new root (/sbin -> usr/sbin) was answered from the initramfs. */
       vfs_inode_unlock_read(current->inode);
       vfs_node_put(current);
-      vfs_node_get(root_node);
-      current = root_node;
-      current = vfs_cross_root_mount(current, &cur_mnt);
+      cur_mnt = 0;
+      detached_skip = 0;
+      dstart = walk_detached_start(curr_path, &detached_skip);
+      if (dstart) {
+        vfs_node_get(dstart);
+        current = dstart;
+        rest = curr_path + detached_skip;
+      } else {
+        vfs_node_get(start);
+        current = start;
+        if (!task_root)
+          current = vfs_cross_root_mount(current, &cur_mnt);
+      }
       vfs_inode_lock_read(current->inode);
-      parent_path[0] = '/';
-      parent_path[1] = '\0';
+      if (dstart) {
+        copy_path(parent_path, VFS_MAX_PATH, "/.b1nix-detached");
+      } else {
+        parent_path[0] = '/';
+        parent_path[1] = '\0';
+      }
 
       goto restart_traversal;
     }
@@ -5028,7 +5092,17 @@ isize vfs_pread_h(struct vfs_handle *h, char *buf, usize size, u64 offset) {
   if (h->kind != VFS_HANDLE_NODE || !h->node)
     return -ESPIPE;
   u64 pos = offset;
-  return node_read_impl(h, buf, size, &pos);
+  isize res = node_read_impl(h, buf, size, &pos);
+
+  /* A positional read is an access too, as vfs_handle_read reports one:
+   * io_uring reads at an explicit offset, and a fanotify monitor waiting for
+   * FAN_ACCESS on such a read waited for ever (liburing's fsnotify). */
+  if (res > 0 && !h->no_notify &&
+      (fanotify_active() || vfs_inotify_watching())) {
+    vfs_inotify_notify(h->node, IN_ACCESS, 0);
+    fanotify_notify(h->node, IN_ACCESS);
+  }
+  return res;
 }
 
 isize vfs_pread(int fd, char *buf, usize size, u64 offset) {
@@ -5153,9 +5227,20 @@ isize vfs_handle_write(struct vfs_handle *h, const void *buf, usize size) {
   /* A read-only mount refuses the write here rather than in vfs_write, because
    * a caller that holds the open file and not its descriptor number — io_uring
    * with a registered file — goes straight through this door. */
-  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(h->node);
-  if (mnt && (mnt->flags & MS_RDONLY))
-    return -EROFS;
+  /* Only for a file whose contents live on that filesystem. A device node,
+   * a FIFO or a socket on a read-only mount is written as on Linux -- the
+   * write goes to the driver, not to the filesystem -- and refusing it made
+   * every program in a read-only sandbox (systemd's generators, logging to
+   * /dev/kmsg) lose its log. */
+  if (h->node && h->node->inode &&
+      (h->node->inode->type == VFS_FILE || h->node->inode->type == VFS_DIRECTORY ||
+       /* /proc and /sys files are regular files to userspace, and a
+        * read-only bind of /proc/sys (ProtectKernelTunables=) must refuse */
+       (h->node->inode->flags & VFS_NODE_PSEUDO_REG))) {
+    struct vfs_mount_entry *mnt = vfs_get_mount_for_node(h->node);
+    if (mnt && (mnt->flags & MS_RDONLY))
+      return -EROFS;
+  }
 
   return h->ops->write(h, (const char *)buf, size);
 }
@@ -5588,17 +5673,33 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
   }
   kfree(p_path);
 
+  /* A name that exists is EEXIST whatever the mount is, as on Linux, so it
+   * is looked up (loading it if nobody has yet) and tested before EROFS.
+   * systemd creates a path's parents one mkdirat() at a time from "/" and
+   * takes EEXIST as "already there"; inside a unit's read-only root it got
+   * EROFS for /run and gave up -- a generator then wrote no .wants links, and
+   * every nofail fstab mount was never started. */
+  {
+    struct vfs_node *pre = vfs_find_node_no_follow(resolved_path);
+
+    if (!IS_ERR(pre)) {
+      vfs_node_put(pre);
+      vfs_node_put(parent);
+      return -EEXIST;
+    }
+  }
+
   struct vfs_node *node = 0;
   vfs_inode_lock(parent->inode);
-  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(parent);
-  if (mnt && (mnt->flags & MS_RDONLY)) {
-    res = -EROFS;
-    goto out_unlock;
-  }
   struct vfs_node *existing_child = find_child(parent, name);
   if (existing_child) {
     vfs_node_put(existing_child); /* Drop ref from find_child */
     res = -EEXIST;
+    goto out_unlock;
+  }
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(parent);
+  if (mnt && (mnt->flags & MS_RDONLY)) {
+    res = -EROFS;
     goto out_unlock;
   }
   const struct cred *cred = get_current_cred();
@@ -6134,6 +6235,21 @@ static int vfs_remove_node(const char *path, int is_rmdir) {
   struct vfs_node *parent = vfs_find_node(p_path);
   if (IS_ERR(parent))
     return (int)PTR_ERR(parent);
+
+  /* Look the name up before removing it, as Linux's unlink does. The removal
+   * below walks only the children this directory has already loaded, so a
+   * file nobody had looked at yet -- a name that came with the image -- was
+   * answered ENOENT and left on disk. apt and dpkg unlink a stale file and
+   * treat ENOENT as "already gone", then create the name again with O_EXCL or
+   * link(2), and got EEXIST: apt-get install failed on dpkg's status-old
+   * backup. The lookup loads the entry; the last component is not followed, a
+   * symlink is removed as itself. */
+  {
+    struct vfs_node *pre = vfs_find_node_no_follow(r_path);
+
+    if (!IS_ERR(pre))
+      vfs_node_put(pre);
+  }
 
   /* Reference the entry before it is unlinked so IN_DELETE_SELF can name it
    * after the removal has already dropped it from the tree. */
@@ -6832,6 +6948,7 @@ int vfs_fd_abspath(int fd, char *buf, usize size) {
    * resolves to nothing there -- systemd-nspawn chroots into the container
    * and then walks /sys/fs/cgroup one openat(dirfd, ...) at a time. */
   struct vfs_node *task_root = scheduler_get_root_node();
+  int detached = 0;
   vfs_tree_read_acquire(&flags);
   int steps = 0;
   for (struct vfs_node *c = node; c && n < 64 && steps < 256; steps++) {
@@ -6844,15 +6961,32 @@ int vfs_fd_abspath(int fd, char *buf, usize size) {
       c = mp;
       continue;
     }
-    if (!c->parent)
+    if (!c->parent) {
+      detached = c == g_detached_root;
       break;
+    }
     parts[n++] = c->name;
     c = c->parent;
   }
 
   usize pos = 0;
+  /* A node in the tree detached mounts live in names itself under that
+   * tree's prefix: that is the path a walk reaches it by (see
+   * walk_detached_start). Without it the name of fsmount's descriptor was
+   * "/0", and openat() on it created nothing where the mount was. */
+  if (detached) {
+    static const char pfx[] = "/.b1nix-detached";
+
+    if (sizeof(pfx) > size) {
+      vfs_tree_read_release(flags);
+      return -ENAMETOOLONG;
+    }
+    memcpy(buf, pfx, sizeof(pfx) - 1);
+    pos = sizeof(pfx) - 1;
+  }
   if (n == 0) {
-    buf[pos++] = '/'; /* the fd refers to the root itself */
+    if (!detached)
+      buf[pos++] = '/'; /* the fd refers to the root itself */
   } else {
     for (int i = n - 1; i >= 0; i--) {
       const char *name = parts[i];
@@ -6941,6 +7075,14 @@ static int path_is_under(const char *path, const char *under);
  * has, so on a machine that never unshared a mount namespace this walks the
  * table once and does nothing. */
 static void vfs_mount_propagate(int midx) {
+  /* A mount the new mount API has not given a place yet is anonymous in Linux
+   * and propagates nowhere. Here it sits under a private directory of "/", and
+   * "/" is shared: every namespace systemd set up for a service got a copy, and
+   * the copies outlived the slot. The next fsmount in that slot then found
+   * them under its own mount, and move_mount carried the whole stack along --
+   * six stray tmpfs mounts landed on /boot beneath the ESP and hid it. */
+  if (mount_is_detached(mounts[midx].target))
+    return;
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
 
@@ -7255,6 +7397,23 @@ int vfs_set_propagation(const char *target, u64 flags) {
   /* Linux allows a propagation change on any mountpoint; a path that is not
    * one is EINVAL. */
   return touched ? 0 : -EINVAL;
+}
+
+/* The flags of the mount a path resolves to, for fspick(2): its context starts
+ * from what the mount already is, so reconfiguring one option leaves the rest
+ * alone. */
+int vfs_mount_flags_at(const char *path, u64 *flags) {
+  struct vfs_node *node = vfs_find_node(path);
+  struct vfs_mount_entry *m;
+
+  if (IS_ERR(node))
+    return (int)PTR_ERR(node);
+  m = vfs_get_mount_for_node(node);
+  vfs_node_put(node);
+  if (!m)
+    return -EINVAL;
+  *flags = m->flags;
+  return 0;
 }
 
 int vfs_remount(const char *target, u64 flags) {
@@ -7803,6 +7962,9 @@ int vfs_move_mount(const char *source, const char *target) {
   dcache_invalidate_node(dst_node);
   vfs_node_put(old_mp);
   vfs_node_put(src_node);
+  /* The real root has arrived at "/": what waited for it can start. */
+  if (strcmp(dst, "/") == 0)
+    module_boot_root_arrived();
   mount_table_trace(dst);
   return 0;
 }
@@ -8490,6 +8652,56 @@ void vfs_mnt_ns_destroy(u32 ns) {
 
     if (n == 0)
       return; /* nothing left in this namespace */
+
+    for (usize i = 0; i < n; i++) {
+      module_put(owners[i]);
+      vfs_node_put(roots[i]);
+      vfs_node_put(mps[i]);
+    }
+  }
+}
+
+/* Drop every entry, in every namespace, mounted at or below `path`. For the
+ * private place of a detached mount only: a namespace cloned while the mount
+ * sat there got a copy of it, and nothing in that namespace will ever unmount
+ * a path it does not know it has. Left behind, the copy is found under the
+ * next mount built in that slot and moves along with it. */
+static void vfs_mounts_drop_under(const char *path) {
+  for (;;) {
+    struct vfs_node *roots[MNT_RELEASE_BATCH];
+    struct vfs_node *mps[MNT_RELEASE_BATCH];
+    struct module *owners[MNT_RELEASE_BATCH];
+    usize n = 0;
+
+    while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+      scheduler_yield();
+
+    for (usize i = 0; i < mount_hwm && n < MNT_RELEASE_BATCH; i++) {
+      if (!mounts[i].used || !path_is_under(mounts[i].target, path))
+        continue;
+      if (mount_root_refs(mounts[i].root_node) <= 1 && mounts[i].fstype[0]) {
+        for (struct vfs_fs *fs = filesystems; fs; fs = fs->next) {
+          if (strcmp(fs->name, mounts[i].fstype) != 0)
+            continue;
+          if (fs->umount && mounts[i].root_node)
+            fs->umount(mounts[i].root_node);
+          break;
+        }
+      }
+      roots[n] = mounts[i].root_node;
+      mps[n] = mounts[i].mount_point;
+      owners[n] = mounts[i].owner;
+      n++;
+      mounts[i].used = 0;
+      mounts[i].owner = 0;
+      mounts[i].root_node = 0;
+      mounts[i].mount_point = 0;
+    }
+
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+
+    if (n == 0)
+      return;
 
     for (usize i = 0; i < n; i++) {
       module_put(owners[i]);
@@ -9381,6 +9593,15 @@ int vfs_get_node_path(struct vfs_node *node, char *buf, usize buf_len) {
 
   usize pos = 0;
   buf[0] = '\0';
+  /* The detached-mount tree's prefix, as in vfs_fd_abspath. */
+  if (count > 0 && path_nodes[count - 1] == g_detached_root) {
+    static const char pfx[] = "/.b1nix-detached";
+
+    if (sizeof(pfx) > buf_len)
+      return -ENAMETOOLONG;
+    memcpy(buf, pfx, sizeof(pfx));
+    pos = sizeof(pfx) - 1;
+  }
   for (int i = count - 1; i >= 0; i--) {
     struct vfs_node *n = path_nodes[i];
     if (n->parent == NULL) {
@@ -10697,6 +10918,11 @@ isize vfs_setxattr(const char *path, const char *name, const void *value,
     return -ERANGE;
   if (size > XATTR_VALUE_MAX)
     return -E2BIG;
+  /* An empty value is an empty attribute, not a removal: a filesystem's
+   * callback (ext4's) reads a NULL value as "remove", so it is never handed
+   * one -- Linux's __vfs_setxattr does the same. */
+  if (!value)
+    value = "";
 
   struct vfs_node *node = xattr_lookup(path, nofollow);
   if (IS_ERR(node))
@@ -11060,9 +11286,8 @@ static int detached_claim(char *path_out, usize path_len, int as_dir) {
   if (id < 0)
     return -EMFILE;
 
-  /* The parent is created on first use rather than at boot: a machine that
-   * never touches the new mount API never grows the directory. */
-  (void)vfs_mkdir(DETACHED_MOUNT_DIR, 0700);
+  /* DETACHED_MOUNT_DIR itself is the root of a tree no filesystem holds
+   * (detached_root() above), so it always exists and never reaches a disk. */
 
   char path[VFS_MAX_PATH];
   snprintf(path, sizeof(path), "%s/%d", DETACHED_MOUNT_DIR, id);
@@ -11093,6 +11318,7 @@ static void detached_free_slot(int id) {
   copy_path(path, sizeof(path), detached_mounts[id].path);
   detached_mounts[id].used = 0;
   detached_release_lock();
+  vfs_mounts_drop_under(path);
   /* Whichever kind it was created as — one of the two removes it. */
   if (vfs_rmdir(path) < 0)
     (void)vfs_unlink(path);

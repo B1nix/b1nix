@@ -847,8 +847,35 @@ void sync_inodes_sb(struct super_block *sb)
 	 * walk is the superblock's list rather than a writeback queue, which
 	 * makes it proportional to the number of cached inodes — acceptable at
 	 * sync time and not something to do on a hot path. */
-	list_for_each_entry(inode, &sb->s_inodes, i_sb_list)
+	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+		struct writeback_control wbc = {
+			.sync_mode = WB_SYNC_ALL,
+			.nr_to_write = LONG_MAX,
+			.for_sync = 1,
+		};
+		unsigned long flags;
+		int dirty;
+
 		filemap_write_and_wait(inode->i_mapping);
+		/*
+		 * Then the inode itself, when it is dirty. A filesystem without a
+		 * journal keeps an inode's size and times in its own on-disk
+		 * record and writes that record only here: FAT's is the directory
+		 * entry, and skipping this left a file written in the initramfs
+		 * with its data on the disk and a size of zero. ext4 and btrfs
+		 * journal their inodes and answer a for_sync write at once.
+		 */
+		spin_lock_irqsave(&inode->i_lock, flags);
+		dirty = inode->i_state & I_DIRTY_INODE;
+		inode->i_state &= ~I_DIRTY_INODE;
+		spin_unlock_irqrestore(&inode->i_lock, flags);
+		if (dirty && sb->s_op && sb->s_op->write_inode &&
+		    sb->s_op->write_inode(inode, &wbc) < 0) {
+			spin_lock_irqsave(&inode->i_lock, flags);
+			inode->i_state |= dirty; /* not written: still dirty */
+			spin_unlock_irqrestore(&inode->i_lock, flags);
+		}
+	}
 }
 
 void writeback_inodes_sb(struct super_block *sb, enum wb_reason reason)

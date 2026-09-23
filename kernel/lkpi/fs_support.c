@@ -14,6 +14,7 @@
  */
 
 #include <linux/fs.h>
+#include <linux/time.h>
 #include <linux/pagemap.h>
 #include <linux/bio.h>
 #include <linux/blkdev.h>
@@ -1429,4 +1430,53 @@ int generic_encode_ino32_fh(struct inode *inode, __u32 *fh, int *max_len,
 	}
 	*max_len = len;
 	return type;
+}
+
+/* ── broken-down time ───────────────────────────────────────────── */
+
+/* This kernel keeps no timezone: gettimeofday reports UTC and settimeofday's
+ * timezone is not stored, so FAT's local time is UTC -- what Linux does too
+ * until something sets one. */
+struct timezone sys_tz;
+
+/* Seconds since the epoch, plus `offset`, as a calendar date. Days to a civil
+ * date by the era method: exact for every year, no tables. */
+void time64_to_tm(time64_t totalsecs, int offset, struct tm *result)
+{
+	s64 secs = totalsecs + offset;
+	s64 days = secs / 86400;
+	s64 rem = secs % 86400;
+
+	if (rem < 0) {
+		rem += 86400;
+		days--;
+	}
+	result->tm_hour = (int)(rem / 3600);
+	rem %= 3600;
+	result->tm_min = (int)(rem / 60);
+	result->tm_sec = (int)(rem % 60);
+	/* 1970-01-01 was a Thursday. */
+	result->tm_wday = (int)((4 + days % 7 + 7) % 7);
+
+	s64 z = days + 719468; /* days since 0000-03-01 */
+	s64 era = (z >= 0 ? z : z - 146096) / 146097;
+	s64 doe = z - era * 146097;
+	s64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+	s64 y = yoe + era * 400;
+	s64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100); /* from March 1st */
+	s64 mp = (5 * doy + 2) / 153;
+	s64 d = doy - (153 * mp + 2) / 5 + 1;
+	s64 m = mp < 10 ? mp + 3 : mp - 9;
+
+	if (m <= 2)
+		y++;
+	result->tm_mday = (int)d;
+	result->tm_mon = (int)(m - 1);
+	result->tm_year = (long)(y - 1900);
+	{
+		int leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+		/* Day of the year from January 1st: March-based doy shifted by
+		 * January and February (59 days, 60 in a leap year). */
+		result->tm_yday = (int)(m <= 2 ? doy - 306 : doy + 59 + leap);
+	}
 }

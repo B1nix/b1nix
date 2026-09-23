@@ -10,4 +10,10 @@
  */
 #include <linux/module.h>
 
+/* Evaluate `x`; if it is not there, ask for the module and evaluate it again.
+ * Every NLS table and filesystem here is built in, so the second look finds
+ * what the first did. */
+#define try_then_request_module(x, mod...) \
+	((x) ?: (request_module(mod), (x)))
+
 #endif /* LKPI_LINUX_KMOD_H */

@@ -41,10 +41,13 @@ mkdir -p "$OUT_DIR"
 # of waiting to learn nothing.
 qemu_boot() { # image serial-log
 	LOG="$2" REPO="$REPO" DEADLINE="$BOOT_TIMEOUT" SILENCE="${SILENCE:-45}" \
+		IMG_FORMAT="${IMG_FORMAT:-raw}" SNAPSHOT="${SNAPSHOT:-on}" \
 		sh "$ROOT_DIR/tools/run/run-distro.sh" "$1" >>"$LOG.run" 2>&1 || true
 }
 
-clean_log() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$1"; }
+# The guest's console ends lines with CR as well: left in, "apt-update=ok\r"
+# matched no `*=ok)` pattern and a passing check was reported as failed.
+clean_log() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g; s/\r$//' "$1"; }
 marker() { clean_log "$1" | grep -a "DISTRO-SMOKE: $2" | head -1; }
 
 # ── stage 1: build ──────────────────────────────────────────────────────────
@@ -55,7 +58,7 @@ else
 	info "building the overlay packages and the disk image"
 	sh "$ROOT_DIR/tools/deb/build-deb.sh" >>"$LOG" 2>&1 || stage_die build-packages
 	sh "$ROOT_DIR/tools/deb/publish-repo.sh" >>"$LOG" 2>&1 || stage_die publish-repo
-	CMDLINE_EXTRA="console=ttyS0 b1nix.smoke" sh "$ROOT_DIR/tools/image/mk-b1nix-image.sh" \
+	CMDLINE_EXTRA="console=ttyS0 b1nix.smoke ${DISTRO_EXTRA_CMDLINE:-}" sh "$ROOT_DIR/tools/image/mk-b1nix-image.sh" \
 		>>"$LOG" 2>&1 || stage_die build-image
 fi
 # The image's age is printed so that a stale one is visible in the log rather
@@ -154,10 +157,16 @@ if [ "$SKIP_BUILD" != "1" ]; then
 fi
 [ -f "$BROKEN_IMG" ] || stage_die no-broken-image
 
+# The four boots share one disk: each has to see the try the one before it
+# spent. A qcow2 overlay over the broken image is that disk, and throwaway --
+# the image itself is never written.
+_fb_disk="$OUT_DIR/distro-smoke-fallback.qcow2"
+rm -f "$_fb_disk"
+qemu-img create -q -f qcow2 -b "$BROKEN_IMG" -F raw "$_fb_disk" || stage_die fallback-overlay
 _fell_back=0
 for _try in 1 2 3 4; do
 	_bl="$OUT_DIR/distro-smoke-fallback-$_try.log"
-	qemu_boot "$BROKEN_IMG" "$_bl"
+	IMG_FORMAT=qcow2 SNAPSHOT=off qemu_boot "$_fb_disk" "$_bl"
 	if clean_log "$_bl" | grep -aq "DISTRO-SMOKE: done"; then
 		# The in-guest checks ran, so this boot reached userspace: the only
 		# kernel that can do that here is the good one.

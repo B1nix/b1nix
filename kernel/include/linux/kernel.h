@@ -289,6 +289,41 @@ int sscanf(const char *buf, const char *fmt, ...);
 int hex_dump_to_buffer(const void *buf, usize len, int rowsize, int groupsize,
                        char *linebuf, usize linebuflen, bool ascii);
 
+/* Hex digits one at a time (<linux/hex.h> upstream). FAT spells a name its
+ * charset cannot hold as ":xxxx", and reads the same form back. */
+#define hex_asc_lo(x) ("0123456789abcdef"[(x) & 0x0f])
+#define hex_asc_hi(x) ("0123456789abcdef"[((x) & 0xf0) >> 4])
+static inline char *hex_byte_pack(char *buf, u8 byte)
+{
+	*buf++ = hex_asc_hi(byte);
+	*buf++ = hex_asc_lo(byte);
+	return buf;
+}
+static inline int hex_to_bin(unsigned char ch)
+{
+	if (ch >= '0' && ch <= '9')
+		return ch - '0';
+	ch |= 0x20;
+	if (ch >= 'a' && ch <= 'f')
+		return ch - 'a' + 10;
+	return -1;
+}
+static inline int hex2bin(u8 *dst, const char *src, usize count)
+{
+	while (count--) {
+		int hi = hex_to_bin((unsigned char)*src++);
+		int lo;
+
+		if (hi < 0)
+			return -EINVAL;
+		lo = hex_to_bin((unsigned char)*src++);
+		if (lo < 0)
+			return -EINVAL;
+		*dst++ = (u8)((hi << 4) | lo);
+	}
+	return 0;
+}
+
 /* Has the kernel been marked with this taint flag? b1nix records no taint —
  * there are no out-of-tree modules and no known-bad states to mark — so the
  * answer is always no, which is the answer that makes callers take their

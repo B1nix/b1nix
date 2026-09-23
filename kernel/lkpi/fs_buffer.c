@@ -940,13 +940,132 @@ int generic_write_end(const struct kiocb *iocb, struct address_space *mapping,
 {
 	int ret;
 
+	struct inode *inode = mapping->host;
+	loff_t old_size = inode->i_size;
+
 	(void)iocb;
-	(void)mapping;
 	(void)fsdata;
 	ret = block_write_end(pos, len, copied, folio);
 	folio_unlock(folio);
 	folio_put(folio);
+	/*
+	 * A write that grew the file has changed the inode, and the filesystem
+	 * has to hear it: FAT keeps the size in the directory entry, and writes
+	 * that entry only for an inode marked dirty. Upstream marks it here,
+	 * after the folio is unlocked, because marking may take other locks.
+	 */
+	if (ret > 0 && i_size_read(inode) != old_size)
+		mark_inode_dirty(inode);
 	return ret;
+}
+
+/*
+ * Zero-fill from the end of a file up to `pos` through the ordinary write
+ * path. A filesystem that cannot have holes (FAT) must allocate and zero every
+ * block below a write past its end; `*bytes` is how far it has already done so
+ * and advances as blocks are filled. Upstream's cont_expand_zero.
+ */
+static int cont_expand_zero(const struct kiocb *iocb,
+                            struct address_space *mapping, loff_t pos,
+                            loff_t *bytes)
+{
+	struct inode *inode = mapping->host;
+	const struct address_space_operations *aops = mapping->a_ops;
+	unsigned int blocksize = i_blocksize(inode);
+	struct folio *folio;
+	void *fsdata = NULL;
+	pgoff_t index, curidx;
+	loff_t curpos;
+	unsigned zerofrom, offset, len;
+	int err = 0;
+
+	index = (pgoff_t)(pos >> PAGE_SHIFT);
+	offset = (unsigned)(pos & ~PAGE_MASK);
+
+	while (index > (curidx = (pgoff_t)((curpos = *bytes) >> PAGE_SHIFT))) {
+		zerofrom = (unsigned)(curpos & ~PAGE_MASK);
+		if (zerofrom & (blocksize - 1)) {
+			*bytes |= (blocksize - 1);
+			(*bytes)++;
+		}
+		len = PAGE_SIZE - zerofrom;
+
+		err = aops->write_begin(iocb, mapping, curpos, len, &folio, &fsdata);
+		if (err)
+			return err;
+		folio_zero_range(folio, offset_in_folio(folio, curpos), len);
+		err = aops->write_end(iocb, mapping, curpos, len, len, folio, fsdata);
+		if (err < 0)
+			return err;
+		if ((unsigned)err != len)
+			return -EIO;
+		err = 0;
+		balance_dirty_pages_ratelimited(mapping);
+	}
+
+	/* The folio holding the boundary: zero from the old end up to `pos`. */
+	if (index == curidx) {
+		zerofrom = (unsigned)(curpos & ~PAGE_MASK);
+		if (offset <= zerofrom)
+			return 0;
+		if (zerofrom & (blocksize - 1)) {
+			*bytes |= (blocksize - 1);
+			(*bytes)++;
+		}
+		len = offset - zerofrom;
+
+		err = aops->write_begin(iocb, mapping, curpos, len, &folio, &fsdata);
+		if (err)
+			return err;
+		folio_zero_range(folio, offset_in_folio(folio, curpos), len);
+		err = aops->write_end(iocb, mapping, curpos, len, len, folio, fsdata);
+		if (err < 0)
+			return err;
+		if ((unsigned)err != len)
+			return -EIO;
+		err = 0;
+	}
+	return err;
+}
+
+int cont_write_begin(const struct kiocb *iocb, struct address_space *mapping,
+                     loff_t pos, unsigned len, struct folio **foliop,
+                     void **fsdata, get_block_t *get_block, loff_t *bytes)
+{
+	struct inode *inode = mapping->host;
+	unsigned int blocksize = i_blocksize(inode);
+	unsigned int zerofrom;
+	int err;
+
+	(void)fsdata;
+	err = cont_expand_zero(iocb, mapping, pos, bytes);
+	if (err)
+		return err;
+
+	zerofrom = (unsigned)(*bytes & ~PAGE_MASK);
+	if (pos + len > *bytes && zerofrom & (blocksize - 1)) {
+		*bytes |= (blocksize - 1);
+		(*bytes)++;
+	}
+	return block_write_begin(mapping, pos, len, foliop, get_block);
+}
+
+int generic_cont_expand_simple(struct inode *inode, loff_t size)
+{
+	struct address_space *mapping = inode->i_mapping;
+	const struct address_space_operations *aops = mapping->a_ops;
+	struct folio *folio;
+	void *fsdata = NULL;
+	int err;
+
+	err = inode_newsize_ok(inode, size);
+	if (err)
+		return err;
+	err = aops->write_begin(NULL, mapping, size, 0, &folio, &fsdata);
+	if (err)
+		return err;
+	err = aops->write_end(NULL, mapping, size, 0, 0, folio, fsdata);
+	return err > 0 ? 0 : err;
 }
 
 void block_commit_write(struct folio *folio, size_t from, size_t to)
@@ -1190,4 +1309,121 @@ bool __folio_start_writeback(struct folio *folio, bool keep_write)
 	if (!was)
 		folio_start_writeback(folio);
 	return was;
+}
+
+/* ── the get_block generics a simple filesystem is built from ───── */
+
+/* Direct I/O: see the declaration in <linux/fs.h>. -ENOTBLK is the answer
+ * generic_file_read_iter takes as "use the page cache instead". */
+ssize_t blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
+                           struct iov_iter *iter, get_block_t get_block)
+{
+	(void)iocb; (void)inode; (void)iter; (void)get_block;
+	return -ENOTBLK;
+}
+
+/*
+ * The mpage entry points, block by block. Upstream builds one bio per run of
+ * contiguous blocks; here every buffer is its own request, which the block
+ * cache below merges. What the filesystem sees -- which blocks are asked for,
+ * which are mapped, what ends up on the disk -- is the same.
+ */
+int mpage_read_folio(struct folio *folio, get_block_t get_block)
+{
+	return block_read_full_folio(folio, get_block);
+}
+
+void mpage_readahead(struct readahead_control *rac, get_block_t get_block)
+{
+	struct folio *folio;
+
+	while ((folio = readahead_folio(rac)) != NULL)
+		block_read_full_folio(folio, get_block);
+}
+
+int mpage_writepages(struct address_space *mapping,
+                     struct writeback_control *wbc, get_block_t get_block)
+{
+	struct folio *folio = NULL;
+	int err = 0;
+
+	while ((folio = writeback_iter(mapping, wbc, folio, &err)))
+		err = block_write_full_page(folio_page(folio, 0), get_block, wbc);
+	return err;
+}
+
+/* bmap(2): the disk block behind a file block, 0 for a hole. */
+sector_t generic_block_bmap(struct address_space *mapping, sector_t block,
+                           get_block_t *get_block)
+{
+	struct inode *inode = mapping->host;
+	struct buffer_head tmp = { .b_size = i_blocksize(inode) };
+
+	get_block(inode, block, &tmp, 0);
+	return tmp.b_blocknr;
+}
+
+/*
+ * Zero the rest of the block a truncation ends in. The bytes past the new end
+ * are still on the disk; left alone, a later extension of the file would bring
+ * them back. A hole needs nothing.
+ */
+int block_truncate_page(struct address_space *mapping, loff_t from,
+                        get_block_t *get_block)
+{
+	pgoff_t index = (pgoff_t)(from >> PAGE_SHIFT);
+	struct inode *inode = mapping->host;
+	unsigned blocksize = i_blocksize(inode);
+	size_t offset, length, pos;
+	sector_t iblock;
+	struct folio *folio;
+	struct buffer_head *bh;
+	int err = 0;
+
+	length = (size_t)(from & (blocksize - 1));
+	if (!length)
+		return 0;
+	length = blocksize - length;
+	iblock = (sector_t)(((loff_t)index << PAGE_SHIFT) >> inode->i_blkbits);
+
+	folio = __filemap_get_folio(mapping, index, FGP_LOCK | FGP_ACCESSED |
+	                            FGP_CREAT, mapping_gfp_mask(mapping));
+	if (IS_ERR(folio))
+		return (int)PTR_ERR(folio);
+
+	bh = folio_buffers(folio);
+	if (!bh)
+		bh = folio_create_buffers(folio, blocksize, 0);
+	if (!bh) {
+		err = -ENOMEM;
+		goto unlock;
+	}
+
+	offset = offset_in_folio(folio, from);
+	pos = blocksize;
+	while (offset >= pos) {
+		bh = bh->b_this_page;
+		iblock++;
+		pos += blocksize;
+	}
+
+	if (!buffer_mapped(bh)) {
+		err = get_block(inode, iblock, bh, 0);
+		if (err || !buffer_mapped(bh))
+			goto unlock; /* an error, or a hole: nothing to zero */
+	}
+	if (folio_test_uptodate(folio))
+		set_buffer_uptodate(bh);
+	if (!buffer_uptodate(bh) && !buffer_delay(bh) && !buffer_unwritten(bh)) {
+		err = bh_read(bh, 0);
+		if (err < 0)
+			goto unlock;
+		err = 0;
+	}
+	folio_zero_range(folio, offset, length);
+	mark_buffer_dirty(bh);
+unlock:
+	folio_unlock(folio);
+	folio_put(folio);
+	return err;
 }

@@ -314,7 +314,13 @@ struct b1nix_statfs {
 #define B1NIX_POLLRDHUP 0x2000
 
 #define B1NIX_MSG_PEEK 0x02
+/* On a datagram socket: return the datagram's real length even when it is
+ * longer than the buffer (Linux's MSG_TRUNC for recv). */
+#define B1NIX_MSG_TRUNC 0x20
 #define B1NIX_MSG_DONTWAIT 0x40
+/* send on a datagram socket: more of this datagram follows (Linux MSG_MORE);
+ * the pieces leave as one datagram with the first send without it. */
+#define B1NIX_MSG_MORE 0x8000
 /* recvmsg: set FD_CLOEXEC on descriptors arriving as SCM_RIGHTS. A process that
  * receives a descriptor and then execs a helper is the normal case in an IPC
  * system (a browser's broker does it for every renderer it starts), and without

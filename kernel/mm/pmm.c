@@ -1570,6 +1570,14 @@ void pmm_free_frame(u64 frame) {
           console_write(current_task->name);
         }
         console_write("\n");
+        /* The immediate caller is kfree for every large block, which names no
+         * owner; the chain above it does. */
+        {
+          extern void arch_backtrace(u64 fp, u64 pc);
+
+          arch_backtrace((u64)(usize)__builtin_frame_address(0),
+                         (u64)(usize)__builtin_return_address(0));
+        }
         pmm_report_frame_free_site(frame);
         /* Is it still mapped? A frame that is parked in a bucket and also
          * reachable from a live address space is the whole diagnosis: the

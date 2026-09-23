@@ -27,6 +27,18 @@
 #define be16_to_cpup(p) be16_to_cpu(*(const __be16 *)(p))
 #define be32_to_cpup(p) be32_to_cpu(*(const __be32 *)(p))
 #define be64_to_cpup(p) be64_to_cpu(*(const __be64 *)(p))
+/* The double-underscore spellings the uapi headers use. */
+#define __cpu_to_le16(x) cpu_to_le16(x)
+#define __cpu_to_le32(x) cpu_to_le32(x)
+#define __cpu_to_le64(x) cpu_to_le64(x)
+#define __le16_to_cpu(x) le16_to_cpu(x)
+#define __le32_to_cpu(x) le32_to_cpu(x)
+#define __le64_to_cpu(x) le64_to_cpu(x)
+#define __cpu_to_be16(x) cpu_to_be16(x)
+#define __cpu_to_be32(x) cpu_to_be32(x)
+#define __be16_to_cpu(x) be16_to_cpu(x)
+#define __be32_to_cpu(x) be32_to_cpu(x)
+
 /* Byte swaps, spelled the way imported code spells them. */
 #define swab16(x) __builtin_bswap16((u16)(x))
 #define swab32(x) __builtin_bswap32((u32)(x))

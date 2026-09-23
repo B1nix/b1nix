@@ -56,7 +56,11 @@ STAGE_DIR="$ROOT_DIR/build/src/fs-${LINUX_VERSION}"
 
 mkdir -p "$SRC_PARENT"
 
-if [ -f "$STAGE_DIR/B1NIX-OBJECTS" ]; then
+# Bumped whenever this script stages something new, so a tree staged by an
+# older copy of it is replaced rather than silently built without the addition.
+STAGE_REV=3
+if [ -f "$STAGE_DIR/B1NIX-OBJECTS" ] &&
+	[ "$(cat "$STAGE_DIR/B1NIX-STAGE-REV" 2>/dev/null)" = "$STAGE_REV" ]; then
 	echo "$STAGE_DIR"
 	exit 0
 fi
@@ -148,6 +152,23 @@ tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
 	"linux-${LINUX_VERSION}/include/linux/mbcache.h" \
 	"linux-${LINUX_VERSION}/include/linux/maple_tree.h"
 
+# FAT, which is what an EFI system partition is: the boot-counting state lives
+# there, so /boot has to be a filesystem this kernel can write, with long names
+# and the exact on-disk rules every firmware and every other OS reads back. It
+# stands on buffer heads, as ext4 does, and on the character-set tables in
+# fs/nls -- the three every FAT mount asks for by default: codepage 437 for
+# short names, iso8859-1 and utf8 for long ones. nls.h and msdos_fs.h are
+# their interfaces, the second with its on-disk uapi half.
+tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
+	"linux-${LINUX_VERSION}/fs/fat" \
+	"linux-${LINUX_VERSION}/fs/nls/nls_base.c" \
+	"linux-${LINUX_VERSION}/fs/nls/nls_cp437.c" \
+	"linux-${LINUX_VERSION}/fs/nls/nls_iso8859-1.c" \
+	"linux-${LINUX_VERSION}/fs/nls/nls_utf8.c" \
+	"linux-${LINUX_VERSION}/include/linux/nls.h" \
+	"linux-${LINUX_VERSION}/include/linux/msdos_fs.h" \
+	"linux-${LINUX_VERSION}/include/uapi/linux/msdos_fs.h"
+
 # The uapi headers the three trees include. Named individually rather than
 # staging include/uapi/linux wholesale: that directory is 500 files, most of
 # them nothing to do with a filesystem, and a wholesale copy would shadow the
@@ -208,6 +229,13 @@ emit_objs() {
 	# Two single files pulled out of larger directories: there is no -y list to
 	# read for either, so naming them is the honest form.
 	echo "fs/mbcache.c"
+	# msdos-y is a one-line assignment followed by a blank line, so the range
+	# above runs on into the KUnit line after it; KUnit is not built here.
+	emit_objs fs/fat fat-y vfat-y msdos-y | grep -v '_test\.c$'
+	echo "fs/nls/nls_base.c"
+	echo "fs/nls/nls_cp437.c"
+	echo "fs/nls/nls_iso8859-1.c"
+	echo "fs/nls/nls_utf8.c"
 	echo "lib/maple_tree.c"
 	echo "lib/xarray.c"
 	echo "lib/radix-tree.c"
@@ -232,6 +260,7 @@ if [ "$count" -lt 95 ]; then
 	exit 1
 fi
 
+echo "$STAGE_REV" > "$STAGE_DIR.tmp/B1NIX-STAGE-REV"
 rm -rf "$STAGE_DIR"
 mv "$STAGE_DIR.tmp" "$STAGE_DIR"
 echo "fetch-linux-fs: staged $count objects" >&2

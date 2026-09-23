@@ -49,6 +49,11 @@
 #include <linux/srcu.h>
 #include <linux/dcache.h>
 #include <linux/uuid.h>
+/* Upstream's uapi <linux/fs.h> brings the ioctl encoding with it, and uapi
+ * headers that define ioctl numbers (msdos_fs.h) count on that. */
+#include <linux/ioctl.h>
+/* struct tm and the timezone, which upstream reaches through <linux/time.h>. */
+#include <linux/time.h>
 /* pfn_t, for the DAX interfaces named in <linux/dax.h>. */
 #include <linux/pfn_t.h>
 /* `enum migrate_mode` appears in address_space_operations below, and both
@@ -231,6 +236,8 @@ struct qstr {
 typedef kuid_t vfsuid_t;
 typedef kgid_t vfsgid_t;
 static inline kuid_t vfsuid_into_kuid(vfsuid_t vfsuid) { return vfsuid; }
+static inline bool vfsuid_eq_kuid(vfsuid_t vfsuid, kuid_t kuid)
+{ return uid_eq(vfsuid, kuid); }
 static inline kgid_t vfsgid_into_kgid(vfsgid_t vfsgid) { return vfsgid; }
 
 struct iattr {
@@ -860,6 +867,12 @@ enum inode_i_mutex_lock_class {
 #define S_IXOTH 00001
 #define S_IRWXUGO (S_IRWXU | S_IRWXG | S_IRWXO)
 #define S_IALLUGO (S_ISUID | S_ISGID | S_ISVTX | S_IRWXUGO)
+#ifndef S_IRUGO
+#define S_IRUGO (S_IRUSR | S_IRGRP | S_IROTH)
+#endif
+#ifndef S_IWUGO
+#define S_IWUGO (S_IWUSR | S_IWGRP | S_IWOTH)
+#endif
 
 #define IS_RDONLY(inode)    sb_rdonly((inode)->i_sb)
 #define IS_SYNC(inode)      (((inode)->i_sb->s_flags & SB_SYNCHRONOUS) || \
@@ -1524,6 +1537,8 @@ void simple_release_fs(struct vfsmount **mount, int *count);
 /* Flush a block device's own cache of metadata. Called at unmount and before a
  * superblock write that must be ordered against everything before it. */
 int sync_blockdev(struct block_device *bdev);
+/* Start writing the device's dirty blocks without waiting for them. */
+int sync_blockdev_nowait(struct block_device *bdev);
 int sync_blockdev_range(struct block_device *bdev, loff_t lstart, loff_t lend);
 void invalidate_bdev(struct block_device *bdev);
 /* Resolve a path to the block device it names, without opening it. */
@@ -1558,6 +1573,12 @@ static inline void inode_fsgid_set(struct inode *inode, struct mnt_idmap *idmap)
 
 struct inode *new_inode(struct super_block *sb);
 struct inode *iget_locked(struct super_block *sb, unsigned long ino);
+/* An inode number no inode of `sb` has, above `max_reserved`: FAT has no
+ * inode numbers on disk and hands these out. */
+unsigned long iunique(struct super_block *sb, unsigned long max_reserved);
+/* A PATH_MAX buffer for a name being converted (the names_cache upstream). */
+#define __getname() kmalloc(PATH_MAX, GFP_KERNEL)
+#define __putname(name) kfree(name)
 struct inode *ilookup(struct super_block *sb, unsigned long ino);
 struct inode *ilookup5(struct super_block *sb, unsigned long hashval,
                        int (*test)(struct inode *, void *), void *data);
@@ -1706,6 +1727,13 @@ static inline bool ra_has_index(struct file_ra_state *ra, pgoff_t index)
 struct buffer_head;
 typedef int (get_block_t)(struct inode *inode, sector_t iblock,
                           struct buffer_head *bh_result, int create);
+/* Direct I/O through a get_block filesystem. The bridge reads and writes
+ * through the page cache, so there is no direct path to take, and -ENOTBLK is
+ * the answer that sends the caller to the buffered one. */
+struct kiocb;
+struct iov_iter;
+ssize_t blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
+                           struct iov_iter *iter, get_block_t get_block);
 
 int generic_file_open(struct inode *inode, struct file *filp);
 ssize_t generic_file_read_iter(struct kiocb *iocb, struct iov_iter *iter);
@@ -1714,6 +1742,8 @@ ssize_t __generic_file_write_iter(struct kiocb *iocb, struct iov_iter *from);
 ssize_t generic_perform_write(struct kiocb *iocb, struct iov_iter *iter);
 int generic_write_checks(struct kiocb *iocb, struct iov_iter *from);
 int generic_file_mmap(struct file *file, struct vm_area_struct *vma);
+struct vm_area_desc;
+int generic_file_mmap_prepare(struct vm_area_desc *desc);
 int generic_file_readonly_mmap(struct file *file, struct vm_area_struct *vma);
 loff_t generic_file_llseek(struct file *file, loff_t offset, int whence);
 loff_t generic_file_llseek_size(struct file *file, loff_t offset, int whence,
@@ -1728,6 +1758,9 @@ ssize_t iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
                                loff_t *ppos, size_t len, unsigned int flags);
 int generic_file_fsync(struct file *file, loff_t start, loff_t end,
                        int datasync);
+/* The same without flushing the device's write cache; the caller does that. */
+int __generic_file_fsync(struct file *file, loff_t start, loff_t end,
+                         int datasync);
 int file_write_and_wait_range(struct file *file, loff_t lstart, loff_t lend);
 int file_check_and_advance_wb_err(struct file *file);
 int filemap_write_and_wait_range(struct address_space *mapping, loff_t lstart,
@@ -2029,6 +2062,7 @@ static inline u32 new_encode_dev(dev_t dev)
 
 	return (minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12);
 }
+static inline u64 huge_encode_dev(dev_t dev) { return new_encode_dev(dev); }
 static inline dev_t new_decode_dev(u32 dev)
 {
 	unsigned major = (dev & 0xfff00) >> 8;

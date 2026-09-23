@@ -24,6 +24,13 @@ echo "DEBIAN-SMOKE: start pid=$$"
 ok() { echo "DEBIAN-SMOKE: ok $1"; }
 bad() { echo "DEBIAN-SMOKE: FAIL $1 status=${2:-1}"; }
 
+# `tmark <label>` — where the time goes. The guest's uptime at a stage
+# boundary, so the host can tell a slow boot from a slow stage. /proc may not
+# be mounted yet at the first call; the mark is then simply absent.
+tmark() {
+	read -r _up _ </proc/uptime 2>/dev/null && echo "DEBIAN-SMOKE: time $1 up=$_up"
+}
+
 # `expect <label> <want> <got>` — one comparison, one marker.
 expect() {
 	if [ "$2" = "$3" ]; then
@@ -33,6 +40,7 @@ expect() {
 	fi
 }
 
+tmark stage1
 # ── Stage 1: a glibc dynamic binary ran ────────────────────────────────────
 # The marker text itself is produced by the Debian /bin/dash, so it cannot be
 # printed unless a real glibc ELF executed and its libc resolved.
@@ -51,6 +59,7 @@ else
 	bad ld-present 1
 fi
 
+tmark stage2
 # ── Stage 2: distro coreutils ──────────────────────────────────────────────
 # /proc has to exist before ps, mount and dmesg mean anything.
 mount -t proc proc /proc 2>/dev/null || echo "DEBIAN-SMOKE: note mount-proc status=$?"
@@ -88,6 +97,7 @@ else
 	bad stage2-coreutils 1
 fi
 
+tmark stage3
 # ── Stage 3: running under a real init ─────────────────────────────────────
 # Read PID 1 from /proc rather than from `ps`: plain `ps` lists only the
 # processes sharing this terminal, so it says nothing about init at all.
@@ -109,6 +119,14 @@ b1nix-stage.sh | sh | dash)
 	;;
 esac
 
+# A liburing part boot (b1nix.liburing-part=N/M) runs its slice of the suite
+# and nothing else. Stages 4-13 and 15-17 are the boot without liburing's; run
+# in every part as well they only repeated the same verdicts M times over.
+lu_part_boot=
+grep -q 'b1nix\.liburing-part=' /proc/cmdline 2>/dev/null && lu_part_boot=1
+
+if [ -z "$lu_part_boot" ]; then # stages 4-13
+tmark stage4
 # ── Stage 4: processes and signals, through the distro's own tools ─────────
 # Mirrors what m12_smoke and m15_smoke assert: exit status propagation, zombie
 # reaping, session and process groups, signal delivery, and a blocked signal
@@ -181,6 +199,7 @@ else
 	bad proc-perl 127
 fi
 
+tmark stage5
 # ── Stage 5: file descriptors across exec ──────────────────────────────────
 # Mirrors m12/m13: dup2, an inherited descriptor, and one that close-on-exec
 # takes away.
@@ -210,6 +229,7 @@ if command -v perl >/dev/null 2>&1; then
 	' || bad fd-perl $?
 fi
 
+tmark stage6
 # ── Stage 6: the errno matrix ──────────────────────────────────────────────
 # Mirrors m17_smoke. perl reports errno numerically, so these are real codes
 # rather than message text.
@@ -235,6 +255,7 @@ if command -v perl >/dev/null 2>&1; then
 	' || bad errno-perl $?
 fi
 
+tmark stage7
 # ── Stage 7: memory ────────────────────────────────────────────────────────
 # A 64 MiB allocation that is written and read back exercises the same brk and
 # mmap paths m13 covers, through glibc malloc instead of ours.
@@ -255,6 +276,7 @@ if command -v perl >/dev/null 2>&1; then
 	fi
 fi
 
+tmark stage8
 # ── Stage 8: System V IPC, with util-linux ─────────────────────────────────
 # Mirrors m15_smoke's shm/mq/semaphore markers.
 if command -v ipcmk >/dev/null 2>&1 && command -v ipcs >/dev/null 2>&1; then
@@ -288,6 +310,7 @@ else
 	bad ipc-tools 127
 fi
 
+tmark stage9
 # ── Stage 9: job control ───────────────────────────────────────────────────
 # Mirrors m13_job_control: a stopped job really stops, and continues on SIGCONT.
 if command -v bash >/dev/null 2>&1; then
@@ -311,6 +334,7 @@ else
 	bad job-bash 127
 fi
 
+tmark stage10
 # ── Stage 10: clocks and timeouts ──────────────────────────────────────────
 # Mirrors m15's clock-timer: time has to move, and a timeout has to fire.
 t0=$(date +%s)
@@ -328,6 +352,7 @@ else
 	bad timeout-fires 127
 fi
 
+tmark stage11
 # ── Stage 11: the rest of our own tests' kernel surfaces ───────────────────
 # exec limits (m13), POSIX mq, signal ignore and permissions (m15), O_PATH,
 # O_NOFOLLOW, renameat2 and EROFS (m17), mremap (m12) -- through glibc and
@@ -412,6 +437,7 @@ else
 	bad "errno-erofs (mount -o ro failed)"
 fi
 
+tmark stage12
 # ── Stage 12: system calls Linux added later (M124) ────────────────────────
 # Called by number from perl, and judged by their results: a call that merely
 # stops answering ENOSYS proves nothing. x86_64 numbers.
@@ -723,6 +749,7 @@ if [ -x /usr/bin/perl ] && [ "$(uname -m)" = x86_64 ]; then
 	' && ok vdso-glibc || bad vdso-glibc $?
 fi
 
+tmark stage13
 # ── Stage 13: namespaces through systemd-nspawn (M123) ─────────────────────
 # Debian's own container manager starts a command in new PID, mount, UTS, IPC
 # and cgroup namespaces over a tree that shares the host's /usr read-only.
@@ -770,6 +797,9 @@ if [ -x /usr/bin/systemd-nspawn ]; then
 	fi
 fi
 
+fi # stages 4-13
+
+tmark stage14
 # ── Stage 14: liburing's own test suite (M125) ─────────────────────────────
 # The suite is staged at /opt/liburing by tools/image/mk-debian-image.sh when
 # tools/image/fetch-liburing.sh has built it. Each test is a program whose
@@ -809,11 +839,37 @@ if [ -d /opt/liburing ] && ls /opt/liburing/*.t >/dev/null 2>&1; then
 	# syscall log to say which write and what it answered.
 	lu_strace=$(sed -n 's/.*b1nix\.liburing-strace=\([^ ]*\).*/\1/p' \
 		/proc/cmdline 2>/dev/null | tr ',' ' ')
+	# b1nix.liburing-taskdump=<comma-separated names> dumps the kernel's task
+	# table to the console after each of those tests: what a test left behind
+	# when the next one cannot fork, or hangs.
+	lu_taskdump=$(sed -n 's/.*b1nix\.liburing-taskdump=\([^ ]*\).*/\1/p' \
+		/proc/cmdline 2>/dev/null | tr ',' ' ')
+	# b1nix.liburing-perf=<comma-separated names> runs those tests under the
+	# distribution's perf record and prints the top of the report: where a
+	# test that is merely slow spends its time, kernel side included.
+	lu_perf=$(sed -n 's/.*b1nix\.liburing-perf=\([^ ]*\).*/\1/p' \
+		/proc/cmdline 2>/dev/null | tr ',' ' ')
+	lu_perf_bin=perf
+	for cand in /usr/lib/linux-tools/*/perf /usr/lib/linux-tools-*/perf; do
+		[ -x "$cand" ] && lu_perf_bin="$cand"
+	done
+	# b1nix.liburing-hangdump (no value) dumps the task table one second
+	# before a test's kill timeout -- while the hang is still there to see.
+	lu_hangdump=
+	grep -q 'b1nix\.liburing-hangdump' /proc/cmdline 2>/dev/null && lu_hangdump=1
 	lu_pn=${lu_part%%/*}
 	lu_pm=${lu_part##*/}
 	lu_idx=0
+	# b1nix.liburing-repeat=<n> runs each selected test n times: a test that
+	# hangs one run in ten needs the ten runs to be seen at all.
+	lu_rep=$(sed -n 's/.*b1nix\.liburing-repeat=\([0-9]*\).*/\1/p' \
+		/proc/cmdline 2>/dev/null)
+	lu_rep=${lu_rep:-1}
 	echo "DEBIAN-SMOKE: liburing suite starts"
-	for t in /opt/liburing/*.t; do
+	for t in $(for x in /opt/liburing/*.t; do
+		r=0
+		while [ "$r" -lt "$lu_rep" ]; do echo "$x"; r=$((r + 1)); done
+	done); do
 		n=$(basename "$t" .t)
 		if [ -n "$lu_part" ]; then
 			lu_idx=$((lu_idx + 1))
@@ -832,14 +888,40 @@ if [ -d /opt/liburing ] && ls /opt/liburing/*.t >/dev/null 2>&1; then
 			;;
 		esac
 		_pfx=""
+		case " $lu_perf " in
+		*" $n "*)
+			_pfx="$lu_perf_bin record -g -F 499 -o /tmp/lu-perf.data --"
+			;;
+		esac
 		case " $lu_strace " in
 		*" $n "*)
 			command -v strace >/dev/null 2>&1 &&
 				_pfx="strace -f -y -s 96"
 			;;
 		esac
-		timeout -s KILL "$lu_to" $_pfx "$t" >/tmp/liburing-run/out 2>&1
+		# A test whose own sleeps add up past the kill timeout gets the time
+		# it sleeps for: multicqes_drain sleeps 2 s in each of its 10 rounds.
+		_to=$lu_to
+		case $n in
+		multicqes_drain) [ "$_to" -ge 40 ] || _to=40 ;;
+		esac
+		read -r _t0 _ </proc/uptime
+		_w=
+		if [ -n "$lu_hangdump" ]; then
+			# The dump goes to the console, which is quiet after init: open it
+			# for the dump alone (syslog's console level), so the run up to the
+			# hang is timed as it is without the dump.
+			(sleep $((_to - 1)) && dmesg -n 8 2>/dev/null &&
+				cat /proc/b1nix-tasks >/dev/null 2>&1; dmesg -n 4 2>/dev/null
+				# A stalled connection shows in its queues.
+				sed 's/^/DEBIAN-SMOKE: net-tcp /' /proc/net/tcp 2>/dev/null) &
+			_w=$!
+		fi
+		timeout -s KILL "$_to" $_pfx "$t" >/tmp/liburing-run/out 2>&1
 		rc=$?
+		[ -z "$_w" ] || kill "$_w" 2>/dev/null
+		read -r _t1 _ </proc/uptime
+		echo "DEBIAN-SMOKE: liburing-time $n rc=$rc $(echo "$_t0 $_t1" | awk '{printf "%.2f", $2 - $1}')s"
 		case $rc in
 		0)
 			lu_pass=$((lu_pass + 1))
@@ -858,6 +940,17 @@ if [ -d /opt/liburing ] && ls /opt/liburing/*.t >/dev/null 2>&1; then
 			echo "DEBIAN-SMOKE: liburing-fail $n rc=$rc $(tail -3 /tmp/liburing-run/out 2>/dev/null | tr -d '\r' | tr '\n' '|')"
 			;;
 		esac
+		case " $lu_taskdump " in
+		*" $n "*) cat /proc/b1nix-tasks >/dev/null 2>&1 ;;
+		esac
+		case " $lu_perf " in
+		*" $n "*)
+			"$lu_perf_bin" report -i /tmp/lu-perf.data --stdio --no-children \
+				--sort sym 2>&1 | grep -v '^#' | grep -v '^$' | head -60 |
+				sed 's/^/DEBIAN-SMOKE: liburing-perf /'
+			rm -f /tmp/lu-perf.data
+			;;
+		esac
 		# A single named test is somebody working on that one failure: print
 		# everything it said, not the two lines a whole-suite run can afford.
 		if [ -n "$lu_only" ]; then
@@ -873,6 +966,8 @@ if [ -d /opt/liburing ] && ls /opt/liburing/*.t >/dev/null 2>&1; then
 	echo "DEBIAN-SMOKE: ok liburing-suite-ran"
 fi
 
+if [ -z "$lu_part_boot" ]; then # stages 15-17
+tmark stage15
 # ── Stage 15: fio through its io_uring engine (M125) ───────────────────────
 # A consumer that is not a test suite. fio's io_uring engine drives the rings
 # itself rather than through liburing, so it is a second, independent reading
@@ -911,6 +1006,7 @@ if command -v fio >/dev/null 2>&1; then
 	rm -f /tmp/fio-uring.dat
 fi
 
+tmark stage16
 # ── Stage 16: the distribution's own perf (M126) ───────────────────────────
 # perf is the reason perf_event_open(2) exists, and it is a far harder user of
 # it than a hand-written test: it opens counters by name, mmaps a ring buffer,
@@ -1002,6 +1098,7 @@ else
 	echo "DEBIAN-SMOKE: note perf is not installed in this image"
 fi
 
+tmark stage17
 # ── Stage 17: suspend, through the distribution's own tools (M129) ─────────
 # `rtcwake` is what a Debian user (and every laptop lid) reaches for: it arms
 # the RTC alarm through /dev/rtc0's ioctls and writes the state to
@@ -1036,6 +1133,9 @@ else
 	echo "DEBIAN-SMOKE: note /sys/power/state is absent"
 fi
 
+fi # stages 15-17
+
+tmark end
 echo "DEBIAN-SMOKE: done"
 
 # Let QEMU exit on its own where possible; the host harness kills it on timeout

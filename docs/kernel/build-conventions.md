@@ -1,6 +1,6 @@
 # Build and smoke conventions
 
-Three rules that keep the build fast and the smoke results honest.
+The rules that keep the build fast and the smoke results honest.
 
 ## A per-file tool loop must be skippable
 
@@ -58,6 +58,32 @@ deadline says what it was waiting for when it fired.
 
 The rule behind all three: when an experiment can only tell you something by
 finishing, make it finish quickly or say why it did not.
+
+## A lane of many boots builds once and boots in parallel
+
+`tests/debian-smoke.sh` is thirteen boots: one runs every stage but liburing,
+twelve run a slice of liburing's suite each (`LIBURING_PARTS`) and nothing
+else. It took 20-40 minutes and now takes under two. The time was not in the
+guests. The whole harness without liburing runs in 8 s of guest time. It went
+to three things:
+
+- Every boot ran `make iso`, and every `make` repacked the 274 MiB root image,
+  because two recipes flipped five library links between a file and a link.
+  The ISO stage directory also kept an earlier build's `rootfs.img`, so a
+  lane that asked for no root module packed 570 MB anyway. `mkiso.sh` now
+  clears modules this build did not name. Look for the same pattern whenever
+  a no-op build is slow: `find <tree> -newer <image>` names the file.
+- The kernel is built once. Each boot gets its own ISO from `mkiso.sh` (the
+  command line lives in the boot loader's config) and runs on its own qcow2
+  overlay of one scratch image, so no boot copies or resets the image.
+- The boots run `DEBIAN_JOBS` at a time: six on an 8-CPU host, which measured
+  the same passes and timeouts as four. `DEBIAN_BOOTS="base 3"` runs a
+  subset. Every step prints `[TIME]`, and the harness prints its uptime at each
+  stage boundary and each liburing test's duration.
+
+What remains is liburing's hangs. Each one costs its 20 s kill timeout, and
+they are two thirds of the guest time. They are kernel bugs, not a lane
+setting.
 
 ## The kernel may be loaded anywhere, and says where it was
 

@@ -4025,6 +4025,34 @@ static int vmm_handle_page_fault_inner(u64 fault_addr, u64 error_code) {
         *resolved_va = page_aligned;
         *resolved_repeat = 0;
       }
+      /* The entry above was read from the task's own tables; the processor
+       * walks whatever CR3 holds. When the two differ, "retry" retries a walk
+       * of some other address space for ever -- a vfork child of systemd spun
+       * here on an instruction fetch, and PID 1, waiting for it to exec, took
+       * the boot down with it. Load the task's space, and say so once with
+       * enough to find whoever left CR3 behind. */
+      if (current_task && current_task->pml4_phys &&
+          paging_cr3_to_pml4(read_cr3()) != current_task->pml4_phys) {
+        static int cr3_reported;
+
+        if (!__atomic_exchange_n(&cr3_reported, 1, __ATOMIC_ACQ_REL)) {
+          console_write("paging: CR3 is not the faulting task's address space: pid ");
+          console_write_dec((u64)current_task->id);
+          console_write(" ");
+          console_write(current_task->name ? current_task->name : "(none)");
+          console_write(" cr3-pml4 0x");
+          console_write_hex64(paging_cr3_to_pml4(read_cr3()));
+          console_write(" task-pml4 0x");
+          console_write_hex64(current_task->pml4_phys);
+          console_write(" loaded 0x");
+          console_write_hex64(rs_pcpu ? rs_pcpu->loaded_pml4_phys : 0);
+          console_write("\n");
+        }
+        if (rs_pcpu)
+          rs_pcpu->loaded_pml4_phys = 0; /* the record is wrong too */
+        paging_switch_address_space(current_task->pml4_phys);
+        return 0;
+      }
       if ((++*resolved_repeat % 8u) == 0u) {
         u64 cr3;
 

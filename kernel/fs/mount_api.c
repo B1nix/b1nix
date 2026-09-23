@@ -99,6 +99,10 @@ struct fsctx_state {
    * fsmount, and dropping the reference there made that last step fail with
    * EINVAL — the whole credentials sequence, one call from done. */
   int owns_mount;
+  /* fspick(2): a context onto a mount that already exists, named by the
+   * path it was picked at. CMD_RECONFIGURE then remounts that mount. */
+  int picked;
+  char pick_path[VFS_MAX_PATH];
 };
 
 /* What fsmount and open_tree hand back.
@@ -326,6 +330,50 @@ int vfs_fsopen(const char *fstype, u32 flags) {
   return fd;
 }
 
+/* fspick(2) flags. */
+#define FSPICK_CLOEXEC 0x1u
+#define FSPICK_VALID   0xfu
+
+int vfs_fspick(const char *path, u32 flags) {
+  u64 cur = 0;
+  int rc;
+
+  if (!path || (flags & ~FSPICK_VALID))
+    return -EINVAL;
+  if (!vfs_may_mount())
+    return -EPERM;
+  rc = vfs_mount_flags_at(path, &cur);
+  if (rc < 0)
+    return rc;
+
+  struct fsctx_state *ctx = kzalloc(sizeof(*ctx));
+  if (!ctx)
+    return -ENOMEM;
+  ctx->detached_id = -1;
+  ctx->picked = 1;
+  strncpy(ctx->pick_path, path, sizeof(ctx->pick_path) - 1);
+  ctx->flags = cur & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC |
+                      MS_NOATIME | MS_NODIRATIME);
+
+  struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_FSCTX);
+  if (!h) {
+    kfree(ctx);
+    return -ENFILE;
+  }
+  h->private_data = ctx;
+  h->ops = &fsctx_ops;
+  h->flags = B1NIX_O_RDWR;
+
+  int fd = scheduler_fd_alloc(h);
+  if (fd < 0) {
+    vfs_handle_release(h);
+    return fd == -ENOMEM ? -ENOMEM : -EMFILE;
+  }
+  if (flags & FSPICK_CLOEXEC)
+    scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
+  return fd;
+}
+
 int vfs_fsconfig(int fd, u32 cmd, const char *key, const char *value,
                  int aux) {
   (void)aux;
@@ -368,6 +416,14 @@ int vfs_fsconfig(int fd, u32 cmd, const char *key, const char *value,
     }
     return 0;
   case FSCONFIG_CMD_RECONFIGURE:
+    if (ctx->picked) {
+      /* The mount fspick named: the options gathered on this context are its
+       * new flags, which is mount(MS_REMOUNT) spelled the new way -- how
+       * util-linux's mount(8) remounts "/" for systemd-remount-fs. */
+      rc = vfs_remount(ctx->pick_path, ctx->flags | MS_REMOUNT);
+      mount_api_trace("fsconfig-reconfigure-picked", cmd, key, rc);
+      return rc;
+    }
     /* Apply the options gathered since CMD_CREATE to the filesystem that call
      * built. This is how a caller seals a mount after filling it: systemd
      * creates the credentials tmpfs, writes the credentials into it, then sets

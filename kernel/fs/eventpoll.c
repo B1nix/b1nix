@@ -1059,6 +1059,25 @@ static void epoll_release(struct vfs_handle *h) {
  * itself not ready rather than following the loop. */
 static u32 epoll_match(struct epoll_watch *w, u32 revents);
 
+static int g_epoll_peek_depth[MAX_CPUS];
+
+/* Whether the poll running now is an epoll answering "is anything ready" for
+ * the epoll that contains it, rather than a wait that reports to userspace. A
+ * file whose poll consumes the event it reports (mountinfo's POLLPRI) must
+ * not consume it here: the report goes nowhere, and the real wait on the
+ * inner epoll then finds nothing. That is how systemd -- whose own epoll
+ * watches libmount's -- lost the mountinfo change for a mount it had just
+ * made, and failed the unit with "Mount process finished, but there is no
+ * mount". Linux's nested epoll only looks at the ready list; it never runs a
+ * consuming ->poll for this. */
+int epoll_poll_peeking(void) {
+  int cpu = (int)percpu_read(cpu_id);
+
+  if (cpu < 0 || cpu >= MAX_CPUS)
+    cpu = 0;
+  return g_epoll_peek_depth[cpu] > 0;
+}
+
 static int epoll_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   /* Per-CPU, spelled out.
    *
@@ -1082,6 +1101,7 @@ static int epoll_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
     return 0;
 
   depth[dcpu]++;
+  g_epoll_peek_depth[dcpu]++;
   for (int i = 0; i < ep->capacity; i++) {
     if (!ep->watch[i].used)
       continue;
@@ -1100,6 +1120,7 @@ static int epoll_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
       break;
     }
   }
+  g_epoll_peek_depth[dcpu]--;
   depth[dcpu]--;
   return 0;
 }

@@ -71,6 +71,9 @@
 #define EINPROGRESS    115
 #define ESTALE         116
 #define EREMOTEIO      121
+/* A byte sequence that is not a character in the charset asked for: the NLS
+ * tables answer it for a name FAT cannot store. */
+#define EILSEQ          84
 #define ENOTSUP        EOPNOTSUPP
 #define EDEADLOCK      EDEADLK
 /*

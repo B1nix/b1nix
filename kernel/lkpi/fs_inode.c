@@ -250,6 +250,25 @@ static void wait_on_inode_new(struct inode *inode)
 	}
 }
 
+unsigned long iunique(struct super_block *sb, unsigned long max_reserved)
+{
+	/* One counter for every superblock, as upstream's: the numbers only have
+	 * to be unique within one, and a shared counter makes that cheap. */
+	static unsigned long counter;
+	unsigned long flags;
+	unsigned long res;
+
+	inode_hash_init();
+	spin_lock_irqsave(&inode_hash_lock, flags);
+	do {
+		if (counter <= max_reserved)
+			counter = max_reserved + 1;
+		res = counter++;
+	} while (find_inode_locked(sb, res, NULL, NULL, res));
+	spin_unlock_irqrestore(&inode_hash_lock, flags);
+	return res;
+}
+
 struct inode *iget_locked(struct super_block *sb, unsigned long ino)
 {
 	struct inode *inode;

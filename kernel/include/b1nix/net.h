@@ -293,6 +293,8 @@ struct net_sock_info {
 	u16 local_port;
 	u16 remote_port;
 	int state;
+	u32 tx_queue; /* bytes sent and not yet acknowledged */
+	u32 rx_queue; /* bytes received and not yet read */
 };
 usize tcp_conn_snapshot(struct net_sock_info *out, usize max);
 usize udp_binding_snapshot(struct net_sock_info *out, usize max);

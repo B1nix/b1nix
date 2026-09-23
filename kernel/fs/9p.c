@@ -614,9 +614,13 @@ static int p9_vfs_lookup(struct vfs_node *dir, const char *name) {
     type = VFS_SYMLINK;
   }
 
-  /* Open the fid if regular file */
+  /* Open the fid if regular file. Read-write when the server allows it, else
+   * read-only: a share exported readonly=on refuses the first, and a fid left
+   * unopened answers every read with EINVAL -- which is how apt, reading its
+   * index off the repository share, reported "read (22: Invalid argument)". */
   if (type == VFS_FILE) {
-    p9_proto_lopen(p9dev, new_fid, B1NIX_O_RDWR);
+    if (p9_proto_lopen(p9dev, new_fid, B1NIX_O_RDWR) < 0)
+      p9_proto_lopen(p9dev, new_fid, B1NIX_O_RDONLY);
   }
 
   struct vfs_node *child = vfs_create_node(type);

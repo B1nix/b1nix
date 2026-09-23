@@ -299,10 +299,14 @@ if mount -t 9p b1nixrepo /mnt 2>/tmp/9p.err; then
 		-o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0 >/dev/null 2>&1; then
 		say "apt-update=ok"
 		if apt-get install -y --reinstall -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/b1nix-smoke.list \
-			-o Dir::Etc::sourceparts=/dev/null b1nix-tools >/dev/null 2>&1; then
+			-o Dir::Etc::sourceparts=/dev/null b1nix-tools >/tmp/apt-install.log 2>&1; then
 			say "apt-install=ok"
 		else
 			say "apt-install=FAIL"
+			# The first attempt's own words: a second run only reports that
+			# the first one left dpkg half-done.
+			tail -12 /tmp/apt-install.log |
+				while IFS= read -r l; do say "apt-install-err=$l"; done
 		fi
 	else
 		say "apt-update=FAIL"
@@ -322,9 +326,28 @@ if mount -t 9p b1nixrepo /mnt 2>/tmp/9p.err; then
 				apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/b1nix-smoke.list \
 				-o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0 \
 				>/tmp/apt-strace.txt 2>&1
-			say "apt-strace=done"
+			say "apt-strace=done ($(wc -l </tmp/apt-strace.txt) lines)"
 			grep -a -- "-1 E" /tmp/apt-strace.txt | tail -12 |
 				while IFS= read -r l; do say "apt-syscall=$l"; done
+			# The calls around the failing read, whatever strace made of them:
+			# a trace with no "-1 E" line at all still says what apt was doing.
+			grep -a -B6 "EINVAL\|Invalid argument" /tmp/apt-strace.txt | tail -20 |
+				while IFS= read -r l; do say "apt-around=$l"; done
+			# A trace this short is strace failing, not apt: say what it said.
+			if [ "$(wc -l </tmp/apt-strace.txt)" -lt 20 ]; then
+				while IFS= read -r l; do say "apt-strace-out=$l"; done </tmp/apt-strace.txt
+			fi
+			ls -la /var/lib/apt/lists/partial/ 2>&1 | tail -6 |
+				while IFS= read -r l; do say "apt-partial=$l"; done
+			# The same bytes read three ways: straight from the share, through
+			# the symlink apt made, and with a large read the way apt's FileFd
+			# reads. Which one fails says where the EINVAL comes from.
+			_pk=/mnt/dists/trixie/main/binary-amd64/Packages
+			say "apt-read-direct=$(cat "$_pk" 2>&1 | wc -c) $(cat "$_pk" 2>&1 >/dev/null | head -1)"
+			for _l in /var/lib/apt/lists/partial/*_Packages; do
+				say "apt-read-link=$(cat "$_l" 2>&1 | wc -c) $(cat "$_l" 2>&1 >/dev/null | head -1)"
+			done
+			say "apt-read-bigblock=$(dd if="$_pk" bs=1M count=4 2>&1 | tail -1)"
 		fi
 	fi
 else
@@ -515,6 +538,12 @@ if [ "$PROFILE" = "broken" ]; then
 	cp "$_real" "$ROOTFS/boot/b1nix-$_broken"
 	cp "$ROOTFS/boot/initrd-$_rel" "$ROOTFS/boot/initrd-$_broken" 2>/dev/null ||
 		die "no initramfs to copy for the broken kernel"
+	# The machine this stands for was running the real kernel before the
+	# update arrived, so that kernel has completed a boot: it is the known-good
+	# entry the fallback returns to. Without it there is nothing to fall back
+	# to, and the hook rightly leaves the default alone.
+	sed -i "s/^\(entry=$_rel .*\)good=0/\1good=1/" "$ROOTFS/boot/b1nix/boot-state" ||
+		die "no boot state to mark the real kernel good in"
 	in_rootfs "ESP=/boot ROOT_SPEC=LABEL=$ROOT_LABEL /usr/sbin/b1nix-update-bootloader" ||
 		die "regenerating the boot configuration failed"
 	# init=/bin/false on the broken entry only: the kernel boots, the

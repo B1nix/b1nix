@@ -17,6 +17,15 @@ typedef struct {
 	int val[2];
 } __kernel_fsid_t;
 
+/* The 64-bit id a filesystem without a UUID (FAT: its volume serial) folds
+ * into the two words. */
+static inline __kernel_fsid_t u64_to_fsid(u64 v)
+{
+	__kernel_fsid_t f = { .val = { (int)(u32)v, (int)(u32)(v >> 32) } };
+
+	return f;
+}
+
 struct kstatfs {
 	long f_type;
 	long f_bsize;

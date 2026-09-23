@@ -416,6 +416,15 @@ int lkpi_bridge_sync_fs(void *rootp)
 	int ret = 0;
 	if (sb->s_op && sb->s_op->sync_fs)
 		ret = sb->s_op->sync_fs(sb, 1);
+	/* And the device's own buffers, as sync(2) ends upstream: a filesystem
+	 * without a journal (FAT) leaves its directory entries and allocation
+	 * table there, dirty, and nothing else writes them. */
+	if (sb->s_bdev) {
+		int err = sync_blockdev(sb->s_bdev);
+
+		if (!ret)
+			ret = err;
+	}
 	up_read(&sb->s_umount);
 	return ret;
 }

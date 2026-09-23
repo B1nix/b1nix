@@ -298,24 +298,45 @@ static u64 sock_deadline_remaining(u64 deadline) {
  * fatal NET_SEND_FAILED, which is how a package download died mid-handshake.
  * Waits with a short timeout rather than purely on a wake, so a wake that races
  * the block costs one retry instead of a hang. SO_SNDTIMEO bounds the wait. */
+/*
+ * tcp_send() puts at most one segment on the wire per call. The call as a
+ * whole sends what Linux's tcp_sendmsg would: all of it when blocking, as much
+ * as the window takes when not -- one segment was all a non-blocking send (and
+ * every io_uring send, which is one) ever managed, 1460 bytes of a 4096-byte
+ * sendmsg in liburing's vec-regbuf. What was sent is reported even when the
+ * rest then fails or times out.
+ */
 static isize tcp_send_blocking(struct vfs_handle *h, struct vfs_socket_state *s,
                                struct tcp_conn *conn, const void *buf,
-                               usize len) {
+                               usize len, int dontwait) {
   u64 deadline = sock_deadline(s->so_sndtimeo_ms);
+  usize done = 0;
+
   for (;;) {
     if (!s->connected && tcp_is_established(conn))
       s->connected = 1;
     if (s->connected) {
-      isize n = tcp_send(conn, buf, len);
+      isize n = tcp_send(conn, (const u8 *)buf + done, len - done);
+
+      if (n > 0) {
+        done += (usize)n;
+        if (done == len)
+          return (isize)done;
+        continue;
+      }
       if (n != -EAGAIN)
-        return n;
+        return done ? (isize)done : n;
     }
-    if (h->flags & B1NIX_O_NONBLOCK)
-      return -EAGAIN;
+    /* MSG_DONTWAIT is this one call's O_NONBLOCK. Ignored, a sendmsg that
+     * asked not to wait blocked on a full window -- and liburing's
+     * sendmsg_iov_clean fills the window that way before it starts the
+     * reader, so it waited for ever. */
+    if ((h->flags & B1NIX_O_NONBLOCK) || dontwait)
+      return done ? (isize)done : -EAGAIN;
     if (sock_deadline_passed(deadline))
-      return -EAGAIN; /* SO_SNDTIMEO expired with nothing sent */
+      return done ? (isize)done : -EAGAIN; /* SO_SNDTIMEO expired */
     if (scheduler_signal_pending())
-      return -ERESTARTSYS;
+      return done ? (isize)done : -ERESTARTSYS;
     u64 wait_ticks = 10; /* 100 ms */
     if (deadline) {
       u64 left = sock_deadline_remaining(deadline);
@@ -327,8 +348,53 @@ static isize tcp_send_blocking(struct vfs_handle *h, struct vfs_socket_state *s,
   }
 }
 
+/* MSG_MORE on UDP: append this send to the datagram being assembled. Returns
+ * 1 when the piece is held (more to come), 0 when the datagram is complete --
+ * then out and out_len say what to send, the assembled datagram if one was being
+ * built -- or a negative errno. A datagram that would exceed what UDP carries
+ * is EMSGSIZE and is dropped, as Linux's ip_append_data refuses it. */
+static int udp_cork_append(struct vfs_socket_state *s, const void *buf,
+                           usize len, int flags, const void **out,
+                           usize *out_len) {
+  *out = buf;
+  *out_len = len;
+  if (!(flags & B1NIX_MSG_MORE) && !s->udp_cork_len)
+    return 0;
+  if ((usize)s->udp_cork_len + len > 65507u) {
+    kfree(s->udp_cork);
+    s->udp_cork = 0;
+    s->udp_cork_len = 0;
+    return -EMSGSIZE;
+  }
+  if (len) {
+    u8 *grown = kmalloc((usize)s->udp_cork_len + len);
+
+    if (!grown)
+      return -ENOBUFS;
+    if (s->udp_cork_len)
+      memcpy(grown, s->udp_cork, s->udp_cork_len);
+    memcpy(grown + s->udp_cork_len, buf, len);
+    kfree(s->udp_cork);
+    s->udp_cork = grown;
+    s->udp_cork_len += (u32)len;
+  }
+  if (flags & B1NIX_MSG_MORE)
+    return 1;
+  *out = s->udp_cork;
+  *out_len = s->udp_cork_len;
+  return 0;
+}
+
+/* The assembled datagram has been handed to the IP layer (which copies it). */
+static void udp_cork_done(struct vfs_socket_state *s) {
+  if (s->udp_cork) {
+    kfree(s->udp_cork);
+    s->udp_cork = 0;
+  }
+  s->udp_cork_len = 0;
+}
+
 isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int flags) {
-  (void)flags;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
 
   /* After shutdown(SHUT_WR) the write half is closed: POSIX requires EPIPE. */
@@ -371,17 +437,37 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
                                 dst.bytes[15]}};
         if (s->local.in6.sin6_port == 0)
           s->local.in6.sin6_port = udp_autobind(h);
-        udp_send_net_oif(v4, s->local.in6.sin6_port, s->peer.in6.sin6_port,
-                         buf, len, s->bind_ifindex);
+        {
+          const void *dgram;
+          usize dlen;
+          int held = udp_cork_append(s, buf, len, flags, &dgram, &dlen);
+
+          if (held)
+            return held < 0 ? held : (isize)len;
+          udp_send_net_oif(v4, s->local.in6.sin6_port, s->peer.in6.sin6_port,
+                           dgram, dlen, s->bind_ifindex);
+          udp_cork_done(s);
+        }
         return (isize)len;
       }
       if (s->local.in6.sin6_port == 0)
         s->local.in6.sin6_port = udp_autobind(h);
-      udp6_send(dst, s->local.in6.sin6_port, s->peer.in6.sin6_port, buf, len);
+      {
+        const void *dgram;
+        usize dlen;
+        int held = udp_cork_append(s, buf, len, flags, &dgram, &dlen);
+
+        if (held)
+          return held < 0 ? held : (isize)len;
+        udp6_send(dst, s->local.in6.sin6_port, s->peer.in6.sin6_port, dgram,
+                  dlen);
+        udp_cork_done(s);
+      }
       return (isize)len;
     }
     if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {
-      return tcp_send_blocking(h, s, (struct tcp_conn *)s->tcp_conn, buf, len);
+      return tcp_send_blocking(h, s, (struct tcp_conn *)s->tcp_conn, buf, len,
+                               (flags & B1NIX_MSG_DONTWAIT) != 0);
     }
     return -ENOTCONN;
   }
@@ -407,12 +493,22 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
       return -EACCES;
     if (s->local.in.sin_port == 0)
       s->local.in.sin_port = udp_autobind(h);
-    udp_send_net_oif(dst_ip, s->local.in.sin_port, s->peer.in.sin_port, buf,
-                     len, s->bind_ifindex);
+    {
+      const void *dgram;
+      usize dlen;
+      int held = udp_cork_append(s, buf, len, flags, &dgram, &dlen);
+
+      if (held)
+        return held < 0 ? held : (isize)len;
+      udp_send_net_oif(dst_ip, s->local.in.sin_port, s->peer.in.sin_port,
+                       dgram, dlen, s->bind_ifindex);
+      udp_cork_done(s);
+    }
     return (isize)len;
   }
   if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {
-    return tcp_send_blocking(h, s, (struct tcp_conn *)s->tcp_conn, buf, len);
+    return tcp_send_blocking(h, s, (struct tcp_conn *)s->tcp_conn, buf, len,
+                             (flags & B1NIX_MSG_DONTWAIT) != 0);
   }
   return -ENOTCONN;
 }
@@ -489,7 +585,8 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     u8 slot = s->udp_q_head;
     usize pkt_len = s->udp_q_len[slot];
     usize to_copy = len < pkt_len ? len : pkt_len;
-    memcpy(buf, s->udp_q_buf[slot], to_copy);
+    memcpy(buf, s->udp_q_big[slot] ? s->udp_q_big[slot] : s->udp_q_buf[slot],
+           to_copy);
     memcpy(s->udp_last_src_ip, s->udp_q_src_ip[slot], sizeof(s->udp_last_src_ip));
     s->udp_last_src_port = s->udp_q_src_port[slot];
     s->udp_last_src_is6 = s->udp_q_src_is6[slot];
@@ -503,11 +600,15 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     s->nl_last_portid = s->udp_q_nlportid[slot];
     s->nl_have_cred = 1;
     if (!(flags & B1NIX_MSG_PEEK)) {
+      if (s->udp_q_big[slot]) {
+        kfree(s->udp_q_big[slot]);
+        s->udp_q_big[slot] = 0;
+      }
       s->udp_q_head = (u8)((s->udp_q_head + 1) % SOCK_DGRAM_Q_SLOTS);
       s->udp_q_count--;
       s->recv_len = (s->udp_q_count > 0) ? s->udp_q_len[s->udp_q_head] : 0;
     }
-    return (isize)to_copy;
+    return (isize)((flags & B1NIX_MSG_TRUNC) ? pkt_len : to_copy);
   }
   if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {
     struct tcp_conn *conn = (struct tcp_conn *)s->tcp_conn;
@@ -814,6 +915,16 @@ usize vfs_socket_last_srcaddr(int fd, void *addr, usize cap) {
  * the message the last recvmsg handed over. Read by the syscall layer, which
  * turns it into an SCM_TIMESTAMP control message — the same accessor shape as
  * vfs_socket_last_srcaddr above, so no receive path has to grow an argument. */
+/* Whether the descriptor is a datagram socket (UDP, raw, AF_UNIX datagram):
+ * the kind whose recv can report a message's real length with MSG_TRUNC. */
+int vfs_socket_is_dgram(int fd) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h || h->kind != VFS_HANDLE_SOCKET)
+    return 0;
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  return s && (s->type == B1NIX_SOCK_DGRAM || s->type == B1NIX_SOCK_RAW);
+}
+
 int vfs_socket_timestamp_enabled(int fd) {
   struct vfs_handle *h = scheduler_fd_get(fd);
   if (!h || h->kind != VFS_HANDLE_SOCKET)
@@ -938,6 +1049,11 @@ static int socket_teardown(struct vfs_handle *h) {
     tcp_close((struct tcp_conn *)s->tcp_conn);
     s->tcp_conn = 0;
   }
+  for (int i = 0; i < SOCK_DGRAM_Q_SLOTS; i++)
+    if (s->udp_q_big[i])
+      kfree(s->udp_q_big[i]);
+  if (s->udp_cork)
+    kfree(s->udp_cork);
   kfree(s);
   h->private_data = 0;
   return 0;
@@ -1919,6 +2035,7 @@ int vfs_accept_h(struct vfs_handle *h, void *addr, usize *addrlen) {
   new_s->type = s->type;
   /* An accepted socket inherits the listener's buffer sizes, as on Linux. */
   new_s->so_rcvbuf = s->so_rcvbuf;
+  new_s->rcvbuf_locked = s->rcvbuf_locked;
   /* An accepted connection inherits what the listening socket asked for. */
   new_s->so_passpidfd = s->so_passpidfd;
   new_s->so_no_passrights = s->so_no_passrights;
@@ -2194,7 +2311,12 @@ static void sock_apply_tcp_opts(struct vfs_socket_state *s) {
                               (u32)s->tcp_keepalive_param[i]);
   if (s->so_keepalive)
     tcp_set_keepalive((struct tcp_conn *)s->tcp_conn, 1);
-  if (s->so_rcvbuf > 0)
+  /* Only a buffer the program asked for bounds the receive window. The
+   * default was applied as well, which switched auto-tuning off on every
+   * connection: 212992 bytes and no more, so a writer ahead of its reader
+   * stalled there for ever (liburing's recv-bundle-short-ooo writes 1 MiB
+   * before reading). Linux does the same: SOCK_RCVBUF_LOCK. */
+  if (s->rcvbuf_locked && s->so_rcvbuf > 0)
     tcp_set_rcvbuf((struct tcp_conn *)s->tcp_conn, (u32)s->so_rcvbuf);
   if (s->tcp_syncnt > 0)
     tcp_set_syncnt((struct tcp_conn *)s->tcp_conn, (u32)s->tcp_syncnt);
@@ -2585,6 +2707,7 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
       s->so_rcvbuf = (optname == SOCK_SO_RCVBUFFORCE)
                          ? sock_clamp_mem(v, (u32)-1)
                          : sock_clamp_mem(v, sock_rmem_max());
+      s->rcvbuf_locked = 1;
       /* On a TCP socket the value is not just recorded: it is the ceiling the
        * receive buffer may auto-tune to, and therefore the window we invite the
        * peer to fill. */
@@ -3039,9 +3162,21 @@ int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len,
         return 0;
       }
       u8 slot = s->udp_q_tail;
-      usize copy = (len > sizeof(s->udp_q_buf[slot])) ? sizeof(s->udp_q_buf[slot]) : len;
-      memcpy(s->udp_q_buf[slot], data, copy);
-      s->udp_q_len[slot] = copy;
+      char *big = 0;
+
+      if (len > sizeof(s->udp_q_buf[slot]) && len <= 65535u)
+        big = kmalloc(len);
+      if (big) {
+        memcpy(big, data, len);
+        s->udp_q_len[slot] = len;
+      } else {
+        usize copy = (len > sizeof(s->udp_q_buf[slot]))
+                         ? sizeof(s->udp_q_buf[slot])
+                         : len;
+        memcpy(s->udp_q_buf[slot], data, copy);
+        s->udp_q_len[slot] = copy;
+      }
+      s->udp_q_big[slot] = big;
       /* Remember who sent it — recvfrom() must report this sender, not the
        * socket's last send target. */
       memset(s->udp_q_src_ip[slot], 0, sizeof(s->udp_q_src_ip[slot]));

@@ -92,8 +92,8 @@ struct tcp_header {
  * fixed large buffer is paid by every connection that exists, and a browser
  * opens them by the dozen.
  *
- * So the buffer starts at 64 KiB and doubles, up to a megabyte, each time it
- * is filled — a connection that is actually moving bulk data earns its window,
+ * So the buffer starts at 64 KiB and doubles, up to 6 MiB -- Linux's
+ * tcp_rmem maximum -- each time it is filled — a connection that is actually moving bulk data earns its window,
  * an idle one keeps the small buffer. The window *scale* cannot follow: it is
  * negotiated once in the SYN and never changes, so it is chosen for the
  * ceiling from the start, exactly as Linux does with tcp_rmem's maximum.
@@ -101,9 +101,15 @@ struct tcp_header {
  * Heap-allocated per connection, so the cost is paid by connections that
  * exist rather than by the image; and it is what makes the advertised window
  * scale below non-zero, which is the only way to express more than 64 KiB.
+ *
+ * The ceiling was a megabyte, and that is a limit a program can meet: with no
+ * reader yet, a sender on loopback can put everything the receiver will hold
+ * into it, and one megabyte written ahead of the first read (liburing's
+ * recv-bundle-short-ooo) never completed -- the window closed a few segments
+ * short and the writer blocked for ever. On Linux the same write fits.
  */
 #define TCP_RECV_BUF_INIT 65536
-#define TCP_RECV_BUF_MAX 1048576
+#define TCP_RECV_BUF_MAX (6u * 1024u * 1024u)
 #define TCP_RECV_BUF_SIZE TCP_RECV_BUF_MAX
 /* The window field of a SYN is never scaled, so it cannot express more than
  * 65535 no matter how large the buffer is. */
@@ -595,8 +601,13 @@ static u32 tcp_recv_append(struct tcp_conn *conn, const u8 *data, u32 len) {
   memcpy(conn->recv_buf + conn->recv_len, data, len);
   conn->recv_len += len;
   conn->rcv_nxt += len;
-  /* Filled it: this connection can use more than it was given. */
-  if (conn->recv_len == conn->recv_cap)
+  /* As good as full: this connection can use more than it was given. Less
+   * than a segment free is full in practice -- the window we advertise then
+   * reads as closed and the sender, avoiding silly windows, waits for a whole
+   * segment's room that never comes. Growing only when exactly full never
+   * happened: a writer ahead of its reader blocked for ever a few hundred
+   * bytes short. */
+  if (conn->recv_cap - conn->recv_len < TCP_MSS)
     tcp_recv_grow(conn);
   return len;
 }
@@ -2865,6 +2876,11 @@ usize tcp_conn_snapshot(struct net_sock_info *out, usize max) {
     e->local_port = tcp_conns[i].local_port;
     e->remote_port = tcp_conns[i].remote_port;
     e->state = tcp_linux_st(tcp_conns[i].state);
+    /* The two numbers ss and netstat read to find a stalled connection. */
+    if (tcp_conns[i].state != TCP_LISTEN) {
+      e->tx_queue = tcp_conns[i].snd_nxt - tcp_conns[i].snd_una;
+      e->rx_queue = tcp_conns[i].recv_len - tcp_conns[i].recv_read;
+    }
     if (e->family == 6) {
       memcpy(e->remote_ip, tcp_conns[i].remote_ip6.bytes, 16);
       /* listeners bind the wildcard address; established use the host IP6 */

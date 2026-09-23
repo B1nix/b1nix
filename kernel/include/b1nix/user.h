@@ -147,7 +147,10 @@ struct user_loaded_image {
 	 * != 0 marks this path; entry becomes the interpreter's entry, and
 	 * app_entry preserves the executable's own entry point for AT_ENTRY. */
 	u64 app_entry;
+	/* AT_BASE: where the interpreter was placed, 0 for an ET_EXEC one that
+	 * sits at its own link addresses. has_interp is what says there is one. */
 	u64 interp_base;
+	u8 has_interp;
 	/* Where the vDSO's ELF header is mapped (AT_SYSINFO_EHDR); the [vvar]
 	 * page is the one below it. Chosen before the initial stack is built,
 	 * mapped by user_run_elf_image. 0 = this image has no vDSO. */

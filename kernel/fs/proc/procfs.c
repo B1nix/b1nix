@@ -1462,7 +1462,11 @@ static int mountinfo_poll(struct vfs_handle *h, struct vfs_node *node,
     u64 gen = vfs_mount_generation();
 
     if (h && h->poll_seq != gen) {
-      h->poll_seq = gen;
+      extern int epoll_poll_peeking(void);
+
+      /* A containing epoll only asks; it does not report. */
+      if (!epoll_poll_peeking())
+        h->poll_seq = gen;
       pfd->revents |= B1NIX_POLLPRI | B1NIX_POLLERR;
       __atomic_fetch_add(&g_mi_pri_reports, 1, __ATOMIC_RELAXED);
       g_mi_pri_last_pid = current_task ? (usize)current_task->id : 0;
@@ -1677,8 +1681,13 @@ static int r_b1nix_prof(usize pid, struct sbuf *s) {
 static int r_b1nix_tasks(usize pid, struct sbuf *s) {
   extern void scheduler_dump_tasks(void);
 
+  extern void io_uring_dump_state(void);
+
   (void)pid;
   scheduler_dump_tasks();
+  /* A task blocked in io_uring_enter is owed a completion; the rings say by
+   * which request and whether anything is left to deliver it. */
+  io_uring_dump_state();
   sb_puts(s, "task dump written to console\n");
   return 0;
 }
@@ -2696,8 +2705,7 @@ static int r_pid_maps_walked(usize pid, struct sbuf *s, int smaps) {
         u64 send =
             (seg->vaddr + seg->memsz + PAGE_SIZE - 1) & ~(u64)(PAGE_SIZE - 1);
         if (m[i].start >= sstart && m[i].start < send) {
-          int is_interp = (img->interp_base && seg->vaddr >= img->interp_base &&
-                           img->interp_path[0]);
+          int is_interp = seg->from_interp && img->interp_path[0];
           m[i].name = is_interp ? img->interp_path : img->path;
           m[i].ino = is_interp ? interp_ino : exe_ino;
           m[i].dev = is_interp ? interp_dev : exe_dev;
@@ -4023,8 +4031,8 @@ static void net_render_inet(struct sbuf *s, int family /*4 or 6*/, int udp) {
       sb_hexaddr4(s, info[i].remote_ip, info[i].remote_port);
       sb_puts(s, " ");
     }
-    sb_addf(s, "%02X 00000000:00000000 00:00000000 00000000     0        0 0\n",
-            info[i].state);
+    sb_addf(s, "%02X %08X:%08X 00:00000000 00000000     0        0 0\n",
+            info[i].state, info[i].tx_queue, info[i].rx_queue);
   }
 }
 

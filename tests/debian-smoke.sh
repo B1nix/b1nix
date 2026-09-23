@@ -49,6 +49,12 @@ NC='\033[0m'
 PASSED=0
 FAILED=0
 
+# Where the minutes go: every host-side step and every boot's milestones are
+# printed as "[TIME] <what> <seconds>", so a slow lane is measured, not guessed.
+now() { date +%s.%N; }
+since() { awk -v a="$1" -v b="$(now)" 'BEGIN { printf "%.1f", b - a }'; }
+LANE_T0=$(now)
+
 pass() {
 	printf "  ${GREEN}PASS${NC} %s\n" "$1"
 	PASSED=$((PASSED + 1))
@@ -81,11 +87,16 @@ fi
 CMDLINE="root=LABEL=$IMG_LABEL init=${DEBIAN_INIT:-/sbin/init} ${DEBIAN_EXTRA_CMDLINE:-}"
 
 # ── Build ──────────────────────────────────────────────────────────────────
+# The kernel is built once. Each boot below needs its own command line, and on
+# this boot path the command line lives in the ISO's boot-loader config, so each
+# boot gets an ISO of its own from mkiso.sh -- a second, not a `make iso`.
+KERNEL_ELF="$BUILD_DIR/kernel.elf"
 if [ "${SKIP_BUILD:-0}" = "1" ]; then
-	[ -f "$ISO" ] || { printf "  ${RED}no prebuilt %s${NC}\n" "$ISO"; exit 1; }
-	echo "  (SKIP_BUILD=1 — reusing $ISO)"
+	[ -f "$KERNEL_ELF" ] || { printf "  ${RED}no prebuilt %s${NC}\n" "$KERNEL_ELF"; exit 1; }
+	echo "  (SKIP_BUILD=1 — reusing $KERNEL_ELF)"
 else
 	echo "[BUILD] Building kernel ISO for the Debian boot..."
+	_t=$(now)
 	if ! (cd "$PROJECT_DIR" && make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
 		ISO_NO_ROOT_MODULE="${ISO_NO_ROOT_MODULE:-1}" \
 		KERNEL_CMDLINE="$CMDLINE" iso) >"$BUILD_LOG" 2>&1; then
@@ -93,18 +104,22 @@ else
 		tail -60 "$BUILD_LOG"
 		exit 1
 	fi
-	# `iso` always writes b1nix.iso; keep a stable copy for SKIP_BUILD reruns.
+	# `iso` always writes b1nix.iso; keep a stable copy under the lane's name.
 	cp "$BUILD_DIR/b1nix.iso" "$ISO"
-	# The image is 550 MB and QEMU mmaps it: hand the copy to the page cache
-	# before booting from it, or the first run can read a half-written ISO.
-	sync
+	echo "[TIME] build $(since "$_t")s"
 	pass "kernel builds without errors"
 fi
 
 # ── Per-run scratch copy of the image ──────────────────────────────────────
-# The pristine image is never written by a test run.
-RUN_IMG="$PROJECT_DIR/smoke_run/debian-root-$$.img"
-cp "$IMG" "$RUN_IMG"
+# The pristine image is never written by a test run. One scratch copy carries
+# the current harness, and every boot runs on a copy-on-write overlay of it, so
+# the boots are independent of each other and none of them copies the image.
+RUN_DIR="$PROJECT_DIR/smoke_run/debian-run-$$"
+RUN_IMG="$RUN_DIR/root.img"
+mkdir -p "$RUN_DIR"
+_t=$(now)
+cp --reflink=auto "$IMG" "$RUN_IMG" 2>/dev/null || cp "$IMG" "$RUN_IMG"
+echo "[TIME] image-copy $(since "$_t")s"
 # Put the current harness into the copy.
 #
 # The script inside the image is whatever the image was built with, which may
@@ -113,114 +128,198 @@ cp "$IMG" "$RUN_IMG"
 # harness that sits beside it in the repository.
 STAGE="$PROJECT_DIR/tools/image/debian-stage.sh"
 if [ -f "$STAGE" ] && command -v debugfs >/dev/null 2>&1; then
+	_t=$(now)
 	if debugfs -w -R "rm /b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1 &&
 		debugfs -w -R "write $STAGE b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1; then
 		echo "  (harness injected from tools/image/debian-stage.sh)"
+		echo "[TIME] harness-inject $(since "$_t")s"
 	else
 		printf "  ${YELLOW}note${NC}: could not inject the harness; using the one in the image\n"
 	fi
 fi
-QEMU_PID=""
 cleanup() {
-	[ -n "$QEMU_PID" ] && kill -9 "$QEMU_PID" 2>/dev/null || true
-	rm -f "$RUN_IMG"
+	for _pf in "$RUN_DIR"/*.pid; do
+		[ -f "$_pf" ] && kill -9 "$(cat "$_pf")" 2>/dev/null
+	done
+	rm -rf "$RUN_DIR"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# A signal must end the run too: a trap that only cleans up leaves the loop
+# polling on, booting the next part.
+trap 'exit 130' INT TERM
 
 # ── Run ────────────────────────────────────────────────────────────────────
 ACCEL_ARGS=""
-if [ -w /dev/kvm ] && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw kvm; then
+# DEBIAN_ACCEL=tcg forces the emulator: slower, but QEMU's -d int can then log
+# the exceptions that end in a silent triple-fault reset, which it cannot see
+# under KVM.
+if [ "${DEBIAN_ACCEL:-}" = "tcg" ]; then
+	ACCEL_ARGS="-accel tcg"
+elif [ -w /dev/kvm ] && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw kvm; then
 	ACCEL_ARGS="-accel kvm -cpu host,+invtsc"
 elif [ "$(uname)" = "Darwin" ] && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw hvf; then
 	ACCEL_ARGS="-accel hvf -cpu host"
 fi
 
-# One boot, appending to $LOG. $1 is added to the kernel command line, which is
-# how the liburing suite is split across boots: two hundred programs do not fit
-# in one boot's deadline, and a run that is cut off reports every test it never
-# reached as a failure -- thirty of them, none of them about the kernel.
-# $2 is that boot's deadline, because a part carrying fifty-odd programs that
-# may each burn their kill timeout needs more than the plain boot does.
-boot_once() { # extra-cmdline [deadline]
-	_extra="$1"
-	_deadline="${2:-$TIMEOUT}"
-	_blog="$PROJECT_DIR/smoke_run/debian-boot-part.log"
+# The boots. "base" runs everything but liburing; pN runs the Nth slice of
+# liburing's suite, which is split across boots because two hundred programs do
+# not fit in one boot's deadline, and a run that is cut off reports every test
+# it never reached as a failure -- thirty of them, none of them about the kernel.
+# LIBURING_PARTS=0 runs the whole harness, suite included, in one boot.
+LIBURING_PARTS="${LIBURING_PARTS:-12}"
+LIBURING_TIMEOUT="${LIBURING_TIMEOUT:-20}"
+# DEBIAN_BOOTS="base 3 5" runs only those boots ("base" is the one without
+# liburing, numbers are liburing parts) -- for working on one of them. The
+# checks below then report what the skipped boots would have printed as FAIL.
+DEBIAN_BOOTS="${DEBIAN_BOOTS:-}"
+want_boot() {
+	[ -z "$DEBIAN_BOOTS" ] && return 0
+	case " $DEBIAN_BOOTS " in *" $1 "*) return 0 ;; esac
+	return 1
+}
+BOOTS=""
+if [ "$LIBURING_PARTS" -gt 0 ]; then
+	want_boot base && BOOTS="base"
+	_p=1
+	while [ "$_p" -le "$LIBURING_PARTS" ]; do
+		want_boot "$_p" && BOOTS="$BOOTS p$_p"
+		_p=$((_p + 1))
+	done
+else
+	BOOTS="all"
+fi
+boot_extra() {
+	case "$1" in
+	base) echo "b1nix.liburing=__none__" ;;
+	all) echo "" ;;
+	p*) echo "b1nix.liburing-part=${1#p}/$LIBURING_PARTS b1nix.liburing-timeout=$LIBURING_TIMEOUT" ;;
+	esac
+}
+# A part carrying thirty-odd programs that may each burn their kill timeout
+# needs a longer deadline than the plain boot does.
+boot_deadline() {
+	case "$1" in
+	base) echo "$TIMEOUT" ;;
+	*) echo "${LIBURING_PART_TIMEOUT:-600}" ;;
+	esac
+}
 
-	: >"$_blog"
-	echo "[RUN] Booting QEMU with $RUN_IMG as root (label $IMG_LABEL)${_extra:+ [$_extra]}..."
-	(cd "$PROJECT_DIR" && make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
-		ISO_NO_ROOT_MODULE="${ISO_NO_ROOT_MODULE:-1}" \
-		KERNEL_CMDLINE="$CMDLINE $_extra" iso) >>"$BUILD_LOG" 2>&1 || {
-		printf "  ${RED}BUILD FAILED${NC} (log: %s)\n" "$BUILD_LOG"
+# Boots run side by side, DEBIAN_JOBS at a time. The guests spend most of
+# their time waiting -- on a test's kill timeout, on a sleep inside a test -- so
+# one and a half guest CPUs per host CPU cost nothing measurable: on 8 host CPUs
+# 6 boots at once gave the same passes and timeouts as 4, in 98 s instead of
+# 150. Past that liburing's timing-sensitive tests are what would pay for it.
+DEBIAN_SMP="${DEBIAN_SMP:-2}"
+if [ -z "${DEBIAN_JOBS:-}" ]; then
+	DEBIAN_JOBS=$((NPROC * 3 / (2 * DEBIAN_SMP)))
+	[ "$DEBIAN_JOBS" -le 6 ] || DEBIAN_JOBS=6
+	[ "$DEBIAN_JOBS" -ge 1 ] || DEBIAN_JOBS=1
+fi
+# A guest that prints nothing for this long is stuck, whatever its deadline.
+DEBIAN_SILENCE="${DEBIAN_SILENCE:-120}"
+DONE_PATTERN="${DEBIAN_DONE_PATTERN:-DEBIAN-SMOKE: done|KERNEL PANIC|\[PANIC\]}"
+
+boot_start() { # name
+	_b="$1"
+	_extra=$(boot_extra "$_b")
+	_iso="${ISO%.iso}-$_b.iso"
+	sh "$PROJECT_DIR/tools/image/mkiso.sh" --stage "$BUILD_DIR/iso-debian-$_b" \
+		--out "$_iso" --arch "$ARCH" --kernel "$KERNEL_ELF" --timeout 0 \
+		--cmdline "$CMDLINE $_extra" >>"$BUILD_LOG" 2>&1 || {
+		printf "  ${RED}ISO FAILED${NC} for %s (log: %s)\n" "$_b" "$BUILD_LOG"
 		return 1
 	}
-	cp "$BUILD_DIR/b1nix.iso" "$ISO"
-	sync
-	qemu-system-x86_64 $ACCEL_ARGS -m "${DEBIAN_MEM_MB:-1024}" -smp "${DEBIAN_SMP:-2}" \
-		-cdrom "$ISO" \
+	# cache=unsafe below: the overlay is thrown away after the run, so a guest
+	# flush has nothing to protect. Honoured, one guest's sync became an
+	# fdatasync on the host that took over a hundred seconds with six guests
+	# writing, and the boot sat that long after its done marker.
+	qemu-img create -q -f qcow2 -F raw -b "$RUN_IMG" "$RUN_DIR/$_b.qcow2" || return 1
+	: >"$RUN_DIR/$_b.log"
+	echo "[RUN] $_b: booting${_extra:+ [$_extra]}"
+	qemu-system-x86_64 $ACCEL_ARGS -m "${DEBIAN_MEM_MB:-1024}" -smp "$DEBIAN_SMP" \
+		-cdrom "$_iso" \
 		-serial stdio -serial null -display none -monitor none -no-reboot \
-		-drive file="$RUN_IMG",if=none,id=debroot,format=raw \
+		-drive file="$RUN_DIR/$_b.qcow2",if=none,id=debroot,format=qcow2,cache=unsafe \
 		-device virtio-blk-pci,drive=debroot \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-		${EXTRA_QEMU_ARGS:-} >"$_blog" 2>&1 &
-	QEMU_PID=$!
+		${EXTRA_QEMU_ARGS:-} >"$RUN_DIR/$_b.log" 2>&1 &
+	echo $! >"$RUN_DIR/$_b.pid"
+	now >"$RUN_DIR/$_b.t0"
+	echo 0 >"$RUN_DIR/$_b.seen"
+	echo "0 $(date +%s)" >"$RUN_DIR/$_b.quiet"
+}
 
-	DONE_PATTERN="${DEBIAN_DONE_PATTERN:-DEBIAN-SMOKE: done|KERNEL PANIC|\[PANIC\]}"
-	start_ts=$(date +%s)
-	reported=0
-	while :; do
-		lines=$(wc -l <"$_blog" | tr -d ' ')
-		if [ "$lines" -gt "$reported" ]; then
-			sed -n "$((reported + 1)),${lines}p" "$_blog" | grep -a "DEBIAN-SMOKE:" || true
-			reported=$lines
-		fi
-		if grep -qa -E "$DONE_PATTERN" "$_blog" 2>/dev/null; then
-			break
-		fi
-		if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-			sleep 1
-			echo "[debian-smoke] QEMU exited before the done marker" >>"$_blog"
-			break
-		fi
-		now_ts=$(date +%s)
-		if [ $((now_ts - start_ts)) -ge "$_deadline" ]; then
-			echo "[debian-smoke] timeout after ${_deadline}s" >>"$_blog"
-			break
-		fi
-		sleep 1
-	done
+boot_stop() { # name why
+	_pid=$(cat "$RUN_DIR/$1.pid")
+	[ -z "$2" ] || echo "[debian-smoke] $2" >>"$RUN_DIR/$1.log"
 	# Kill BY PID — never pkill -f, which would match this script's own command line.
-	kill -9 "$QEMU_PID" 2>/dev/null || true
-	wait "$QEMU_PID" 2>/dev/null || true
-	QEMU_PID=""
-	cat "$_blog" >>"$LOG"
-	# The scratch image carries whatever the last boot wrote; every boot starts
-	# from the pristine one so the parts are independent.
-	cp "$IMG" "$RUN_IMG"
-	if [ -f "$STAGE" ] && command -v debugfs >/dev/null 2>&1; then
-		debugfs -w -R "rm /b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1
-		debugfs -w -R "write $STAGE b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1
+	kill -9 "$_pid" 2>/dev/null || true
+	wait "$_pid" 2>/dev/null || true
+	rm -f "$RUN_DIR/$1.pid" "$RUN_DIR/$1.qcow2"
+	echo "[TIME] $1 qemu-run $(since "$(cat "$RUN_DIR/$1.t0")")s"
+}
+
+# One look at a running boot: print its new harness lines, and stop it when it
+# is done, dead, past its deadline or silent. Returns 0 while it still runs.
+boot_poll() { # name
+	_b="$1"
+	_log="$RUN_DIR/$_b.log"
+	_seen=$(cat "$RUN_DIR/$_b.seen")
+	_lines=$(wc -l <"$_log" | tr -d ' ')
+	if [ "$_lines" -gt "$_seen" ]; then
+		sed -n "$((_seen + 1)),${_lines}p" "$_log" | tr -d '\r' |
+			grep -a "DEBIAN-SMOKE:" | sed "s/^/[$_b] /" || true
+		echo "$_lines" >"$RUN_DIR/$_b.seen"
+	fi
+	if grep -qa -E "$DONE_PATTERN" "$_log" 2>/dev/null; then
+		boot_stop "$_b" ""
+		return 1
+	fi
+	if ! kill -0 "$(cat "$RUN_DIR/$_b.pid")" 2>/dev/null; then
+		boot_stop "$_b" "QEMU exited before the done marker"
+		return 1
+	fi
+	_size=$(wc -c <"$_log" | tr -d ' ')
+	read -r _qsize _qts <"$RUN_DIR/$_b.quiet"
+	_now=$(date +%s)
+	if [ "$_size" != "$_qsize" ]; then
+		echo "$_size $_now" >"$RUN_DIR/$_b.quiet"
+	elif [ $((_now - _qts)) -ge "$DEBIAN_SILENCE" ]; then
+		boot_stop "$_b" "silent for ${DEBIAN_SILENCE}s"
+		return 1
+	fi
+	_el=$(awk -v a="$(cat "$RUN_DIR/$_b.t0")" -v b="$(now)" 'BEGIN { printf "%d", b - a }')
+	if [ "$_el" -ge "$(boot_deadline "$_b")" ]; then
+		boot_stop "$_b" "timeout after $(boot_deadline "$_b")s"
+		return 1
 	fi
 	return 0
 }
 
-: >"$LOG"
-# The first boot runs everything but liburing; the parts that follow run the
-# suite a slice at a time. LIBURING_PARTS=0 keeps the old single-boot behaviour.
-LIBURING_PARTS="${LIBURING_PARTS:-4}"
-if [ "$LIBURING_PARTS" -gt 0 ]; then
-	boot_once "b1nix.liburing=__none__" || exit 1
-	_p=1
-	while [ "$_p" -le "$LIBURING_PARTS" ]; do
-		boot_once "b1nix.liburing-part=$_p/$LIBURING_PARTS b1nix.liburing-timeout=${LIBURING_TIMEOUT:-20}" \
-			"${LIBURING_PART_TIMEOUT:-600}" || exit 1
-		_p=$((_p + 1))
+echo "[RUN] $(echo $BOOTS | wc -w | tr -d ' ') boot(s), $DEBIAN_JOBS at a time"
+_queue="$BOOTS"
+_running=""
+while [ -n "$_queue" ] || [ -n "$_running" ]; do
+	for _b in $_running; do
+		boot_poll "$_b" || _running=$(echo " $_running " | sed "s/ $_b / /;s/^ *//;s/ *\$//")
 	done
-else
-	boot_once "" || exit 1
-fi
+	while [ -n "$_queue" ] && [ "$(echo $_running | wc -w)" -lt "$DEBIAN_JOBS" ]; do
+		set -- $_queue
+		_b="$1"
+		shift
+		_queue="$*"
+		boot_start "$_b" || exit 1
+		_running="$_running $_b"
+	done
+	[ -z "$_running" ] || sleep 1
+done
+: >"$LOG"
+for _b in $BOOTS; do
+	cat "$RUN_DIR/$_b.log" >>"$LOG"
+done
 
 # ── Check ──────────────────────────────────────────────────────────────────
+echo "[TIME] lane-total $(since "$LANE_T0")s"
 echo ""
 echo "[CHECK] $LOG"
 check_output() {

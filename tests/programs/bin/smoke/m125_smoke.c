@@ -187,6 +187,8 @@ struct ring {
   struct io_uring_cqe *cqes;
 };
 
+static int ring_map(struct ring *r);
+
 static int ring_make(struct ring *r, unsigned entries, unsigned flags,
                      unsigned cq_entries) {
   memset(r, 0, sizeof(*r));
@@ -198,7 +200,11 @@ static int ring_make(struct ring *r, unsigned entries, unsigned flags,
   r->fd = io_uring_setup_(entries, &r->p);
   if (r->fd < 0)
     return -1;
+  return ring_map(r);
+}
 
+/* Map the rings the params in `r` describe. */
+static int ring_map(struct ring *r) {
   r->sq_sz = r->p.sq_off.array + r->p.sq_entries * sizeof(unsigned);
   size_t cq_sz = r->p.cq_off.cqes + r->p.cq_entries * sizeof(struct io_uring_cqe);
 
@@ -325,13 +331,48 @@ static void check_setup(void) {
   if (fd >= 0)
     close(fd);
 
-  memset(&p, 0, sizeof(p));
-  p.flags = IORING_SETUP_ATTACH_WQ;
-  fd = io_uring_setup_(8, &p);
-  judge("refuses-attach-wq", fd < 0 && errno == EINVAL,
-        "IORING_SETUP_ATTACH_WQ was accepted", (long)fd);
-  if (fd >= 0)
-    close(fd);
+  /* IORING_SETUP_ATTACH_WQ names another ring in wq_fd. A descriptor that is
+   * not a ring is EINVAL; a ring is accepted, and the new ring works. */
+  {
+    int pfd[2] = {-1, -1};
+
+    if (pipe(pfd) == 0) {
+      memset(&p, 0, sizeof(p));
+      p.flags = IORING_SETUP_ATTACH_WQ;
+      p.wq_fd = (unsigned)pfd[0];
+      fd = io_uring_setup_(8, &p);
+      judge("attach-wq-not-ring", fd < 0 && errno == EINVAL,
+            "ATTACH_WQ to a pipe was not EINVAL", (long)fd);
+      if (fd >= 0)
+        close(fd);
+      close(pfd[0]);
+      close(pfd[1]);
+    }
+  }
+  {
+    struct ring a, b;
+    struct io_uring_cqe cqe;
+    int ok_ = 0;
+
+    if (ring_make(&a, 8, 0, 0) == 0) {
+      memset(&b, 0, sizeof(b));
+      b.p.flags = IORING_SETUP_ATTACH_WQ;
+      b.p.wq_fd = (unsigned)a.fd;
+      b.fd = io_uring_setup_(8, &b.p);
+      if (b.fd >= 0 && ring_map(&b) == 0) {
+        struct io_uring_sqe *sqe = sq_get(&b);
+
+        sqe->opcode = IORING_OP_NOP;
+        sqe->user_data = 0xa77ac4;
+        ok_ = submit_wait(&b, 1, &cqe) == 0 && cqe.user_data == 0xa77ac4 &&
+              cqe.res == 0;
+      }
+      if (b.fd >= 0)
+        ring_free(&b);
+      ring_free(&a);
+    }
+    judge("attach-wq", ok_, "a ring attached to another did not work", 0);
+  }
 
   memset(&p, 0, sizeof(p));
   fd = io_uring_setup_(0, &p);
@@ -2759,10 +2800,12 @@ static void check_xattr_opcodes(void) {
 
   /* SETXATTR by path, then GETXATTR reads back exactly what was set. */
   sqe = sq_get(&r);
+  /* Linux's layout (liburing's io_uring_prep_setxattr): the name in addr,
+   * the value in addr2, the path in addr3. */
   sqe->opcode = IORING_OP_SETXATTR;
   sqe->addr = (unsigned long long)(uintptr_t) "user.b1nix";
-  sqe->addr2 = (unsigned long long)(uintptr_t)path;
-  sqe->addr3 = (unsigned long long)(uintptr_t) "through-the-ring";
+  sqe->addr2 = (unsigned long long)(uintptr_t) "through-the-ring";
+  sqe->addr3 = (unsigned long long)(uintptr_t)path;
   sqe->len = 16;
   sqe->user_data = 1;
   rc = submit_wait(&r, 1, &cqe);
@@ -2772,8 +2815,8 @@ static void check_xattr_opcodes(void) {
   sqe = sq_get(&r);
   sqe->opcode = IORING_OP_GETXATTR;
   sqe->addr = (unsigned long long)(uintptr_t) "user.b1nix";
-  sqe->addr2 = (unsigned long long)(uintptr_t)path;
-  sqe->addr3 = (unsigned long long)(uintptr_t)value;
+  sqe->addr2 = (unsigned long long)(uintptr_t)value;
+  sqe->addr3 = (unsigned long long)(uintptr_t)path;
   sqe->len = sizeof(value);
   sqe->user_data = 2;
   rc = submit_wait(&r, 1, &cqe);
@@ -2788,7 +2831,7 @@ static void check_xattr_opcodes(void) {
   sqe->opcode = IORING_OP_FSETXATTR;
   sqe->fd = fd;
   sqe->addr = (unsigned long long)(uintptr_t) "user.byfd";
-  sqe->addr3 = (unsigned long long)(uintptr_t) "fd-form";
+  sqe->addr2 = (unsigned long long)(uintptr_t) "fd-form";
   sqe->len = 7;
   sqe->user_data = 3;
   rc = submit_wait(&r, 1, &cqe);
@@ -2799,7 +2842,7 @@ static void check_xattr_opcodes(void) {
   sqe->opcode = IORING_OP_FGETXATTR;
   sqe->fd = fd;
   sqe->addr = (unsigned long long)(uintptr_t) "user.byfd";
-  sqe->addr3 = (unsigned long long)(uintptr_t)value;
+  sqe->addr2 = (unsigned long long)(uintptr_t)value;
   sqe->len = sizeof(value);
   sqe->user_data = 4;
   rc = submit_wait(&r, 1, &cqe);
@@ -3415,6 +3458,111 @@ static void check_personality(void) {
   ring_free(&r);
 }
 
+
+/* IORING_REGISTER_RESIZE_RINGS and IORING_REGISTER_QUERY. A resize keeps the
+ * completion still waiting in the old ring, and the new ring has the sizes
+ * asked for -- both in the params handed back and in the mapped rings -- and
+ * works. Only a DEFER_TASKRUN ring may be resized, as on Linux. The query says
+ * what the kernel supports, with a ring or without one, and refuses what it
+ * does not know. */
+static void check_resize_and_query(void) {
+  struct ring r;
+  struct io_uring_cqe cqe;
+
+  if (ring_make(&r, 8, 0, 0) == 0) {
+    struct io_uring_params np;
+
+    memset(&np, 0, sizeof(np));
+    np.sq_entries = 32;
+    int rc = io_uring_register_(r.fd, 33 /* IORING_REGISTER_RESIZE_RINGS */, &np, 1);
+
+    judge("resize-needs-defer", rc < 0 && errno == EINVAL,
+          "a ring without DEFER_TASKRUN was resized", rc);
+    ring_free(&r);
+  }
+
+  if (ring_make(&r, 8, IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN,
+                0) == 0) {
+    struct io_uring_sqe *sqe = sq_get(&r);
+    int kept = 0, fresh = 0, sizes = 0;
+
+    sqe->opcode = IORING_OP_NOP;
+    sqe->user_data = 0x5e1;
+    /* Submitted and completed, but not reaped: it has to survive. */
+    io_uring_enter_(r.fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0);
+
+    struct io_uring_params np;
+
+    memset(&np, 0, sizeof(np));
+    np.sq_entries = 32;
+    np.cq_entries = 128;
+    np.flags = IORING_SETUP_CQSIZE;
+    int rc = io_uring_register_(r.fd, 33 /* IORING_REGISTER_RESIZE_RINGS */, &np, 1);
+
+    if (rc == 0) {
+      munmap(r.sqes, r.sqes_sz);
+      munmap(r.sq_ptr, r.sq_sz);
+      r.sqes = 0;
+      r.sq_ptr = 0;
+      r.p = np;
+      if (ring_map(&r) == 0) {
+        sizes = np.sq_entries == 32 && np.cq_entries == 128 &&
+                *r.sq_entries == 32 && *r.cq_entries == 128;
+        kept = cq_get(&r, &cqe) && cqe.user_data == 0x5e1 && cqe.res == 0;
+        sqe = sq_get(&r);
+        sqe->opcode = IORING_OP_NOP;
+        sqe->user_data = 0x5e2;
+        fresh = submit_wait(&r, 1, &cqe) == 0 && cqe.user_data == 0x5e2;
+      }
+    }
+    judge("resize-rings", rc == 0 && sizes,
+          "IORING_REGISTER_RESIZE_RINGS did not give the sizes asked for", rc);
+    judge("resize-keeps-cqe", kept,
+          "the completion waiting in the old ring was lost", 0);
+    judge("resize-ring-works", fresh, "the resized ring does not work", 0);
+    ring_free(&r);
+  }
+
+  {
+    struct {
+      unsigned long long next_entry, query_data;
+      unsigned query_op, size;
+      int result;
+      unsigned resv[3];
+    } hdr;
+    struct {
+      unsigned nr_request_opcodes, nr_register_opcodes;
+      unsigned long long feature_flags, ring_setup_flags, enter_flags,
+          sqe_flags;
+      unsigned nr_query_opcodes, pad;
+    } ans;
+    int rc;
+
+    memset(&hdr, 0, sizeof(hdr));
+    memset(&ans, 0xff, sizeof(ans));
+    hdr.query_op = 0; /* IO_URING_QUERY_OPCODES */
+    hdr.query_data = (unsigned long long)(unsigned long)&ans;
+    hdr.size = sizeof(ans);
+    rc = io_uring_register_(-1, 35 /* IORING_REGISTER_QUERY */, &hdr, 0);
+    judge("query-opcodes",
+          rc == 0 && hdr.result == 0 && hdr.size == sizeof(ans) &&
+              ans.nr_request_opcodes >= IORING_OP_NOP + 1 &&
+              (ans.feature_flags & IORING_FEAT_NODROP) &&
+              (ans.ring_setup_flags & IORING_SETUP_SQPOLL) &&
+              (ans.enter_flags & IORING_ENTER_GETEVENTS) &&
+              (ans.sqe_flags & IOSQE_IO_LINK) && ans.nr_query_opcodes >= 1,
+          "the query did not describe the kernel", rc);
+
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.query_op = 1000;
+    hdr.query_data = (unsigned long long)(unsigned long)&ans;
+    hdr.size = sizeof(ans);
+    rc = io_uring_register_(-1, 35, &hdr, 0);
+    judge("query-unknown", rc == 0 && hdr.result == -EOPNOTSUPP,
+          "an unknown query was not EOPNOTSUPP", hdr.result);
+  }
+}
+
 int main(void) {
   printf("M125-SMOKE: start\n");
   fflush(stdout);
@@ -3470,6 +3618,7 @@ int main(void) {
   check_drain_after_overflow();
   check_drain_other_rings();
   check_personality();
+  check_resize_and_query();
 
   printf("M125-SMOKE: done\n");
   fflush(stdout);

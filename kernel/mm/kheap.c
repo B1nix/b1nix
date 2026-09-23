@@ -195,6 +195,13 @@ static spinlock_t heap_lock = SPINLOCK_INIT;
 struct kheap_magazine {
   struct kheap_block *slot[MAG_NCLASS][MAG_DEPTH];
   u16 count[MAG_NCLASS];
+  /* Its own CPU takes this with interrupts off, so it is never contended
+   * except by kheap_mag_evict_range, which rewrites every CPU's magazine under
+   * heap_lock. Without it the eviction's compaction raced the owner's push and
+   * pop: an entry the owner had just popped came back, and the same block was
+   * handed out twice -- heap corruption, and later a page returned to the pmm
+   * twice. Order: heap_lock, then a magazine lock. */
+  spinlock_t lock;
 };
 static struct kheap_magazine kheap_mag[MAX_CPUS];
 
@@ -235,12 +242,14 @@ static void *kheap_mag_alloc(usize size) {
   struct percpu *p = get_percpu();
   struct kheap_magazine *m = &kheap_mag[p->cpu_id];
   void *ptr = 0;
+  spin_lock(&m->lock);
   if (m->count[cls] > 0) {
     struct kheap_block *block = m->slot[cls][--m->count[cls]];
     block->magic = KHEAP_MAGIC;
     block->next = 0;
     ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
   }
+  spin_unlock(&m->lock);
   kheap_irq_restore(f);
   return ptr;
 }
@@ -257,12 +266,14 @@ static int kheap_mag_free(struct kheap_block *block) {
   struct percpu *p = get_percpu();
   struct kheap_magazine *m = &kheap_mag[p->cpu_id];
   int cached = 0;
+  spin_lock(&m->lock);
   if (m->count[cls] < MAG_DEPTH) {
     block->next = 0;
     block->magic = KHEAP_MAG_MAGIC;
     m->slot[cls][m->count[cls]++] = block;
     cached = 1;
   }
+  spin_unlock(&m->lock);
   kheap_irq_restore(f);
   return cached;
 }
@@ -296,6 +307,7 @@ static struct kheap_block *kheap_walk_topmost(void) {
 static void kheap_mag_evict_range(u64 lo, u64 hi) {
   for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
     struct kheap_magazine *m = &kheap_mag[cpu];
+    spin_lock(&m->lock);
     for (int cls = 0; cls < MAG_NCLASS; cls++) {
       u16 keep = 0;
       for (u16 i = 0; i < m->count[cls]; i++) {
@@ -308,6 +320,7 @@ static void kheap_mag_evict_range(u64 lo, u64 hi) {
       }
       m->count[cls] = keep;
     }
+    spin_unlock(&m->lock);
   }
 }
 

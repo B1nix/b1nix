@@ -19,4 +19,31 @@
 static inline unsigned long vfs_pressure_ratio(unsigned long val)
 { return val; }
 
+/*
+ * Name hashing for filesystems with their own d_hash (<linux/stringhash.h>
+ * upstream). The value only has to be consistent within this kernel: it keys
+ * in-memory lookups and is never stored. `salt` is the parent dentry upstream
+ * mixes in; mixing it in here as well keeps equal names in different
+ * directories apart.
+ */
+#define init_name_hash(salt) ((unsigned long)(salt))
+static inline unsigned long partial_name_hash(unsigned long c,
+                                              unsigned long prevhash)
+{
+	return (prevhash + (c << 4) + (c >> 4)) * 11;
+}
+static inline unsigned int end_name_hash(unsigned long hash)
+{
+	return (unsigned int)(hash ^ (hash >> 32));
+}
+static inline unsigned int full_name_hash(const void *salt, const char *name,
+                                          unsigned int len)
+{
+	unsigned long hash = init_name_hash(salt);
+
+	while (len--)
+		hash = partial_name_hash((unsigned char)*name++, hash);
+	return end_name_hash(hash);
+}
+
 #endif

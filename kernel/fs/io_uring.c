@@ -214,6 +214,8 @@ struct iou_overflow {
 enum iou_state {
   IOU_ST_QUEUED = 0, /* in a link chain, not yet issued */
   IOU_ST_ARMED,      /* issued, waiting for readiness or a deadline */
+  IOU_ST_DEFERRED,   /* not issued: held back by IOSQE_IO_DRAIN, see
+                      * iou_issue_or_defer */
 };
 
 struct iou_req {
@@ -253,6 +255,10 @@ struct iou_req {
    * exists -- accepting it and starting anyway is the one answer that is
    * worse than refusing it. */
   u8 is_drain;
+  u8 drain_gate; /* deferred as a drain: waits for everything older */
+  /* The process that submitted it (the ring's owner for what its SQPOLL
+   * thread picked up): its exit cancels it, see iou_cancel_task. */
+  usize tgid;
   u8 is_futex;
   u8 is_waitid; /* IORING_OP_WAITID: armed until the child it names exits */
   u8 futex_nr;                /* 1 for WAIT, n for WAITV */
@@ -317,9 +323,20 @@ struct iou_req {
    * writable reports POLLIN, and the socket becoming writable afterwards is a
    * new edge that the plain latch swallowed for ever. */
   u16 mshot_seen;
+  /* The file's readiness generation at the last report: a new one is a new
+   * edge even when the level never dropped between two sweeps. */
+  u32 mshot_gen;
   u8 buf_select; /* IOSQE_BUFFER_SELECT: the buffer comes from a group */
   u8 is_poll_update; /* IORING_POLL_UPDATE_*: change a poll already armed */
   u16 buf_group;
+  /* The buffer IOSQE_BUFFER_SELECT chose for a RECVMSG, whose sqe->addr is the
+   * message header and so cannot carry it the way it does for a RECV. */
+  u64 sel_addr;
+  u32 sel_buflen;
+  /* A SEND/SEND_ZC's destination (io_uring_prep_send_set_addr), copied in at
+   * submission: the program may reuse the memory the moment the SQE is in. */
+  u8 *send_addr;
+  u16 send_alen;
   u32 sel_len; /* sqe->len as submitted; a buffer pick overwrites sqe->len */
   /* sqe->file_index: a direct (registered) descriptor slot to install the
    * result in, biased by one, or IORING_FILE_INDEX_ALLOC. 0 means "give the
@@ -409,6 +426,7 @@ struct io_ring_ctx {
   volatile int sweeping;
   volatile usize sweeper;
   u32 nr_live;
+  u32 nr_deferred; /* requests in IOU_ST_DEFERRED */
 
   struct iou_overflow *ovfl_head, *ovfl_tail;
 
@@ -421,6 +439,10 @@ struct io_ring_ctx {
   struct iou_req *defer_head;
 
   struct vfs_handle *cq_eventfd; /* retained */
+  /* The CQ tail when the eventfd was last signalled for a CQE, and whether
+   * deferred work has already been announced: see iou_signal_eventfd. */
+  u32 evfd_last_tail;
+  volatile int evfd_announced;
   int eventfd_async; /* IORING_REGISTER_EVENTFD_ASYNC */
 
   /* Provided buffers: the classic IORING_OP_PROVIDE_BUFFERS lists and the
@@ -432,7 +454,23 @@ struct io_ring_ctx {
   int sq_tid;
   u32 sq_idle_ms;
   volatile int sq_stop;
+  /* The last things that happened to this ring, for the dump: a hang is a
+   * request that went somewhere, and the log says where, without the cost of
+   * printing every event while the race is being run. */
+  struct {
+    u64 ns;
+    u64 user_data;
+    i32 res;
+    u8 ev;
+    u8 op;
+  } evlog[16];
+  u32 evpos;
+  /* g_vfs_poll_seq when io_uring_task_work last swept this ring. */
+  u64 tw_seq;
   volatile int sq_alive;
+  /* The thread itself, recorded by the thread: sq_tid is written by its
+   * creator after kthread_create returns, which may be after it has run. */
+  struct task *sq_self;
   int sq_wait; /* the address is the channel the submission thread sleeps on */
   /* Started once, the first time this ring arms a request it cannot finish
    * inside io_uring_enter: see iou_async_kick. */
@@ -504,15 +542,26 @@ struct iou_bgroup {
 #define IOU_PBUF_RING_TAIL_OFF 14u
 
 static struct io_ring_ctx *g_ctx_list;
+/* Rings alive: the gate on the syscall-exit work below, so a machine with no
+ * rings pays one load per system call for it. */
+static int g_iou_nr_rings;
 static volatile int g_ctx_list_lock;
 
+/* These locks spin with a yield, so their holder can be preempted -- and a
+ * SIGKILL is acted on at the preemption point unless the task is inside a
+ * kernel critical section (scheduler_kcrit_enter). A thread killed while
+ * holding one left it held by a task that no longer existed, and every later
+ * system call of every io_uring user spun on it: an exit_group of a threaded
+ * test took the whole machine with it. The kill waits for the unlock. */
 static void iou_list_lock(void) {
+  scheduler_kcrit_enter();
   while (__atomic_test_and_set(&g_ctx_list_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
 }
 
 static void iou_list_unlock(void) {
   __atomic_clear(&g_ctx_list_lock, __ATOMIC_RELEASE);
+  scheduler_kcrit_leave();
 }
 
 /* The per-ring lock is a plain spin-with-yield, like the rest of this file's
@@ -522,13 +571,17 @@ static void iou_list_unlock(void) {
  * it is held — the issue paths take it, drop it, do the I/O, and take it again
  * to post. */
 static void iou_lock(struct io_ring_ctx *ctx) {
+  scheduler_kcrit_enter(); /* see iou_list_lock */
   while (__atomic_test_and_set(&ctx->lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
 }
 
 static void iou_unlock(struct io_ring_ctx *ctx) {
   __atomic_clear(&ctx->lock, __ATOMIC_RELEASE);
+  scheduler_kcrit_leave();
 }
+
+extern volatile u64 g_vfs_poll_seq;
 
 static void iou_trace(const char *what, u64 a, u64 b, isize rc) {
   static int on = -1;
@@ -626,6 +679,9 @@ static int iou_mmap_page_phys(struct vfs_handle *handle, u64 offset,
     return -EBADF;
   ctx = (struct io_ring_ctx *)handle->private_data;
 
+  /* Resolved and referenced under the ring lock, which a resize swaps the
+   * regions under: see vfs_inode::mmap_page_cb_refs. */
+  iou_lock(ctx);
   if (offset >= IORING_OFF_SQES) {
     base = ctx->sqes_phys;
     pages = ctx->sqes_pages;
@@ -645,15 +701,19 @@ static int iou_mmap_page_phys(struct vfs_handle *handle, u64 offset,
   }
 
   region_bytes = (u64)pages * PAGE_SIZE;
-  if (!base || (within & (PAGE_SIZE - 1)) || within >= region_bytes)
+  if (!base || (within & (PAGE_SIZE - 1)) || within >= region_bytes) {
+    iou_unlock(ctx);
     return -EINVAL;
+  }
   *out_phys = base + within;
+  pmm_ref_frame(*out_phys);
+  iou_unlock(ctx);
   return 0;
 }
 
 /* ---- completions -------------------------------------------------------- */
 
-static void iou_signal_eventfd(struct io_ring_ctx *ctx) {
+static void iou_signal_eventfd(struct io_ring_ctx *ctx, int cqe_event) {
   struct vfs_handle *efd = ctx->cq_eventfd;
   u64 one = 1;
 
@@ -663,6 +723,17 @@ static void iou_signal_eventfd(struct io_ring_ctx *ctx) {
   if (__atomic_load_n(&ctx->hdr->cq_flags, __ATOMIC_ACQUIRE) &
       IORING_CQ_EVENTFD_DISABLED)
     return;
+  /* For a posted completion, only when the ring gained a CQE since the last
+   * such signal, as Linux's io_eventfd_signal decides. An announcement of
+   * deferred work (cqe_event 0) is not a CQE and is not deduplicated here;
+   * its caller signals it once per batch. */
+  if (cqe_event) {
+    u32 tail = __atomic_load_n(&ctx->hdr->cq_tail, __ATOMIC_ACQUIRE);
+
+    if (__atomic_exchange_n(&ctx->evfd_last_tail, tail, __ATOMIC_ACQ_REL) ==
+        tail)
+      return;
+  }
   efd->ops->write(efd, (const char *)&one, sizeof(one));
 }
 
@@ -744,6 +815,24 @@ static void iou_post_cqe_locked(struct io_ring_ctx *ctx, u64 user_data,
                    __ATOMIC_RELEASE);
 }
 
+/* Would a completion posted now have to go to the overflow list? A multishot
+ * request that meets this stops being multishot: Linux's io_req_post_cqe
+ * refuses an F_MORE completion the ring has no room for, and the request then
+ * finishes with that result as its last -- which a program sees as the
+ * multishot "downgrading" on overflow and re-arms. Carrying on through the
+ * overflow list instead let one request fill it without bound. */
+static int iou_cq_full(struct io_ring_ctx *ctx) {
+  int full;
+
+  iou_lock(ctx);
+  full = ctx->ovfl_head != 0 ||
+         __atomic_load_n(&ctx->hdr->cq_tail, __ATOMIC_RELAXED) -
+                 __atomic_load_n(&ctx->hdr->cq_head, __ATOMIC_ACQUIRE) >=
+             ctx->cq_entries;
+  iou_unlock(ctx);
+  return full;
+}
+
 /* Whether anything on this machine has ever polled a ring's own descriptor.
  * A ring is pollable -- readable once its completion queue is not empty -- and
  * a program that watches one ring from another relies on the completion being
@@ -760,14 +849,28 @@ static volatile int g_iou_crossring_busy;
 
 static void iou_crossring_kick(struct io_ring_ctx *ctx);
 
+enum { IOU_EV_SUBMIT = 1, IOU_EV_CQE, IOU_EV_QUIESCE, IOU_EV_DROP,
+       IOU_EV_ENTER, IOU_EV_ARM, IOU_EV_RELEASE, IOU_EV_SETUP };
+
+static void iou_evlog(struct io_ring_ctx *ctx, u8 ev, u8 op, u64 ud, i32 res) {
+  u32 i = __atomic_fetch_add(&ctx->evpos, 1, __ATOMIC_RELAXED) % 16;
+
+  ctx->evlog[i].ns = ktime_monotonic_ns();
+  ctx->evlog[i].user_data = ud;
+  ctx->evlog[i].res = res;
+  ctx->evlog[i].ev = ev;
+  ctx->evlog[i].op = op;
+}
+
 static void iou_post_cqe_n(struct io_ring_ctx *ctx, u64 user_data, i32 res,
                            u32 cflags, int counts) {
+  iou_evlog(ctx, IOU_EV_CQE, 0, user_data, res);
   iou_trace("cqe", user_data, (u64)(u32)cflags, res);
   TRACEPOINT_FIRE(TP_IO_URING_COMPLETE, user_data, (u64)(u32)res, cflags);
   iou_lock(ctx);
   iou_post_cqe_locked(ctx, user_data, res, cflags, counts);
   iou_unlock(ctx);
-  iou_signal_eventfd(ctx);
+  iou_signal_eventfd(ctx, 1);
   scheduler_wake_all(ctx);
   if (__atomic_load_n(&g_iou_ringpoll_armed, __ATOMIC_RELAXED) > 0)
     iou_crossring_kick(ctx);
@@ -819,6 +922,8 @@ static void iou_req_unlink(struct io_ring_ctx *ctx, struct iou_req *req) {
       *pp = req->next;
       if (ctx->live_tail == req)
         ctx->live_tail = prev;
+      if (req->state == IOU_ST_DEFERRED && ctx->nr_deferred)
+        ctx->nr_deferred--;
       req->next = 0;
       if (ctx->nr_live)
         ctx->nr_live--;
@@ -842,6 +947,8 @@ static void iou_req_free(struct iou_req *req) {
     kfree(req->iov);
   if (req->fx)
     kfree(req->fx);
+  if (req->send_addr)
+    kfree(req->send_addr);
   kfree(req);
 }
 
@@ -1331,6 +1438,62 @@ static const char *iou_handle_path(struct vfs_handle *h) {
   return 0;
 }
 
+static int iou_tmp_fd(struct vfs_handle *h);
+static void iou_tmp_fd_put(int fd);
+
+/* A SEND or SEND_ZC: to the connected peer, or to the address
+ * io_uring_prep_send_set_addr put in addr2/addr_len, as sendto(2) would. An
+ * address that cannot be read is EFAULT, as move_addr_to_kernel makes it. */
+static isize iou_send_to(struct iou_req *req, struct vfs_handle *h,
+                         const void *buf, usize len) {
+  int tfd;
+  isize r;
+
+  if (!req->send_addr)
+    return vfs_socket_send_h(h, buf, len, (int)req->sqe.msg_flags);
+  tfd = iou_tmp_fd(h);
+  if (tfd < 0)
+    return tfd;
+  r = vfs_socket_sendto(tfd, buf, len, (int)req->sqe.msg_flags, req->send_addr,
+                        req->send_alen);
+  iou_tmp_fd_put(tfd);
+  return r;
+}
+
+/* The value of an xattr request moves through a kernel buffer, as the system
+ * calls move it: a filesystem's xattr callback copies with memcpy, so handing
+ * it the program's pointer wrote (or read) the value somewhere other than the
+ * program's buffer, and liburing's xattr read back garbage. */
+static isize iou_xattr_rw(const char *path, const char *name, u64 uvalue,
+                          u32 len, int flags, int set) {
+  usize cap = len > XATTR_VALUE_MAX ? XATTR_VALUE_MAX : len;
+  void *kbuf = 0;
+  isize ret;
+
+  if (set && len > XATTR_VALUE_MAX)
+    return -E2BIG;
+  if (cap) {
+    kbuf = kmalloc(cap);
+    if (!kbuf)
+      return -ENOMEM;
+  }
+  if (set) {
+    if (cap && syscall_copyin(kbuf, (const void *)(usize)uvalue, cap) < 0) {
+      kfree(kbuf);
+      return -EFAULT;
+    }
+    ret = vfs_setxattr(path, name, kbuf, cap, flags, 0);
+  } else {
+    ret = vfs_getxattr(path, name, kbuf, cap, 0);
+    if (ret > 0 && cap &&
+        syscall_copyout((void *)(usize)uvalue, kbuf, (usize)ret) < 0)
+      ret = -EFAULT;
+  }
+  if (kbuf)
+    kfree(kbuf);
+  return ret;
+}
+
 static int iou_path_at(int dirfd, u64 user_path, char *out, usize outsz) {
   char kpath[VFS_MAX_PATH];
   char dirbuf[VFS_MAX_PATH];
@@ -1459,9 +1622,15 @@ static i32 iou_remove_direct(struct io_ring_ctx *ctx, u32 file_index) {
   if (file_index == 0)
     return -EINVAL;
   iou_lock(ctx);
-  if (!ctx->files || file_index - 1 >= ctx->nr_files) {
+  /* No table at all is ENXIO, a slot past its end EINVAL, as Linux's
+   * io_fixed_fd_remove tells them apart. */
+  if (!ctx->files || !ctx->nr_files) {
     iou_unlock(ctx);
     return -ENXIO;
+  }
+  if (file_index - 1 >= ctx->nr_files) {
+    iou_unlock(ctx);
+    return -EINVAL;
   }
   h = ctx->files[file_index - 1].file;
   ctx->files[file_index - 1].file = 0;
@@ -1725,12 +1894,76 @@ static i32 iou_perform_op(struct iou_req *req) {
     return (i32)r;
   }
 
+  /* There is no page-pinned zero-copy path here: SEND_ZC's transfer is the
+   * same copy IORING_OP_SEND makes, vectored form included. What the ABI
+   * requires of SEND_ZC beyond that is the second, notification completion,
+   * and it is posted for real -- see iou_complete, which posts it once the
+   * data has left. A program that waits for IORING_CQE_F_NOTIF therefore gets
+   * the answer it is owed. */
+  case IORING_OP_SEND_ZC:
   case IORING_OP_SEND: {
     char *bounce;
     u32 len = sqe->len;
+    /* The flags either opcode takes, as io_send_zc_prep / io_sendmsg_prep
+     * check them: anything else is EINVAL. */
+    u32 valid = IORING_RECVSEND_POLL_FIRST | IORING_RECVSEND_FIXED_BUF |
+                IORING_SEND_VECTORIZED |
+                (sqe->opcode == IORING_OP_SEND_ZC ? IORING_SEND_ZC_REPORT_USAGE
+                                                  : IORING_RECVSEND_BUNDLE);
 
     if (!h)
       return -EBADF;
+    if (sqe->ioprio & ~valid)
+      return -EINVAL;
+    if (sqe->ioprio & IORING_SEND_VECTORIZED) {
+      /* addr is an iovec array and len its count. Gathered into one buffer
+       * and sent in one call, so a datagram leaves whole; read as a flat
+       * buffer it sent the first bytes of the iovec array itself. */
+      struct iou_iovec *iov;
+      u32 nr = sqe->len;
+      usize total = 0;
+
+      if (nr == 0 || nr > 1024)
+        return -EINVAL;
+      iov = kmalloc(sizeof(*iov) * nr);
+      if (!iov)
+        return -ENOMEM;
+      if (syscall_copyin(iov, (const void *)(usize)sqe->addr,
+                         sizeof(*iov) * nr) < 0) {
+        kfree(iov);
+        return -EFAULT;
+      }
+      for (u32 i = 0; i < nr; i++)
+        total += iov[i].len;
+      if (total > IOU_BOUNCE)
+        total = IOU_BOUNCE;
+      bounce = kmalloc(total ? total : 1);
+      if (!bounce) {
+        kfree(iov);
+        return -ENOMEM;
+      }
+      {
+        usize at = 0;
+
+        for (u32 i = 0; i < nr && at < total; i++) {
+          usize n = iov[i].len;
+
+          if (n > total - at)
+            n = total - at;
+          if (n && syscall_copyin(bounce + at,
+                                  (const void *)(usize)iov[i].base, n) < 0) {
+            kfree(bounce);
+            kfree(iov);
+            return -EFAULT;
+          }
+          at += n;
+        }
+      }
+      kfree(iov);
+      r = iou_send_to(req, h, bounce, total);
+      kfree(bounce);
+      return (i32)r;
+    }
     if (len > IOU_BOUNCE)
       len = IOU_BOUNCE;
     bounce = kmalloc(len ? len : 1);
@@ -1740,7 +1973,7 @@ static i32 iou_perform_op(struct iou_req *req) {
       kfree(bounce);
       return -EFAULT;
     }
-    r = vfs_socket_send_h(h, bounce, len, (int)sqe->msg_flags);
+    r = iou_send_to(req, h, bounce, len);
     kfree(bounce);
     return (i32)r;
   }
@@ -1864,35 +2097,18 @@ static i32 iou_perform_op(struct iou_req *req) {
       r = (isize)(i64)syscall_sendmsg_user(
           tfd, (const struct syscall_msghdr *)(usize)sqe->addr,
           (int)sqe->msg_flags);
+    else if (req->buf_select && req->multishot)
+      r = (isize)(i64)syscall_recvmsg_user_mshot(
+          tfd, (struct syscall_msghdr *)(usize)sqe->addr, (int)sqe->msg_flags,
+          req->sel_addr, req->sel_buflen);
+    else if (req->buf_select)
+      r = (isize)(i64)syscall_recvmsg_user_buf(
+          tfd, (struct syscall_msghdr *)(usize)sqe->addr, (int)sqe->msg_flags,
+          req->sel_addr, req->sel_buflen);
     else
       r = (isize)(i64)syscall_recvmsg_user(
           tfd, (struct syscall_msghdr *)(usize)sqe->addr, (int)sqe->msg_flags);
     iou_tmp_fd_put(tfd);
-    return (i32)r;
-  }
-
-  case IORING_OP_SEND_ZC: {
-    /* There is no page-pinned zero-copy path here: the transfer is the same
-     * copy IORING_OP_SEND makes. What the ABI requires of SEND_ZC beyond that
-     * is the second, notification completion, and it is posted for real — see
-     * iou_complete, which posts it once the data has left. A program that
-     * waits for IORING_CQE_F_NOTIF therefore gets the answer it is owed. */
-    char *bounce;
-    u32 len = sqe->len;
-
-    if (!h)
-      return -EBADF;
-    if (len > IOU_BOUNCE)
-      len = IOU_BOUNCE;
-    bounce = kmalloc(len ? len : 1);
-    if (!bounce)
-      return -ENOMEM;
-    if (len && syscall_copyin(bounce, (const void *)(usize)sqe->addr, len) < 0) {
-      kfree(bounce);
-      return -EFAULT;
-    }
-    r = vfs_socket_send_h(h, bounce, len, (int)sqe->msg_flags);
-    kfree(bounce);
     return (i32)r;
   }
 
@@ -2157,11 +2373,11 @@ static i32 iou_perform_op(struct iou_req *req) {
   case IORING_OP_SETXATTR:
   case IORING_OP_GETXATTR: {
     /* setxattr(2)/getxattr(2) by path. The SQE carries the name in `addr`, the
-     * value in `addr3` and its size in `len`; the path is in `addr2`, which is
-     * the layout Linux gave these opcodes. */
+     * value in `addr2` (the `off` word) and its size in `len`; the path is in
+     * `addr3` -- Linux's io_xattr layout, and liburing's prep helpers. */
     char path[VFS_MAX_PATH];
     char name[256];
-    int rc = iou_path_at(AT_FDCWD, sqe->addr2, path, sizeof(path));
+    int rc = iou_path_at(AT_FDCWD, sqe->addr3, path, sizeof(path));
 
     if (rc < 0)
       return (i32)rc;
@@ -2169,11 +2385,9 @@ static i32 iou_perform_op(struct iou_req *req) {
         syscall_copyinstr(name, sizeof(name), (const char *)(usize)sqe->addr) <
             0)
       return -EFAULT;
-    if (sqe->opcode == IORING_OP_SETXATTR)
-      return (i32)vfs_setxattr(path, name, (const void *)(usize)sqe->addr3,
-                               sqe->len, (int)sqe->xattr_flags, 0);
-    return (i32)vfs_getxattr(path, name, (void *)(usize)sqe->addr3, sqe->len,
-                             0);
+    return (i32)iou_xattr_rw(path, name, sqe->addr2, sqe->len,
+                             (int)sqe->xattr_flags,
+                             sqe->opcode == IORING_OP_SETXATTR);
   }
 
   case IORING_OP_FSETXATTR:
@@ -2193,11 +2407,9 @@ static i32 iou_perform_op(struct iou_req *req) {
         syscall_copyinstr(name, sizeof(name), (const char *)(usize)sqe->addr) <
             0)
       return -EFAULT;
-    if (sqe->opcode == IORING_OP_FSETXATTR)
-      return (i32)vfs_setxattr(fpath, name, (const void *)(usize)sqe->addr3,
-                               sqe->len, (int)sqe->xattr_flags, 0);
-    return (i32)vfs_getxattr(fpath, name, (void *)(usize)sqe->addr3, sqe->len,
-                             0);
+    return (i32)iou_xattr_rw(fpath, name, sqe->addr2, sqe->len,
+                             (int)sqe->xattr_flags,
+                             sqe->opcode == IORING_OP_FSETXATTR);
   }
 
   case IORING_OP_EPOLL_WAIT: {
@@ -2300,11 +2512,26 @@ static i32 iou_perform_op(struct iou_req *req) {
     char oldp[VFS_MAX_PATH], newp[VFS_MAX_PATH];
     int rc;
 
-    if (sqe->hardlink_flags & ~(u32)IOU_AT_SYMLINK_FOLLOW)
+    if (sqe->hardlink_flags & ~(u32)(IOU_AT_SYMLINK_FOLLOW | AT_EMPTY_PATH))
       return -EINVAL;
+    /* AT_EMPTY_PATH with an empty name links the file the descriptor is open
+     * on, as linkat(2) does; liburing's hardlink skipped without it. */
+    if ((sqe->hardlink_flags & AT_EMPTY_PATH) && sqe->addr) {
+      char first;
+
+      if (syscall_copyin(&first, (const void *)(usize)sqe->addr, 1) < 0)
+        return -EFAULT;
+      if (!first) {
+        rc = vfs_fd_abspath((int)sqe->fd, oldp, sizeof(oldp));
+        if (rc < 0)
+          return (i32)rc;
+        goto linkat_new;
+      }
+    }
     rc = iou_path_at((int)sqe->fd, sqe->addr, oldp, sizeof(oldp));
     if (rc < 0)
       return (i32)rc;
+  linkat_new:
     rc = iou_path_at((int)sqe->len, sqe->addr2, newp, sizeof(newp));
     if (rc < 0)
       return (i32)rc;
@@ -2337,6 +2564,15 @@ static i32 iou_perform_op(struct iou_req *req) {
       hin = scheduler_fd_get_retain(sqe->splice_fd_in);
       if (!hin)
         return -EBADF;
+    }
+    /* tee(2) duplicates what is in the pipe and leaves it there. Done as a
+     * copy_file_range it consumed the source, and a caller that then read the
+     * source pipe -- liburing's splice test does, to check it -- waited for
+     * ever on bytes the tee had taken. */
+    if (sqe->opcode == IORING_OP_TEE) {
+      r = vfs_pipe_tee(hin, h, sqe->len);
+      vfs_handle_release(hin);
+      return (i32)r;
     }
     tfd_in = iou_tmp_fd(hin);
     vfs_handle_release(hin);
@@ -2588,9 +2824,14 @@ static i32 iou_perform(struct iou_req *req, u32 *cflags) {
     if (rc < 0)
       return (i32)rc;
     selected = 1;
-    req->sqe.addr = b.addr;
-    req->sqe.len = (!req->sel_len || req->sel_len > b.len) ? b.len
-                                                           : req->sel_len;
+    if (req->sqe.opcode == IORING_OP_RECVMSG) {
+      req->sel_addr = b.addr;
+      req->sel_buflen = b.len;
+    } else {
+      req->sqe.addr = b.addr;
+      req->sqe.len = (!req->sel_len || req->sel_len > b.len) ? b.len
+                                                             : req->sel_len;
+    }
     /* A vectored read reads its segments from the list copied in at prep, and
      * never looks at sqe->addr -- so the chosen buffer was ignored and the
      * read filled the caller's own iovec, the full length of it. Linux allows
@@ -2744,8 +2985,11 @@ static void iou_complete(struct iou_req *req, i32 res, u32 cflags) {
     iou_lock(ctx);
     iou_req_unlink(ctx, t);
     iou_unlock(ctx);
-    /* Linux: a link timeout whose target finished first completes -ECANCELED. */
-    iou_post_req_cqe(t, -ECANCELED, 0);
+    /* Linux: a link timeout whose target finished first completes -ECANCELED
+     * -- without being marked failed, so its own IOSQE_CQE_SKIP_SUCCESS still
+     * hides that completion (io_req_queue_tw_complete; liburing's skip-cqe). */
+    if (!t->cqe_skip)
+      iou_post_req_cqe(t, -ECANCELED, 0);
     iou_req_free(t);
   }
 
@@ -2825,6 +3069,7 @@ static int iou_run_once(struct iou_req *req) {
   i32 res;
   int last;
 
+
   /* A personality this ring never registered is an error, not a request that
    * quietly runs as the submitter. The whole point of naming one is that the
    * request runs as somebody else; running it as the caller instead is the one
@@ -2852,6 +3097,7 @@ static int iou_run_once(struct iou_req *req) {
   if ((res == -EAGAIN || res == -EWOULDBLOCK) &&
       ((req->poll_mask && iou_pollable(req->file)) || req->is_waitid)) {
     req->state = IOU_ST_ARMED;
+    iou_evlog(req->ctx, IOU_EV_ARM, req->sqe.opcode, req->sqe.user_data, 0);
     req->eagain_sweep = req->ctx->sweep_gen;
     return 1;
   }
@@ -2867,9 +3113,12 @@ static int iou_run_once(struct iou_req *req) {
     default:
       break;
     }
+  if (req->multishot && !last && iou_cq_full(req->ctx))
+    last = 1; /* no room for another F_MORE completion: see iou_cq_full */
   if (req->multishot && !last) {
     iou_post_req_cqe(req, res, cflags | IORING_CQE_F_MORE);
     req->state = IOU_ST_ARMED;
+    iou_evlog(req->ctx, IOU_EV_ARM, req->sqe.opcode, req->sqe.user_data, 0);
     return 1;
   }
   iou_complete(req, res, cflags);
@@ -2919,6 +3168,69 @@ static void iou_issue_chain(struct iou_req *head) {
   }
 }
 
+/* IOSQE_IO_DRAIN, as Linux keeps it: a drain request is not issued until
+ * everything submitted before it has completed, and nothing submitted after it
+ * is issued before it is -- the ring holds them all back, in submission order,
+ * on its defer list. Issuing the later ones at once was what let liburing's
+ * multicqes_drain cancel a drained multishot poll before the drain had let it
+ * start, and so see its completion ahead of requests older than it.
+ *
+ * A held-back request is not armed: a cancel does not find it (-ENOENT, as
+ * Linux's poll remove answers for a request still on the defer list). A drain
+ * flag anywhere in a link chain drains the whole chain, as Linux moves it onto
+ * the head. A chain that failed to prepare is failed at once, not held. */
+static void iou_issue_or_defer(struct iou_req *head) {
+  struct io_ring_ctx *ctx = head->ctx;
+  int drain = 0, poisoned = 0;
+
+  for (struct iou_req *r = head; r; r = r->link_next) {
+    drain |= r->is_drain;
+    poisoned |= r->failed;
+  }
+  if (!poisoned) {
+    iou_lock(ctx);
+    if (ctx->nr_deferred || (drain && iou_older_live(ctx, head))) {
+      head->state = IOU_ST_DEFERRED;
+      head->drain_gate = (u8)drain;
+      ctx->nr_deferred++;
+      iou_unlock(ctx);
+      iou_evlog(ctx, IOU_EV_ARM, head->sqe.opcode, head->sqe.user_data, 1);
+      return;
+    }
+    iou_unlock(ctx);
+  }
+  iou_issue_chain(head);
+}
+
+/* Issue what the defer list lets go, oldest first: the oldest held-back request
+ * goes as soon as it is not a drain or nothing older is left, and the ones
+ * behind it wait for it. Returns whether anything was issued. */
+static int iou_run_deferred(struct io_ring_ctx *ctx) {
+  int did = 0;
+
+  while (__atomic_load_n(&ctx->nr_deferred, __ATOMIC_ACQUIRE)) {
+    struct iou_req *go = 0;
+
+    iou_lock(ctx);
+    for (struct iou_req *r = ctx->live; r; r = r->next) {
+      if (r->state != IOU_ST_DEFERRED)
+        continue;
+      if (!r->drain_gate || !iou_older_live(ctx, r)) {
+        go = r;
+        go->state = IOU_ST_QUEUED; /* claimed, under the lock */
+        ctx->nr_deferred--;
+      }
+      break;
+    }
+    iou_unlock(ctx);
+    if (!go)
+      break;
+    did = 1;
+    iou_issue_chain(go);
+  }
+  return did;
+}
+
 /* Arm the link timeout that follows `req`, if the next link is one.
  *
  * Returns 1 when that timeout could not be prepared, in which case `req` is to
@@ -2964,11 +3276,13 @@ static i32 iou_poll_update(struct io_ring_ctx *ctx,
       r->poll_mask = (u16)(sqe->poll32_events & 0xffff);
       if (!r->poll_mask)
         r->poll_mask = B1NIX_POLLIN;
-      r->mshot_reported = 0;
-      r->mshot_seen = 0;
     }
     if (sqe->len & IORING_POLL_UPDATE_USER_DATA)
       r->sqe.user_data = sqe->off;
+    /* Linux re-arms the poll after either update, so what is ready now is
+     * reported again. */
+    r->mshot_reported = 0;
+    r->mshot_seen = 0;
     rc = 0;
     break;
   }
@@ -3007,22 +3321,32 @@ static int iou_issue(struct iou_req *req) {
     return 0;
   }
 
+  /* A multishot read is driven by readiness, so a file that cannot be polled
+   * -- a regular file -- is refused as Linux's io_read_mshot refuses it. */
+  if (sqe->opcode == IORING_OP_READ_MULTISHOT && !iou_pollable(req->file)) {
+    iou_complete(req, -EBADFD, 0);
+    return 0;
+  }
+
   /* A drain waits for the ring to be empty of everything older. It is armed
    * with no readiness of its own; the sweep starts it when the last request
    * ahead of it is gone. */
   if (req->is_drain && iou_older_live(ctx, req)) {
     req->state = IOU_ST_ARMED;
+    iou_evlog(req->ctx, IOU_EV_ARM, req->sqe.opcode, req->sqe.user_data, 0);
     return 1;
   }
 
   /* Requests that are nothing but a deadline or a registration. */
   if (req->is_timeout) {
     req->state = IOU_ST_ARMED;
+    iou_evlog(req->ctx, IOU_EV_ARM, req->sqe.opcode, req->sqe.user_data, 0);
     req->timeout_target = ctx->cq_posted + req->timeout_count;
     return 1;
   }
   if (sqe->opcode == IORING_OP_POLL_ADD) {
     req->state = IOU_ST_ARMED;
+    iou_evlog(req->ctx, IOU_EV_ARM, req->sqe.opcode, req->sqe.user_data, 0);
     return 1; /* the sweep below reports it, ready or not */
   }
   if (sqe->opcode == IORING_OP_WAITID) {
@@ -3031,6 +3355,7 @@ static int iou_issue(struct iou_req *req) {
      * without a second entry. */
     req->is_waitid = 1;
     req->state = IOU_ST_ARMED;
+    iou_evlog(req->ctx, IOU_EV_ARM, req->sqe.opcode, req->sqe.user_data, 0);
     return 1;
   }
   if (sqe->opcode == IORING_OP_FUTEX_WAIT ||
@@ -3042,6 +3367,7 @@ static int iou_issue(struct iou_req *req) {
       return 0;
     }
     req->state = IOU_ST_ARMED;
+    iou_evlog(req->ctx, IOU_EV_ARM, req->sqe.opcode, req->sqe.user_data, 0);
     return 1;
   }
   if (req->is_linktmo) {
@@ -3050,11 +3376,27 @@ static int iou_issue(struct iou_req *req) {
     return 0;
   }
 
+  /* A message header is read when the request is prepared, as Linux does in
+   * its prep: a bad one is EFAULT there and then, not a wait for readiness
+   * that is then never answered (liburing's send_recv submits a recvmsg with
+   * no header and waits for its -EFAULT). */
+  if (sqe->opcode == IORING_OP_SENDMSG || sqe->opcode == IORING_OP_RECVMSG ||
+      sqe->opcode == IORING_OP_SENDMSG_ZC) {
+    u64 probe[7]; /* struct msghdr: 56 bytes on both LP64 arches */
+
+    if (syscall_copyin(probe, (const void *)(usize)sqe->addr,
+                       sizeof(probe)) < 0) {
+      iou_complete(req, -EFAULT, 0);
+      return 0;
+    }
+  }
+
   if (req->poll_mask && iou_pollable(req->file)) {
     u16 rev = iou_poll_now(req->file, req->poll_mask);
 
     if (!(rev & (req->poll_mask | B1NIX_POLLERR | B1NIX_POLLHUP))) {
       req->state = IOU_ST_ARMED;
+      iou_evlog(req->ctx, IOU_EV_ARM, req->sqe.opcode, req->sqe.user_data, 0);
       return 1;
     }
   }
@@ -3067,7 +3409,8 @@ static int iou_issue(struct iou_req *req) {
  * means "before us in the list". */
 static int iou_older_live(struct io_ring_ctx *ctx, struct iou_req *req) {
   for (struct iou_req *r = ctx->live; r && r != req; r = r->next) {
-    if (r->state == IOU_ST_ARMED || r->state == IOU_ST_QUEUED)
+    if (r->state == IOU_ST_ARMED || r->state == IOU_ST_QUEUED ||
+        r->state == IOU_ST_DEFERRED)
       return 1;
   }
   return 0;
@@ -3302,6 +3645,8 @@ static int iou_progress(struct io_ring_ctx *ctx) {
   if (__atomic_load_n(&ctx->sweeping, __ATOMIC_ACQUIRE) &&
       __atomic_load_n(&ctx->sweeper, __ATOMIC_ACQUIRE) == me)
     return 0;
+  /* The sweep is a lock too: see iou_list_lock. */
+  scheduler_kcrit_enter();
   while (__atomic_test_and_set(&ctx->sweeping, __ATOMIC_ACQUIRE))
     scheduler_yield();
   __atomic_store_n(&ctx->sweeper, me, __ATOMIC_RELEASE);
@@ -3315,6 +3660,9 @@ static int iou_progress(struct io_ring_ctx *ctx) {
     struct iou_req *victim = 0;
     i32 res = 0;
     int is_poll_report = 0;
+
+    if (iou_run_deferred(ctx))
+      did = 1;
     /* Expired timeouts complete in DEADLINE order, not in the order the list
      * happens to hold them. Several timeouts armed at once and reaped in one
      * go is exactly what liburing's test_multi_timeout checks, and a list walk
@@ -3366,9 +3714,16 @@ static int iou_progress(struct io_ring_ctx *ctx) {
       if (r->is_drain) {
         if (iou_older_live(ctx, r))
           continue; /* still waiting for the ones before it */
-        victim = r;
-        res = 1; /* marker: run it below, now that the ring is drained */
-        break;
+        /* Drained. A request that waits on readiness still waits on it: the
+         * drain was only the first of two conditions. Run blind, a read of an
+         * empty pipe blocked the submitter inside io_uring_enter, before it
+         * ever reached the write that would have filled the pipe (liburing's
+         * submit-link-fail). It falls through to the readiness test below. */
+        if (!(r->poll_mask && iou_pollable(r->file))) {
+          victim = r;
+          res = 1; /* marker: run it below, now that the ring is drained */
+          break;
+        }
       }
 
       if (r->is_waitid) {
@@ -3420,7 +3775,8 @@ static int iou_progress(struct io_ring_ctx *ctx) {
            * reported on every sweep. An event that was not in the last report
            * is a new edge, whatever the rest of the mask is still doing. */
           if (r->multishot && r->mshot_reported &&
-              !(rev & (u16)~r->mshot_seen))
+              !(rev & (u16)~r->mshot_seen) &&
+              vfs_handle_event_gen(r->file) == r->mshot_gen)
             continue;
           victim = r;
           res = (i32)rev;
@@ -3489,7 +3845,10 @@ static int iou_progress(struct io_ring_ctx *ctx) {
                        target->sqe.opcode == IORING_OP_FUTEX_WAIT ||
                        target->sqe.opcode == IORING_OP_FUTEX_WAITV))
           tres = 1;
-        iou_post_req_cqe(victim, tres, 0);
+        /* Not failed either, whatever it reports: see the note in
+         * iou_complete on a link timeout's IOSQE_CQE_SKIP_SUCCESS. */
+        if (!victim->cqe_skip)
+          iou_post_req_cqe(victim, tres, 0);
       }
       iou_req_free(victim);
       if (target) {
@@ -3507,8 +3866,13 @@ static int iou_progress(struct io_ring_ctx *ctx) {
       continue;
     }
 
+    if (is_poll_report && victim->multishot && iou_cq_full(ctx)) {
+      iou_complete(victim, res, 0); /* see iou_cq_full */
+      continue;
+    }
     if (is_poll_report && victim->multishot) {
       victim->mshot_reported = 1;
+      victim->mshot_gen = vfs_handle_event_gen(victim->file);
       /* Only what is still ready stays remembered: an event that goes away and
        * comes back is a new edge too. */
       victim->mshot_seen = (u16)res;
@@ -3533,15 +3897,80 @@ static int iou_progress(struct io_ring_ctx *ctx) {
 
   __atomic_store_n(&ctx->sweeper, 0, __ATOMIC_RELEASE);
   __atomic_clear(&ctx->sweeping, __ATOMIC_RELEASE);
+  scheduler_kcrit_leave();
   if (did)
     scheduler_wake_all(ctx);
-  /* The owner has just done the work the flag was asking for. */
-  if (ctx->flags & (IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_TASKRUN_FLAG))
+  /* The owner has just done the work the flag was asking for, and the next
+   * work that turns up is a new batch for the eventfd too. */
+  if (ctx->flags & (IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_TASKRUN_FLAG)) {
     iou_taskrun_flag(ctx, 0);
+    __atomic_store_n(&ctx->evfd_announced, 0, __ATOMIC_RELEASE);
+  }
   return did;
 }
 
 /* ---- cancellation ------------------------------------------------------- */
+
+/* Complete an armed request, already unlinked, as cancelled, and everything
+ * linked behind it. */
+static void iou_cancel_victim(struct iou_req *victim) {
+  if (victim->sqe.opcode == IORING_OP_WAITID ||
+      victim->sqe.opcode == IORING_OP_FUTEX_WAIT ||
+      victim->sqe.opcode == IORING_OP_FUTEX_WAITV)
+    g_iou_cancel_counted = 1;
+  if (victim->tmo_target)
+    victim->tmo_target->tmo_armed = 0;
+  struct iou_req *rest = victim->link_next;
+
+  victim->link_next = 0;
+  iou_post_req_cqe(victim, -ECANCELED, 0);
+  iou_req_free(victim);
+  if (rest)
+    iou_cancel_chain(rest);
+}
+
+/* Whether an exiting task's request is one its exit cancels. Linux's
+ * io_uring_cancel_generic, on a task exit, takes only the requests marked
+ * REQ_F_INFLIGHT -- those holding an io_uring file, the ones that can pin a
+ * ring for ever -- and the link chains they are in. Everything else stays and
+ * completes for whoever still has the ring: liburing's io-cancel forks a child
+ * that arms a poll on the ring (cancelled) and a plain timeout (fires, -ETIME,
+ * after the child is gone). */
+static int iou_req_exit_cancels(const struct iou_req *r, usize tgid) {
+  if ((r->state != IOU_ST_ARMED && r->state != IOU_ST_DEFERRED) ||
+      r->tgid != tgid)
+    return 0;
+  for (const struct iou_req *m = r; m; m = m->link_next)
+    if (m->file && iou_is_ring_handle(m->file))
+      return 1;
+  return 0;
+}
+
+/* Cancel what a process's exit cancels on this ring.
+ *
+ * Linux does this when a task exits (io_uring_cancel_generic), before its
+ * files are closed, and it is what breaks the cycle a request can make with
+ * its own ring: a poll on the ring's own descriptor holds that descriptor,
+ * the ring only lets its requests go when the descriptor is released, and the
+ * ring outlived its process for ever. */
+static void iou_cancel_task(struct io_ring_ctx *ctx, usize tgid) {
+  for (;;) {
+    struct iou_req *victim = 0;
+
+    iou_lock(ctx);
+    for (struct iou_req *r = ctx->live; r; r = r->next)
+      if (iou_req_exit_cancels(r, tgid)) {
+        victim = r;
+        break;
+      }
+    if (victim)
+      iou_req_unlink(ctx, victim);
+    iou_unlock(ctx);
+    if (!victim)
+      return;
+    iou_cancel_victim(victim);
+  }
+}
 
 static int iou_cancel_by(struct io_ring_ctx *ctx, u64 user_data, int by_fd,
                          int fd, u32 cancel_flags) {
@@ -3579,20 +4008,7 @@ static int iou_cancel_by(struct io_ring_ctx *ctx, u64 user_data, int by_fd,
     if (!victim)
       break;
     found++;
-
-    if (victim->sqe.opcode == IORING_OP_WAITID ||
-        victim->sqe.opcode == IORING_OP_FUTEX_WAIT ||
-        victim->sqe.opcode == IORING_OP_FUTEX_WAITV)
-      g_iou_cancel_counted = 1;
-    if (victim->tmo_target)
-      victim->tmo_target->tmo_armed = 0;
-    struct iou_req *rest = victim->link_next;
-
-    victim->link_next = 0;
-    iou_post_req_cqe(victim, -ECANCELED, 0);
-    iou_req_free(victim);
-    if (rest)
-      iou_cancel_chain(rest);
+    iou_cancel_victim(victim);
 
     if (!(cancel_flags & (IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_ANY)))
       break;
@@ -3601,6 +4017,12 @@ static int iou_cancel_by(struct io_ring_ctx *ctx, u64 user_data, int by_fd,
 }
 
 /* ---- submission --------------------------------------------------------- */
+
+/* The io_uring_enter flags this kernel knows. */
+#define IOU_ENTER_VALID                                                        \
+  (IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG | IORING_ENTER_EXT_ARG_REG |  \
+   IORING_ENTER_ABS_TIMER | IORING_ENTER_NO_IOWAIT | IORING_ENTER_SQ_WAKEUP |  \
+   IORING_ENTER_SQ_WAIT | IORING_ENTER_REGISTERED_RING)
 
 #define IOU_SQE_VALID_FLAGS                                                    \
   (IOSQE_FIXED_FILE | IOSQE_IO_LINK | IOSQE_IO_HARDLINK | IOSQE_ASYNC |        \
@@ -3721,10 +4143,15 @@ static int iou_submit_one(struct io_ring_ctx *ctx,
     return -EBUSY;
 
   iou_trace("sqe", sqe->opcode, sqe->user_data, (isize)sqe->flags);
+  iou_trace("sqe-ring", ctx->owner_tgid, (u64)(u32)(usize)ctx, 0);
+  iou_evlog(ctx, IOU_EV_SUBMIT, sqe->opcode, sqe->user_data, 0);
   req = kzalloc(sizeof(*req));
   if (!req)
     return -ENOMEM;
   req->ctx = ctx;
+  req->tgid = (current_task && current_task != ctx->sq_self)
+                  ? task_tgid(current_task)
+                  : ctx->owner_tgid;
   req->sqe = *sqe; /* IORING_FEAT_SUBMIT_STABLE: the SQE is ours from here */
   req->is_drain = (sqe->flags & IOSQE_IO_DRAIN) ? 1 : 0;
   req->state = IOU_ST_QUEUED;
@@ -3832,6 +4259,52 @@ static int iou_submit_one(struct io_ring_ctx *ctx,
     req->deadline_ns = (sqe->timeout_flags & IORING_TIMEOUT_ABS)
                            ? iou_abs_deadline_ns(ns)
                            : ktime_monotonic_ns() + ns;
+  } else if ((sqe->opcode == IORING_OP_SEND ||
+              sqe->opcode == IORING_OP_SEND_ZC) &&
+             sqe->addr2) {
+    /* io_send_setup's move_addr_to_kernel: read now, EINVAL for a length no
+     * sockaddr has, EFAULT for one that cannot be read. */
+    usize alen = sqe->addr_len;
+
+    if (alen > 128) {
+      req->failed = 1;
+      req->fail_res = -EINVAL;
+      goto linked;
+    }
+    if (alen) {
+      req->send_addr = kmalloc(alen);
+      if (!req->send_addr) {
+        req->failed = 1;
+        req->fail_res = -ENOMEM;
+        goto linked;
+      }
+      if (syscall_copyin(req->send_addr, (const void *)(usize)sqe->addr2,
+                         alen) < 0) {
+        req->failed = 1;
+        req->fail_res = -EFAULT;
+        goto linked;
+      }
+      req->send_alen = (u16)alen;
+    }
+  } else if (sqe->opcode == IORING_OP_POLL_REMOVE) {
+    /* liburing's io_uring_prep_poll_update is a POLL_REMOVE with update flags
+     * in sqe->len: it changes the poll and leaves it armed, it does not cancel
+     * it. Cancelling it cost poll-mshot-update the events that arrived before
+     * the program armed the poll again. The checks are io_poll_remove_prep's. */
+    u32 fl = sqe->len;
+
+    if (sqe->buf_index || sqe->splice_fd_in ||
+        (fl & ~(u32)(IORING_POLL_UPDATE_EVENTS | IORING_POLL_UPDATE_USER_DATA |
+                     IORING_POLL_ADD_MULTI)) ||
+        fl == IORING_POLL_ADD_MULTI ||
+        (!(fl & IORING_POLL_UPDATE_USER_DATA) && sqe->off) ||
+        (!(fl & IORING_POLL_UPDATE_EVENTS) && sqe->poll32_events)) {
+      req->failed = 1;
+      req->fail_res = -EINVAL;
+      goto linked;
+    }
+    if (fl & (IORING_POLL_UPDATE_EVENTS | IORING_POLL_UPDATE_USER_DATA))
+      req->is_poll_update = 1;
   } else if (sqe->opcode == IORING_OP_POLL_ADD) {
     u32 mask = sqe->poll32_events;
 
@@ -3926,7 +4399,7 @@ linked:
 
       *chain_head = 0;
       *chain_tail = 0;
-      iou_issue_chain(head);
+      iou_issue_or_defer(head);
     }
     return doomed;
   }
@@ -3940,7 +4413,7 @@ linked:
   {
     int doomed = req->failed ? 1 : 0;
 
-    iou_issue(req);
+    iou_issue_or_defer(req);
     return doomed;
   }
 }
@@ -3997,7 +4470,9 @@ static int iou_submit_sqes(struct io_ring_ctx *ctx, u32 to_submit) {
   /* A chain the batch never terminated still has to run: Linux issues an
    * unterminated link when the submission batch ends. */
   if (chain_head)
-    iou_issue_chain(chain_head);
+    iou_issue_or_defer(chain_head);
+  /* What this batch completed inline may have opened the drain. */
+  iou_run_deferred(ctx);
   return (int)submitted;
 }
 
@@ -4021,7 +4496,17 @@ static isize iou_wait_cqes(struct io_ring_ctx *ctx, u32 min_complete,
   u64 wait_t0 = 0;
   isize rc;
 
+  /* No more than the ring can hold, as Linux's io_cqring_wait clamps it: a
+   * full completion ring is all a waiter can ever see, and asking for more
+   * than that -- liburing's iopoll-overflow asks for 128 of a 64-entry ring,
+   * the rest in the overflow list -- waited for ever. */
+  if (min_complete > ctx->cq_entries)
+    min_complete = ctx->cq_entries;
+
   for (;;) {
+    /* Read before the sweep: see g_vfs_poll_seq. */
+    u64 seq0 = __atomic_load_n(&g_vfs_poll_seq, __ATOMIC_SEQ_CST);
+
     iou_progress(ctx);
 
     iou_lock(ctx);
@@ -4074,6 +4559,11 @@ static isize iou_wait_cqes(struct io_ring_ctx *ctx, u32 min_complete,
       rc = 0;
       goto done;
     }
+    /* Something became ready since the sweep: sweep again, do not sleep. */
+    if (__atomic_load_n(&g_vfs_poll_seq, __ATOMIC_SEQ_CST) != seq0) {
+      scheduler_wait_cancel();
+      continue;
+    }
     if (scheduler_signal_pending()) {
       scheduler_wait_cancel();
       rc = -EINTR;
@@ -4106,16 +4596,23 @@ done:
  * is not a shortcut, and there is no separate polling queue to build because
  * nothing is ever in flight to poll for.
  *
- * What is still refused: IORING_SETUP_SQ_AFF (there is no way to pin the
- * submission thread to sq_thread_cpu, and accepting the flag would be a
- * promise about placement that is not kept), ATTACH_WQ (no io-wq to attach
- * to), NO_MMAP, REGISTERED_FD_ONLY, HYBRID_IOPOLL and CQE_MIXED. */
+ * IORING_SETUP_ATTACH_WQ is checked as Linux checks
+ * it (wq_fd must be a ring, and one with a submission thread when this ring
+ * asks for one); the attached ring then gets its own submission thread rather
+ * than a share of the other's, which no program can tell apart -- there is no
+ * io-wq whose workers could be shared either.
+ *
+ * What is still refused: IORING_SETUP_SQ_AFF (the submission thread is a
+ * kernel thread, and kernel threads run on the boot CPU only, so a placement
+ * on sq_thread_cpu is a promise that could not be kept), NO_MMAP,
+ * REGISTERED_FD_ONLY, HYBRID_IOPOLL and CQE_MIXED. */
 #define IOU_SETUP_SUPPORTED                                                    \
   (IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP | IORING_SETUP_SUBMIT_ALL |        \
    IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG |                     \
    IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_R_DISABLED |                      \
    IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL | IORING_SETUP_SQE128 |           \
-   IORING_SETUP_CQE32 | IORING_SETUP_NO_SQARRAY | IORING_SETUP_DEFER_TASKRUN)
+   IORING_SETUP_CQE32 | IORING_SETUP_NO_SQARRAY | IORING_SETUP_DEFER_TASKRUN | \
+   IORING_SETUP_ATTACH_WQ)
 
 /* What is true here, and nothing more. IORING_FEAT_SINGLE_MMAP because both
  * rings share one region; NODROP because an overflow is kept; SUBMIT_STABLE
@@ -4155,6 +4652,7 @@ static void iou_ctx_put(struct io_ring_ctx *ctx) {
   while (*pp) {
     if (*pp == ctx) {
       *pp = ctx->next;
+      __atomic_sub_fetch(&g_iou_nr_rings, 1, __ATOMIC_RELEASE);
       break;
     }
     pp = &(*pp)->next;
@@ -4209,6 +4707,7 @@ static void iou_sq_thread(void *arg) {
     iou_ctx_put(ctx);
     return;
   }
+  ctx->sq_self = current_task;
   __atomic_store_n(&ctx->sq_alive, 1, __ATOMIC_RELEASE);
   last_work = ktime_monotonic_ns();
 
@@ -4292,6 +4791,16 @@ static void iou_sq_thread_stop(struct io_ring_ctx *ctx) {
   if (!ctx->sq_tid && !__atomic_load_n(&ctx->cq_started, __ATOMIC_ACQUIRE))
     return;
   __atomic_store_n(&ctx->sq_stop, 1, __ATOMIC_RELEASE);
+  /* The thread may be the one tearing the ring down. It adopted the owner's
+   * descriptor table, and when the owner dies first the thread holds the last
+   * reference: handing the table back closes the ring's descriptor, and that
+   * lands here, inside the very thread this waits for. It waited on itself for
+   * ever -- READY, yielding, never leaving -- and liburing's pollfree, which
+   * does that a few hundred times, left the CPU to hundreds of them and the
+   * task table full. The thread is already past its loop and touches nothing
+   * after this but the context it holds a reference to. */
+  if (current_task && current_task == ctx->sq_self)
+    return;
   scheduler_wake_all(&ctx->sq_wait);
   /* The completion thread sleeps on the readiness channel, not on sq_wait. */
   scheduler_wake_all(vfs_poll_chan);
@@ -4301,6 +4810,81 @@ static void iou_sq_thread_stop(struct io_ring_ctx *ctx) {
     scheduler_yield();
   }
   ctx->sq_tid = 0;
+}
+
+/* A process is leaving: stop the threads its rings lent their context to,
+ * before it gives up its descriptor table and address space.
+ *
+ * Linux's io threads belong to the task and die with it. Here they borrow the
+ * owner's table and page tables (scheduler_adopt_owner_context), and a thread
+ * that outlived its owner became the LAST holder of both: handing them back
+ * closed the ring's own descriptor from inside the ring's own thread and tore
+ * the owner's address space down from a kernel thread. Stopped here, while the
+ * owner still holds everything, the thread gives back a borrow and nothing
+ * more, and the owner's ordinary exit closes the ring. */
+void io_uring_task_exit(usize tgid) {
+  for (;;) {
+    struct io_ring_ctx *victim = 0;
+
+    iou_list_lock();
+    for (struct io_ring_ctx *c = g_ctx_list; c; c = c->next) {
+      int refs;
+
+      if (c->owner_tgid != tgid ||
+          __atomic_load_n(&c->sq_stop, __ATOMIC_ACQUIRE) ||
+          (!c->sq_tid && !__atomic_load_n(&c->cq_started, __ATOMIC_ACQUIRE)))
+        continue;
+      /* Only a ring that is not already on its way out: a zero count is a put
+       * waiting on this lock to unlink it. */
+      refs = __atomic_load_n(&c->refs, __ATOMIC_ACQUIRE);
+      while (refs > 0 &&
+             !__atomic_compare_exchange_n(&c->refs, &refs, refs + 1, 0,
+                                                  __ATOMIC_ACQ_REL,
+                                                  __ATOMIC_ACQUIRE))
+        ;
+      if (refs <= 0)
+        continue;
+      victim = c;
+      break;
+    }
+    iou_list_unlock();
+    if (!victim)
+      break;
+    iou_sq_thread_stop(victim);
+    iou_ctx_put(victim);
+  }
+
+  /* Then its requests, in any ring, owned or inherited. The scan under the
+   * list lock only reads a hint; the cancel itself takes the ring's lock. */
+  for (;;) {
+    struct io_ring_ctx *victim = 0;
+
+    iou_list_lock();
+    for (struct io_ring_ctx *c = g_ctx_list; c && !victim; c = c->next) {
+      int mine = 0;
+      int refs;
+
+      for (struct iou_req *r = c->live; r; r = r->next)
+        if (iou_req_exit_cancels(r, tgid)) {
+          mine = 1;
+          break;
+        }
+      if (!mine)
+        continue;
+      refs = __atomic_load_n(&c->refs, __ATOMIC_ACQUIRE);
+      while (refs > 0 &&
+             !__atomic_compare_exchange_n(&c->refs, &refs, refs + 1, 0,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        ;
+      if (refs > 0)
+        victim = c;
+    }
+    iou_list_unlock();
+    if (!victim)
+      return;
+    iou_cancel_task(victim, tgid);
+    iou_ctx_put(victim);
+  }
 }
 
 /* ---- the completion thread (every other ring) ---------------------------
@@ -4334,12 +4918,18 @@ static void iou_sq_thread_stop(struct io_ring_ctx *ctx) {
  * may not write the CQE. liburing's defer-taskrun checks both halves: the
  * eventfd fires, and the completion queue stays empty until it calls
  * io_uring_get_events(). */
+/* Returns 0, or 1 when something is ready, or 2 when something is ready that
+ * is not waiting on the ring's own eventfd. The distinction is Linux's
+ * eventfd_signal_allowed(): readiness that the eventfd's own signal produced
+ * does not signal it again, or one completion counts twice. */
 static int iou_defer_ready(struct io_ring_ctx *ctx) {
   u64 now = ktime_monotonic_ns();
-  int ready = 0;
+  int result = 0;
 
   iou_lock(ctx);
-  for (struct iou_req *r = ctx->live; r; r = r->next) {
+  for (struct iou_req *r = ctx->live; r && result < 2; r = r->next) {
+    int ready = 0;
+
     if (r->state != IOU_ST_ARMED)
       continue;
     if (r->is_timeout || r->is_linktmo) {
@@ -4360,10 +4950,10 @@ static int iou_defer_ready(struct io_ring_ctx *ctx) {
         ready = 1;
     }
     if (ready)
-      break;
+      result = (r->file && r->file == ctx->cq_eventfd) ? 1 : 2;
   }
   iou_unlock(ctx);
-  return ready;
+  return result;
 }
 
 /* IORING_SQ_TASKRUN: "there is work for the owner of this ring, enter the
@@ -4375,13 +4965,18 @@ static int iou_defer_ready(struct io_ring_ctx *ctx) {
 static void iou_taskrun_flag(struct io_ring_ctx *ctx, int on) {
   u32 f;
 
-  if (!ctx->hdr)
-    return;
-  f = __atomic_load_n(&ctx->hdr->sq_flags, __ATOMIC_RELAXED);
-  __atomic_store_n(&ctx->hdr->sq_flags,
-                   on ? (f | IORING_SQ_TASKRUN)
-                      : (f & ~(u32)IORING_SQ_TASKRUN),
-                   __ATOMIC_RELEASE);
+  /* Under the ring lock: the ring's own thread raises this flag, and a
+   * resize (iou_register_resize_rings) swaps the header under the same lock,
+   * so the store cannot land in the header it just freed. */
+  iou_lock(ctx);
+  if (ctx->hdr) {
+    f = __atomic_load_n(&ctx->hdr->sq_flags, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctx->hdr->sq_flags,
+                     on ? (f | IORING_SQ_TASKRUN)
+                        : (f & ~(u32)IORING_SQ_TASKRUN),
+                     __ATOMIC_RELEASE);
+  }
+  iou_unlock(ctx);
 }
 
 /* This ring has just become readable, so report it to the rings watching it.
@@ -4442,7 +5037,59 @@ void io_uring_dump_state(void) {
     console_write_dec((u64)iou_cq_ready(c));
     console_write(" live=");
     console_write_dec((u64)c->nr_live);
+    {
+      u32 held = 0;
+
+      for (u32 i = 0; c->files && i < c->nr_files; i++)
+        if (c->files[i].file)
+          held++;
+      console_write(" files=");
+      console_write_dec((u64)held);
+      if (c->hdr) {
+        console_write(" sq=");
+        console_write_dec((u64)__atomic_load_n(&c->hdr->sq_head, __ATOMIC_RELAXED));
+        console_write("/");
+        console_write_dec((u64)__atomic_load_n(&c->hdr->sq_tail, __ATOMIC_RELAXED));
+        console_write(" cq=");
+        console_write_dec((u64)__atomic_load_n(&c->hdr->cq_head, __ATOMIC_RELAXED));
+        console_write("/");
+        console_write_dec((u64)__atomic_load_n(&c->hdr->cq_tail, __ATOMIC_RELAXED));
+      }
+      console_write(" refs=");
+      console_write_dec((u64)c->refs);
+    }
+    /* Who is meant to finish what is armed: the ring's thread, if it has
+     * one, and whether it is still there. */
+    console_write(" thread=");
+    console_write_dec((u64)(c->sq_tid > 0 ? c->sq_tid : 0));
+    console_write(__atomic_load_n(&c->cq_started, __ATOMIC_RELAXED)
+                      ? " started" : "");
+    console_write(__atomic_load_n(&c->sq_alive, __ATOMIC_RELAXED) ? " alive"
+                                                                  : " gone");
+    console_write(__atomic_load_n(&c->sq_stop, __ATOMIC_RELAXED) ? " stop"
+                                                                 : "");
+    console_write(" ctx=0x");
+    console_write_hex64((u64)(usize)c);
     console_write("\n");
+    {
+      static const char *const evn[] = {"?", "submit", "cqe", "quiesce",
+                                        "drop", "enter", "arm", "release",
+                                        "setup"};
+      u32 end = c->evpos;
+      u32 start = end > 16 ? end - 16 : 0;
+      u64 now = ktime_monotonic_ns();
+
+      for (u32 k = start; k < end; k++) {
+        const __typeof__(c->evlog[0]) *e = &c->evlog[k % 16];
+        char line[128];
+
+        snprintf(line, sizeof(line), "  ev -%lums %s op=%u data=%lx res=%d\n",
+                 (unsigned long)((now - e->ns) / 1000000),
+                 e->ev < 9 ? evn[e->ev] : "?", (unsigned)e->op,
+                 (unsigned long)e->user_data, (int)e->res);
+        console_write(line);
+      }
+    }
     for (struct iou_req *r = c->live; r && armed < 8; r = r->next) {
       if (r->state != IOU_ST_ARMED)
         continue;
@@ -4515,19 +5162,28 @@ static void iou_cq_thread(void *arg) {
     iou_ctx_put(ctx);
     return;
   }
+  ctx->sq_self = current_task;
   __atomic_store_n(&ctx->sq_alive, 1, __ATOMIC_RELEASE);
 
   while (!__atomic_load_n(&ctx->sq_stop, __ATOMIC_ACQUIRE)) {
+    u64 seq0 = __atomic_load_n(&g_vfs_poll_seq, __ATOMIC_SEQ_CST);
+
     /* The owner's address space is this thread's: stop the moment the reaper
      * can start on it, exactly as the submission thread does. */
     if (!scheduler_owner_context_alive(ctx->owner_tgid))
       break;
     if (__atomic_load_n(&ctx->enabled, __ATOMIC_ACQUIRE)) {
       if (ctx->flags & IORING_SETUP_DEFER_TASKRUN) {
-        /* Announce, do not post: see iou_defer_ready. */
-        if (iou_defer_ready(ctx)) {
+        /* Announce, do not post: see iou_defer_ready. Once per batch of
+         * work, as Linux signals when the first item is queued; the owner
+         * taking the work (the flag coming down) starts the next batch. */
+        int rd = iou_defer_ready(ctx);
+
+        if (rd) {
           iou_taskrun_flag(ctx, 1);
-          iou_signal_eventfd(ctx);
+          if (rd == 2 &&
+              !__atomic_exchange_n(&ctx->evfd_announced, 1, __ATOMIC_ACQ_REL))
+            iou_signal_eventfd(ctx, 0);
         }
       } else {
         iou_progress(ctx);
@@ -4536,8 +5192,9 @@ static void iou_cq_thread(void *arg) {
     /* The bound is what keeps an armed deadline honest on a machine where
      * nothing else happens to wake the channel. */
     scheduler_wait_prepare_timeout(vfs_poll_chan, SCHED_MS_TO_TICKS(10));
-    if (__atomic_load_n(&ctx->sq_stop, __ATOMIC_ACQUIRE))
-      scheduler_wait_cancel();
+    if (__atomic_load_n(&ctx->sq_stop, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&g_vfs_poll_seq, __ATOMIC_SEQ_CST) != seq0)
+      scheduler_wait_cancel(); /* see g_vfs_poll_seq */
     else
       scheduler_wait_commit();
   }
@@ -4575,6 +5232,8 @@ static void iou_async_kick(struct io_ring_ctx *ctx) {
 static void iou_quiesce(struct io_ring_ctx *ctx) {
   struct iou_req *r;
 
+  iou_trace("quiesce", ctx->owner_tgid, (u64)(u32)(usize)ctx, ctx->nr_live);
+  iou_evlog(ctx, IOU_EV_QUIESCE, 0, 0, (i32)ctx->nr_live);
   iou_sq_thread_stop(ctx);
 
   iou_lock(ctx);
@@ -4582,11 +5241,14 @@ static void iou_quiesce(struct io_ring_ctx *ctx) {
   ctx->live = 0;
   ctx->live_tail = 0;
   ctx->nr_live = 0;
+  ctx->nr_deferred = 0;
   iou_unlock(ctx);
 
   while (r) {
     struct iou_req *next = r->next;
 
+    iou_trace("quiesce-drop", r->sqe.opcode, r->sqe.user_data, r->state);
+    iou_evlog(ctx, IOU_EV_DROP, r->sqe.opcode, r->sqe.user_data, r->state);
     r->link_next = 0;
     r->tmo_armed = 0;
     r->tmo_target = 0;
@@ -4627,6 +5289,15 @@ static void iou_handle_release(struct vfs_handle *h) {
 
   h->private_data = 0;
   if (ctx) {
+    /* Who let the last descriptor go, and in which system call: a ring torn
+     * down under a thread still waiting on it is otherwise a mystery with no
+     * witness. It was a close() of descriptor 0 from another thread. */
+    {
+      extern u64 task_current_syscall(void);
+
+      iou_evlog(ctx, IOU_EV_RELEASE, 0, task_current_syscall(),
+                current_task ? (i32)current_task->id : -1);
+    }
     iou_quiesce(ctx);
     /* Credentials this ring registered die with it; a personality id outliving
      * its ring would hand the next ring somebody else's identity. */
@@ -4654,6 +5325,14 @@ static int iou_handle_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
     return -EBADF;
   if (iou_cq_ready(ctx) > 0)
     pfd->revents |= B1NIX_POLLIN;
+  /* Writable while the submission ring has room, as Linux's io_uring_poll
+   * says: a poll on the ring's own descriptor asking for POLLOUT waited for
+   * ever on a ring that was empty. */
+  if (ctx->hdr &&
+      __atomic_load_n(&ctx->hdr->sq_tail, __ATOMIC_ACQUIRE) -
+              __atomic_load_n(&ctx->hdr->sq_head, __ATOMIC_ACQUIRE) <
+          ctx->sq_entries)
+    pfd->revents |= B1NIX_POLLOUT;
   return 0;
 }
 
@@ -4664,6 +5343,10 @@ static const struct vfs_file_ops iou_file_ops = {
 
 static int iou_is_ring_handle(const struct vfs_handle *h) {
   return h && h->ops == &iou_file_ops;
+}
+
+int io_uring_is_ring_handle(const struct vfs_handle *h) {
+  return iou_is_ring_handle(h);
 }
 
 /* The inode outlives the descriptor when a mapping is still standing, so the
@@ -4682,6 +5365,64 @@ static void iou_inode_release(struct vfs_node *node) {
     ctx->node = 0;
     iou_ctx_put(ctx);
   }
+}
+
+/* The ring sizes a setup (or a resize) asks for, as io_uring_fill_params
+ * works them out: SQ entries rounded up to a power of two, the CQ twice that
+ * unless IORING_SETUP_CQSIZE names it, and IORING_SETUP_CLAMP cutting what is
+ * too large down instead of refusing it. */
+static int iou_ring_sizes(u32 entries, const struct io_uring_params *pp,
+                          u32 *sq_out, u32 *cq_out) {
+  u32 sq_entries, cq_entries;
+
+  if (entries == 0)
+    return -EINVAL;
+  if (entries > IOU_MAX_SQ_ENTRIES) {
+    if (!(pp->flags & IORING_SETUP_CLAMP))
+      return -EINVAL;
+    entries = IOU_MAX_SQ_ENTRIES;
+  }
+  sq_entries = iou_roundup_pow2(entries);
+  if (pp->flags & IORING_SETUP_CQSIZE) {
+    if (pp->cq_entries == 0)
+      return -EINVAL;
+    cq_entries = iou_roundup_pow2(pp->cq_entries);
+    if (cq_entries > IOU_MAX_CQ_ENTRIES) {
+      if (!(pp->flags & IORING_SETUP_CLAMP))
+        return -EINVAL;
+      cq_entries = IOU_MAX_CQ_ENTRIES;
+    }
+    if (cq_entries < sq_entries)
+      return -EINVAL;
+  } else {
+    cq_entries = sq_entries * 2;
+    if (cq_entries > IOU_MAX_CQ_ENTRIES)
+      cq_entries = IOU_MAX_CQ_ENTRIES;
+  }
+  *sq_out = sq_entries;
+  *cq_out = cq_entries;
+  return 0;
+}
+
+static void iou_fill_offsets(struct io_uring_params *pp, u32 cqes_off) {
+  pp->sq_off.head = IOU_OFF_SQ_HEAD;
+  pp->sq_off.tail = IOU_OFF_SQ_TAIL;
+  pp->sq_off.ring_mask = IOU_OFF_SQ_MASK;
+  pp->sq_off.ring_entries = IOU_OFF_SQ_ENTRIES;
+  pp->sq_off.flags = IOU_OFF_SQ_FLAGS;
+  pp->sq_off.dropped = IOU_OFF_SQ_DROPPED;
+  pp->sq_off.array = IOU_OFF_SQ_ARRAY;
+  pp->sq_off.resv1 = 0;
+  pp->sq_off.user_addr = 0;
+  pp->cq_off.head = IOU_OFF_CQ_HEAD;
+  pp->cq_off.tail = IOU_OFF_CQ_TAIL;
+  pp->cq_off.ring_mask = IOU_OFF_CQ_MASK;
+  pp->cq_off.ring_entries = IOU_OFF_CQ_ENTRIES;
+  pp->cq_off.overflow = IOU_OFF_CQ_OVERFLOW;
+  pp->cq_off.cqes = cqes_off;
+  pp->cq_off.flags = IOU_OFF_CQ_FLAGS;
+  pp->cq_off.resv1 = 0;
+  pp->cq_off.user_addr = 0;
 }
 
 static isize iou_setup(u32 entries, u64 uparams) {
@@ -4717,31 +5458,24 @@ static isize iou_setup(u32 entries, u64 uparams) {
   if ((p.flags & IORING_SETUP_SQPOLL) &&
       (!current_task || !current_task->pml4_phys))
     return -EINVAL;
+  /* io_sq_offload_create's checks, in its order. */
+  if (p.flags & IORING_SETUP_ATTACH_WQ) {
+    struct vfs_handle *wq = scheduler_fd_get((int)p.wq_fd);
 
-  if (entries > IOU_MAX_SQ_ENTRIES) {
-    if (!(p.flags & IORING_SETUP_CLAMP))
+    if (!wq)
+      return -ENXIO;
+    if (!iou_is_ring_handle(wq))
       return -EINVAL;
-    entries = IOU_MAX_SQ_ENTRIES;
+    if ((p.flags & IORING_SETUP_SQPOLL) &&
+        !(((struct io_ring_ctx *)wq->private_data)->flags & IORING_SETUP_SQPOLL))
+      return -EINVAL;
   }
-  u32 sq_entries = iou_roundup_pow2(entries);
-  u32 cq_entries;
 
-  if (p.flags & IORING_SETUP_CQSIZE) {
-    if (p.cq_entries == 0)
-      return -EINVAL;
-    cq_entries = iou_roundup_pow2(p.cq_entries);
-    if (cq_entries > IOU_MAX_CQ_ENTRIES) {
-      if (!(p.flags & IORING_SETUP_CLAMP))
-        return -EINVAL;
-      cq_entries = IOU_MAX_CQ_ENTRIES;
-    }
-    if (cq_entries < sq_entries)
-      return -EINVAL;
-  } else {
-    cq_entries = sq_entries * 2;
-    if (cq_entries > IOU_MAX_CQ_ENTRIES)
-      cq_entries = IOU_MAX_CQ_ENTRIES;
-  }
+  u32 sq_entries, cq_entries;
+  int szrc = iou_ring_sizes(entries, &p, &sq_entries, &cq_entries);
+
+  if (szrc < 0)
+    return szrc;
 
   ctx = kzalloc(sizeof(*ctx));
   if (!ctx)
@@ -4818,6 +5552,7 @@ static isize iou_setup(u32 entries, u64 uparams) {
     node->inode->gid = cred ? cred->egid : ROOT_GID;
   }
   node->inode->mmap_handle_page_phys_cb = iou_mmap_page_phys;
+  node->inode->mmap_page_cb_refs = 1;
   node->inode->release_cb = iou_inode_release;
   ctx->node = node;
   iou_ctx_get(ctx); /* the inode's reference */
@@ -4825,6 +5560,7 @@ static isize iou_setup(u32 entries, u64 uparams) {
   iou_list_lock();
   ctx->next = g_ctx_list;
   g_ctx_list = ctx;
+  __atomic_add_fetch(&g_iou_nr_rings, 1, __ATOMIC_RELEASE);
   iou_list_unlock();
 
   struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_NODE);
@@ -4875,30 +5611,15 @@ static isize iou_setup(u32 entries, u64 uparams) {
   p.sq_entries = sq_entries;
   p.cq_entries = cq_entries;
   p.features = IOU_FEATURES;
-  p.sq_off.head = IOU_OFF_SQ_HEAD;
-  p.sq_off.tail = IOU_OFF_SQ_TAIL;
-  p.sq_off.ring_mask = IOU_OFF_SQ_MASK;
-  p.sq_off.ring_entries = IOU_OFF_SQ_ENTRIES;
-  p.sq_off.flags = IOU_OFF_SQ_FLAGS;
-  p.sq_off.dropped = IOU_OFF_SQ_DROPPED;
-  p.sq_off.array = IOU_OFF_SQ_ARRAY;
-  p.sq_off.resv1 = 0;
-  p.sq_off.user_addr = 0;
-  p.cq_off.head = IOU_OFF_CQ_HEAD;
-  p.cq_off.tail = IOU_OFF_CQ_TAIL;
-  p.cq_off.ring_mask = IOU_OFF_CQ_MASK;
-  p.cq_off.ring_entries = IOU_OFF_CQ_ENTRIES;
-  p.cq_off.overflow = IOU_OFF_CQ_OVERFLOW;
-  p.cq_off.cqes = cqes_off;
-  p.cq_off.flags = IOU_OFF_CQ_FLAGS;
-  p.cq_off.resv1 = 0;
-  p.cq_off.user_addr = 0;
+  iou_fill_offsets(&p, cqes_off);
 
   if (syscall_copyout((void *)(usize)uparams, &p, sizeof(p)) < 0) {
     vfs_close(fd);
     return -EFAULT;
   }
   iou_trace("setup", entries, p.flags, fd);
+  iou_evlog(ctx, IOU_EV_SETUP, 0, (u64)(u32)fd,
+            current_task ? (i32)current_task->id : -1);
   return fd;
 }
 
@@ -5039,59 +5760,89 @@ static struct vfs_handle *iou_reg_ring_get(u32 index) {
   return h;
 }
 
-static struct io_ring_ctx *iou_ctx_from_fd(int fd, int *err) {
-  struct vfs_handle *h = scheduler_fd_get(fd);
 
+/* ---- io_uring_enter ----------------------------------------------------- */
+
+/*
+ * The ring's descriptor, held for the whole call -- Linux's fdget/fdput.
+ *
+ * A thread waiting in io_uring_enter must keep its ring even if another thread
+ * closes the descriptor meanwhile: the ring then goes away when the wait ends,
+ * not under it. Looked up without a reference, a close() from another thread
+ * tore the ring down while its own thread waited for a completion that could
+ * now never come -- liburing's socket test, whose direct variant closes
+ * descriptor 0, the number the next iteration's ring was given.
+ */
+static struct vfs_handle *iou_ring_handle_get(int fd, int registered, int *err) {
+  struct vfs_handle *h;
+
+  if (registered) {
+    /* `fd` is an index into this task's registered-ring table, not a
+     * descriptor. */
+    h = iou_reg_ring_get((u32)fd);
+    if (!h || !h->private_data) {
+      *err = -EINVAL;
+      return 0;
+    }
+    vfs_handle_retain(h);
+    return h;
+  }
+  h = scheduler_fd_get_retain(fd);
   if (!h) {
     *err = -EBADF;
     return 0;
   }
   if (h->ops != &iou_file_ops || !h->private_data) {
+    vfs_handle_release(h);
     *err = -EOPNOTSUPP;
     return 0;
   }
-  *err = 0;
-  return (struct io_ring_ctx *)h->private_data;
+  return h;
 }
 
-/* ---- io_uring_enter ----------------------------------------------------- */
+static isize iou_enter_ctx(struct io_ring_ctx *ctx, u32 to_submit,
+                           u32 min_complete, u32 flags, u64 argp, usize argsz);
 
 static isize iou_enter(int fd, u32 to_submit, u32 min_complete, u32 flags,
                        u64 argp, usize argsz) {
-  int ctxerr = 0;
-  struct io_ring_ctx *ctx;
+  int err = 0;
+  struct vfs_handle *h =
+      iou_ring_handle_get(fd, (flags & IORING_ENTER_REGISTERED_RING) != 0, &err);
+  isize rc;
 
-  if (flags & IORING_ENTER_REGISTERED_RING) {
-    /* `fd` is an index into this task's registered-ring table, not a
-     * descriptor. */
-    struct vfs_handle *h = iou_reg_ring_get((u32)fd);
+  if (!h)
+    return err;
+  rc = iou_enter_ctx((struct io_ring_ctx *)h->private_data, to_submit,
+                     min_complete, flags, argp, argsz);
+  vfs_handle_release(h);
+  return rc;
+}
 
-    if (!h || !h->private_data)
-      return -EINVAL;
-    ctx = (struct io_ring_ctx *)h->private_data;
-  } else {
-    ctx = iou_ctx_from_fd(fd, &ctxerr);
-  }
+static isize iou_enter_ctx(struct io_ring_ctx *ctx, u32 to_submit,
+                           u32 min_complete, u32 flags, u64 argp, usize argsz) {
   u64 deadline = 0;
   int have_deadline = 0;
   isize submitted = 0;
+  int defer_sweep;
 
-  if (!ctx)
-    return ctxerr;
   iou_trace("enter-in", to_submit, min_complete, (isize)flags);
-  if (flags & ~(u32)(IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG |
-                     IORING_ENTER_EXT_ARG_REG | IORING_ENTER_ABS_TIMER |
-                     IORING_ENTER_NO_IOWAIT | IORING_ENTER_SQ_WAKEUP |
-                     IORING_ENTER_SQ_WAIT | IORING_ENTER_REGISTERED_RING))
+  iou_evlog(ctx, IOU_EV_ENTER, 0, to_submit, (i32)min_complete);
+  if (flags & ~(u32)IOU_ENTER_VALID)
     return -EINVAL;
   if ((flags & (IORING_ENTER_SQ_WAKEUP | IORING_ENTER_SQ_WAIT)) &&
       !(ctx->flags & IORING_SETUP_SQPOLL))
     return -EINVAL;
   if (!ctx->enabled)
     return -EBADFD;
-  /* One issuer means one: see submitter_tid. */
+  /* One issuer means one: see submitter_tid. What another task is refused is
+   * what Linux refuses it: submitting (a submission thread submits for
+   * everybody), and waiting on a DEFER_TASKRUN ring, whose completions only the
+   * issuer may run (io_allowed_run_tw). Just waiting is anybody's. */
   if ((ctx->flags & IORING_SETUP_SINGLE_ISSUER) && ctx->submitter_tid &&
-      current_task && (usize)current_task->id != ctx->submitter_tid)
+      current_task && (usize)current_task->id != ctx->submitter_tid &&
+      ((to_submit && !(ctx->flags & IORING_SETUP_SQPOLL)) ||
+       ((flags & IORING_ENTER_GETEVENTS) &&
+        (ctx->flags & IORING_SETUP_DEFER_TASKRUN))))
     return -EEXIST;
 
   if (flags & IORING_ENTER_EXT_ARG_REG) {
@@ -5167,6 +5918,9 @@ static isize iou_enter(int fd, u32 to_submit, u32 min_complete, u32 flags,
     return -EINVAL;
   }
 
+  defer_sweep = (flags & IORING_ENTER_GETEVENTS) ||
+                !(ctx->flags & IORING_SETUP_DEFER_TASKRUN);
+
   if (ctx->flags & IORING_SETUP_SQPOLL) {
     /* The submission thread owns the queue. What io_uring_enter does for an
      * SQPOLL ring is wake that thread and, with IORING_ENTER_SQ_WAIT, wait
@@ -5196,7 +5950,14 @@ static isize iou_enter(int fd, u32 to_submit, u32 min_complete, u32 flags,
       }
     }
   } else {
-    iou_progress(ctx);
+    /* With IORING_SETUP_DEFER_TASKRUN what became ready is Linux's local task
+     * work, run only by an enter that asks for events: a submit-only enter
+     * posts nothing but what its own SQEs completed inline. Swept here, a
+     * multishot poll reported POLLOUT alone at submit, and the POLLIN that
+     * arrived before the caller waited never made it into a completion
+     * (liburing's poll test_missing_events). */
+    if (defer_sweep)
+      iou_progress(ctx);
 
     if (to_submit) {
       int rc = iou_submit_sqes(ctx, to_submit);
@@ -5215,7 +5976,7 @@ static isize iou_enter(int fd, u32 to_submit, u32 min_complete, u32 flags,
       return -EINTR;
     if (rc == -ETIME && submitted == 0 && min_complete)
       return -ETIME;
-  } else {
+  } else if (defer_sweep) {
     iou_progress(ctx);
   }
 
@@ -5454,6 +6215,34 @@ static isize iou_unregister_files(struct io_ring_ctx *ctx) {
   return 0;
 }
 
+/* Whether a range may be registered as a fixed buffer, as Linux's
+ * io_buffer_validate and the page pinning behind it decide. A null base with
+ * no length is an empty slot. Otherwise the range must be non-empty, at most a
+ * gigabyte, mapped from end to end, and memory rather than a file on a disk:
+ * Linux cannot pin a file's page-cache pages for the life of a registration,
+ * and says EOPNOTSUPP. Probing only the first and last byte let an empty range
+ * and a file-backed one through. */
+static i32 iou_buffer_validate(u64 base, u64 len) {
+  u64 addr, end;
+
+  if (!base)
+    return len ? -EFAULT : 0;
+  if (!len || len > (1ull << 30) || base + len < base)
+    return -EFAULT;
+  end = base + len;
+  for (addr = base; addr < end;) {
+    struct vm_area *v = vma_lookup(current_task, addr);
+
+    if (!v || v->start > addr)
+      return -EFAULT;
+    if (v->node && v->node->inode && v->node->inode->type == VFS_FILE &&
+        !(v->node->inode->flags & VFS_NODE_MEMORY_BACKED))
+      return -EOPNOTSUPP;
+    addr = v->end;
+  }
+  return 0;
+}
+
 static isize iou_register_buffers(struct io_ring_ctx *ctx, u64 uaddr, u32 nr) {
   struct iou_iovec *iov;
 
@@ -5477,19 +6266,14 @@ static isize iou_register_buffers(struct io_ring_ctx *ctx, u64 uaddr, u32 nr) {
   for (u32 i = 0; i < nr; i++) {
     /* The range has to be one this process can actually reach; a registration
      * that accepts a bad pointer only moves the -EFAULT to a stranger place. */
-    if (iov[i].len) {
-      char probe;
+    i32 bad = iou_buffer_validate(iov[i].base, iov[i].len);
 
-      if (syscall_copyin(&probe, (const void *)(usize)iov[i].base, 1) < 0 ||
-          syscall_copyin(&probe,
-                         (const void *)(usize)(iov[i].base + iov[i].len - 1),
-                         1) < 0) {
-        kfree(ctx->bufs);
-        ctx->bufs = 0;
-        ctx->nr_bufs = 0;
-        kfree(iov);
-        return -EFAULT;
-      }
+    if (bad) {
+      kfree(ctx->bufs);
+      ctx->bufs = 0;
+      ctx->nr_bufs = 0;
+      kfree(iov);
+      return bad;
     }
     ctx->bufs[i].addr = iov[i].base;
     ctx->bufs[i].len = iov[i].len;
@@ -5555,16 +6339,11 @@ static isize iou_buffers_update(struct io_ring_ctx *ctx, u64 uaddr,
     return -EFAULT;
   }
   for (u32 i = 0; i < up.nr; i++) {
-    if (iov[i].len) {
-      char probe;
+    i32 bad = iou_buffer_validate(iov[i].base, iov[i].len);
 
-      if (syscall_copyin(&probe, (const void *)(usize)iov[i].base, 1) < 0 ||
-          syscall_copyin(&probe,
-                         (const void *)(usize)(iov[i].base + iov[i].len - 1),
-                         1) < 0) {
-        kfree(iov);
-        return -EFAULT;
-      }
+    if (bad) {
+      kfree(iov);
+      return bad;
     }
     ctx->bufs[up.offset + i].addr = iov[i].base;
     ctx->bufs[up.offset + i].len = iov[i].len;
@@ -5923,12 +6702,15 @@ static isize iou_register_probe(struct io_ring_ctx *ctx, u64 uaddr,
 
 static isize iou_register_mem_region(struct io_ring_ctx *ctx, u64 uaddr,
                                     u32 nr_args);
+static isize iou_register_resize_rings(struct io_ring_ctx *ctx, u64 uarg);
 static isize iou_clone_buffers(struct io_ring_ctx *ctx, u64 uaddr, u32 nr_args);
 static isize iou_register_send_msg_ring(u64 uaddr, u32 nr_args);
+static isize iou_query(u64 uhdr, u32 nr_args);
+
+static isize iou_register_ctx(struct io_ring_ctx *ctx, u32 opcode, u64 arg,
+                              u32 nr_args);
 
 static isize iou_register(int fd, u32 opcode, u64 arg, u32 nr_args) {
-  int ctxerr = 0;
-  struct io_ring_ctx *ctx;
   isize rc;
 
   /* One registration has no ring of its own: sending a message into another
@@ -5940,9 +6722,27 @@ static isize iou_register(int fd, u32 opcode, u64 arg, u32 nr_args) {
     iou_trace("register", opcode, nr_args, rc);
     return rc;
   }
-  ctx = iou_ctx_from_fd(fd, &ctxerr);
-  if (!ctx)
-    return ctxerr;
+  /* Nor does the query interface, when asked without one. */
+  if (fd == -1 && opcode == IORING_REGISTER_QUERY)
+    return iou_query(arg, nr_args);
+  {
+    int err = 0;
+    /* Held for the call, as io_uring_enter holds it: see iou_ring_handle_get. */
+    struct vfs_handle *h = iou_ring_handle_get(fd, 0, &err);
+
+    if (!h)
+      return err;
+    rc = iou_register_ctx((struct io_ring_ctx *)h->private_data, opcode, arg,
+                          nr_args);
+    vfs_handle_release(h);
+    return rc;
+  }
+}
+
+static isize iou_register_ctx(struct io_ring_ctx *ctx, u32 opcode, u64 arg,
+                              u32 nr_args) {
+  isize rc;
+
   /* IORING_REGISTER_USE_REGISTERED_RING would take a registered ring index
    * instead of a descriptor; the registration it needs is not implemented, and
    * IORING_FEAT_REG_REG_RING is not advertised, so refuse the bit outright. */
@@ -6204,6 +7004,14 @@ static isize iou_register(int fd, u32 opcode, u64 arg, u32 nr_args) {
     rc = iou_register_mem_region(ctx, arg, nr_args);
     break;
 
+  case IORING_REGISTER_RESIZE_RINGS:
+    rc = nr_args == 1 ? iou_register_resize_rings(ctx, arg) : -EINVAL;
+    break;
+
+  case IORING_REGISTER_QUERY:
+    rc = iou_query(arg, nr_args);
+    break;
+
   case IORING_REGISTER_CLONE_BUFFERS:
     rc = iou_clone_buffers(ctx, arg, nr_args);
     break;
@@ -6213,8 +7021,8 @@ static isize iou_register(int fd, u32 opcode, u64 arg, u32 nr_args) {
     break;
 
   default:
-    /* io-wq affinity, NAPI busy-poll, the clock selection, ring resizing and
-     * the query interface: none of them exist here. -EINVAL is what a kernel
+    /* io-wq affinity, NAPI busy-poll and the clock selection: none of them
+     * exist here. -EINVAL is what a kernel
      * without the opcode answers, which is what liburing tests for, and
      * IORING_REGISTER_PROBE plus the absent feature bits say so in advance. */
     rc = -EINVAL;
@@ -6222,6 +7030,215 @@ static isize iou_register(int fd, u32 opcode, u64 arg, u32 nr_args) {
   }
   iou_trace("register", opcode, nr_args, rc);
   return rc;
+}
+
+/* IORING_REGISTER_QUERY, Linux's io_query: a chain of headers, each naming a
+ * query and a buffer for its answer. The answer is cut to what the caller's
+ * buffer holds, and the header says how much was written and whether the
+ * query is known. The only query answered is IO_URING_QUERY_OPCODES -- what
+ * this kernel supports; the zero-copy-receive ones describe a feature that is
+ * not here, so they get -EOPNOTSUPP, and nr_query_opcodes says so in advance. */
+struct iou_query_hdr { /* struct io_uring_query_hdr */
+  u64 next_entry;
+  u64 query_data;
+  u32 query_op;
+  u32 size;
+  i32 result;
+  u32 resv[3];
+};
+
+struct iou_query_opcode { /* struct io_uring_query_opcode */
+  u32 nr_request_opcodes;
+  u32 nr_register_opcodes;
+  u64 feature_flags;
+  u64 ring_setup_flags;
+  u64 enter_flags;
+  u64 sqe_flags;
+  u32 nr_query_opcodes;
+  u32 pad;
+};
+
+#define IOU_QUERY_OPCODES 0u
+#define IOU_QUERY_MAX_ENTRIES 1000
+
+static isize iou_query(u64 uhdr, u32 nr_args) {
+  int nr = 0;
+
+  if (nr_args)
+    return -EINVAL;
+  while (uhdr) {
+    struct iou_query_hdr hdr;
+    struct iou_query_opcode ans;
+    usize usize_ = 0, res_size = 0;
+    i32 res = -EINVAL;
+
+    if (syscall_copyin(&hdr, (const void *)(usize)uhdr, sizeof(hdr)) < 0)
+      return -EFAULT;
+    usize_ = hdr.size;
+    memset(&ans, 0, sizeof(ans));
+    if (hdr.query_op != IOU_QUERY_OPCODES) {
+      res = -EOPNOTSUPP;
+    } else if (!hdr.resv[0] && !hdr.resv[1] && !hdr.resv[2] && !hdr.result &&
+               hdr.size) {
+      ans.nr_request_opcodes = IORING_OP_LAST;
+      ans.nr_register_opcodes = IORING_REGISTER_LAST;
+      ans.feature_flags = IOU_FEATURES;
+      ans.ring_setup_flags = IOU_SETUP_SUPPORTED;
+      ans.enter_flags = IOU_ENTER_VALID;
+      ans.sqe_flags = IOU_SQE_VALID_FLAGS;
+      ans.nr_query_opcodes = 1;
+      res_size = sizeof(ans);
+      res = 0;
+    }
+    hdr.result = res;
+    hdr.size = (u32)(usize_ < res_size ? usize_ : res_size);
+    if (hdr.size &&
+        syscall_copyout((void *)(usize)hdr.query_data, &ans, hdr.size) < 0)
+      return -EFAULT;
+    /* The rest of the caller's buffer is cleared, as copy_struct_to_user
+     * clears what a newer caller's larger struct has beyond this answer. */
+    for (usize at = hdr.size; at < usize_;) {
+      static const u8 zeros[64];
+      usize n = usize_ - at < sizeof(zeros) ? usize_ - at : sizeof(zeros);
+
+      if (syscall_copyout((void *)(usize)(hdr.query_data + at), zeros, n) < 0)
+        return -EFAULT;
+      at += n;
+    }
+    if (syscall_copyout((void *)(usize)uhdr, &hdr, sizeof(hdr)) < 0)
+      return -EFAULT;
+    uhdr = hdr.next_entry;
+    /* A limit, so a chain that loops back on itself ends. */
+    if (++nr >= IOU_QUERY_MAX_ENTRIES)
+      return -ERANGE;
+    if (scheduler_signal_pending())
+      return -EINTR;
+  }
+  return 0;
+}
+
+/* IORING_REGISTER_RESIZE_RINGS, as Linux's io_register_resize_rings: new
+ * rings of the sizes io_uring_params asks for, what is still unconsumed in the
+ * old ones carried over in place (-EOVERFLOW when it does not fit), and the
+ * params -- with the new offsets -- handed back for the program to map the new
+ * rings. Only a DEFER_TASKRUN ring may be resized, as on Linux: its completions
+ * are posted by the task doing the resize, so nothing writes the rings while
+ * they change. Only CQSIZE and CLAMP may be asked for; the layout flags are
+ * the ring's own. The old rings are freed at once: a mapping of them holds a
+ * reference on every frame (pmm_ref_frame at mmap), so a program that has not
+ * unmapped them yet keeps reading memory that is still its. */
+static isize iou_register_resize_rings(struct io_ring_ctx *ctx, u64 uarg) {
+  struct io_uring_params p;
+  u32 sq_entries, cq_entries, cqes_off = 0;
+  u64 ring_phys, sqes_phys, old_ring_phys, old_sqes_phys;
+  usize ring_pages, sqes_pages, ring_bytes, old_ring_pages, old_sqes_pages;
+  struct iou_ring_hdr *nh, *oh;
+  u32 *narray;
+  struct io_uring_sqe *nsqes;
+  struct io_uring_cqe *ncqes;
+  int rc;
+
+  if (!(ctx->flags & IORING_SETUP_DEFER_TASKRUN))
+    return -EINVAL;
+  if (!uarg || syscall_copyin(&p, (const void *)(usize)uarg, sizeof(p)) < 0)
+    return -EFAULT;
+  if (p.flags & ~(u32)(IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP))
+    return -EINVAL;
+  p.flags |= ctx->flags & (IORING_SETUP_NO_SQARRAY | IORING_SETUP_SQE128 |
+                           IORING_SETUP_CQE32);
+  rc = iou_ring_sizes(p.sq_entries, &p, &sq_entries, &cq_entries);
+  if (rc < 0)
+    return rc;
+  ring_bytes = iou_ring_bytes(
+      (p.flags & IORING_SETUP_NO_SQARRAY) ? 0 : sq_entries, cq_entries,
+      ctx->cqe_size, &cqes_off);
+  p.sq_entries = sq_entries;
+  p.cq_entries = cq_entries;
+  p.features = IOU_FEATURES;
+  iou_fill_offsets(&p, cqes_off);
+  if (syscall_copyout((void *)(usize)uarg, &p, sizeof(p)) < 0)
+    return -EFAULT;
+  if (sq_entries == ctx->sq_entries && cq_entries == ctx->cq_entries)
+    return 0; /* nothing to change; the params are the answer */
+
+  ring_phys = iou_alloc_region(ring_bytes, &ring_pages);
+  sqes_phys = iou_alloc_region((usize)sq_entries * ctx->sqe_size, &sqes_pages);
+  if (!ring_phys || !sqes_phys) {
+    iou_free_region(ring_phys, ring_pages);
+    iou_free_region(sqes_phys, sqes_pages);
+    return -ENOMEM;
+  }
+  nh = (struct iou_ring_hdr *)iou_kva(ring_phys);
+  narray = (p.flags & IORING_SETUP_NO_SQARRAY)
+               ? 0
+               : (u32 *)((char *)nh + IOU_OFF_SQ_ARRAY);
+  ncqes = (struct io_uring_cqe *)((char *)nh + cqes_off);
+  nsqes = (struct io_uring_sqe *)iou_kva(sqes_phys);
+  nh->sq_ring_mask = sq_entries - 1;
+  nh->sq_ring_entries = sq_entries;
+  nh->cq_ring_mask = cq_entries - 1;
+  nh->cq_ring_entries = cq_entries;
+  if (narray)
+    for (u32 i = 0; i < sq_entries; i++)
+      narray[i] = i;
+
+  iou_lock(ctx);
+  oh = ctx->hdr;
+  {
+    u32 tail = __atomic_load_n(&oh->sq_tail, __ATOMIC_ACQUIRE);
+    u32 head = ctx->sq_local_head;
+    u32 ctail = __atomic_load_n(&oh->cq_tail, __ATOMIC_ACQUIRE);
+    u32 chead = __atomic_load_n(&oh->cq_head, __ATOMIC_ACQUIRE);
+
+    if (tail - head > sq_entries || ctail - chead > cq_entries) {
+      iou_unlock(ctx);
+      iou_free_region(ring_phys, ring_pages);
+      iou_free_region(sqes_phys, sqes_pages);
+      return -EOVERFLOW;
+    }
+    /* The unconsumed SQEs keep their ring positions; each lands in the slot
+     * its position names in the new ring, and the new array points there. */
+    for (u32 i = head; i != tail; i++) {
+      u32 idx = ctx->sq_array ? ctx->sq_array[i & ctx->sq_mask]
+                              : (i & ctx->sq_mask);
+      u32 dst = i & (sq_entries - 1);
+
+      if (idx < ctx->sq_entries)
+        memcpy((char *)nsqes + (usize)dst * ctx->sqe_size,
+               iou_sqe_at(ctx, idx), ctx->sqe_size);
+    }
+    for (u32 i = chead; i != ctail; i++)
+      memcpy((char *)ncqes + (usize)(i & (cq_entries - 1)) * ctx->cqe_size,
+             iou_cqe_at(ctx, i), ctx->cqe_size);
+    nh->sq_head = head;
+    nh->sq_tail = tail;
+    nh->cq_head = chead;
+    nh->cq_tail = ctail;
+    nh->sq_flags = __atomic_load_n(&oh->sq_flags, __ATOMIC_ACQUIRE);
+    nh->sq_dropped = oh->sq_dropped;
+    nh->cq_flags = oh->cq_flags;
+    nh->cq_overflow = oh->cq_overflow;
+  }
+  old_ring_phys = ctx->ring_phys;
+  old_ring_pages = ctx->ring_pages;
+  old_sqes_phys = ctx->sqes_phys;
+  old_sqes_pages = ctx->sqes_pages;
+  ctx->ring_phys = ring_phys;
+  ctx->ring_pages = ring_pages;
+  ctx->sqes_phys = sqes_phys;
+  ctx->sqes_pages = sqes_pages;
+  ctx->sq_array = narray;
+  ctx->cqes = ncqes;
+  ctx->sqes = nsqes;
+  ctx->sq_entries = sq_entries;
+  ctx->cq_entries = cq_entries;
+  ctx->sq_mask = sq_entries - 1;
+  ctx->cq_mask = cq_entries - 1;
+  __atomic_store_n(&ctx->hdr, nh, __ATOMIC_RELEASE);
+  iou_unlock(ctx);
+  iou_free_region(old_ring_phys, old_ring_pages);
+  iou_free_region(old_sqes_phys, old_sqes_pages);
+  return 0;
 }
 
 /* IORING_REGISTER_MEM_REGION: remember a region of the caller's memory that
@@ -6411,4 +7428,61 @@ int io_uring_syscall(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
   }
   *ret = (u64)r;
   return 1;
+}
+
+/*
+ * Run what is ready on the rings this process owns, on its way back to user
+ * mode from any system call -- Linux's io_uring task work.
+ *
+ * On Linux a completion that a wake makes possible is queued to the submitting
+ * task and runs the next time it returns to user space. Without that, a ready
+ * request here waited for the ring's completion thread, a kernel thread that
+ * only the boot CPU runs: a program writing into a pipe a line per
+ * millisecond, with a multishot read on the other end, had two lines land in
+ * one buffer before the thread got round to the first (liburing's read-mshot,
+ * "truncated message"). Rings that defer their work to io_uring_enter
+ * (DEFER_TASKRUN) and rings with a submission thread keep their own rules.
+ */
+#define IOU_TASKWORK_MAX 8
+/* A sweep walks every live request, so on the way out of every system call it
+ * has to stay cheap: rings with more armed than this are left to their thread,
+ * which sweeps them once per wake instead of once per call. liburing's
+ * poll-mshot-update arms five thousand polls and then reads a pipe a thousand
+ * times; sweeping all of them on each read made it time out. */
+#define IOU_TASKWORK_MAX_LIVE 64
+
+void io_uring_task_work(void) {
+  struct io_ring_ctx *mine[IOU_TASKWORK_MAX];
+  int n = 0;
+  usize tgid;
+
+  if (!__atomic_load_n(&g_iou_nr_rings, __ATOMIC_ACQUIRE) || !current_task ||
+      !current_task->pml4_phys)
+    return;
+  tgid = task_tgid(current_task);
+  iou_list_lock();
+  for (struct io_ring_ctx *c = g_ctx_list; c && n < IOU_TASKWORK_MAX; c = c->next) {
+    u64 seq = __atomic_load_n(&g_vfs_poll_seq, __ATOMIC_ACQUIRE);
+
+    /* Nothing woke since this ring was last swept here: nothing can have
+     * become ready. */
+    if (c->owner_tgid != tgid || c->nr_live == 0 ||
+        c->nr_live > IOU_TASKWORK_MAX_LIVE || c->tw_seq == seq ||
+        (c->flags & (IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SQPOLL)) ||
+        !__atomic_load_n(&c->enabled, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&c->sq_stop, __ATOMIC_ACQUIRE))
+      continue;
+    c->tw_seq = seq;
+    iou_ctx_get(c);
+    mine[n++] = c;
+  }
+  iou_list_unlock();
+  /* Swept even when nothing looks armed: the ring's own thread may be half
+   * way through performing the request, and iou_progress waits for that sweep
+   * to finish. Returning at once let a writer's next write land before the
+   * read its last one woke had run, and read-mshot saw the two merged. */
+  for (int i = 0; i < n; i++) {
+    iou_progress(mine[i]);
+    iou_ctx_put(mine[i]);
+  }
 }

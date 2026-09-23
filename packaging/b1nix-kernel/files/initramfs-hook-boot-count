@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Put what the boot-count script needs into the initramfs.
+#
+# The script (scripts/init-premount/b1nix-boot-count) runs before the root is
+# mounted, so everything it calls must be in the initramfs itself. A klibc
+# initramfs has a shell, mount and cat, and none of blkid, awk, sed, sort or
+# head -- without this hook every one of them was "not found", the counter
+# never moved and no fallback ever happened. See docs/distro/boot-counting.md.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "${1:-}" in
+prereqs) prereqs; exit 0 ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+for tool in /usr/sbin/blkid /usr/bin/awk /usr/bin/sed /usr/bin/sort /usr/bin/head; do
+	copy_exec "$tool"
+done
+exit 0

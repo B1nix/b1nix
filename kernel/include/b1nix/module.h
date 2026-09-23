@@ -269,5 +269,9 @@ void module_sysfs_attach_root(struct vfs_node *sys_root);
 /* Boot-time bring-up: loads the modules the kernel itself needs (filesystems,
  * the sound driver, the IPv6 stack) from the initramfs. */
 void module_init_builtin_deps(void);
+/* The boot is on an initramfs: load the boot modules once the real root has
+ * been moved onto "/" (run-init's MS_MOVE), where /lib/modules is. */
+void module_boot_defer_until_root(void);
+void module_boot_root_arrived(void);
 
 #endif /* B1NIX_MODULE_H */

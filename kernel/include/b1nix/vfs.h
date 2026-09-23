@@ -464,6 +464,12 @@ struct vfs_inode {
    * for one page at a time. The two are mutually exclusive; this one wins. */
   int (*mmap_handle_page_phys_cb)(struct vfs_handle *handle, u64 offset,
                                   u64 *out_phys);
+  /* The per-page callback takes the mapping's frame reference itself, under
+   * whatever lock keeps the page it names from being freed in between; sys_mmap
+   * then takes none. For a file whose pages can be replaced while it is mapped
+   * (a resized io_uring), a reference taken after the callback returned could
+   * land on a frame already freed. */
+  int mmap_page_cb_refs;
   /* Those pages are read by a device that does not snoop the CPU's caches (a
    * display engine scanning a framebuffer), so userspace's mapping of them
    * must be write-combining: a cacheable mapping leaves the frame in the
@@ -572,6 +578,8 @@ void vfs_detached_release(int id);
 /* The new mount API, descriptor side. Implemented in kernel/fs/mount_api.c. */
 int vfs_fsopen(const char *fstype, u32 flags);
 int vfs_fsconfig(int fd, u32 cmd, const char *key, const char *value, int aux);
+int vfs_fspick(const char *path, u32 flags);
+int vfs_mount_flags_at(const char *path, u64 *flags);
 int vfs_fsmount(int fsfd, u32 flags, u32 attr_flags);
 int vfs_open_tree(const char *path, u32 flags);
 int vfs_move_mount_fd(int from_fd, const char *from_path, const char *to_path,
@@ -779,6 +787,8 @@ isize vfs_getdents(int handle, struct dirent *buf, usize max_entries);
 int vfs_pipe(int pipefd[2]);
 /* tee(2): copy bytes between two pipes without consuming the source. */
 isize vfs_pipe_tee(struct vfs_handle *in, struct vfs_handle *out, usize len);
+/* The readiness generation of a handle's object (0 where it keeps none). */
+u32 vfs_handle_event_gen(struct vfs_handle *h);
 
 /* mknod(2): only S_IFIFO (named pipes) and S_IFREG are creatable; character and
  * block special files have no userspace-creatable backing in b1nix and return
@@ -908,6 +918,7 @@ usize vfs_socket_last_srcaddr(int fd, void *addr, usize cap);
 usize vfs_socket_origdstaddr(int fd, void *addr, usize cap);
 /* SO_TIMESTAMP: 0 = off, 1 = SO_TIMESTAMP, 2 = SO_TIMESTAMPNS. */
 int vfs_socket_timestamp_enabled(int fd);
+int vfs_socket_is_dgram(int fd);
 u64 vfs_socket_last_timestamp_usec(int fd);
 
 /* M32b pseudo-terminals (kernel/dev/pty.c). */
@@ -1054,6 +1065,11 @@ struct vfs_pipe {
    * (M11's fifo-rendezvous on a single-CPU guest). Reset with the slot. */
   u32 reader_opens;
   u32 writer_opens;
+  /* Bumped by every write that adds data: the event a multishot poll reports,
+   * which a level test between two sweeps misses. Every write, not only the
+   * one that fills an empty pipe: Linux wakes a pipe's pollers on each write,
+   * and liburing's poll-mshot-update reads one byte per completion. */
+  u32 event_gen;
   volatile int lock;
 };
 
@@ -1144,6 +1160,9 @@ struct vfs_socket_state {
   u32 icmp6_filter[8];
   int so_error;
   int so_rcvbuf;
+  /* SO_RCVBUF was set by the program (Linux's SOCK_RCVBUF_LOCK): only then is
+   * so_rcvbuf a ceiling on a TCP receive buffer; otherwise it auto-tunes. */
+  u8 rcvbuf_locked;
   int so_sndbuf;
   /* SO_RCVTIMEO / SO_SNDTIMEO, in milliseconds; 0 means "no timeout", which is
    * what a socket starts with. A blocking recv/send that reaches the deadline
@@ -1161,6 +1180,15 @@ struct vfs_socket_state {
    * kzalloc'd state. */
   char udp_q_buf[SOCK_DGRAM_Q_SLOTS][SOCK_DGRAM_SLOT_MAX];
   usize udp_q_len[SOCK_DGRAM_Q_SLOTS];
+  /* A UDP datagram larger than a slot, kept whole on the heap instead (the
+   * slot is then unused). Loopback and IP reassembly deliver datagrams up to
+   * 64 KiB, and cutting one at the slot size broke the datagram's contract:
+   * liburing's send_recv sent 4096 bytes and read back 2048. Freed when the
+   * datagram is consumed or the socket goes away. */
+  char *udp_q_big[SOCK_DGRAM_Q_SLOTS];
+  /* A UDP datagram being assembled from sends carrying MSG_MORE. */
+  u8 *udp_cork;
+  u32 udp_cork_len;
   /* Where each queued datagram came from. recvfrom() has to report the
    * sender of the datagram it just handed back — musl's resolver drops any
    * reply whose reported source does not match the nameserver it queried, so

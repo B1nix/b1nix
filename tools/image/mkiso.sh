@@ -155,6 +155,19 @@ done
 # every menu entry repeats. --reflink=auto makes the multi-hundred-MB rootfs
 # copy free on a CoW filesystem and is silently ignored elsewhere.
 MODULE_BLOCK=""
+# The stage directory is reused across builds, and xorriso packs everything in
+# it: a module an earlier build staged -- a 570 MB rootfs.img -- rode along in
+# every later ISO that never named it. Only the kernel, Limine's directory and
+# this build's modules belong in boot/.
+for f in "$STAGE/boot/"*; do
+  [ -e "$f" ] || continue
+  base="${f##*/}"
+  case "$base" in kernel.elf|limine) continue ;; esac
+  case "
+$MODULES" in *":$base
+"*) continue ;; esac
+  rm -rf "$f"
+done
 printf '%s' "$MODULES" | while IFS= read -r m; do
   [ -n "$m" ] || continue
   src="${m%:*}"; name="${m##*:}"

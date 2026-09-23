@@ -26,6 +26,16 @@ static inline s64 div64_s64(s64 dividend, s64 divisor)
 	return divisor ? dividend / divisor : 0;
 }
 
+static inline s64 div_s64_rem(s64 dividend, s32 divisor, s32 *remainder)
+{
+	if (!divisor) {
+		*remainder = 0;
+		return 0;
+	}
+	*remainder = (s32)(dividend % divisor);
+	return dividend / divisor;
+}
+
 static inline u64 div_u64_rem(u64 dividend, u32 divisor, u32 *remainder)
 {
 	if (!divisor) {

@@ -15,6 +15,7 @@
 #include <b1nix/ftrace.h>
 #include <b1nix/gdbstub.h>
 #include <b1nix/initramfs.h>
+#include <b1nix/initrd.h>
 #include <b1nix/cpufreq.h>
 #include <b1nix/cpuidle.h>
 #include <b1nix/mm.h>
@@ -278,6 +279,22 @@ static struct block_device *blk_first_removable(void) {
  * diagnosis for a machine that came up with none of its userspace: the real
  * root never mounted and PID 1 came out of the embedded file set. */
 static char g_boot_root[64] = "initramfs";
+
+/* The boot came up on the boot loader's initramfs, and its program -- rdinit=,
+ * /init by default -- is PID 1 instead of init=. */
+static int g_initramfs_root;
+static char g_rdinit_path[128] = "/init";
+
+static int rdinit_present(void)
+{
+	struct b1nix_stat st;
+	char v[sizeof(g_rdinit_path)];
+
+	if (bootinfo_get_kv("rdinit", v, sizeof(v)) && v[0])
+		snprintf(g_rdinit_path, sizeof(g_rdinit_path), "%s", v);
+	return vfs_stat(g_rdinit_path, &st) == 0 &&
+	       (st.st_mode & B1NIX_S_IFMT) == B1NIX_S_IFREG;
+}
 static char g_boot_init[80] = "(not spawned)";
 
 void boot_summary_set_root(const char *what) {
@@ -849,6 +866,31 @@ void kernel_main(usize arg0, usize arg1)
 			else
 				klog_info("lkpi-fs: imported ext4 registered");
 		}
+		/*
+		 * FAT, which stands on the same buffer heads as ext4, and the
+		 * character sets it converts names through: the tables first, since
+		 * a FAT mount asks for its codepage and iocharset by name.
+		 */
+		{
+			extern int lkpi_initcall_init_nls_cp437(void);
+			extern int lkpi_initcall_init_nls_iso8859_1(void);
+			extern int lkpi_initcall_init_nls_utf8(void);
+			extern int lkpi_initcall_init_fat_fs(void);
+			extern int lkpi_initcall_init_vfat_fs(void);
+			extern int lkpi_initcall_init_msdos_fs(void);
+			int nrc = lkpi_initcall_init_nls_cp437() |
+			          lkpi_initcall_init_nls_iso8859_1() |
+			          lkpi_initcall_init_nls_utf8();
+			int frc = nrc == 0 ? lkpi_initcall_init_fat_fs() : -22;
+
+			if (frc == 0)
+				frc = lkpi_initcall_init_vfat_fs() |
+				      lkpi_initcall_init_msdos_fs();
+			if (frc != 0)
+				klog_error("lkpi-fs: imported FAT failed to initialise");
+			else
+				klog_info("lkpi-fs: imported vfat/msdos registered");
+		}
 #endif
 
 		if (rc != 0) {
@@ -1222,7 +1264,21 @@ void kernel_main(usize arg0, usize arg1)
 	{
 		int rc = -1;
 		char root_val[64];
-		if (bootinfo_get_kv("root", root_val, sizeof(root_val))) {
+#ifdef B1NIX_FS_IMPORT
+		/* The boot loader's initrd is an initramfs: unpack it at "/" and let
+		 * its /init find the root (see kernel/fs/initrd_cpio.c). The kernel
+		 * then mounts nothing itself, as Linux does not. */
+		if (initrd_is_initramfs() && initrd_unpack_to_rootfs() == 0 &&
+		    rdinit_present()) {
+			g_initramfs_root = 1;
+			boot_summary_set_root("initramfs");
+			vfs_repopulate_after_root_mount();
+			rc = 0;
+		}
+#endif
+		if (g_initramfs_root) {
+			/* the root is /init's to mount */
+		} else if (bootinfo_get_kv("root", root_val, sizeof(root_val))) {
 			if (strcmp(root_val, "initramfs") == 0) {
 				/* Keep the RAM filesystem as /, the way Linux does before an
 				 * initramfs hands over with switch_root. The boot then has a
@@ -1469,7 +1525,10 @@ void kernel_main(usize arg0, usize arg1)
 	 * earlier in the boot needs them — they are optional filesystems, a sound
 	 * driver and a network protocol — so the load belongs on this side of the
 	 * mount. */
-	module_init_builtin_deps();
+	if (g_initramfs_root)
+		module_boot_defer_until_root(); /* /lib/modules is on the root to come */
+	else
+		module_init_builtin_deps();
 
 	k_info(NULL, "Step 11: Drivers initialized");
 	/* The splash again, for a framebuffer that only a driver provided. */
@@ -1896,8 +1955,12 @@ void kernel_main(usize arg0, usize arg1)
 	 * The old test orchestrator `/bin/init` can be selected via `init=/bin/init`. */
 	char init_path_buf[128];
 	const char *init_path = "/sbin/init";
-	if (bootinfo_get_kv("init", init_path_buf, sizeof(init_path_buf)) &&
-	    init_path_buf[0] != '\0') {
+	if (g_initramfs_root) {
+		/* init= belongs to the root /init hands over to; it reads it from
+		 * /proc/cmdline. */
+		init_path = g_rdinit_path;
+	} else if (bootinfo_get_kv("init", init_path_buf, sizeof(init_path_buf)) &&
+	           init_path_buf[0] != '\0') {
 		init_path = init_path_buf;
 	} else if (bootinfo_has_flag("b1nix.single")) {
 		init_path = "/bin/sh";

@@ -50,6 +50,8 @@ override_dh_auto_install:
 	# the decrement cannot live in userspace.
 	install -D -m 0755 files/initramfs-boot-count \
 		debian/$(COMMON)/usr/share/initramfs-tools/scripts/init-premount/b1nix-boot-count
+	install -D -m 0755 files/initramfs-hook-boot-count \
+		debian/$(COMMON)/usr/share/initramfs-tools/hooks/b1nix-boot-count
 	install -D -m 0755 files/b1nix-boot-good \
 		debian/$(COMMON)/usr/sbin/b1nix-boot-good
 	install -D -m 0644 files/b1nix-boot-good.service \

@@ -444,6 +444,14 @@ int generic_file_fsync(struct file *file, loff_t start, loff_t end,
 	return sync_inode_metadata(inode, 1);
 }
 
+int __generic_file_fsync(struct file *file, loff_t start, loff_t end,
+                         int datasync)
+{
+	/* What generic_file_fsync does here already leaves the device's cache to
+	 * the caller: the block cache is flushed by the filesystem's own sync. */
+	return generic_file_fsync(file, start, end, datasync);
+}
+
 /* ── directories ────────────────────────────────────────────────── */
 
 /*
@@ -625,6 +633,13 @@ int generic_file_mmap(struct file *file, struct vm_area_struct *vma)
 	 */
 	(void)file;
 	(void)vma;
+	return -ENODEV;
+}
+
+/* The 6.17 form of the same hook, refused for the same reason. */
+int generic_file_mmap_prepare(struct vm_area_desc *desc)
+{
+	(void)desc;
 	return -ENODEV;
 }
 

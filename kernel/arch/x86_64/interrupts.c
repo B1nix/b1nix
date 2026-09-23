@@ -2122,6 +2122,19 @@ static int fp_is_safe(u64 fp) {
   if (fp < 0x0000800000000000ULL)
     /* Low identity-mapped region: kernel image + heap/stacks live below 4 GiB. */
     return fp + 16 <= 0x0000000100000000ULL;
+  /* Every kernel thread's stack is a heap block, and the boot stack is in the
+   * kernel image: refusing both stopped each backtrace taken on a kernel
+   * thread at its first frame. */
+  {
+    extern void kheap_bounds(u64 *base, u64 *current, u64 *end);
+    u64 hb = 0, hc = 0;
+
+    kheap_bounds(&hb, &hc, 0);
+    if (hb && fp >= hb && fp + 16 <= hc)
+      return 1;
+  }
+  if (fp >= KERNEL_VMA)
+    return 1;
   /* Higher-half direct map. */
   return fp + 16 <= 0xffff800100000000ULL;
 }
@@ -2236,9 +2249,8 @@ static const char *user_module_at(struct task *t, u64 addr, u64 *off) {
       continue;
     if (addr < seg->vaddr || addr >= seg->vaddr + seg->memsz)
       continue;
-    if (img->interp_base && seg->vaddr >= img->interp_base &&
-        img->interp_path[0]) {
-      *off = addr - img->interp_base;
+    if (seg->from_interp && img->interp_path[0]) {
+      *off = seg->file_offset + (addr - seg->vaddr);
       return img->interp_path;
     }
     *off = seg->file_offset + (addr - seg->vaddr);

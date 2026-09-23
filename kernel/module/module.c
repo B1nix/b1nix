@@ -1416,6 +1416,27 @@ static const char *const module_boot_list[] = {
     "isofs", "ntfs", "hda", "ndp", "ipv6", "ntp",
 };
 
+static int g_module_boot_deferred;
+
+void module_boot_defer_until_root(void) {
+  __atomic_store_n(&g_module_boot_deferred, 1, __ATOMIC_RELEASE);
+}
+
+static void module_boot_thread(void *arg) {
+  (void)arg;
+  module_init_builtin_deps();
+}
+
+/* Called from the mount move that puts a root at "/". Once, and in a thread
+ * of its own: the caller is a system call (run-init's), and loading a module
+ * reads files and runs initcalls that must not run inside it. */
+void module_boot_root_arrived(void) {
+  if (!__atomic_exchange_n(&g_module_boot_deferred, 0, __ATOMIC_ACQ_REL))
+    return;
+  if (kthread_create("boot-modules", module_boot_thread, 0) < 0)
+    console_write("module: could not start the boot module loader\n");
+}
+
 void module_init_builtin_deps(void) {
   for (usize i = 0; i < sizeof(module_boot_list) / sizeof(module_boot_list[0]);
        i++) {

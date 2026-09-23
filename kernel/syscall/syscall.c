@@ -2195,9 +2195,21 @@ static u64 sigsuspend_with_mask(u64 mask) {
   while (1) {
     u64 pending = __atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
     int has_deliverable = 0;
-    for (int i = 1; i < NSIG; i++) {
+    /* Every signal, real-time ones included: they are pending bits like the
+     * rest, and one that is unblocked ends the wait. Scanning only 1..31 left
+     * an unblocked RT signal pending and unnoticed, and the task slept through
+     * it. Their actions live in a side table (scheduler_rt_action_current). */
+    for (int i = 1; i <= NSIG_MAX; i++) {
       if (pending & (1ULL << (i - 1))) {
-        sighandler_t handler = current_task->sigactions[i - 1].sa_handler;
+        sighandler_t handler;
+
+        if (SIG_IS_RT(i)) {
+          struct sigaction *rsa = scheduler_rt_action_current(i);
+
+          handler = rsa ? rsa->sa_handler : SIG_DFL;
+        } else {
+          handler = current_task->sigactions[i - 1].sa_handler;
+        }
         if (handler == SIG_IGN || (handler == SIG_DFL && (i == SIGCHLD || i == SIGURG || i == SIGWINCH || (i == SIGCONT && current_task->state != TASK_STOPPED)))) {
           __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
         } else if (handler == SIG_DFL &&
@@ -2235,9 +2247,24 @@ static u64 sigsuspend_with_mask(u64 mask) {
       break;
     }
     /* No channel: this wait ends on a signal, and the previous wait's channel
-     * must not be left behind to catch a wake meant for it. */
+     * must not be left behind to catch a wake meant for it.
+     *
+     * BLOCKED is published first and the pending set read again after it.
+     * A signal posted from another CPU between the scan above and the store
+     * found this task RUNNING, so its wake did nothing -- and the task then
+     * slept for ever with the signal it was waiting for already pending. That
+     * was a vfork child of systemd, and with it PID 1, which waits for the
+     * child to exec: the whole boot stopped. The poster's wake turns BLOCKED
+     * into READY, so once the store is visible no signal can be missed. */
     current_task->wait_chan = 0;
-    current_task->state = TASK_BLOCKED;
+    scheduler_lease_clear_here(__func__);
+    __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE) &
+        ~current_task->blocked_signals) {
+      scheduler_wait_cancel_keep_irqs();
+      continue;
+    }
     scheduler_yield();
   }
   interrupts_restore(flags);
@@ -3652,6 +3679,16 @@ u64 syscall_sendmsg_user(int fd, const struct syscall_msghdr *user_msg,
             err = -EBADF;
             goto sendmsg_fail;
           }
+          /* An io_uring cannot travel in SCM_RIGHTS: Linux refuses it with
+           * EINVAL (scm_fp_copy, 6.8 on). A ring in flight can hold the socket
+           * that carries it through its registered files, a cycle only a
+           * garbage collector could break -- liburing's ring-leak builds
+           * exactly that and waited for ever on a pipe the ring never let go. */
+          if (io_uring_is_ring_handle(h)) {
+            vfs_handle_release(h);
+            err = -EINVAL;
+            goto sendmsg_fail;
+          }
           handles[nhandles++] = h;
         }
       } else if (c->cmsg_level == K_SOL_SOCKET &&
@@ -3708,7 +3745,44 @@ sendmsg_fail:
   return (u64)err;
 }
 
+static u64 recvmsg_common(int fd, struct syscall_msghdr *user_msg, int flags,
+                          u64 sel_buf, usize sel_len, int mshot);
+
 u64 syscall_recvmsg_user(int fd, struct syscall_msghdr *user_msg, int flags) {
+  return recvmsg_common(fd, user_msg, flags, 0, 0, 0);
+}
+
+/* io_uring's multishot recvmsg: each message goes into one selected buffer as
+ * a struct io_uring_recvmsg_out, then as much of msg_namelen and of
+ * msg_controllen as the program's header reserves, then the payload. The
+ * program's header is only read. Returns the bytes of the buffer used, which
+ * is what the completion reports -- Linux's io_recvmsg_multishot. */
+u64 syscall_recvmsg_user_mshot(int fd, struct syscall_msghdr *user_msg,
+                               int flags, u64 buf, usize buf_len) {
+  return recvmsg_common(fd, user_msg, flags, buf, buf_len, 1);
+}
+
+/* recvmsg into one buffer the caller chose instead of the message's iovec:
+ * io_uring's IOSQE_BUFFER_SELECT. As Linux's io_recvmsg_prep_setup has it, the
+ * message may name at most one iovec, whose length (when not zero) caps the
+ * buffer's; the message header is otherwise the program's, and is read and
+ * written back as recvmsg(2) does. */
+u64 syscall_recvmsg_user_buf(int fd, struct syscall_msghdr *user_msg,
+                             int flags, u64 buf, usize buf_len) {
+  return recvmsg_common(fd, user_msg, flags, buf, buf_len ? buf_len : 1, 0);
+}
+
+struct recvmsg_out_abi { /* struct io_uring_recvmsg_out */
+  u32 namelen;
+  u32 controllen;
+  u32 payloadlen;
+  u32 flags;
+};
+
+static u64 recvmsg_common(int fd, struct syscall_msghdr *user_msg, int flags,
+                          u64 sel_buf, usize sel_len, int mshot) {
+  usize mshot_hdr = 0;
+
   struct syscall_msghdr msg;
   struct syscall_iovec iov[SYSCALL_IOV_MAX];
   char *payload = 0;
@@ -3716,10 +3790,54 @@ u64 syscall_recvmsg_user(int fd, struct syscall_msghdr *user_msg, int flags) {
   int err = copyin_message(user_msg, &msg, iov, &payload, &payload_len);
   if (err < 0)
     return (u64)err;
+  if (mshot) {
+    mshot_hdr = sizeof(struct recvmsg_out_abi) + (usize)msg.msg_namelen +
+                (usize)msg.msg_controllen;
+    kfree(payload);
+    payload = 0;
+    payload_len = 0;
+    if (sel_len < mshot_hdr)
+      return (u64)-EFAULT;
+    payload_len = sel_len - mshot_hdr;
+    if (payload_len) {
+      payload = kmalloc(payload_len);
+      if (!payload)
+        return (u64)-ENOMEM;
+    }
+    iov[0].iov_base = (void *)(usize)(sel_buf + mshot_hdr);
+    iov[0].iov_len = payload_len;
+    msg.msg_iovlen = 1;
+  } else if (sel_len) {
+    usize cap = sel_len;
+
+    if (msg.msg_iovlen > 1) {
+      kfree(payload);
+      return (u64)-EINVAL;
+    }
+    if (msg.msg_iovlen == 1 && iov[0].iov_len && iov[0].iov_len < cap)
+      cap = iov[0].iov_len;
+    kfree(payload);
+    payload = kmalloc(cap);
+    if (!payload)
+      return (u64)-ENOMEM;
+    payload_len = cap;
+    iov[0].iov_base = (void *)(usize)sel_buf;
+    iov[0].iov_len = cap;
+    msg.msg_iovlen = 1;
+  }
 
   usize header_space = K_CMSG_ALIGN(sizeof(struct syscall_cmsghdr));
   usize fd_capacity = 0;
-  if (msg.msg_control && msg.msg_controllen > header_space)
+  /* Where the name and the control data go: the program's buffers, or for a
+   * multishot receive the selected buffer, behind the io_uring_recvmsg_out. */
+  void *name_dst = mshot ? (void *)(usize)(sel_buf +
+                                           sizeof(struct recvmsg_out_abi))
+                         : msg.msg_name;
+  void *control_dst =
+      mshot ? (void *)(usize)(sel_buf + sizeof(struct recvmsg_out_abi) +
+                              msg.msg_namelen)
+            : msg.msg_control;
+  if (control_dst && msg.msg_controllen > header_space)
     fd_capacity = (msg.msg_controllen - header_space) / sizeof(int);
   if (fd_capacity > VFS_SCM_MAX_FDS)
     fd_capacity = VFS_SCM_MAX_FDS;
@@ -3729,6 +3847,11 @@ u64 syscall_recvmsg_user(int fd, struct syscall_msghdr *user_msg, int flags) {
   struct b1nix_ucred cred;
   int has_cred = 0;
   int ctrunc = 0;
+  /* A multishot receive reports a datagram's whole length and marks it
+   * truncated when the buffer held less (io_recvmsg_multishot passes
+   * MSG_TRUNC). A stream socket has no datagram length, and is not asked. */
+  if (mshot && vfs_socket_is_dgram(fd))
+    flags |= B1NIX_MSG_TRUNC;
   isize rc = vfs_socket_recvmsg(fd, payload, payload_len, flags, received_fds,
                                 fd_capacity, &received_count, &cred, &has_cred,
                                 &ctrunc);
@@ -3761,11 +3884,11 @@ u64 syscall_recvmsg_user(int fd, struct syscall_msghdr *user_msg, int flags) {
    * resolver discards a reply unless msg_name matches the nameserver it
    * queried, so name resolution failed system-wide with the answer sitting
    * in the buffer. Falls back to zeros only when the socket cannot say. */
-  if (msg.msg_name && msg.msg_namelen) {
+  if (name_dst && msg.msg_namelen) {
     u8 src[128] = {0};
     usize cap = msg.msg_namelen < sizeof(src) ? msg.msg_namelen : sizeof(src);
     usize n = vfs_socket_last_srcaddr(fd, src, cap);
-    if (syscall_copyout(msg.msg_name, src, cap) < 0)
+    if (syscall_copyout(name_dst, src, cap) < 0)
       return (u64)-EFAULT;
     if (n)
       msg.msg_namelen = (u32)n;
@@ -3910,9 +4033,23 @@ u64 syscall_recvmsg_user(int fd, struct syscall_msghdr *user_msg, int flags) {
       }
     }
   }
-  if (control_len && syscall_copyout(msg.msg_control, control, control_len) < 0)
+  if (control_len && syscall_copyout(control_dst, control, control_len) < 0)
     return (u64)-EFAULT;
 
+  if (mshot) {
+    usize copied_payload = (usize)rc < payload_len ? (usize)rc : payload_len;
+    struct recvmsg_out_abi out = {
+        .namelen = msg.msg_namelen,
+        .controllen = (u32)control_len,
+        .payloadlen = (u32)rc,
+        .flags = (ctrunc ? K_MSG_CTRUNC : 0) |
+                 ((usize)rc > payload_len ? B1NIX_MSG_TRUNC : 0),
+    };
+
+    if (syscall_copyout((void *)(usize)sel_buf, &out, sizeof(out)) < 0)
+      return (u64)-EFAULT;
+    return (u64)(mshot_hdr + copied_payload);
+  }
   msg.msg_controllen = control_len;
   msg.msg_flags = ctrunc ? K_MSG_CTRUNC : 0;
   if (syscall_copyout(user_msg, &msg, sizeof(msg)) < 0)
@@ -4660,7 +4797,8 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
         return (u64)(rc < 0 ? rc : -EINVAL);
       }
       vmm_map_page(v, phys, dev_flags);
-      pmm_ref_frame(phys);
+      if (!node->inode->mmap_page_cb_refs)
+        pmm_ref_frame(phys);
     }
   } else if (node && node->inode && node->inode->type == VFS_DEVICE &&
              (node->inode->mmap_handle_phys_cb || node->inode->mmap_phys_cb)) {
@@ -6121,6 +6259,9 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
    * enabled (M86). */
   u64 r = syscall_dispatch_traced(number, arg0, arg1, arg2, arg3, arg4, arg5,
                                   frame);
+  /* On the way out, what this process's rings can now finish: see
+   * io_uring_task_work. */
+  io_uring_task_work();
   TRACEPOINT_FIRE(TP_SYS_EXIT, number, r, 0);
   sched_acct_leave_kernel();
 
@@ -6385,6 +6526,17 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
         trace_errno = bootinfo_get_u32("b1nix.trace-errno", 0);
       trace_errno_pid = bootinfo_get_u32("b1nix.trace-errno-pid", 0);
     }
+    /* `b1nix.trace-errno-comm=<name>`: only tasks whose command name starts
+     * with this. A program run at boot has no pid anyone can know in advance,
+     * but it has a name. */
+    static char trace_errno_comm[16];
+    static int trace_errno_comm_read;
+    if (!trace_errno_comm_read) {
+      trace_errno_comm_read = 1;
+      if (!bootinfo_get_kv("b1nix.trace-errno-comm", trace_errno_comm,
+                           sizeof(trace_errno_comm)))
+        trace_errno_comm[0] = '\0';
+    }
     u32 e = trace_errno;
     if (e) {
       u32 pid = (unsigned)(current_task ? current_task->id : 0);
@@ -6393,7 +6545,13 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
       i64 sret = (i64)ret;
       int failed = (e == TRACE_ERRNO_ALL) ? (sret < 0 && sret >= -4095)
                                           : (ret == (u64)(-(i64)e));
-      if (failed && (trace_errno_pid == 0 || pid == trace_errno_pid)) {
+      const char *comm = (current_task && current_task->name) ? current_task->name : "";
+      const char *base = strrchr(comm, '/');
+
+      base = base ? base + 1 : comm;
+      if (failed && (trace_errno_pid == 0 || pid == trace_errno_pid) &&
+          (!trace_errno_comm[0] ||
+           strncmp(base, trace_errno_comm, strlen(trace_errno_comm)) == 0)) {
         if (e == TRACE_ERRNO_ALL)
           e = (u32)(-sret);
         /* The path, where the call has one. "errno 2 from syscall 83" says a
@@ -6423,6 +6581,13 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
         case 267: /* readlinkat */
         case 269: /* faccessat */
           upath = (const char *)(usize)arg1;
+          break;
+        case 86:  /* link: the new name */
+        case 88:  /* symlink: the new name */
+          upath = (const char *)(usize)arg1;
+          break;
+        case 266: /* symlinkat: the new name */
+          upath = (const char *)(usize)arg2;
           break;
         default:
           break;
@@ -6753,9 +6918,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           long tv[2] = {0, 0};
           if (syscall_copyin(tv, (void *)(usize)arg4, sizeof(tv)) < 0)
             return (u64)-EFAULT;
+          /* Rounded up, never down: a timeout is a minimum. Truncated, a
+           * 100-microsecond select became a zero-length poll that returned
+           * at once, and a program's usleep-paced loop ran flat out. */
           arg4 = (number == LINUX_NR_SELECT)
-                     ? (u64)tv[0] * 1000 + (u64)tv[1] / 1000    /* usec */
-                     : (u64)tv[0] * 1000 + (u64)tv[1] / 1000000; /* nsec */
+                     ? (u64)tv[0] * 1000 + ((u64)tv[1] + 999) / 1000 /* usec */
+                     : (u64)tv[0] * 1000 +
+                           ((u64)tv[1] + 999999) / 1000000; /* nsec */
         }
       }
       /* fcntl(72) F_GETFL/F_SETFL: the status-flag VALUES differ between the
@@ -7574,12 +7743,23 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
             (int)arg0, have_path ? resolved_attr : 0, (u32)arg2, &attr);
       }
 
-      /* fspick(2) reconfigures a mount that already exists, which needs the
-       * live-superblock reconfiguration fsconfig(CMD_RECONFIGURE) also
-       * refuses. Every caller reaches it through a fallback to
-       * mount(MS_REMOUNT), which works. */
-      if (number == LX_fspick)
-        return (u64)-EOPNOTSUPP;
+      /* fspick(dfd, path, flags): a filesystem context onto a mount that
+       * already exists, which fsconfig(CMD_RECONFIGURE) then remounts. It is
+       * how util-linux's mount(8) remounts; answering EOPNOTSUPP failed
+       * systemd-remount-fs with "fspick() failed" and no fallback.
+       * FSPICK_EMPTY_PATH (8) names the descriptor itself. */
+      if (number == LX_fspick) {
+        char kpath[VFS_MAX_PATH];
+        char resolved_pick[VFS_MAX_PATH];
+        int rc = linux_at_path((int)arg0, (const char *)(usize)arg1,
+                               ((u32)arg2 & 8u) ? AT_EMPTY_PATH : 0, kpath,
+                               sizeof(kpath));
+
+        if (rc < 0)
+          return (u64)rc;
+        vfs_resolve_path(kpath, resolved_pick);
+        return (u64)(isize)vfs_fspick(resolved_pick, (u32)arg2);
+      }
 
       {
         u64 modern_ret;
@@ -7935,14 +8115,27 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 
       /* --- M92: wrapper syscalls (thin shims over existing b1nix handlers) --- */
       if (number == LX_pipe2) {
-        /* pipe2(fds, flags): call pipe, then set FD_CLOEXEC if requested. */
+        /* pipe2(fds, flags): call pipe, then apply the flags to both ends.
+         * O_NONBLOCK was dropped here, so every pipe2(O_NONBLOCK) -- glibc's,
+         * systemd's, any event loop's -- came back blocking, and a read that
+         * should have said EAGAIN slept for ever (liburing's openat2 test).
+         * O_DIRECT asks for packet mode, which these pipes do not have; it is
+         * accepted and ignored as it always was. Anything else is EINVAL, as
+         * on Linux. */
+        const u64 lx_cloexec = 02000000, lx_nonblock = 04000, lx_direct = 040000;
+        if (arg1 & ~(lx_cloexec | lx_nonblock | lx_direct))
+          return (u64)-EINVAL;
         int kfds[2];
         int rc = (int)vfs_pipe(kfds);
         if (rc < 0)
           return (u64)rc;
-        if (arg1 & 02000000) { /* O_CLOEXEC */
+        if (arg1 & lx_cloexec) {
           sys_fcntl(kfds[0], B1NIX_F_SETFD, B1NIX_FD_CLOEXEC);
           sys_fcntl(kfds[1], B1NIX_F_SETFD, B1NIX_FD_CLOEXEC);
+        }
+        if (arg1 & lx_nonblock) {
+          sys_fcntl(kfds[0], B1NIX_F_SETFL, B1NIX_O_NONBLOCK);
+          sys_fcntl(kfds[1], B1NIX_F_SETFL, B1NIX_O_NONBLOCK);
         }
         if (syscall_copyout((void *)(usize)arg0, kfds, sizeof(kfds)) < 0)
           return (u64)-EFAULT;
@@ -8467,7 +8660,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                 else
                   timeout_ms = 1;
               } else {
-                timeout_ms = tv_sec * 1000 + tv_nsec / 1000000;
+                /* Rounded up: a relative timeout is a minimum. */
+                timeout_ms = tv_sec * 1000 + (tv_nsec + 999999) / 1000000;
                 if (timeout_ms == 0)
                   timeout_ms = 1;
               }
@@ -9539,9 +9733,9 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           struct timespec ts;
           if (syscall_copyin(&ts, (const void *)(usize)arg3, sizeof(ts)) < 0)
             return (u64)-EFAULT;
-          timeout_ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-          if (timeout_ms < 0)
+          if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000)
             return (u64)-EINVAL;
+          timeout_ms = ts.tv_sec * 1000 + (ts.tv_nsec + 999999) / 1000000;
         }
         return (u64)(isize)sysv_semop((int)arg0, ops, nops, timeout_ms);
       }

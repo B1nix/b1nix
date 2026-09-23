@@ -507,6 +507,17 @@ int sync_blockdev(struct block_device *bdev)
 	return 0;
 }
 
+int sync_blockdev_nowait(struct block_device *bdev)
+{
+	extern int lkpi_write_dirty_buffers(struct address_space *mapping);
+
+	if (!bdev || !bdev->bd_inode || !bdev->bd_inode->i_mapping)
+		return 0;
+	/* The dirty buffers go to the block cache; the cache reaches the medium
+	 * on its own flusher's schedule, which is the "without waiting" part. */
+	return lkpi_write_dirty_buffers(bdev->bd_inode->i_mapping) < 0 ? -EIO : 0;
+}
+
 int sync_blockdev_range(struct block_device *bdev, loff_t lstart, loff_t lend)
 {
 	(void)lstart;

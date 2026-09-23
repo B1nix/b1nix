@@ -322,6 +322,9 @@ sector_t generic_block_bmap(struct address_space *mapping, sector_t block,
 int cont_write_begin(const struct kiocb *iocb, struct address_space *mapping,
                      loff_t pos, unsigned len, struct folio **foliop,
                      void **fsdata, get_block_t *get_block, loff_t *bytes);
+/* Grow a file to `size` through the write path, zero-filling the gap: how a
+ * filesystem without holes (FAT) extends one. */
+int generic_cont_expand_simple(struct inode *inode, loff_t size);
 int nobh_truncate_page(struct address_space *mapping, loff_t from,
                        get_block_t *get_block);
 int sync_mapping_buffers(struct address_space *mapping);

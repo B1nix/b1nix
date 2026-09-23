@@ -74,6 +74,14 @@ static inline void security_free_mnt_opts(void **mnt_opts)
 static inline int security_quota_on(struct dentry *dentry)
 { (void)dentry; return 0; }
 
+/* An attribute change an LSM may veto; with none, nothing is vetoed. */
+struct mnt_idmap;
+struct iattr;
+static inline int security_inode_setattr(struct mnt_idmap *idmap,
+                                         struct dentry *dentry,
+                                         struct iattr *attr)
+{ (void)idmap; (void)dentry; (void)attr; return 0; }
+
 static inline int security_quotactl(int cmds, int type, int id,
                                     struct super_block *sb)
 { (void)cmds; (void)type; (void)id; (void)sb; return 0; }

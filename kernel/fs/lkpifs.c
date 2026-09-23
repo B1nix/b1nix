@@ -1079,6 +1079,28 @@ static struct vfs_fs lkpifs_ext_types[] = {
 	{ .name = "ext3", .mount = lkpifs_mount_ext4, .umount = lkpifs_umount },
 	{ .name = "ext2", .mount = lkpifs_mount_ext4, .umount = lkpifs_umount },
 };
+
+static struct vfs_node *lkpifs_mount_vfat(const char *source, u64 flags,
+                                          void *data)
+{
+	(void)data;
+	return lkpifs_mount_type("vfat", source, flags);
+}
+
+static struct vfs_node *lkpifs_mount_msdos(const char *source, u64 flags,
+                                           void *data)
+{
+	(void)data;
+	return lkpifs_mount_type("msdos", source, flags);
+}
+
+/* FAT is built with ext4 because it stands on the same buffer heads. "vfat"
+ * is what every fstab and every EFI system partition says; "msdos" is the same
+ * driver with 8.3 names only, as on Linux. */
+static struct vfs_fs lkpifs_fat_types[] = {
+	{ .name = "vfat", .mount = lkpifs_mount_vfat, .umount = lkpifs_umount },
+	{ .name = "msdos", .mount = lkpifs_mount_msdos, .umount = lkpifs_umount },
+};
 #endif
 
 void lkpifs_init(void)
@@ -1089,6 +1111,9 @@ void lkpifs_init(void)
 	for (usize i = 0; i < sizeof(lkpifs_ext_types) / sizeof(lkpifs_ext_types[0]); i++)
 		vfs_register_fs(&lkpifs_ext_types[i]);
 	klog_info("lkpifs: ext4/ext3/ext2 registered (imported Linux " LKPI_FS_LINUX_VERSION " ext4)");
+	for (usize i = 0; i < sizeof(lkpifs_fat_types) / sizeof(lkpifs_fat_types[0]); i++)
+		vfs_register_fs(&lkpifs_fat_types[i]);
+	klog_info("lkpifs: vfat/msdos registered (imported Linux " LKPI_FS_LINUX_VERSION " fat)");
 #endif
 }
 

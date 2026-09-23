@@ -246,7 +246,8 @@ static struct user_address_space user_address_space_create(void) {
  * elf64_parse_dynamic — the in-kernel eager linker plays no further part once
  * control transfers to a real interpreter. */
 static int elf64_load_interpreter(struct user_loaded_image *image,
-                                  const char *path, u64 base, u64 *out_entry)
+                                  const char *path, u64 base, u64 *out_entry,
+                                  u64 *out_base)
 {
   char *data = 0;
   usize size = 0;
@@ -259,7 +260,8 @@ static int elf64_load_interpreter(struct user_loaded_image *image,
   const struct elf64_ehdr *ehdr = (const struct elf64_ehdr *)data;
   if (ehdr->e_ident[0] != ELF_MAGIC0 || ehdr->e_ident[1] != ELF_MAGIC1 ||
       ehdr->e_ident[2] != ELF_MAGIC2 || ehdr->e_ident[3] != ELF_MAGIC3 ||
-      ehdr->e_ident[4] != ELF_CLASS_64 || ehdr->e_type != ELF_TYPE_DYN ||
+      ehdr->e_ident[4] != ELF_CLASS_64 ||
+      (ehdr->e_type != ELF_TYPE_DYN && ehdr->e_type != ELF_TYPE_EXEC) ||
       (ehdr->e_machine != ELF_MACHINE_X86_64 &&
        ehdr->e_machine != ELF_MACHINE_AARCH64) ||
       ehdr->e_phentsize != sizeof(struct elf64_phdr) ||
@@ -267,6 +269,12 @@ static int elf64_load_interpreter(struct user_loaded_image *image,
     kfree(data);
     return -1;
   }
+  /* An ET_EXEC interpreter (klibc's shared object, which every Debian
+   * initramfs runs) was linked at fixed addresses and is loaded at them, with
+   * no bias -- Linux's load_elf_interp does the same, and reports 0 as its
+   * AT_BASE. */
+  if (ehdr->e_type == ELF_TYPE_EXEC)
+    base = 0;
   /* The node its text is shared from. Only a disk-backed file with a read_cb
    * has page-cache pages to share; an initramfs ld.so has none and stays
    * eager. */
@@ -333,6 +341,7 @@ static int elf64_load_interpreter(struct user_loaded_image *image,
       memcpy(seg->data, data + ph->p_offset, ph->p_filesz);
   }
   *out_entry = base + ehdr->e_entry;
+  *out_base = base;
   kfree(data);
   return 0;
 }
@@ -515,7 +524,7 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
    * process's initial IP, which is separate from this auxv value. */
   if (user_stack_push_usize(
           stack, &sp,
-          (usize)(image->interp_base ? image->app_entry : image->entry)) < 0)
+          (usize)(image->has_interp ? image->app_entry : image->entry)) < 0)
     goto out;
   if (user_stack_push_usize(stack, &sp, AT_ENTRY) < 0) goto out;
   if (user_stack_push_usize(stack, &sp, PAGE_SIZE) < 0) goto out;
@@ -925,11 +934,12 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
      * under SMP exec churn). */
     char line[128 + sizeof(interp)];
     u64 interp_entry = 0;
+    u64 interp_base = 0;
     usize seg_count_before = image->segment_count;
     /* Try the absolute path first (real / mount), then /mnt/root (test-mode
      * ram0 mount — matches how initramfs-era boot stages find rootfs libs). */
     int interp_rc = elf64_load_interpreter(image, interp, USER_LDSO_LOAD_BASE,
-                                           &interp_entry);
+                                           &interp_entry, &interp_base);
     if (interp_rc != 0) {
       image->segment_count = seg_count_before; /* undo partial segments */
       char alt[80];
@@ -938,7 +948,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
         memcpy(alt, "/mnt/root", 9);
         memcpy(alt + 9, interp, ilen2 + 1);
         interp_rc = elf64_load_interpreter(image, alt, USER_LDSO_LOAD_BASE,
-                                           &interp_entry);
+                                           &interp_entry, &interp_base);
       }
     }
     if (interp_rc != 0) {
@@ -947,7 +957,8 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
       goto cleanup;
     }
     image->app_entry = image->entry;
-    image->interp_base = USER_LDSO_LOAD_BASE;
+    image->has_interp = 1;
+    image->interp_base = interp_base;
     {
       usize il = strlen(interp);
       if (il >= sizeof(image->interp_path))
@@ -957,7 +968,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     }
     image->entry = interp_entry;
     k_dbg("elf", "load: PT_INTERP=%s (userspace ld.so, base=0x%lx)", interp,
-          (unsigned long)USER_LDSO_LOAD_BASE);
+          (unsigned long)interp_base);
     break; /* at most one PT_INTERP */
   }
 
@@ -989,7 +1000,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * cost 72 seconds, about 0.18 s each, for a binary that is the same file
    * every time and should come from the page cache after the first. That is a
    * fifth of a lane whose whole budget is 360 s. */
-  int demand_page = (load_base == 0) || image->interp_base != 0;
+  int demand_page = (load_base == 0) || image->has_interp;
   for (u16 i = 0; demand_page && i < ehdr->e_phnum; i++) {
     struct elf64_phdr *a = &phdrs[i];
     if (a->p_type != PT_LOAD)
@@ -1107,7 +1118,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * first dereference faults. Apply the one relocation type such a binary can
    * emit, R_X86_64_RELATIVE (*target = load_base + addend), into the staged
    * segments before they are mapped. */
-  if (load_base != 0 && image->interp_base == 0) {
+  if (load_base != 0 && !image->has_interp) {
     for (u16 i = 0; i < ehdr->e_phnum; i++) {
       struct elf64_phdr *phdr = &phdrs[i];
       if (phdr->p_type != PT_DYNAMIC)
@@ -1382,7 +1393,15 @@ void user_address_space_cleanup(struct task *t) {
      * not been torn down yet still caches out of this very list. */
     vma_cache_forget(t);
     vma_cache_invalidate_space(t->pml4_phys);
-    kfree(vma);
+    /* Retired, not freed: a walker on another CPU -- a fault, the task dump
+     * reading this process -- may have read the list head before it was
+     * detached above, and freeing under it read freed memory (the dump then
+     * wedged the machine part-way through a line). */
+    {
+      extern void vma_retire(struct vm_area *vma);
+
+      vma_retire(vma);
+    }
     vma = next;
   }
 

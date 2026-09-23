@@ -585,6 +585,7 @@ static struct vfs_fs fat32_vfs = {
     .mount = fat32_vfs_mount_cb,
 };
 
+#if !defined(B1NIX_FS_IMPORT_EXT4) || !B1NIX_FS_IMPORT_EXT4
 /* The names Linux answers to for the same filesystem. Every fstab, every
  * installer and every /etc/fstab systemd generates says "vfat" -- Linux has
  * not called it "fat32" since the three drivers were merged -- so a kernel
@@ -604,6 +605,7 @@ static struct vfs_fs msdos_vfs = {
     .name = "msdos",
     .mount = fat32_vfs_mount_cb,
 };
+#endif
 
 int fat32_mount(struct block_device *dev, const char *mount_point) {
     if (!dev) return -ENODEV;
@@ -612,6 +614,10 @@ int fat32_mount(struct block_device *dev, const char *mount_point) {
 
 void fat32_init(void) {
     vfs_register_fs(&fat32_vfs);
+    /* With the imported Linux FAT in the kernel, "vfat" and "msdos" are its
+     * names (kernel/fs/lkpifs.c): it writes, this driver only reads. */
+#if !defined(B1NIX_FS_IMPORT_EXT4) || !B1NIX_FS_IMPORT_EXT4
     vfs_register_fs(&vfat_vfs);
     vfs_register_fs(&msdos_vfs);
+#endif
 }

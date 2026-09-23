@@ -13,4 +13,7 @@
 #define S_IRUGO (S_IRUSR | S_IRGRP | S_IROTH)
 #define S_IWUSR_IRUGO (S_IWUSR | S_IRUGO)
 #define S_IRWXU 0700
+#ifndef S_IWUGO
+#define S_IWUGO (S_IWUSR | S_IWGRP | S_IWOTH)
+#endif
 #endif

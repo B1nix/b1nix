@@ -1504,6 +1504,36 @@ static struct task *find_unused_task(int user) {
       console_write(" ready=");
       console_write_dec((u64)ready);
       console_write("\n");
+      /* Which rows, not just how many: a few of each kind, with what the
+       * reapers decide on -- thread or not, parent, whether it still holds an
+       * address space. */
+      {
+        usize shown_dead = 0, shown_ready = 0;
+
+        for (usize k = 0; k < g_task_hwm; k++) {
+          struct task *s = T(k);
+          enum task_state st = __atomic_load_n(&s->state, __ATOMIC_RELAXED);
+
+          /* Ready rows from past the boot-time kernel threads, which are
+           * always ready and say nothing about what filled the table. */
+          if (st == TASK_DEAD ? shown_dead++ >= 3
+                              : st != TASK_READY || k < 64 ||
+                                    shown_ready++ >= 3)
+            continue;
+          console_write(st == TASK_DEAD ? "sched:  dead " : "sched:  ready ");
+          console_write_dec((u64)s->id);
+          console_write(" '");
+          console_write(s->name ? s->name : "?");
+          console_write("' parent=");
+          console_write_dec((u64)s->parent_id);
+          console_write(task_is_thread(s) ? " thread" : " process");
+          console_write(s->pml4_phys ? " mm" : " no-mm");
+          console_write(s->user_image ? " image" : "");
+          console_write(__atomic_load_n(&s->stack_released, __ATOMIC_RELAXED)
+                            ? " released\n"
+                            : " on-stack\n");
+        }
+      }
     }
     tasks_unlock(flags);
     return 0;
@@ -3092,10 +3122,18 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
     task->fd_table = 0;
     task->fd_flags = 0;
     task->fd_lock = 0;
-  } else if (parent_task && (user || !parent_task->user_image)) {
+  } else if (parent_task &&
+             (user || (!parent_task->user_image && !parent_task->pml4_phys))) {
     /* Not for a kernel thread started inside a process's syscall: holding a
      * copy of the process's descriptors, a filesystem worker kept the write
-     * end of a pipe open forever and the reader never saw end-of-file. */
+     * end of a pipe open forever and the reader never saw end-of-file.
+     *
+     * "Inside a process" is any task with an address space, a thread as much
+     * as its leader. Only the leader carries user_image, so an io_uring
+     * completion thread started from a pthread's syscall got a copy -- and
+     * then closed it when it adopted the owner's table, and those closes
+     * reached the ring the pthread was waiting on: liburing's socket test lost
+     * its recv to a quiesce one run in ten. */
     task->fd_capacity = parent_task->fd_capacity;
     task->fd_table = kzalloc(task->fd_capacity * sizeof(struct vfs_handle *));
     task->fd_flags = kzalloc(task->fd_capacity * sizeof(int));
@@ -3986,6 +4024,10 @@ void task_note_syscall(u64 number) {
   if (current_task)
     g_task_syscall[task_index(current_task)] = number;
 }
+/* The system call the running task is in, as task_note_syscall recorded it. */
+u64 task_current_syscall(void) {
+  return current_task ? g_task_syscall[task_index(current_task)] : 0;
+}
 /* ── M86: per-thread CPU time ─────────────────────────────────────────────── */
 /* Nanosecond accessors are the primitives; the tick accessors (clock_t at the
  * 100 Hz USER_HZ times(2)/procfs report in) are derived from them. */
@@ -4579,6 +4621,8 @@ static u64 mm_release_user(struct task *t) {
     }
   }
   spin_unlock_irqrestore(&g_mm_release_lock, flags);
+  if (p && refs == 0)
+    uffd_mm_release(p); /* before the frame can be reused */
   return (p && refs == 0) ? p : 0;
 }
 
@@ -4708,14 +4752,36 @@ void scheduler_release_owner_context(void) {
     kfree(fl);
   }
 
-  last = mm_release_user(t);
-  if (last) {
-    /* Nobody else is left: this thread owns the teardown. */
-    t->pml4_phys = last;
+  /* Off the borrowed tables and out of the holder count in one step. This
+   * thread is the current task and can be preempted: a switch back into it
+   * loads t->pml4_phys, so that must never name a space that may already be
+   * freed. Dropped while the CPU still ran on it, the owner's reaper could
+   * free the tables under this CPU; freed while t->pml4_phys still named them,
+   * the next switch into this thread loaded a freed PML4 -- no kernel mapping,
+   * a fault on the instruction after the CR3 write, and a triple fault. */
+  {
+    u64 fl = interrupts_save();
+
+    interrupts_disable();
     paging_switch_address_space(0);
+    last = mm_release_user(t);
+    interrupts_restore(fl);
+  }
+  if (last) {
+    /* Nobody else is left: this thread owns the teardown. The tables are
+     * still valid while it runs, so a preemption inside it reloads them
+     * harmlessly; they stop being named before they are freed. */
+    t->pml4_phys = last;
     user_address_space_cleanup(t);
+    {
+      u64 fl = interrupts_save();
+
+      interrupts_disable();
+      t->pml4_phys = 0;
+      paging_switch_address_space(0);
+      interrupts_restore(fl);
+    }
     paging_free_address_space(last);
-    t->pml4_phys = 0;
   }
   t->vma_list = 0;
   t->user_brk = 0;
@@ -5439,8 +5505,15 @@ static int scheduler_yield_inner(void) {
      * rather than leaving a machine that appears to run and then wedges nine
      * seconds later on a lock whose holder is not running. A loud stop at the
      * violation is worth more than a quiet one at the consequence. */
+    /* Read with interrupts off: with them on, the reader can be preempted and
+     * moved between reading its CPU number and that CPU's count, and then
+     * reads a count that belongs to whoever runs there now. That fired from
+     * nanosleep while jbd2 held a lock on the CPU the sleeper had just left
+     * (the report then showed the count back at zero). */
+    u64 hflags = interrupts_save();
     int held = lkpi_holding_spinlock();
 
+    interrupts_restore(hflags);
     if (held) {
       extern void lkpi_lock_report_held(void);
 
@@ -6572,7 +6645,20 @@ int scheduler_can_block(void) {
  * name is never woken again, which is how a compositor parked in epoll_wait
  * stopped answering its IPC socket while still, from outside, perfectly alive.
  * The same store applied to wake_tick strands a sleeper with no deadline. */
+/* Every wake of vfs_poll_chan, counted. A waiter that re-tests readiness
+ * itself (io_uring's wait, its ring threads) reads this before the test and
+ * again after publishing itself as blocked: a readiness change that landed in
+ * between woke nobody -- the waiter was not on the channel yet -- and without
+ * the count it slept out its whole bounded timeout, one per event. */
+volatile u64 g_vfs_poll_seq;
+
 void scheduler_wake_all(void *chan) {
+  {
+    extern void *vfs_poll_chan;
+
+    if (chan == vfs_poll_chan)
+      __atomic_add_fetch(&g_vfs_poll_seq, 1, __ATOMIC_SEQ_CST);
+  }
   /* Preserve the caller's interrupt state instead of force-enabling. This is
    * called from inside IRQs-off spinlock critical sections (e.g. tcp_input
    * holds tcp_queue_lock via irq_save() when it wakes pollers on vfs_poll_chan).
@@ -8463,6 +8549,13 @@ void scheduler_exit_current(int exit_code) {
   }
 
   EXIT_STAGE(20);
+  /* Its rings' threads first, while this process still holds what they
+   * borrowed: see io_uring_task_exit. */
+  {
+    extern void io_uring_task_exit(usize tgid);
+
+    io_uring_task_exit(task_tgid(current_task));
+  }
   /* fd-table teardown, with interrupts enabled so writebacks can sleep.
    * Drop our reference first: with CLONE_FILES threads still alive the table
    * must survive — only the LAST user closes the handles and frees the
@@ -9260,6 +9353,9 @@ static void scheduler_dump_sysring(usize idx) {
 static int g_dump_dead;
 
 void scheduler_dump_tasks(void) {
+  /* Every other task's mapping list is read below, while those tasks run and
+   * exit on other CPUs: counted as a walker, so no mapping is freed under it. */
+  vma_walker_enter();
   extern void futex_dump_waiters(void);
   {
     /* Where the run spends itself, printed first because it is the line most
@@ -9643,6 +9739,7 @@ void scheduler_dump_tasks(void) {
    * to say, and one run was read as "the machine went quiet" when in fact the
    * dump itself had wedged. This line is the proof it finished. */
   console_write("TASK-DUMP: end\n");
+  vma_walker_exit();
 }
 
 int scheduler_get_stdout(void) {
@@ -12584,11 +12681,33 @@ static void cputop_thread(void *arg) {
   }
 }
 
+/* b1nix.taskdump-at=<seconds>: dump the task table (and the io_uring rings)
+ * once, that long after boot. For a hang in a boot no harness is watching --
+ * a systemd unit that never finishes -- the dump taken while it hangs is the
+ * whole diagnosis. */
+static void taskdump_thread(void *arg) {
+  u64 secs = (u64)(usize)arg;
+
+  scheduler_sleep_ticks(SCHED_MS_TO_TICKS(secs * 1000));
+  scheduler_dump_tasks();
+  {
+    extern void io_uring_dump_state(void);
+
+    io_uring_dump_state();
+  }
+}
+
 void scheduler_start_reaper(void) {
   if (kthread_create("reaper", reaper_thread, 0) >= 0)
     g_reaper_started = 1;
   if (bootinfo_has_flag("b1nix.cputop"))
     kthread_create("cputop", cputop_thread, 0);
+  {
+    u32 at = bootinfo_get_u32("b1nix.taskdump-at", 0);
+
+    if (at)
+      kthread_create("taskdump", taskdump_thread, (void *)(usize)at);
+  }
 }
 
 /* The AP half of the preemptive tick, for ticks that interrupted ring 3. */
