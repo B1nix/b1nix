@@ -76,10 +76,19 @@ void tracepoint_ref_put(u16 id);
 /* A dynamic probe: a kprobe named by symbol. Returns its id, or -errno. */
 int tracepoint_kprobe_add(const char *name, const char *symbol, int is_return);
 int tracepoint_kprobe_remove(const char *name);
+/* A dynamic probe on a file's text, by inode and offset (a uprobe). Removed
+ * with tracepoint_kprobe_remove, by name, like a kprobe. */
+int tracepoint_uprobe_add(const char *name, const void *inode, u64 offset,
+                          const char *path_label);
+int tracepoint_uprobe_info(u16 id, const char **label, u64 *offset);
 void tracepoint_kprobe_clear_all(void);
+/* The trap frame of the kprobe this CPU is reporting, or NULL. */
+const void *kprobe_current_frame(void);
 
 /* Build the /sys/kernel/tracing tree. Called once, after sysfs is mounted. */
 void tracefs_init(void);
+struct vfs_node;
+struct vfs_node *tracefs_root_get(void);
 /* Create the files for any event that does not have them yet (a dynamic probe
  * has just been added). */
 void tracefs_refresh_events(void);

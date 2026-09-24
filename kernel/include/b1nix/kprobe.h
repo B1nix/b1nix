@@ -33,4 +33,14 @@ const char *kprobe_symbol_of(u16 id);
 int kprobe_handle_bp(struct interrupt_frame *frame);
 int kprobe_handle_db(struct interrupt_frame *frame);
 
+/* uprobes: a breakpoint in a file's text, at a file offset, in every address
+ * space that maps it executable -- the ones mapping it now, and the ones whose
+ * page comes in later (uprobe_page_mapped, from the fault path). A user int3
+ * or single step that is one of them is handled here and not signalled. */
+int uprobe_arm(u16 id, const void *inode, u64 offset);
+int uprobe_disarm(u16 id);
+void uprobe_page_mapped(u64 va);
+int uprobe_handle_bp(struct interrupt_frame *frame);
+int uprobe_handle_db(struct interrupt_frame *frame);
+
 #endif /* B1NIX_KPROBE_H */

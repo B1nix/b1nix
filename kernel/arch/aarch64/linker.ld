@@ -44,6 +44,13 @@ SECTIONS
 		KEEP(*(.kallsyms))
 		__kallsyms_end = .;
 	}
+
+	/* The kernel's BTF; see the x86_64 script. */
+	.BTF ALIGN(8) : {
+		__start_BTF = .;
+		KEEP(*(.BTF))
+		__stop_BTF = .;
+	}
 	. = ALIGN(4K);
 
 	.bss ALIGN(4K) : {

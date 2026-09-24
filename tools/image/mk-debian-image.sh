@@ -103,7 +103,15 @@ sysvinit)
 		_fio_pkgs="$_fio_pkgs linux-perf"
 		RESOLVE_DEPS="${RESOLVE_DEPS:-1}"
 	fi
-	PACKAGES="${PACKAGES:-procps libproc2-0 libncursesw6 sysvinit-core sysvinit-utils$_fio_pkgs}"
+	# BPFTRACE=1 adds the distribution's bpftrace: the tracer the kernel's
+	# eBPF, its contexts and its kprobes and tracepoints are there to serve.
+	if [ "${BPFTRACE:-0}" = "1" ]; then
+		_fio_pkgs="$_fio_pkgs bpftrace"
+		RESOLVE_DEPS="${RESOLVE_DEPS:-1}"
+	fi
+	# bpftool (and libelf1, the one library of its the base lacks): the
+	# distribution's reader of the kernel's BTF (M133).
+	PACKAGES="${PACKAGES:-procps libproc2-0 libncursesw6 sysvinit-core sysvinit-utils bpftool libelf1$_fio_pkgs}"
 	RESOLVE_DEPS="${RESOLVE_DEPS:-0}"
 	;;
 systemd)
@@ -289,6 +297,13 @@ resolve_pkg() {
 CLOSURE_CACHE="$CACHE/closure-$PROFILE.txt"
 if [ "$RESOLVE_DEPS" = "1" ]; then
 	fetch_index
+	# The closure answers for one list of seed packages: a different list
+	# (FIO, PERF, BPFTRACE, an edit here) resolves afresh rather than reusing
+	# an answer that leaves the new packages out.
+	if [ "$(cat "$CLOSURE_CACHE.seeds" 2>/dev/null)" != "$PACKAGES" ]; then
+		rm -f "$CLOSURE_CACHE"
+		printf '%s\n' "$PACKAGES" >"$CLOSURE_CACHE.seeds"
+	fi
 	if [ ! -s "$CLOSURE_CACHE" ]; then
 		log "resolving the dependency closure of: $PACKAGES"
 		# The member name is './var/...' in some layers and 'var/...' in

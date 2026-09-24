@@ -4076,6 +4076,8 @@ static int vmm_handle_page_fault_inner(u64 fault_addr, u64 error_code) {
  * perf's PERF_COUNT_SW_PAGE_FAULTS* counters read these, so the count has to be
  * of faults really serviced: a fault the handler refused is a signal, not a
  * fault the task took. */
+void uprobe_page_mapped(u64 va); /* kernel/trace/kprobe.c */
+
 int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   int rc;
 
@@ -4083,6 +4085,9 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   rc = vmm_handle_page_fault_inner(fault_addr, error_code);
   if (rc == 0 && (error_code & PF_USER) && current_task)
     task_count_fault(current_task, *fault_major_slot());
+  /* A page of a file with a uprobe in it gets its breakpoint as it comes in. */
+  if (rc == 0 && fault_addr < 0x0000800000000000ULL)
+    uprobe_page_mapped(fault_addr);
   return rc;
 }
 
@@ -5435,4 +5440,75 @@ u64 paging_reserve_kernel_va(usize size) {
   if (paging_reserve_kernel_path(va, len) != 0)
     return 0;
   return va;
+}
+
+void tlb_shootdown_mm(u64 pml4_phys);
+
+/* Write one byte of instruction text in the address space at `pml4_phys`, the
+ * way a uprobe plants and lifts its breakpoint. The page must be present. A
+ * frame anybody else holds -- the page cache's copy of the file, a parent's
+ * page after fork -- is not written: this mapping gets its own copy first, so
+ * the breakpoint is this address space's alone, exactly as a debugger's
+ * PTRACE_POKETEXT of shared text must behave. The previous byte is returned in
+ * *old. */
+int paging_user_poke_text(u64 pml4_phys, u64 va, u8 val, u8 *old) {
+  u64 spare = pmm_alloc_frame();
+  u64 cf, *slot = 0, frame, gone = 0;
+  u64 *pml4;
+
+  if (!pml4_phys || va >= 0x0000800000000000ULL) {
+    if (spare)
+      pmm_free_frame(spare);
+    return -EFAULT;
+  }
+  vmm_write_acquire(&cf);
+  pml4 = (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE);
+  {
+    u64 e = pml4[pml4_index(va)];
+    u64 *t;
+
+    if ((e & VMM_PRESENT) && (t = reachable_table(e))) {
+      e = t[pdpt_index(va)];
+      if ((e & VMM_PRESENT) && !(e & HUGE_PAGE_FLAG) && (t = reachable_table(e))) {
+        e = t[pd_index(va)];
+        if ((e & VMM_PRESENT) && !(e & HUGE_PAGE_FLAG) && (t = reachable_table(e)))
+          slot = &t[pt_index(va)];
+      }
+    }
+  }
+  if (!slot || !(*slot & VMM_PRESENT) || !(*slot & VMM_USER)) {
+    vmm_write_release(cf);
+    if (spare)
+      pmm_free_frame(spare);
+    return -EFAULT;
+  }
+  frame = *slot & PAGE_ENTRY_ADDRESS_MASK;
+  if (frame == pmm_zero_page() || pmm_get_refcount(frame) != 1) {
+    if (!spare) {
+      vmm_write_release(cf);
+      return -ENOMEM;
+    }
+    memcpy((void *)(usize)(spare + DIRECT_MAP_BASE),
+           (const void *)(usize)(frame + DIRECT_MAP_BASE), PAGE_SIZE);
+    *slot = spare | (*slot & ~PAGE_ENTRY_ADDRESS_MASK & ~(u64)VMM_SHARED);
+    gone = frame;
+    frame = spare;
+    spare = 0;
+  }
+  {
+    u8 *p = (u8 *)(usize)(frame + DIRECT_MAP_BASE + (va & (PAGE_SIZE - 1)));
+
+    if (old)
+      *old = *p;
+    *p = val;
+  }
+  if (paging_cr3_to_pml4(read_cr3()) == pml4_phys)
+    invalidate_page(va & ~(u64)(PAGE_SIZE - 1));
+  vmm_write_release(cf);
+  tlb_shootdown_mm(pml4_phys);
+  if (gone && gone != pmm_zero_page())
+    pmm_free_frame(gone); /* this mapping's reference to the shared frame */
+  if (spare)
+    pmm_free_frame(spare);
+  return 0;
 }

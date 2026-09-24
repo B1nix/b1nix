@@ -2451,7 +2451,7 @@ static int r_pid_stat(usize pid, struct sbuf *s) {
           (unsigned long)t->heap_start,           /* 26 startcode */
           (unsigned long)t->user_brk,             /* 27 endcode */
           0UL,                                    /* 28 startstack: unknown */
-          0,                                      /* 39 processor: unknown */
+          scheduler_task_cpu(t),                  /* 39 processor */
           (unsigned long)t->heap_start,           /* 45 start_data */
           (unsigned long)t->user_brk,             /* 46 end_data */
           (unsigned long)t->user_brk);            /* 47 start_brk */
@@ -2713,8 +2713,11 @@ static int r_pid_maps_walked(usize pid, struct sbuf *s, int smaps) {
            * mapping at offset 0 as the start of a module and looks for an ELF
            * header there. Reporting 0 for every segment claims each one is a
            * separate module beginning, which is how a crash reporter ends up
-           * reading a data segment as an ELF header. */
-          m[i].offset = seg->file_offset + (m[i].start - sstart);
+           * reading a data segment as an ELF header. It is the offset of the
+           * mapping's first page, as for any mmap: rounded down like the
+           * address, so that address - start + offset is a file offset. */
+          m[i].offset = (seg->file_offset & ~(u64)(PAGE_SIZE - 1)) +
+                        (m[i].start - sstart);
           break;
         }
       }

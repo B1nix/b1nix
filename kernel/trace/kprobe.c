@@ -37,8 +37,13 @@
 #include <b1nix/klog.h>
 #include <b1nix/lapic.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/vfs.h>
+#include <b1nix/sched.h>
+#include <b1nix/mm.h>
 #include <b1nix/tracepoint.h>
+#include <b1nix/user.h>
 
+#include <stdio.h>
 #include <string.h>
 
 #define KPROBE_MAX 32
@@ -57,7 +62,28 @@ int kprobe_arm(const char *symbol, u16 id, int is_return) {
 int kprobe_disarm(u16 id) { (void)id; return -ENOENT; }
 int kprobe_handle_bp(struct interrupt_frame *frame) { (void)frame; return 0; }
 int kprobe_handle_db(struct interrupt_frame *frame) { (void)frame; return 0; }
+const void *kprobe_current_frame(void) { return 0; }
+int uprobe_arm(u16 id, const void *inode, u64 offset) {
+  (void)id; (void)inode; (void)offset;
+  return -EOPNOTSUPP;
+}
+int uprobe_disarm(u16 id) { (void)id; return -ENOENT; }
+void uprobe_page_mapped(u64 va) { (void)va; }
+int uprobe_handle_bp(struct interrupt_frame *frame) { (void)frame; return 0; }
+int uprobe_handle_db(struct interrupt_frame *frame) { (void)frame; return 0; }
 #else
+
+/* The trap frame of the probe being reported on each CPU, for the whole of
+ * the report: an attached program reads the probed context's registers from
+ * it (bpf_run_trace). */
+static const struct interrupt_frame *g_kp_frame[MAX_CPUS];
+static unsigned kprobe_this_cpu(void);
+
+const void *kprobe_current_frame(void) {
+  unsigned cpu = kprobe_this_cpu();
+
+  return cpu < MAX_CPUS ? g_kp_frame[cpu] : 0;
+}
 
 struct kprobe {
   u64 addr;    /* the patched byte's address */
@@ -185,7 +211,19 @@ int kprobe_handle_bp(struct interrupt_frame *frame) {
     /* The hit itself. The site's three words are what a probe can know without
      * a per-function description: where it was, and the first two arguments in
      * the SysV registers. */
-    TRACEPOINT_FIRE(g_kp[i].id, hit, frame->rdi, frame->rsi);
+    cpu = kprobe_this_cpu();
+    if (cpu < MAX_CPUS)
+      g_kp_frame[cpu] = frame;
+    /* The frame says where the probe is: the int3 has moved rip past it. */
+    {
+      u64 saved = frame->rip;
+
+      frame->rip = hit;
+      TRACEPOINT_FIRE(g_kp[i].id, hit, frame->rdi, frame->rsi);
+      frame->rip = saved;
+    }
+    if (cpu < MAX_CPUS)
+      g_kp_frame[cpu] = 0;
     /* Step the displaced instruction with the original byte in place. */
     kprobe_poke(g_kp[i].addr, g_kp[i].orig);
     g_kp[i].patched = 0;
@@ -233,4 +271,253 @@ int kprobe_handle_db(struct interrupt_frame *frame) {
   }
   return 1;
 }
+
+/* ── uprobes ─────────────────────────────────────────────────────────────── */
+
+#define UPROBE_MAX 16
+#define UPROBE_STEP_MAX 64
+
+struct uprobe_site {
+  int used;
+  u16 id;
+  const void *inode; /* the file's inode: every mapping of it is probed */
+  u64 off;           /* file offset of the probed instruction */
+  u8 orig;           /* the byte the breakpoint replaced */
+  int have_orig;
+};
+
+/* A task between its hit and the single step of the original instruction:
+ * per task, not per CPU, because it may run the step somewhere else. */
+struct uprobe_step {
+  usize tid;
+  u64 va;
+  u16 id;
+  int had_tf;
+};
+
+static struct uprobe_site g_up[UPROBE_MAX];
+static struct uprobe_step g_up_step[UPROBE_STEP_MAX];
+static spinlock_t g_up_lock = SPINLOCK_INIT;
+static volatile int g_up_armed;
+
+/* Where the site's instruction is in one of a task's mappings, or 0. */
+#define UP_ELF_PF_X 0x1 /* ELF p_flags: executable segment */
+
+static u64 up_va_in(const struct task *t, const struct vm_area *v,
+                    const struct uprobe_site *u) {
+  if (!v || !(v->prot & PROT_EXEC))
+    return 0;
+  if (v->node) {
+    if (!v->node->inode || v->node->inode != u->inode || v->offset < 0 ||
+        u->off < (u64)v->offset || u->off - (u64)v->offset >= v->end - v->start)
+      return 0;
+    return v->start + (u->off - (u64)v->offset);
+  }
+  /* The loader copies a segment it cannot share from the page cache into
+   * private frames, and that mapping carries no node; the image's segment
+   * table still says which file and offset it came from. */
+  const struct user_loaded_image *img = t->user_image;
+  if (!img || !img->exe_file || img->exe_file->inode != u->inode)
+    return 0;
+  for (usize k = 0; k < img->segment_count; k++) {
+    const struct user_image_segment *seg = &img->segments[k];
+    u64 vstart = seg->vaddr & ~(u64)(PAGE_SIZE - 1);
+    u64 fbase = seg->file_offset & ~(u64)(PAGE_SIZE - 1);
+
+    if (seg->from_interp || !(seg->flags & UP_ELF_PF_X) || vstart != v->start ||
+        u->off < fbase || u->off >= seg->file_offset + seg->filesz)
+      continue;
+    u64 va = vstart + (u->off - fbase);
+    return va < v->end ? va : 0;
+  }
+  return 0;
+}
+
+static int up_byte(u64 pml4, u64 va, u8 *out) {
+  u64 phys = paging_user_phys(pml4, va);
+
+  if (!phys)
+    return -EFAULT;
+  *out = *(const u8 *)(usize)(phys + vmm_direct_map_base());
+  return 0;
+}
+
+/* Plant (or lift) the site's breakpoint wherever `t` maps it and the page is
+ * in; a page not in yet gets it when it comes in. */
+static void up_apply_task(struct task *t, struct uprobe_site *u, int plant) {
+  if (!t || !t->pml4_phys)
+    return;
+  for (struct vm_area *v = t->vma_list; v; v = v->next) {
+    u64 va = up_va_in(t, v, u);
+    u8 cur, old;
+
+    if (!va || up_byte(t->pml4_phys, va, &cur) < 0)
+      continue;
+    if (plant && cur != KPROBE_INT3) {
+      if (paging_user_poke_text(t->pml4_phys, va, KPROBE_INT3, &old) == 0 &&
+          !u->have_orig) {
+        u->orig = old;
+        u->have_orig = 1;
+      }
+    } else if (!plant && cur == KPROBE_INT3 && u->have_orig) {
+      paging_user_poke_text(t->pml4_phys, va, u->orig, &old);
+    }
+  }
+}
+
+static void up_apply_all(struct uprobe_site *u, int plant) {
+  usize n = scheduler_task_slots();
+
+  for (usize i = 0; i < n; i++) {
+    struct task *t = scheduler_task_slot(i);
+
+    if (t && t->state != TASK_UNUSED && t->state != TASK_DEAD &&
+        t->state != TASK_REAPING)
+      up_apply_task(t, u, plant);
+  }
+}
+
+int uprobe_arm(u16 id, const void *inode, u64 offset) {
+  u64 flags;
+  struct uprobe_site *u = 0;
+
+  if (!inode)
+    return -EINVAL;
+  spin_lock_irqsave(&g_up_lock, &flags);
+  for (usize i = 0; i < UPROBE_MAX && !u; i++)
+    if (!g_up[i].used) {
+      u = &g_up[i];
+      memset(u, 0, sizeof(*u));
+      u->used = 1;
+      u->id = id;
+      u->inode = inode;
+      u->off = offset;
+    }
+  spin_unlock_irqrestore(&g_up_lock, flags);
+  if (!u)
+    return -ENOSPC;
+  __atomic_add_fetch(&g_up_armed, 1, __ATOMIC_RELEASE);
+  up_apply_all(u, 1);
+  return 0;
+}
+
+int uprobe_disarm(u16 id) {
+  struct uprobe_site *u = 0;
+
+  for (usize i = 0; i < UPROBE_MAX && !u; i++)
+    if (g_up[i].used && g_up[i].id == id)
+      u = &g_up[i];
+  if (!u)
+    return -ENOENT;
+  up_apply_all(u, 0);
+  u->used = 0;
+  __atomic_sub_fetch(&g_up_armed, 1, __ATOMIC_RELEASE);
+  return 0;
+}
+
+void uprobe_page_mapped(u64 va) {
+  struct task *t = current_task;
+  u64 page = va & ~(u64)(PAGE_SIZE - 1);
+
+  if (!__atomic_load_n(&g_up_armed, __ATOMIC_ACQUIRE) || !t || !t->pml4_phys)
+    return;
+  for (usize i = 0; i < UPROBE_MAX; i++) {
+    if (!g_up[i].used)
+      continue;
+    for (struct vm_area *v = t->vma_list; v; v = v->next) {
+      u64 at = up_va_in(t, v, &g_up[i]);
+      u8 cur, old;
+
+      if (!at || (at & ~(u64)(PAGE_SIZE - 1)) != page ||
+          up_byte(t->pml4_phys, at, &cur) < 0 || cur == KPROBE_INT3)
+        continue;
+      if (paging_user_poke_text(t->pml4_phys, at, KPROBE_INT3, &old) == 0 &&
+          !g_up[i].have_orig) {
+        g_up[i].orig = old;
+        g_up[i].have_orig = 1;
+      }
+    }
+  }
+}
+
+int uprobe_handle_bp(struct interrupt_frame *frame) {
+  struct task *t = current_task;
+  u64 va;
+  u64 flags;
+
+  if (!frame || (frame->cs & 3) != 3 || !t || !t->pml4_phys ||
+      !__atomic_load_n(&g_up_armed, __ATOMIC_ACQUIRE))
+    return 0;
+  va = frame->rip - 1;
+  for (usize i = 0; i < UPROBE_MAX; i++) {
+    struct uprobe_site *u = &g_up[i];
+    struct vm_area *hit = 0;
+    unsigned cpu;
+    u8 old;
+
+    if (!u->used || !u->have_orig)
+      continue;
+    for (struct vm_area *v = t->vma_list; v && !hit; v = v->next)
+      if (up_va_in(t, v, u) == va)
+        hit = v;
+    if (!hit)
+      continue;
+    /* The hit, with the task's registers as they are at the instruction. */
+    cpu = kprobe_this_cpu();
+    frame->rip = va;
+    if (cpu < MAX_CPUS)
+      g_kp_frame[cpu] = frame;
+    TRACEPOINT_FIRE(u->id, va, frame->rdi, frame->rsi);
+    if (cpu < MAX_CPUS)
+      g_kp_frame[cpu] = 0;
+    /* Run the original instruction in place, one step, then put the
+     * breakpoint back (uprobe_handle_db). */
+    if (paging_user_poke_text(t->pml4_phys, va, u->orig, &old) < 0)
+      return 0;
+    spin_lock_irqsave(&g_up_lock, &flags);
+    for (usize k = 0; k < UPROBE_STEP_MAX; k++)
+      if (!g_up_step[k].tid) {
+        g_up_step[k].tid = t->id;
+        g_up_step[k].va = va;
+        g_up_step[k].id = u->id;
+        g_up_step[k].had_tf = (frame->rflags & 0x100ull) != 0;
+        break;
+      }
+    spin_unlock_irqrestore(&g_up_lock, flags);
+    frame->rflags |= 0x100ull; /* TF */
+    return 1;
+  }
+  return 0;
+}
+
+int uprobe_handle_db(struct interrupt_frame *frame) {
+  struct task *t = current_task;
+  struct uprobe_step st = {0};
+  u64 flags;
+
+  if (!frame || (frame->cs & 3) != 3 || !t)
+    return 0;
+  spin_lock_irqsave(&g_up_lock, &flags);
+  for (usize k = 0; k < UPROBE_STEP_MAX; k++)
+    if (g_up_step[k].tid == t->id) {
+      st = g_up_step[k];
+      g_up_step[k].tid = 0;
+      break;
+    }
+  spin_unlock_irqrestore(&g_up_lock, flags);
+  if (!st.tid)
+    return 0;
+  /* The step is done: the breakpoint goes back if the probe is still there. */
+  for (usize i = 0; i < UPROBE_MAX; i++)
+    if (g_up[i].used && g_up[i].id == st.id) {
+      u8 old;
+
+      paging_user_poke_text(t->pml4_phys, st.va, KPROBE_INT3, &old);
+      break;
+    }
+  if (!st.had_tf)
+    frame->rflags &= ~0x100ull;
+  return 1;
+}
+
 #endif /* __x86_64__ */

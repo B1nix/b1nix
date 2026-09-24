@@ -31,6 +31,10 @@ static inline u64 kernel_phys_offset(void) { return (u64)kernel_load_offset; }
 #else
 #define KERNEL_VMA 0x80000000ULL
 #endif
+#ifndef KSYM_TO_PHYS
+/* Only x86_64 is loaded anywhere but where it was linked. */
+#define KSYM_TO_PHYS(v) (((u64)(usize)(v)) - KERNEL_VMA)
+#endif
 
 #ifdef __x86_64__
 #define DIRECT_MAP_BASE 0xffff800000000000ULL
@@ -308,6 +312,7 @@ usize pmm_node_free_frames(int node);
 u64 pmm_alloc_frame_node(int node, int strict);
 u64 pmm_total_usable_memory(void);
 u64 pmm_phys_total_memory(void);
+int pmm_frame_readable(u64 phys);
 u64 pmm_free_memory_estimate(void);
 usize pmm_free_frame_count(void);
 /* Free frames plus those parked in per-CPU buckets — what a leak check wants. */
@@ -452,6 +457,8 @@ u64 paging_user_pte(u64 pml4_phys, u64 vaddr);
  * too. Readers of another task's memory must use this rather than
  * paging_user_frame, which reports a huge-mapped address as absent. */
 u64 paging_user_phys(u64 pml4_phys, u64 vaddr);
+/* A uprobe's breakpoint: one byte of text, in that address space alone. */
+int paging_user_poke_text(u64 pml4_phys, u64 va, u8 val, u8 *old);
 
 // Demand Paging / Swap
 void vmm_set_lazy(u64 virtual_address);

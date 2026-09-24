@@ -9,6 +9,7 @@
  *
  * Every marker is printed only after the operation's result has been checked.
  */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/io_uring.h>
@@ -317,19 +318,8 @@ static void check_setup(void) {
         (long)r.p.features);
   ring_free(&r);
 
-  /* A flag the kernel cannot honour must be refused here, not accepted and
-   * then mishandled. IORING_SETUP_SQ_AFF asks for the submission thread to be
-   * pinned to sq_thread_cpu, which this kernel cannot promise. */
   struct io_uring_params p;
-
-  memset(&p, 0, sizeof(p));
-  p.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
-  int fd = io_uring_setup_(8, &p);
-
-  judge("refuses-sq-aff", fd < 0 && errno == EINVAL,
-        "IORING_SETUP_SQ_AFF was accepted", (long)fd);
-  if (fd >= 0)
-    close(fd);
+  int fd;
 
   /* IORING_SETUP_ATTACH_WQ names another ring in wq_fd. A descriptor that is
    * not a ring is EINVAL; a ring is accepted, and the new ring works. */
@@ -3563,6 +3553,206 @@ static void check_resize_and_query(void) {
   }
 }
 
+/* The id of the thread whose /proc comm is `want`, or -1. */
+static int find_thread(const char *want) {
+  DIR *d = opendir("/proc");
+  struct dirent *de;
+  int found = -1;
+
+  if (!d)
+    return -1;
+  while (found < 0 && (de = readdir(d))) {
+    char path[64], comm[32] = "";
+    int fd;
+
+    if (de->d_name[0] < '1' || de->d_name[0] > '9')
+      continue;
+    snprintf(path, sizeof(path), "/proc/%s/comm", de->d_name);
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+      continue;
+    if (read(fd, comm, sizeof(comm) - 1) > 0) {
+      comm[strcspn(comm, "\n")] = 0;
+      if (!strcmp(comm, want))
+        found = atoi(de->d_name);
+    }
+    close(fd);
+  }
+  closedir(d);
+  return found;
+}
+
+/* The CPU a task last ran on: field 39 of /proc/<id>/stat. */
+static int last_cpu(int id) {
+  char path[64], buf[1024];
+  int fd, n;
+
+  snprintf(path, sizeof(path), "/proc/%d/stat", id);
+  fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return -1;
+  n = (int)read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0)
+    return -1;
+  buf[n] = 0;
+  char *q = strrchr(buf, ')');
+
+  if (!q)
+    return -1;
+  /* Field 3 (state) follows the comm; 39 is 36 fields further on. */
+  q += 2;
+  for (int f = 3; f < 39 && q; f++) {
+    q = strchr(q, ' ');
+    if (q)
+      q++;
+  }
+  return q ? atoi(q) : -1;
+}
+
+/* A mask that names exactly one CPU, `cpu`. */
+static int only_cpu(int id, int cpu) {
+  cpu_set_t set;
+
+  CPU_ZERO(&set);
+  return sched_getaffinity(id, sizeof(set), &set) == 0 &&
+         CPU_COUNT(&set) == 1 && CPU_ISSET(cpu, &set);
+}
+
+/* The threads a ring runs on and where they may run: IORING_SETUP_SQ_AFF puts
+ * the submission thread on sq_thread_cpu, and IORING_REGISTER_IOWQ_AFF places
+ * the thread that finishes the async work. Both carry Linux's names. */
+static void check_affinity(void) {
+  int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+  struct ring r;
+  char name[32];
+  int rc;
+
+  memset(&r, 0, sizeof(r));
+  r.p.flags = IORING_SETUP_SQ_AFF;
+  rc = io_uring_setup_(4, &r.p);
+  judge("sq-aff-needs-sqpoll", rc < 0 && errno == EINVAL,
+        "IORING_SETUP_SQ_AFF without SQPOLL was accepted", (long)rc);
+  if (rc >= 0)
+    close(rc);
+  memset(&r, 0, sizeof(r));
+  r.p.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
+  r.p.sq_thread_cpu = 16 * (unsigned)(ncpu > 0 ? ncpu : 1);
+  rc = io_uring_setup_(4, &r.p);
+  judge("sq-aff-bad-cpu", rc < 0 && errno == EINVAL,
+        "a submission thread was placed on a CPU that is not there", (long)rc);
+  if (rc >= 0)
+    close(rc);
+
+  if (ncpu < 2) {
+    printf("M125-SMOKE: skip sq-aff — one CPU, nowhere else to place a thread\n");
+    printf("M125-SMOKE: skip iowq-aff — one CPU, nowhere else to place a thread\n");
+    fflush(stdout);
+    return;
+  }
+
+  int cpu = ncpu - 1;
+
+  memset(&r, 0, sizeof(r));
+  r.p.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
+  r.p.sq_thread_cpu = (unsigned)cpu;
+  r.p.sq_thread_idle = 1000;
+  r.fd = io_uring_setup_(8, &r.p);
+  if (r.fd < 0 || ring_map(&r) < 0) {
+    bad("sq-aff", "an SQPOLL ring on the last CPU was refused", (long)r.fd);
+    if (r.fd >= 0)
+      ring_free(&r);
+    return;
+  }
+  struct io_uring_sqe *sqe = sq_get(&r);
+  struct io_uring_cqe cqe;
+  int got = 0;
+
+  sqe->opcode = IORING_OP_NOP;
+  sqe->user_data = 0x5a;
+  for (int i = 0; i < 4000 && !got; i++) {
+    got = cq_get(&r, &cqe);
+    if (!got)
+      usleep(1000);
+  }
+  snprintf(name, sizeof(name), "iou-sqp-%d", (int)getpid());
+  int sqp = find_thread(name);
+
+  printf("M125-SMOKE:   %s is thread %d, last on CPU %d\n", name, sqp,
+         sqp > 0 ? last_cpu(sqp) : -1);
+  judge("sq-aff",
+        got && cqe.user_data == 0x5a && sqp > 0 && only_cpu(sqp, cpu) &&
+            last_cpu(sqp) == cpu,
+        "the pinned submission thread did not consume the queue from its CPU",
+        (long)sqp);
+  ring_free(&r);
+
+  /* io-wq affinity: the mask is checked, applied to the thread that finishes
+   * an armed request, and taken back by the unregister. */
+  int pfd[2];
+  char buf[8];
+  cpu_set_t set;
+
+  if (ring_make(&r, 8, 0, 0) < 0 || pipe(pfd) < 0) {
+    bad("iowq-aff", "no ring or pipe", 0);
+    ring_free(&r);
+    return;
+  }
+  CPU_ZERO(&set);
+  CPU_SET(63, &set);
+  rc = io_uring_register_(r.fd, IORING_REGISTER_IOWQ_AFF, &set, sizeof(set));
+  int bad_mask = ncpu < 64 ? (rc < 0 && errno == EINVAL) : 1;
+
+  rc = io_uring_register_(r.fd, IORING_UNREGISTER_IOWQ_AFF, &set, 1);
+  int bad_unreg = rc < 0 && errno == EINVAL;
+
+  CPU_ZERO(&set);
+  CPU_SET(cpu, &set);
+  rc = io_uring_register_(r.fd, IORING_REGISTER_IOWQ_AFF, &set, sizeof(set));
+  sqe = sq_get(&r);
+  sqe->opcode = IORING_OP_READ;
+  sqe->fd = pfd[0];
+  sqe->addr = (unsigned long long)(unsigned long)buf;
+  sqe->len = sizeof(buf);
+  sqe->off = (unsigned long long)-1;
+  sqe->user_data = 0x77;
+  io_uring_enter_(r.fd, 1, 0, 0, 0, 0);
+  snprintf(name, sizeof(name), "iou-wrk-%d", (int)getpid());
+  int wrk = -1;
+
+  for (int i = 0; i < 200 && wrk < 0; i++) {
+    wrk = find_thread(name);
+    if (wrk < 0)
+      usleep(1000);
+  }
+  int placed = wrk > 0 && only_cpu(wrk, cpu);
+
+  got = 0;
+  if (write(pfd[1], "ab", 2) == 2) {
+    for (int i = 0; i < 4000 && !got; i++) {
+      got = cq_get(&r, &cqe);
+      if (!got)
+        usleep(1000);
+    }
+  }
+  int wrk_cpu = wrk > 0 ? last_cpu(wrk) : -1;
+  int unreg = io_uring_register_(r.fd, IORING_UNREGISTER_IOWQ_AFF, 0, 0);
+  int freed = 0;
+
+  if (unreg == 0 && wrk > 0 && sched_getaffinity(wrk, sizeof(set), &set) == 0)
+    freed = CPU_COUNT(&set) == ncpu;
+  printf("M125-SMOKE:   %s is thread %d, last on CPU %d\n", name, wrk, wrk_cpu);
+  judge("iowq-aff",
+        rc == 0 && bad_mask && bad_unreg && placed && got &&
+            cqe.user_data == 0x77 && cqe.res == 2 && wrk_cpu == cpu && freed,
+        "the worker was not placed by the mask, did not finish the read from "
+        "that CPU, or the unregister did not give it every CPU back",
+        (long)wrk);
+  close(pfd[0]);
+  close(pfd[1]);
+  ring_free(&r);
+}
+
 int main(void) {
   printf("M125-SMOKE: start\n");
   fflush(stdout);
@@ -3619,6 +3809,7 @@ int main(void) {
   check_drain_other_rings();
   check_personality();
   check_resize_and_query();
+  check_affinity();
 
   printf("M125-SMOKE: done\n");
   fflush(stdout);

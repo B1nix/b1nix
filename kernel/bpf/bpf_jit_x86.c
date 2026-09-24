@@ -272,6 +272,11 @@ static void emit_prologue(struct jit *j) {
   e8(j, 0x55);                      /* push rbp */
   alu_rr(j, 0x89, 1, 5, 4);         /* mov rbp, rsp */
   alu_ri(j, 5, 1, 4, BPF_STACK_SIZE); /* sub rsp, 512 */
+  /* The frame starts zeroed, as the interpreter's does: the verifier lets a
+   * program read a stack slot it never wrote, and what was there before is a
+   * kernel stack's leftovers, which a program could copy into a map. */
+  for (int off = 8; off <= BPF_STACK_SIZE; off += 8)
+    emit_store_imm(j, 8, 5 /* rbp */, (i16)-off, 0);
   e8(j, 0x53);                      /* push rbx */
   e8(j, 0x41); e8(j, 0x55);         /* push r13 */
   e8(j, 0x41); e8(j, 0x56);         /* push r14 */
@@ -292,6 +297,7 @@ static void emit_epilogue(struct jit *j) {
  * the helper id, so every argument moves up one register. r1..r5 are clobbered
  * by a call in the BPF ABI too, so shuffling them in place is allowed. */
 static void emit_helper_call(struct jit *j, u32 id, u64 fn) {
+  alu_rr(j, 0x89, 1, 9, 8); /* mov r9, r8    (arg6 = BPF r5) */
   alu_rr(j, 0x89, 1, 8, 1); /* mov r8, rcx   (arg5 = BPF r4) */
   alu_rr(j, 0x89, 1, 1, 2); /* mov rcx, rdx  (arg4 = BPF r3) */
   alu_rr(j, 0x89, 1, 2, 6); /* mov rdx, rsi  (arg3 = BPF r2) */
@@ -400,6 +406,12 @@ static void jit_pass(struct jit *j, const struct bpf_jit_req *req, u32 *offs,
       break;
 
     case BPF_LDX: {
+      /* Only the plain load: a sign-extending one is left to the
+       * interpreter's own refusal path, never approximated here. */
+      if ((in->code & 0xe0) != BPF_MEM) {
+        j->fail = 1;
+        break;
+      }
       int size = BPF_SIZE(in->code) == BPF_B   ? 1
                  : BPF_SIZE(in->code) == BPF_H ? 2
                  : BPF_SIZE(in->code) == BPF_W ? 4
@@ -411,6 +423,12 @@ static void jit_pass(struct jit *j, const struct bpf_jit_req *req, u32 *offs,
 
     case BPF_ST:
     case BPF_STX: {
+      /* An atomic read-modify-write is not a store: it runs on the
+       * interpreter. */
+      if ((in->code & 0xe0) != BPF_MEM) {
+        j->fail = 1;
+        break;
+      }
       int size = BPF_SIZE(in->code) == BPF_B   ? 1
                  : BPF_SIZE(in->code) == BPF_H ? 2
                  : BPF_SIZE(in->code) == BPF_W ? 4

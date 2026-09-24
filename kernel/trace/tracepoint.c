@@ -81,6 +81,9 @@ struct tp_dyn {
   struct b1nix_tracepoint tp;
   int is_return;
   int used;
+  /* A uprobe instead of a kprobe: the file's inode and the offset in it. */
+  const void *u_inode;
+  u64 u_offset;
 };
 static struct tp_dyn g_dyn[TP_DYN_MAX];
 static spinlock_t g_tp_lock = SPINLOCK_INIT;
@@ -143,8 +146,12 @@ static int tracepoint_regate(struct b1nix_tracepoint *tp) {
 
       if (!g_dyn[i].used || g_dyn[i].tp.id != tp->id)
         continue;
-      rc = want ? kprobe_arm(g_dyn[i].symbol, tp->id, g_dyn[i].is_return)
-                : kprobe_disarm(tp->id);
+      if (g_dyn[i].u_inode)
+        rc = want ? uprobe_arm(tp->id, g_dyn[i].u_inode, g_dyn[i].u_offset)
+                  : uprobe_disarm(tp->id);
+      else
+        rc = want ? kprobe_arm(g_dyn[i].symbol, tp->id, g_dyn[i].is_return)
+                  : kprobe_disarm(tp->id);
       if (rc < 0)
         return rc;
       break;
@@ -254,6 +261,62 @@ int tracepoint_kprobe_add(const char *name, const char *symbol,
   return (int)d->tp.id;
 }
 
+/* A uprobe: `path_label` is what uprobe_events shows for the site. */
+int tracepoint_uprobe_add(const char *name, const void *inode, u64 offset,
+                          const char *path_label) {
+  u64 flags;
+  int slot = -1;
+
+  if (!name || !*name || !inode)
+    return -EINVAL;
+  if (strlen(name) >= sizeof(g_dyn[0].name))
+    return -ENAMETOOLONG;
+  spin_lock_irqsave(&g_tp_lock, &flags);
+  for (usize i = 0; i < TP_DYN_MAX; i++) {
+    if (g_dyn[i].used && strcmp(g_dyn[i].name, name) == 0) {
+      spin_unlock_irqrestore(&g_tp_lock, flags);
+      return -EEXIST;
+    }
+    if (!g_dyn[i].used && slot < 0)
+      slot = (int)i;
+  }
+  if (slot < 0) {
+    spin_unlock_irqrestore(&g_tp_lock, flags);
+    return -ENOSPC;
+  }
+  struct tp_dyn *d = &g_dyn[slot];
+
+  memset(d, 0, sizeof(*d));
+  strncpy(d->name, name, sizeof(d->name) - 1);
+  strncpy(d->symbol, path_label ? path_label : "?", sizeof(d->symbol) - 1);
+  d->u_inode = inode;
+  d->u_offset = offset;
+  d->tp.group = "uprobes";
+  d->tp.name = d->name;
+  d->tp.fields[0] = "ip";
+  d->tp.fields[1] = "arg0";
+  d->tp.fields[2] = "arg1";
+  d->tp.id = (u16)(TP_KPROBE_BASE + slot);
+  d->used = 1;
+  spin_unlock_irqrestore(&g_tp_lock, flags);
+  return (int)d->tp.id;
+}
+
+/* Whether a dynamic probe is a uprobe, and if so its file and offset. */
+int tracepoint_uprobe_info(u16 id, const char **label, u64 *offset) {
+  for (usize i = 0; i < TP_DYN_MAX; i++)
+    if (g_dyn[i].used && g_dyn[i].tp.id == id) {
+      if (!g_dyn[i].u_inode)
+        return 0;
+      if (label)
+        *label = g_dyn[i].symbol;
+      if (offset)
+        *offset = g_dyn[i].u_offset;
+      return 1;
+    }
+  return 0;
+}
+
 int tracepoint_kprobe_remove(const char *name) {
   u64 flags;
   int rc = -ENOENT;
@@ -265,9 +328,13 @@ int tracepoint_kprobe_remove(const char *name) {
     if (!g_dyn[i].used || strcmp(g_dyn[i].name, name) != 0)
       continue;
     u16 id = g_dyn[i].tp.id;
+    int up = g_dyn[i].u_inode != 0;
 
     spin_unlock_irqrestore(&g_tp_lock, flags);
-    kprobe_disarm(id);
+    if (up)
+      uprobe_disarm(id);
+    else
+      kprobe_disarm(id);
     spin_lock_irqsave(&g_tp_lock, &flags);
     memset(&g_dyn[i], 0, sizeof(g_dyn[i]));
     rc = 0;

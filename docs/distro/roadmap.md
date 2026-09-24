@@ -73,9 +73,9 @@ ship to.
   The disk carries a BIOS boot partition and an ESP, so the layout is ready for
   the day the kernel becomes relocatable. See
   [../kernel/abi-gaps.md](../kernel/abi-gaps.md).
-- [ ] `partial` `/boot` is not mounted in the running system: the ESP is in
-  `/etc/fstab` by label and the mount does not happen, so the boot-counting
-  state is invisible to userspace and no boot is ever marked good.
+- [x] `done` `/boot` is mounted and writable: the ESP is the imported Linux
+  FAT (`vfat`/`msdos` through lkpi), so the boot-counting state reaches the
+  disk and survives a reboot.
 - [x] `done` systemd's mount namespacing works: `vfs_set_propagation` and
   `vfs_remount` match a mount by its node as well as by its path, which is what
   a bind into a prepared root needs. `systemd-udevd`, `systemd-logind`,
@@ -88,19 +88,18 @@ ship to.
 - [x] `initial` The repository reaches the guest over 9p — mounted by tag with
   no options, which is all this kernel's 9p takes. `apt-get update` against it
   still fails on a `symlink()` and on apt's `store:` method.
-- [ ] `planned` Boot counting as designed in
-  [boot-counting.md](boot-counting.md): the initramfs hook decrements, a unit
-  marks the boot good, the postinst seeds and regenerates `limine.conf`.
+- [x] `done` Boot counting as designed in
+  [boot-counting.md](boot-counting.md). The kernel runs a cpio initrd's
+  `/init` as Linux does, so initramfs-tools' hooks run: the hook (with the
+  tools it needs copied in) spends a try, switches Limine's `default_entry`
+  when the tries run out, and `b1nix-boot-good` marks a boot good.
 - [x] `initial` Lane `DISTRO-SMOKE` (`tests/distro-smoke.sh`), to the contract
   in [lanes.md](lanes.md). It boots the image, reads the in-guest checks, grades
   the failed units against `tests/support/known-degraded.txt`, and boots the
   broken-kernel image up to four times to see the fallback happen.
-- [ ] `partial` The lane is not green, and says so: the kernel boots, userspace
-  reaches the in-guest checks, and then `tmp.mount`, `run-lock.mount`,
-  `systemd-logind`, `systemd-udevd` and the rest of the list above still fail,
-  `apt` cannot reach the repository shared over 9p, and no boot is marked good
-  because `/boot` is unmounted. Every one of those is a real gap, not a lane
-  defect.
+- [x] `done` The lane is green, 9/9: multi-user, no unexpected failed units,
+  apt over 9p, a boot marked good, and the fallback to the good kernel on the
+  fourth boot of the broken image.
 
 ## Phase C: cgroup v2
 

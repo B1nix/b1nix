@@ -765,7 +765,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
         perf_pmu_tick(cur ? cur->id : 0);
       }
       perf_event_tick_sample(frame->rip, frame->rbp, in_user,
-                             pcpu ? (int)pcpu->cpu_id : 0);
+                             pcpu ? (int)pcpu->cpu_id : 0, frame);
     }
     if (is_bsp) {
       timer_ticks++;
@@ -1068,6 +1068,11 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   if (frame->vector == 3 && kprobe_handle_bp(frame))
     return;
   if (frame->vector == 1 && kprobe_handle_db(frame))
+    return;
+  /* A uprobe's int3 in a task, and the step after it. */
+  if (frame->vector == 3 && uprobe_handle_bp(frame))
+    return;
+  if (frame->vector == 1 && uprobe_handle_db(frame))
     return;
 
   if ((frame->vector == 3 || frame->vector == 1) &&

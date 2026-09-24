@@ -1167,6 +1167,7 @@ void kernel_main(usize arg0, usize arg1)
 	loop_init();            /* loop block devices + /dev/loop-control */
 	zram_init();            /* compressed RAM block device, sized from /sys */
 	perf_pmu_init();        /* M126: the CPU's own performance counters */
+	perf_event_sysfs_init(); /* the kprobe PMU under /sys/bus/event_source */
 	BOOTMARK(30);	/* loop_init */
 	vt_init();              /* M107 virtual terminals + console font/keymap */
 	BOOTMARK(31);	/* magenta: device init survived, VTs up */

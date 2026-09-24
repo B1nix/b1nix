@@ -1098,6 +1098,75 @@ else
 	echo "DEBIAN-SMOKE: note perf is not installed in this image"
 fi
 
+# The kernel's BTF (M133), read by the distribution's bpftool: libbpf's own
+# parser, which refuses a BTF that is not self-consistent, and the same code a
+# CO-RE loader relocates a program with. `btf list` walks the kernel's BTF ids
+# through bpf(2) and names the kernel's own object.
+if command -v bpftool >/dev/null 2>&1; then
+	echo "DEBIAN-SMOKE: bpftool is present"
+	btf_types=$(bpftool btf dump file /sys/kernel/btf/vmlinux format raw 2>/dev/null |
+		grep -c '^\[')
+	echo "DEBIAN-SMOKE: btf-types=$btf_types"
+	[ "${btf_types:-0}" -gt 1000 ] && ok bpftool-btf-vmlinux || bad bpftool-btf-vmlinux
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c 2>/dev/null |
+		grep -q '^struct vfs_node {' && ok bpftool-btf-c || bad bpftool-btf-c
+	btf_list=$(bpftool btf list 2>&1)
+	if echo "$btf_list" | grep -q 'name \[vmlinux\]'; then
+		ok bpftool-btf-list
+	else
+		bad bpftool-btf-list
+		echo "$btf_list" | head -5 | while IFS= read -r l; do
+			echo "DEBIAN-SMOKE: btf-list: $l"
+		done
+	fi
+fi
+
+# bpftrace, when the image has it (BPFTRACE=1): the tracer eBPF is there for.
+# A kprobe counted into a map, and a timer probe that ends the run -- the
+# program on the kprobe, the one on the perf event, the maps and the output
+# channel its exit() goes through, all of it compiled by bpftrace's LLVM.
+if command -v bpftrace >/dev/null 2>&1; then
+	echo "DEBIAN-SMOKE: bpftrace is present, kprobe PMU type" \
+		"$(cat /sys/bus/event_source/devices/kprobe/type 2>&1)"
+	# tracefs where a systemd machine has it (sys-kernel-tracing.mount): bcc
+	# takes a probe off through its kprobe_events even when perf made it.
+	grep -q ' /sys/kernel/tracing ' /proc/mounts ||
+		mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null
+	# Something to count: path lookups, all the while.
+	(while :; do ls / >/dev/null 2>&1; done) &
+	bt_load=$!
+	bt_out=$(timeout 60 bpftrace -e \
+		'kprobe:vfs_find_node { @c = count(); } interval:s:1 { exit(); }' 2>&1)
+	kill "$bt_load" 2>/dev/null
+	echo "$bt_out" | head -20 | while IFS= read -r l; do
+		echo "DEBIAN-SMOKE: bpftrace: $l"
+	done
+	echo "$bt_out" | grep -Eq '^@c: [1-9]' && ok bpftrace-kprobe-count ||
+		bad bpftrace-kprobe-count
+	# BEGIN: a program bpftrace runs once itself, its printf through the
+	# output ring.
+	bt_out=$(timeout 60 bpftrace -e 'BEGIN { printf("bt-hello %d\n", 42); exit(); }' 2>&1)
+	echo "$bt_out" | grep -q '^bt-hello 42$' && ok bpftrace-begin || {
+		echo "$bt_out" | head -10 | while IFS= read -r l; do
+			echo "DEBIAN-SMOKE: bpftrace: $l"
+		done
+		bad bpftrace-begin
+	}
+	# A uprobe on a libc function every `ls` calls: the uprobe PMU, a
+	# breakpoint in a mapping of a shared library.
+	bt_libc=$(ldd /bin/ls 2>/dev/null | awk '/libc\.so/ { print $3 }')
+	(while :; do ls / >/dev/null 2>&1; done) &
+	bt_load=$!
+	bt_out=$(timeout 60 bpftrace -e \
+		"uprobe:$bt_libc:opendir { @u = count(); } interval:s:1 { exit(); }" 2>&1)
+	kill "$bt_load" 2>/dev/null
+	echo "$bt_out" | head -20 | while IFS= read -r l; do
+		echo "DEBIAN-SMOKE: bpftrace: $l"
+	done
+	echo "$bt_out" | grep -Eq '^@u: [1-9]' && ok bpftrace-uprobe-count ||
+		bad bpftrace-uprobe-count
+fi
+
 tmark stage17
 # ── Stage 17: suspend, through the distribution's own tools (M129) ─────────
 # `rtcwake` is what a Debian user (and every laptop lid) reaches for: it arms

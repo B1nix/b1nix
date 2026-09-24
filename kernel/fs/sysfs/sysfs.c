@@ -28,6 +28,7 @@
 #include <b1nix/uevent.h>
 #include <b1nix/arch.h>
 #include <b1nix/vfs.h>
+#include <b1nix/bpf.h>
 #include <b1nix/version.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1749,6 +1750,21 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
           }
         }
       }
+    }
+  }
+  /* Where tracefs is mounted, as on Linux: an empty directory until someone
+   * mounts it (systemd, perf, libtracefs do). */
+  sysfs_mkchild(kern, "tracing", VFS_DIRECTORY, 0);
+  /* The kernel's BTF, which CO-RE loaders relocate programs against. Present
+   * only when the build had pahole: no file is better than a wrong one. */
+  if (btf_vmlinux_size()) {
+    struct vfs_node *btfd = sysfs_mkchild(kern, "btf", VFS_DIRECTORY, 0);
+    struct vfs_node *vml =
+        btfd ? sysfs_mkchild(btfd, "vmlinux", VFS_DEVICE, 0) : 0;
+
+    if (vml) {
+      vml->inode->read_cb = btf_vmlinux_read;
+      vml->inode->size = btf_vmlinux_size();
     }
   }
   sysfs_mkchild(kern, "ostype", VFS_DEVICE, g_ostype);

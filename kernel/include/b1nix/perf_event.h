@@ -16,7 +16,18 @@ int perf_event_syscall(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4,
 /* Called from the per-CPU timer tick, on the CPU that took it, with the
  * register file of whatever it interrupted. This is where a sampling event's
  * period is charged and where a PERF_RECORD_SAMPLE is written. */
-void perf_event_tick_sample(u64 pc, u64 fp, int in_user, int cpu);
+/* `frame` is the interrupted context (struct interrupt_frame): an attached
+ * program sees its registers. */
+/* The dynamic PMU type the kprobe PMU is published under, in
+ * /sys/bus/event_source/devices/kprobe/type. */
+#define PERF_TYPE_KPROBE_PMU 6
+#define PERF_TYPE_UPROBE_PMU 7
+
+/* Publish the dynamic PMUs under /sys/bus/event_source. */
+void perf_event_sysfs_init(void);
+
+void perf_event_tick_sample(u64 pc, u64 fp, int in_user, int cpu,
+                            const void *frame);
 
 /* Called when a task is about to leave: flushes PERF_RECORD_EXIT so a `perf
  * report` can close the map of a process that has gone. */

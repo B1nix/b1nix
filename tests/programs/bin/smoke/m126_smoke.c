@@ -21,6 +21,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -739,9 +741,23 @@ static long long counter_read(int fd) {
   return v;
 }
 
+/* What libtracefs and perf do when tracefs is not mounted yet: mount it on
+ * the directory sysfs leaves for it. Nothing mounts it at boot on an init
+ * that is not systemd, on Linux as here. */
+static void tracefs_mount_if_needed(void) {
+  struct stat st;
+
+  if (stat(TRACEFS "/available_events", &st) == 0)
+    return;
+  if (mount("nodev", TRACEFS, "tracefs", 0, NULL) != 0)
+    printf("M126-SMOKE: note mount -t tracefs " TRACEFS " failed (errno=%d)\n",
+           errno);
+}
+
 static void check_tracefs_layout(void) {
   char buf[4096];
 
+  tracefs_mount_if_needed();
   if (read_file(TRACEFS "/available_events", buf, sizeof(buf)) <= 0) {
     bad("tracefs", "no " TRACEFS "/available_events to read", 0);
     return;
@@ -848,11 +864,10 @@ static void check_kprobe(void) {
   }
   attr_init(&a, PERF_TYPE_TRACEPOINT, (unsigned long long)id);
   a.disabled = 0;
-  fd = perf_open(&a, -1, 0, -1, 0); /* the probe fires wherever it fires */
-  if (fd < 0) {
-    /* Machine-wide needs privilege; fall back to this task's own hits. */
-    fd = perf_open(&a, 0, -1, -1, 0);
-  }
+  /* This task's hits, on whichever CPU it runs: the probed lookups are its
+   * own. An event bound to CPU 0 counts only what runs there, and on a
+   * machine with a second CPU this task may well be on that one. */
+  fd = perf_open(&a, 0, -1, -1, 0);
   if (fd < 0) {
     bad("kprobe", "perf_event_open on the probe's id", fd);
     (void)write_file(TRACEFS "/kprobe_events", "-:b1smoke\n");

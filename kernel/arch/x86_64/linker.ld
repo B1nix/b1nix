@@ -77,6 +77,15 @@ SECTIONS
 		KEEP(*(.kallsyms))
 		__kallsyms_end = .;
 	}
+
+	/* The kernel's BTF (/sys/kernel/btf/vmlinux), produced by pahole from the
+	 * first pass and linked on the second, beside kallsyms and for the same
+	 * reason: after everything whose address the first pass fixed. */
+	.BTF ALIGN(8) : AT(ADDR(.BTF) - KERNEL_VMA) {
+		__start_BTF = .;
+		KEEP(*(.BTF))
+		__stop_BTF = .;
+	}
 	. = ALIGN(4K);
 
 	.bss ALIGN(4K) : AT(ADDR(.bss) - KERNEL_VMA) {

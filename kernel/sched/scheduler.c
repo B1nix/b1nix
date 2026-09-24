@@ -269,7 +269,13 @@ static int g_clean_fpu_ready = 0;
  * is not yet allocated). Slot indices i map as (i >> 6) -> chunk, (i & 63) ->
  * offset within chunk. */
 static struct task *g_task_chunks[TASK_MAX_CHUNKS];
-static _Atomic usize g_task_hwm = 0; /* one past highest slot ever used */
+/* One past the highest slot ever used. Published with release after the
+ * chunk behind it exists, and read with acquire, which is what _Atomic gave;
+ * spelled with the builtins because _Atomic reaches the debug information as
+ * a DW_TAG_atomic_type, which BTF cannot express, and pahole then refuses to
+ * encode the kernel's types at all. */
+static usize g_task_hwm_v = 0;
+#define g_task_hwm (__atomic_load_n(&g_task_hwm_v, __ATOMIC_ACQUIRE))
 
 /* Tick at which a context switch last actually happened; the stall detector
  * in scheduler_on_timer_tick measures against it. */
@@ -688,6 +694,8 @@ static u64   g_task_pass[TASK_SLOTS];
  * side tables, because find_unused_task must clear it when it recycles a
  * slot. 0 means "any CPU". */
 static u64 g_task_affinity[TASK_SLOTS];
+/* The CPU each task was last switched in on: /proc/<pid>/stat's processor. */
+static u16 g_task_cpu[TASK_SLOTS];
 static u64   g_min_pass = 0;
 /* How far ahead of virtual time a woken task may keep its pass: 200 turns at
  * the nice-0 stride. */
@@ -748,7 +756,7 @@ static int   g_task_nnp[TASK_SLOTS];
  * The cause is fixed at the source instead, and the two conditions below are
  * now unreachable:
  *   - allocate_task_slot calls ensure_task_chunk BEFORE it advances
- *     g_task_hwm, holding the task lock, and g_task_hwm is _Atomic -- so a
+ *     g_task_hwm, holding the task lock, and publishes it with release -- so a
  *     chunk exists for every index below the mark that any walker can observe;
  *   - every caller in this file bounds its index by g_task_hwm (the walks) or
  *     range-checks it explicitly (scheduler_task_slot), and g_task_hwm never
@@ -1557,7 +1565,7 @@ static struct task *find_unused_task(int user) {
   /* Chunk was kzalloc'd, but be explicit so a slot that gets reused after
    * free_task_slot starts from a clean state too (same as the old path). */
   memset(T(i), 0, sizeof(struct task));
-  g_task_hwm = i + 1;
+  __atomic_store_n(&g_task_hwm_v, i + 1, __ATOMIC_RELEASE);
   g_task_pass[i] = sched_birth_pass();
   g_task_affinity[i] = 0;
   g_task_subreaper[i] = 0;
@@ -2876,7 +2884,7 @@ void scheduler_init(void) {
   if (!ensure_task_chunk(0)) {
     panic("scheduler: failed to allocate initial task chunk");
   }
-  g_task_hwm = 1;  /* boot task occupies slot 0 */
+  __atomic_store_n(&g_task_hwm_v, 1, __ATOMIC_RELEASE); /* boot task occupies slot 0 */
 
   struct task *boot = T(0);
   boot->id = 0; /* PID 0: the boot/idle task (Linux calls it swapper) */
@@ -3226,6 +3234,22 @@ int kthread_create_user(const char *name, kernel_thread_entry entry, void *arg,
                         int ap_runnable) {
   return kthread_create_impl(name, entry, arg, kernel_thread_trampoline, 0,
                              ap_runnable, 1);
+}
+
+void sched_note_cpu(const struct task *t, int cpu) {
+  if (t)
+    g_task_cpu[task_index(t)] = (u16)cpu;
+}
+
+int scheduler_task_cpu(const struct task *t) {
+  return t ? g_task_cpu[task_index(t)] : 0;
+}
+
+int kthread_create_ap(const char *name, kernel_thread_entry entry, void *arg) {
+  extern volatile int g_ap_userspace_enabled;
+
+  return kthread_create_impl(name, entry, arg, kernel_thread_trampoline, 0,
+                             g_ap_userspace_enabled ? 1 : 0, 0);
 }
 
 int sched_create_stealable_worker(const char *name, kernel_thread_entry entry,
@@ -6165,6 +6189,11 @@ static int scheduler_yield_inner(void) {
                   old_task ? (u64)old_task->state : 0);
   if (wakelat_enabled())
     wakelat_switch_in(new_task);
+  {
+    struct percpu *pc = get_percpu();
+
+    sched_note_cpu(new_task, pc ? pc->cpu_id : 0);
+  }
   arch_context_switch(&old_task->context, &new_task->context,
                       &old_task->stack_released);
 

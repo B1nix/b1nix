@@ -701,7 +701,7 @@ static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 			/* M126: the same tick is perf's sampling clock. x29 is
 			 * the frame pointer on aarch64. */
 			perf_event_tick_sample(frame->elr, frame->x29, in_user,
-			                       pc ? (int)pc->cpu_id : 0);
+			                       pc ? (int)pc->cpu_id : 0, frame);
 		}
 
 		/* Only the boot CPU runs the housekeeping half of the tick: the

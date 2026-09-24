@@ -426,6 +426,7 @@ void aarch64_ap_main(u64 cpu)
 			 * above won it. */
 			pcpu->cur_task = t;
 			pcpu->sched_return_ctx = &idle_ctx;
+			sched_note_cpu(t, (int)pcpu->cpu_id);
 			arch_context_switch(&idle_ctx, &t->context, (volatile int *)0);
 			pcpu->cur_task = 0;
 			sched_ap_reap_worker(t);

@@ -65,6 +65,43 @@ static isize tf_serve(u64 offset, char *out, usize size, const char *text) {
   return (isize)size;
 }
 
+/* available_filter_functions: the functions a kprobe may be put on -- every
+ * name in the kernel's symbol table, one a line, which is what bpftrace checks
+ * a probe's function against before it attaches. Too long to build whole per
+ * read, so it is walked to the caller's offset and served from there. */
+static isize tf_read_filter_functions(struct vfs_node *node, u64 offset,
+                                      char *out, usize size, int flags) {
+  extern const unsigned char __kallsyms_start[];
+  extern const unsigned char __kallsyms_end[];
+  const unsigned char *p = __kallsyms_start;
+  const unsigned char *end = __kallsyms_end;
+  u64 at = 0;
+  usize n = 0;
+
+  (void)node;
+  (void)flags;
+  while (p + 8 < end && n < size) {
+    const char *name = (const char *)(p + 8);
+    usize len = 0;
+
+    while (p + 8 + len < end && name[len])
+      len++;
+    p += 8 + len + 1;
+    if (at + len + 1 <= offset) {
+      at += len + 1; /* a whole line before the window */
+      continue;
+    }
+    /* The line is name + '\n'; copy whatever part of it lies at or past the
+     * offset and inside the caller's buffer. */
+    for (usize i = 0; i <= len && n < size; i++, at++) {
+      if (at < offset)
+        continue;
+      out[n++] = i < len ? name[i] : '\n';
+    }
+  }
+  return (isize)n;
+}
+
 static isize tf_read_available(struct vfs_node *node, u64 offset, char *out,
                                usize size, int flags) {
   char buf[2048];
@@ -220,7 +257,7 @@ static isize tf_read_kprobe_events(struct vfs_node *node, u64 offset, char *out,
 
     if (!tp)
       break;
-    if (tp->id < TP_KPROBE_BASE)
+    if (tp->id < TP_KPROBE_BASE || tracepoint_uprobe_info(tp->id, 0, 0))
       continue;
     n += (usize)snprintf(buf + n, sizeof(buf) - n, "p:kprobes/%s %s\n",
                          tp->name, kprobe_symbol_of(tp->id));
@@ -228,6 +265,29 @@ static isize tf_read_kprobe_events(struct vfs_node *node, u64 offset, char *out,
       break;
   }
   return tf_serve(offset, out, size, buf);
+}
+
+static struct vfs_node *g_events_dir;
+
+/* Take events/<group>/<name> out of the tree and drop the tree's references to
+ * it and to its files. */
+static void tracefs_forget_event(const char *group, const char *name) {
+  struct vfs_node *g = g_events_dir ? find_child(g_events_dir, group) : 0;
+  struct vfs_node *e = g ? find_child(g, name) : 0;
+
+  if (e) {
+    struct vfs_node *c;
+
+    while ((c = e->first_child) != 0) {
+      vfs_detach_child(e, c);
+      vfs_node_put(c); /* the tree's reference */
+    }
+    vfs_detach_child(g, e);
+    vfs_node_put(e); /* the tree's reference */
+    vfs_node_put(e); /* find_child's */
+  }
+  if (g)
+    vfs_node_put(g);
 }
 
 static isize tf_write_kprobe_events(struct vfs_node *node, u64 offset,
@@ -267,7 +327,14 @@ static isize tf_write_kprobe_events(struct vfs_node *node, u64 offset,
     {
       int rc = tracepoint_kprobe_remove(name);
 
-      return rc < 0 ? rc : (isize)size;
+      if (rc < 0)
+        return rc;
+      /* The event's directory goes with it, as on Linux: a tool that finds
+       * events/kprobes/<name>/id after the removal would open a perf event on
+       * an id nothing owns any more. */
+      tracefs_forget_event("kprobes", name);
+      tracefs_forget_event("uprobes", name);
+      return (isize)size;
     }
   }
   if (line[i] == 'r')
@@ -309,9 +376,108 @@ static isize tf_write_kprobe_events(struct vfs_node *node, u64 offset,
   return (isize)size;
 }
 
-/* ── building the tree ───────────────────────────────────────────────────── */
+/* uprobe_events: the same syntax for probes on a file's text.
+ *   p:name path:offset   a probe at that offset of the file
+ *   -:name               remove it
+ */
+static isize tf_read_uprobe_events(struct vfs_node *node, u64 offset,
+                                   char *out, usize size, int flags) {
+  char buf[1024];
+  usize n = 0;
 
-static struct vfs_node *g_events_dir;
+  (void)node;
+  (void)flags;
+  buf[0] = '\0';
+  for (usize i = 0;; i++) {
+    struct b1nix_tracepoint *tp = tracepoint_nth(i);
+    const char *label;
+    u64 off;
+
+    if (!tp)
+      break;
+    if (tp->id < TP_KPROBE_BASE || !tracepoint_uprobe_info(tp->id, &label, &off))
+      continue;
+    n += (usize)snprintf(buf + n, sizeof(buf) - n, "p:uprobes/%s %s:0x%llx\n",
+                         tp->name, label, (unsigned long long)off);
+    if (n >= sizeof(buf) - 160)
+      break;
+  }
+  return tf_serve(offset, out, size, buf);
+}
+
+static isize tf_write_uprobe_events(struct vfs_node *node, u64 offset,
+                                    const char *in, usize size, int flags) {
+  char line[VFS_MAX_PATH + 96];
+  char name[48], path[VFS_MAX_PATH], resolved[VFS_MAX_PATH];
+  usize i = 0, j;
+  char *colon;
+  u64 off = 0;
+  struct vfs_node *file;
+  int rc;
+
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (!size)
+    return 0;
+  if (size >= sizeof(line))
+    return -E2BIG;
+  memcpy(line, in, size);
+  line[size] = '\0';
+  while (line[i] == ' ' || line[i] == '\t')
+    i++;
+  if (line[i] == '-' || (line[i] != 'p'))
+    return line[i] == '-' ? tf_write_kprobe_events(node, offset, in, size, flags)
+                          : -EINVAL; /* a return uprobe is not offered */
+  if (line[++i] != ':')
+    return -EINVAL;
+  i++;
+  for (j = 0; line[i] && line[i] != ' ' && line[i] != '\t' && line[i] != '\n' &&
+              j < sizeof(name) - 1;)
+    name[j++] = line[i++];
+  name[j] = '\0';
+  {
+    char *slash = strchr(name, '/');
+
+    if (slash)
+      memmove(name, slash + 1, strlen(slash + 1) + 1);
+  }
+  while (line[i] == ' ' || line[i] == '\t')
+    i++;
+  for (j = 0; line[i] && line[i] != ' ' && line[i] != '\t' && line[i] != '\n' &&
+              j < sizeof(path) - 1;)
+    path[j++] = line[i++];
+  path[j] = '\0';
+  colon = strrchr(path, ':');
+  if (!name[0] || !colon)
+    return -EINVAL;
+  *colon = '\0';
+  for (const char *c = colon + 1; *c; c++) {
+    int d = (*c >= '0' && *c <= '9') ? *c - '0'
+            : (*c >= 'a' && *c <= 'f') ? *c - 'a' + 10
+            : (*c >= 'A' && *c <= 'F') ? *c - 'A' + 10 : -1;
+
+    if (c == colon + 1 && *c == '0' && (c[1] == 'x' || c[1] == 'X')) {
+      c++;
+      continue;
+    }
+    if (d < 0)
+      return -EINVAL;
+    off = off * 16 + (u64)d;
+  }
+  vfs_resolve_path(path, resolved);
+  file = vfs_find_node(resolved);
+  if (IS_ERR(file) || !file)
+    return file ? (isize)PTR_ERR(file) : -ENOENT;
+  rc = tracepoint_uprobe_add(name, file->inode, off, path);
+  vfs_node_put(file);
+  if (rc < 0)
+    return rc;
+  tracefs_refresh_events();
+  return (isize)size;
+}
+
+/* ── building the tree ───────────────────────────────────────────────────── */
 
 static struct vfs_node *tf_dir(const char *name, struct vfs_node *parent) {
   extern struct vfs_node *b1nix_debugfs_create_dir(const char *name,
@@ -373,13 +539,15 @@ void tracefs_refresh_events(void) {
   }
 }
 
-void tracefs_init(void) {
-  struct vfs_node *kernel_dir = vfs_find_node("/sys/kernel");
-  struct vfs_node *root;
+/* The tracing tree, one of it, as Linux has one tracefs superblock: every
+ * mount of tracefs is this directory. It is built detached, not under the
+ * boot-time /sys/kernel -- that tree is covered the moment an init mounts sysfs
+ * over /sys, and the files were then nowhere a tool could reach. */
+static struct vfs_node *g_tracefs_root;
 
-  if (!kernel_dir)
-    return;
-  root = tf_dir("tracing", kernel_dir);
+void tracefs_init(void) {
+  struct vfs_node *root = tf_dir("tracing", 0);
+
   if (!root)
     return;
   tf_file("available_events", 0444, root, 0, tf_read_available, 0);
@@ -388,8 +556,19 @@ void tracefs_init(void) {
   tf_file("trace_pipe", 0444, root, 0, tf_read_trace, 0);
   tf_file("kprobe_events", 0644, root, 0, tf_read_kprobe_events,
           tf_write_kprobe_events);
+  tf_file("available_filter_functions", 0444, root, 0,
+          tf_read_filter_functions, 0);
+  tf_file("uprobe_events", 0644, root, 0, tf_read_uprobe_events,
+          tf_write_uprobe_events);
   g_events_dir = tf_dir("events", root);
   tracefs_refresh_events();
-  /* Older tools look under debugfs. One tree, two names. */
-  vfs_symlink("/sys/kernel/tracing", "/sys/kernel/debug/tracing");
+  g_tracefs_root = root;
+}
+
+/* The root a tracefs mount shows, with a reference for the mount to hold. */
+struct vfs_node *tracefs_root_get(void) {
+  if (!g_tracefs_root)
+    return ERR_PTR(-ENODEV);
+  vfs_node_get(g_tracefs_root);
+  return g_tracefs_root;
 }

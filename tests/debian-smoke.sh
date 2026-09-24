@@ -434,6 +434,19 @@ if grep -qa "DEBIAN-SMOKE: liburing suite starts" "$LOG" 2>/dev/null; then
 	done
 	sed -n 's/.*DEBIAN-SMOKE: \(liburing totals .*\)/  \1/p' "$LOG" | tail -1
 fi
+# M133. The kernel's BTF, through the distribution's bpftool (libbpf).
+check_output "DEBIAN-SMOKE: ok bpftool-btf-vmlinux" "libbpf parses /sys/kernel/btf/vmlinux: the kernel's BTF, over a thousand types"
+check_output "DEBIAN-SMOKE: ok bpftool-btf-c" "bpftool renders the kernel's types as C from its BTF"
+check_output "DEBIAN-SMOKE: ok bpftool-btf-list" "bpftool btf list finds the kernel's BTF by id, named vmlinux"
+# M133. bpftrace, when the image was built with BPFTRACE=1: a kprobe program
+# counting into a map, a perf-event program ending the run through the output
+# channel, attached through the kprobe PMU.
+if grep -qa "DEBIAN-SMOKE: bpftrace is present" "$LOG" 2>/dev/null; then
+	check_output "DEBIAN-SMOKE: ok bpftrace-kprobe-count" "bpftrace counts a kprobe's hits into a map and exits from a timer probe"
+	check_output "DEBIAN-SMOKE: ok bpftrace-begin" "bpftrace runs a BEGIN probe and prints through its output ring"
+	check_output "DEBIAN-SMOKE: ok bpftrace-uprobe-count" "bpftrace counts a uprobe on a libc function in every ls"
+fi
+
 # M126. The distribution's own perf, when the image was built with PERF=1.
 if grep -qa "DEBIAN-SMOKE: perf is" "$LOG" 2>/dev/null; then
 	check_output "DEBIAN-SMOKE: ok perf-version" "the distribution's perf runs on this kernel"

@@ -59,6 +59,7 @@
 
 #include <b1nix/arch.h>
 #include <b1nix/bpf.h>
+#include <b1nix/sysfs_attr.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -136,6 +137,9 @@ struct perf_ev {
   u64 tp_hits;
   /* Whether this event holds the site on (dropped when the event closes). */
   int tp_referenced;
+  /* An event opened on the kprobe PMU made its own probe, named here; it is
+   * removed when the event goes. */
+  char kp_auto[24];
 
   /* An eBPF program attached with PERF_EVENT_IOC_SET_BPF. It runs on every
    * sample this event takes, and its return value decides whether the sample
@@ -195,6 +199,7 @@ static int perf_attr_supported(const struct perf_event_attr *a) {
   case PERF_COUNT_SW_PAGE_FAULTS_MAJ:
   case PERF_COUNT_SW_CONTEXT_SWITCHES:
   case PERF_COUNT_SW_DUMMY:
+  case PERF_COUNT_SW_BPF_OUTPUT: /* written by bpf_perf_event_output */
     return 1;
   default:
     return 0;
@@ -312,6 +317,11 @@ static void *perf_kva(u64 phys) {
 }
 
 /* Bytes the program has not consumed yet. */
+/* The CPU that holds g_perf_lock while running events' programs, or -1: a
+ * program's perf_event_output runs inside that hold and must not take the
+ * lock a second time. */
+static volatile int g_perf_lock_cpu = -1;
+
 static u64 perf_rb_used(struct perf_ev *ev) {
   u64 tail = __atomic_load_n(&ev->ctrl->data_tail, __ATOMIC_ACQUIRE);
 
@@ -491,11 +501,9 @@ static void perf_emit_sample(struct perf_ev *ev, u64 pc, u64 fp, int in_user,
 }
 
 /* Does this event want the task that was running when the tick landed? */
-static int perf_watches(const struct perf_ev *ev, struct task *t, int cpu) {
-  /* A sampling event needs somewhere for the sample to go: a ring buffer, or
-   * an attached program, which IS the consumer -- a profiler that counts into
-   * a map never maps a buffer at all. */
-  if (!ev->enabled || (!ev->data && !ev->bpf_prog))
+/* Whether an enabled event is looking at this task on this CPU. */
+static int perf_watches_task(const struct perf_ev *ev, struct task *t, int cpu) {
+  if (!ev->enabled)
     return 0;
   if (ev->cpu >= 0 && ev->cpu != cpu)
     return 0;
@@ -504,6 +512,15 @@ static int perf_watches(const struct perf_ev *ev, struct task *t, int cpu) {
   if (!t)
     return 0;
   return t->id == ev->target || task_tgid(t) == ev->target;
+}
+
+static int perf_watches(const struct perf_ev *ev, struct task *t, int cpu) {
+  /* A sampling event needs somewhere for the sample to go: a ring buffer, or
+   * an attached program, which IS the consumer -- a profiler that counts into
+   * a map never maps a buffer at all. */
+  if (!ev->data && !ev->bpf_prog)
+    return 0;
+  return perf_watches_task(ev, t, cpu);
 }
 
 /* A tracepoint fired. Charge every event that named this site and watches the
@@ -519,25 +536,45 @@ void perf_tracepoint_hit(u16 id, u64 a, u64 b, u64 c) {
   u64 flags;
   int cpu;
 
-  (void)b;
-  (void)c;
   if (!g_events)
     return;
   cpu = get_percpu() ? (int)get_percpu()->cpu_id : 0;
   if (!spin_trylock_irqsave(&g_perf_lock, &flags))
     return;
+  __atomic_store_n(&g_perf_lock_cpu, cpu, __ATOMIC_RELAXED);
   for (struct perf_ev *ev = g_events; ev; ev = ev->next) {
     if (ev->attr.type != PERF_TYPE_TRACEPOINT)
       continue;
     if ((u16)ev->attr.config != id)
       continue;
-    if (!perf_watches(ev, t, cpu))
+    /* A program attached to a trace event runs on every hit, whichever CPU
+     * and task it is: Linux attaches it to the event's site (trace_call_bpf),
+     * not to the perf event's filter -- bcc opens a kprobe's event on CPU 0
+     * alone and still sees every CPU's hits. */
+    if (ev->bpf_prog && ev->enabled && !perf_watches_task(ev, t, cpu)) {
+      bpf_run_trace(ev->bpf_prog, id, a, b, c,
+                    id >= TP_KPROBE_BASE ? kprobe_current_frame() : 0);
+      continue;
+    }
+    /* Counted whether or not anything samples it: `perf stat` on a
+     * tracepoint maps no buffer, and requiring one here left every counting
+     * tracepoint and kprobe event at zero. */
+    if (!perf_watches_task(ev, t, cpu))
       continue;
     ev->tp_hits++;
-    if (!ev->data)
+    if (!ev->data && !ev->bpf_prog)
       continue; /* counting only: `perf stat` maps no buffer */
     if (ev->attr.sample_period > 1 &&
         (ev->tp_hits % ev->attr.sample_period) != 0)
+      continue;
+    /* An attached program decides whether the hit is recorded, as Linux's
+     * trace_call_bpf does: zero drops it. A kprobe's program sees the probed
+     * context's registers. */
+    if (ev->bpf_prog &&
+        bpf_run_trace(ev->bpf_prog, id, a, b, c,
+                      id >= TP_KPROBE_BASE ? kprobe_current_frame() : 0) == 0)
+      continue;
+    if (!ev->data)
       continue;
     /* The instruction pointer a tracepoint sample carries: for a kprobe it is
      * the probed address, which is a real place in the kernel. A static site
@@ -547,6 +584,7 @@ void perf_tracepoint_hit(u16 id, u64 a, u64 b, u64 c) {
     perf_emit_sample(ev, id >= TP_KPROBE_BASE ? a : 0, 0, 0, cpu,
                      ev->attr.sample_period ? ev->attr.sample_period : 1);
   }
+  __atomic_store_n(&g_perf_lock_cpu, -1, __ATOMIC_RELAXED);
   spin_unlock_irqrestore(&g_perf_lock, flags);
   /* No wake of the poll queue here, deliberately: sched:sched_switch fires
    * inside the scheduler's own critical section, and waking a reader from there
@@ -554,7 +592,8 @@ void perf_tracepoint_hit(u16 id, u64 a, u64 b, u64 c) {
    * buffer; the tick sampler still wakes them for everything else. */
 }
 
-void perf_event_tick_sample(u64 pc, u64 fp, int in_user, int cpu) {
+void perf_event_tick_sample(u64 pc, u64 fp, int in_user, int cpu,
+                            const void *frame) {
   struct task *t = current_task;
   u64 flags;
   int woke = 0;
@@ -562,6 +601,7 @@ void perf_event_tick_sample(u64 pc, u64 fp, int in_user, int cpu) {
   if (!g_events)
     return;
   spin_lock_irqsave(&g_perf_lock, &flags);
+  __atomic_store_n(&g_perf_lock_cpu, cpu, __ATOMIC_RELAXED);
   for (struct perf_ev *ev = g_events; ev; ev = ev->next) {
     u64 period;
 
@@ -590,11 +630,11 @@ void perf_event_tick_sample(u64 pc, u64 fp, int in_user, int cpu) {
      * is what a program that is counting into a map returns: it has already
      * recorded what it wanted and no record needs to reach userspace. */
     if (ev->bpf_prog) {
-      u64 pid_tgid = 0;
+      u64 keep = bpf_run_perf(ev->bpf_prog, frame, in_user, period);
 
-      if (current_task)
-        pid_tgid = ((u64)task_tgid(current_task) << 32) | (u32)current_task->id;
-      if (bpf_run_perf(ev->bpf_prog, pc, pid_tgid, (u64)cpu) == 0)
+      if (bpf_take_wakeup())
+        woke = 1; /* a ring-buffer record is waiting for its reader */
+      if (keep == 0)
         continue;
     }
 
@@ -608,6 +648,7 @@ void perf_event_tick_sample(u64 pc, u64 fp, int in_user, int cpu) {
     if (ev->refresh > 0 && --ev->refresh == 0)
       ev->enabled = 0;
   }
+  __atomic_store_n(&g_perf_lock_cpu, -1, __ATOMIC_RELAXED);
   spin_unlock_irqrestore(&g_perf_lock, flags);
   if (woke)
     scheduler_wake_all(vfs_poll_chan);
@@ -627,7 +668,10 @@ static void perf_emit_task_records(struct perf_ev *ev, struct task *t) {
   if (!t || !ev->data)
     return;
 
-  {
+  /* Only what the event asked for, as Linux writes them: a reader that did
+   * not set attr.comm or attr.mmap/mmap2 is not expecting the records -- bcc's
+   * reader of a BPF_OUTPUT ring knows samples and nothing else. */
+  if (ev->attr.comm) {
     /* struct { u32 pid, tid; char comm[]; } — the name padded to 8 bytes. */
     u32 *p = (u32 *)(void *)body;
     const char *nm = t->name ? t->name : "?";
@@ -647,7 +691,8 @@ static void perf_emit_task_records(struct perf_ev *ev, struct task *t) {
     perf_rb_record(ev, PERF_RECORD_COMM, 0, body, (u32)pad + tlen);
   }
 
-  for (struct vm_area *v = t->vma_list; v; v = v->next) {
+  for (struct vm_area *v = t->vma_list;
+       (ev->attr.mmap || ev->attr.mmap2) && v; v = v->next) {
     char path[VFS_MAX_PATH];
     usize len, off;
 
@@ -741,11 +786,62 @@ void perf_event_task_exit(struct task *t) {
 /* ---- the descriptor ----------------------------------------------------- */
 
 static const struct vfs_file_ops perf_file_ops;
+static int perf_bpf_type_ok(const struct perf_ev *ev, void *prog);
+
+/* /sys/bus/event_source/devices/kprobe: its type, and the one format bit a
+ * tool needs to ask for a return probe. */
+static isize perf_show_kprobe_type(void *ctx, char *buf, usize cap) {
+  (void)ctx;
+  return snprintf(buf, cap, "%d\n", PERF_TYPE_KPROBE_PMU);
+}
+
+static isize perf_show_uprobe_type(void *ctx, char *buf, usize cap) {
+  (void)ctx;
+  return snprintf(buf, cap, "%d\n", PERF_TYPE_UPROBE_PMU);
+}
+
+static isize perf_show_retprobe(void *ctx, char *buf, usize cap) {
+  (void)ctx;
+  return snprintf(buf, cap, "config:0\n");
+}
+
+void perf_event_sysfs_init(void) {
+  struct sysfs_dir *kp = sysfs_reg_dir(
+      sysfs_reg_dir(sysfs_reg_dir(sysfs_reg_dir(0, "bus"), "event_source"),
+                    "devices"),
+      "kprobe");
+
+  if (!kp)
+    return;
+  sysfs_reg_attr(kp, "type", 0444, perf_show_kprobe_type, 0, 0, 0);
+  sysfs_reg_attr(sysfs_reg_dir(kp, "format"), "retprobe", 0444,
+                 perf_show_retprobe, 0, 0, 0);
+  {
+    struct sysfs_dir *up = sysfs_reg_dir(sysfs_reg_parent(kp), "uprobe");
+
+    if (up) {
+      sysfs_reg_attr(up, "type", 0444, perf_show_uprobe_type, 0, 0, 0);
+      sysfs_reg_attr(sysfs_reg_dir(up, "format"), "retprobe", 0444,
+                     perf_show_retprobe, 0, 0, 0);
+    }
+  }
+}
+
+/* An event that did not finish opening: its own probe goes with it. */
+static void perf_open_undo(struct perf_ev *ev) {
+  if (ev->kp_auto[0])
+    tracepoint_kprobe_remove(ev->kp_auto);
+  kfree(ev);
+}
 
 static void perf_free(struct perf_ev *ev) {
   if (ev->tp_referenced) {
     tracepoint_ref_put((u16)ev->attr.config);
     ev->tp_referenced = 0;
+  }
+  if (ev->kp_auto[0]) {
+    tracepoint_kprobe_remove(ev->kp_auto);
+    ev->kp_auto[0] = 0;
   }
   if (ev->bpf_prog) {
     bpf_prog_put(ev->bpf_prog);
@@ -934,11 +1030,16 @@ static int perf_handle_ioctl(struct vfs_handle *h, u64 request, void *arg) {
       rc = -EBADF;
       break;
     }
-    void *old = ev->bpf_prog;
+    /* One program per event, as on Linux: replacing one is detaching it
+     * first, and a second attach is EEXIST. */
+    if (ev->bpf_prog || !perf_bpf_type_ok(ev, prog)) {
+      int err = ev->bpf_prog ? -EEXIST : -EINVAL;
 
+      spin_unlock_irqrestore(&g_perf_lock, flags);
+      bpf_prog_put(prog);
+      return err;
+    }
     ev->bpf_prog = prog;
-    if (old)
-      bpf_prog_put(old);
     break;
   }
   case PERF_EVENT_IOC_ID: {
@@ -982,6 +1083,156 @@ static int perf_mmap_phys(struct vfs_handle *handle, u64 offset, usize length,
     return rc;
   *out_phys = ev->rb_phys;
   return 0;
+}
+
+/* Which program type an event runs, as Linux pairs them: a kprobe event a
+ * KPROBE program, a tracepoint a TRACEPOINT one, a sampling event a PERF_EVENT
+ * one. Anything else is EINVAL at attach. */
+static int perf_bpf_type_ok(const struct perf_ev *ev, void *prog) {
+  u32 t = bpf_prog_type(prog);
+
+  if (ev->attr.type == PERF_TYPE_TRACEPOINT)
+    return (u16)ev->attr.config >= TP_KPROBE_BASE ? t == BPF_PROG_TYPE_KPROBE
+                                                  : t == BPF_PROG_TYPE_TRACEPOINT;
+  return t == BPF_PROG_TYPE_PERF_EVENT;
+}
+
+/* bpf_link's side of an attachment (BPF_LINK_CREATE with BPF_PERF_EVENT):
+ * the same one-program rule as PERF_EVENT_IOC_SET_BPF. The program's reference
+ * passes to the event on success. */
+int perf_event_bpf_attach(struct vfs_handle *h, void *prog) {
+  u64 flags;
+  int rc = 0;
+
+  if (!h || h->ops != &perf_file_ops || !h->private_data)
+    return -EBADF;
+  spin_lock_irqsave(&g_perf_lock, &flags);
+  struct perf_ev *ev = (struct perf_ev *)h->private_data;
+
+  if (!perf_bpf_type_ok(ev, prog))
+    rc = -EINVAL;
+  else if (ev->bpf_prog)
+    rc = -EEXIST;
+  else
+    ev->bpf_prog = prog;
+  spin_unlock_irqrestore(&g_perf_lock, flags);
+  return rc;
+}
+
+/* Take `prog` off the event, if it is still the one there. */
+void perf_event_bpf_detach(struct vfs_handle *h, void *prog) {
+  u64 flags;
+  void *gone = 0;
+
+  if (!h || h->ops != &perf_file_ops || !h->private_data)
+    return;
+  spin_lock_irqsave(&g_perf_lock, &flags);
+  struct perf_ev *ev = (struct perf_ev *)h->private_data;
+
+  if (ev->bpf_prog == prog) {
+    gone = prog;
+    ev->bpf_prog = 0;
+  }
+  spin_unlock_irqrestore(&g_perf_lock, flags);
+  if (gone)
+    bpf_prog_put(gone);
+}
+
+/* bpf_perf_event_output: one PERF_RECORD_SAMPLE carrying the program's bytes
+ * as PERF_SAMPLE_RAW, into a PERF_COUNT_SW_BPF_OUTPUT event's ring, as Linux
+ * writes it -- the raw size, then the data, zero-padded so the record stays
+ * 8-byte aligned. An event bound to another CPU is EOPNOTSUPP, one of another
+ * kind EINVAL, a full ring ENOSPC. */
+int perf_event_bpf_output(struct vfs_handle *h, const void *data, u32 size,
+                          int cpu) {
+  static const u8 zeros[8];
+  struct perf_ev *ev;
+  u64 flags = 0, fields[10];
+  u32 n = 0, raw, total;
+  int nested, rc = 0;
+
+  if (!h || h->ops != &perf_file_ops || !h->private_data)
+    return -ENOENT;
+  nested = __atomic_load_n(&g_perf_lock_cpu, __ATOMIC_RELAXED) == cpu;
+  if (!nested)
+    spin_lock_irqsave(&g_perf_lock, &flags);
+  ev = (struct perf_ev *)h->private_data;
+  if (ev->attr.type != PERF_TYPE_SOFTWARE ||
+      ev->attr.config != PERF_COUNT_SW_BPF_OUTPUT) {
+    rc = -EINVAL;
+    goto out;
+  }
+  if (ev->cpu >= 0 && ev->cpu != cpu) {
+    rc = -EOPNOTSUPP;
+    goto out;
+  }
+  if (!ev->enabled || !ev->data || !ev->ctrl) {
+    rc = -ENOENT;
+    goto out;
+  }
+  {
+    u64 st = ev->attr.sample_type;
+    struct task *t = current_task;
+    usize pid = t ? task_tgid(t) : 0, tid = t ? t->id : 0;
+
+    if (st & PERF_SAMPLE_IDENTIFIER)
+      fields[n++] = ev->id;
+    if (st & PERF_SAMPLE_IP)
+      fields[n++] = 0;
+    if (st & PERF_SAMPLE_TID)
+      fields[n++] = ((u64)(u32)tid << 32) | (u32)pid;
+    if (st & PERF_SAMPLE_TIME)
+      fields[n++] = ktime_monotonic_ns();
+    if (st & PERF_SAMPLE_ADDR)
+      fields[n++] = 0;
+    if (st & PERF_SAMPLE_ID)
+      fields[n++] = ev->id;
+    if (st & PERF_SAMPLE_STREAM_ID)
+      fields[n++] = ev->id;
+    if (st & PERF_SAMPLE_CPU)
+      fields[n++] = (u64)(u32)cpu;
+    if (st & PERF_SAMPLE_PERIOD)
+      fields[n++] = 1;
+    if (st & PERF_SAMPLE_CALLCHAIN)
+      fields[n++] = 0; /* an empty chain */
+  }
+  raw = ((size + 4 + 7) & ~7u) - 4;
+  total = (u32)sizeof(struct perf_event_header) + n * 8 + 4 + raw;
+  if (total > 0xffff) {
+    rc = -E2BIG;
+    goto out;
+  }
+  if (perf_rb_used(ev) + total > ev->data_size) {
+    ev->lost++;
+    rc = -ENOSPC;
+    goto out;
+  }
+  {
+    struct perf_event_header hd;
+
+    hd.type = PERF_RECORD_SAMPLE;
+    hd.misc = PERF_RECORD_MISC_KERNEL;
+    hd.size = (u16)total;
+    perf_rb_put(ev, &hd, sizeof(hd));
+  }
+  if (n)
+    perf_rb_put(ev, fields, n * 8);
+  perf_rb_put(ev, &raw, 4);
+  if (size)
+    perf_rb_put(ev, data, size);
+  if (raw > size)
+    perf_rb_put(ev, zeros, raw - size);
+  __atomic_store_n(&ev->ctrl->data_head, ev->head, __ATOMIC_RELEASE);
+  ev->nr_samples++;
+out:
+  if (!nested)
+    spin_unlock_irqrestore(&g_perf_lock, flags);
+  return rc;
+}
+
+/* Whether a descriptor's handle is a perf event, for the event-array map. */
+int perf_event_is_handle(struct vfs_handle *h) {
+  return h && h->ops == &perf_file_ops && h->private_data;
 }
 
 static const struct vfs_file_ops perf_file_ops = {
@@ -1043,6 +1294,10 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
    * u32 of the structure, after attr.type. */
   if (syscall_copyin(&size, (const void *)(usize)(uattr + 4), sizeof(size)) < 0)
     return -EFAULT;
+  /* Zero is the first version, as perf_copy_attr reads it: bcc (under
+   * bpftrace) opens its output events without ever setting the size. */
+  if (!size)
+    size = PERF_ATTR_SIZE_VER0;
   if (size < PERF_ATTR_SIZE_VER0)
     return -EINVAL;
   memset(&attr, 0, sizeof(attr));
@@ -1050,11 +1305,58 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
                      size > sizeof(attr) ? sizeof(attr) : size) < 0)
     return -EFAULT;
 
-  if (!perf_attr_supported(&attr))
+  /* The kprobe PMU (/sys/bus/event_source/devices/kprobe): the probe is
+   * named in the attr -- config1 points at the function's name, config's bit
+   * 0 asks for the return -- and made for this event alone, which is how bcc
+   * and bpftrace attach without tracefs. It becomes a tracepoint event on the
+   * probe it made. A probe by address (config1 zero) is not offered. */
+  char kp_auto[24] = {0};
+  char kp_sym[128];
+  int kp_pmu = attr.type == PERF_TYPE_KPROBE_PMU;
+  /* The uprobe PMU, the same way: config1 points at the file's path and
+   * config2 is the offset in it. */
+  int up_pmu = attr.type == PERF_TYPE_UPROBE_PMU;
+  struct vfs_node *up_node = 0;
+
+  if (kp_pmu) {
+    if ((attr.config & ~1ull) || !attr.config1)
+      return perf_refuse("a kprobe PMU event by address or with unknown bits",
+                         -EOPNOTSUPP);
+    if (attr.config2)
+      return perf_refuse("a kprobe PMU event at an offset", -EOPNOTSUPP);
+    if (syscall_copyinstr(kp_sym, sizeof(kp_sym),
+                          (const char *)(usize)attr.config1) < 0)
+      return -EFAULT;
+  } else if (up_pmu) {
+    char path[VFS_MAX_PATH];
+
+    if (attr.config & ~1ull)
+      return perf_refuse("a uprobe PMU event with unknown bits", -EOPNOTSUPP);
+    if (attr.config & 1)
+      return perf_refuse("a return uprobe", -EOPNOTSUPP);
+    if (!attr.config1 ||
+        syscall_copyinstr(kp_sym, sizeof(kp_sym),
+                          (const char *)(usize)attr.config1) < 0)
+      return -EFAULT;
+    vfs_resolve_path(kp_sym, path);
+    up_node = vfs_find_node(path);
+    if (IS_ERR(up_node) || !up_node)
+      return up_node ? (int)PTR_ERR(up_node) : -ENOENT;
+  } else if (!perf_attr_supported(&attr)) {
     return perf_refuse("this counter is not one the kernel keeps", -EOPNOTSUPP);
-  if (attr.sample_type & ~(u64)PERF_SAMPLE_SUPPORTED)
-    return perf_refuse("a sample_type field this does not produce",
-                       -EOPNOTSUPP);
+  }
+  {
+    /* PERF_SAMPLE_RAW is what a BPF_OUTPUT event's samples are made of; no
+     * other event here writes raw data yet. */
+    u64 ok_st = PERF_SAMPLE_SUPPORTED;
+
+    if (attr.type == PERF_TYPE_SOFTWARE &&
+        attr.config == PERF_COUNT_SW_BPF_OUTPUT)
+      ok_st |= PERF_SAMPLE_RAW;
+    if (attr.sample_type & ~ok_st)
+      return perf_refuse("a sample_type field this does not produce",
+                         -EOPNOTSUPP);
+  }
   if (attr.read_format & ~(u64)PERF_READ_FORMAT_SUPPORTED)
     return perf_refuse("a read_format this does not produce", -EOPNOTSUPP);
 
@@ -1100,10 +1402,40 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
   if (g_nr_events >= PERF_MAX_EVENTS)
     return -EMFILE;
 
+  if (kp_pmu) {
+    static u32 g_kp_seq;
+    int kid;
+
+    snprintf(kp_auto, sizeof(kp_auto), "b1pmu_%u",
+             __atomic_add_fetch(&g_kp_seq, 1, __ATOMIC_RELAXED));
+    kid = tracepoint_kprobe_add(kp_auto, kp_sym, (int)(attr.config & 1));
+    if (kid < 0)
+      return kid;
+    attr.type = PERF_TYPE_TRACEPOINT;
+    attr.config = (u64)kid;
+    attr.config1 = 0;
+  } else if (up_pmu) {
+    static u32 g_up_seq;
+    int kid;
+
+    snprintf(kp_auto, sizeof(kp_auto), "b1upmu_%u",
+             __atomic_add_fetch(&g_up_seq, 1, __ATOMIC_RELAXED));
+    kid = tracepoint_uprobe_add(kp_auto, up_node->inode, attr.config2, kp_sym);
+    vfs_node_put(up_node); /* the probe names the inode, which the file keeps */
+    if (kid < 0)
+      return kid;
+    attr.type = PERF_TYPE_TRACEPOINT;
+    attr.config = (u64)kid;
+    attr.config1 = attr.config2 = 0;
+  }
   ev = kzalloc(sizeof(*ev));
-  if (!ev)
+  if (!ev) {
+    if (kp_auto[0])
+      tracepoint_kprobe_remove(kp_auto);
     return -ENOMEM;
+  }
   ev->attr = attr;
+  memcpy(ev->kp_auto, kp_auto, sizeof(ev->kp_auto));
   ev->cpu = cpu;
   ev->target = (pid == -1) ? 0 : (pid == 0 ? (current_task ? current_task->id : 0)
                                            : (usize)pid);
@@ -1123,7 +1455,7 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
                                !attr.exclude_kernel);
     }
     if (rc < 0) {
-      kfree(ev);
+      perf_open_undo(ev);
       return rc; /* -EOPNOTSUPP with no PMU, -EBUSY with no counter free */
     }
     ev->pmu_slot = rc;
@@ -1136,7 +1468,7 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
     int rc = tracepoint_ref_get((u16)attr.config);
 
     if (rc < 0) {
-      kfree(ev);
+      perf_open_undo(ev);
       return rc;
     }
     ev->tp_referenced = 1;
@@ -1162,21 +1494,25 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
      * nanoseconds, which the tick can charge directly. For an event counter
      * there is no overflow interrupt to hang it off, so it is refused rather
      * than approximated. */
-    if (attr.config != PERF_COUNT_SW_CPU_CLOCK &&
+    if (attr.config == PERF_COUNT_SW_BPF_OUTPUT &&
+        attr.type == PERF_TYPE_SOFTWARE) {
+      /* Its samples are the program's output; nothing ticks it. */
+    } else if (attr.config != PERF_COUNT_SW_CPU_CLOCK &&
         attr.config != PERF_COUNT_SW_TASK_CLOCK && ev->pmu_slot < 0) {
-      kfree(ev);
+      perf_open_undo(ev);
       return perf_refuse("a sample_period on a counter with no overflow "
                          "interrupt behind it",
                          -EOPNOTSUPP);
+    } else {
+      ev->period_ns = attr.sample_period;
+      ev->ns_left = attr.sample_period;
     }
-    ev->period_ns = attr.sample_period;
-    ev->ns_left = attr.sample_period;
   }
 
   struct vfs_node *node = vfs_create_node(VFS_DEVICE);
 
   if (!node) {
-    kfree(ev);
+    perf_open_undo(ev);
     return -ENOMEM;
   }
   strncpy(node->name, "perf_event", sizeof(node->name) - 1);
@@ -1197,7 +1533,7 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
 
   if (!h) {
     vfs_node_put(node);
-    kfree(ev);
+    perf_open_undo(ev);
     return -ENFILE;
   }
   h->node = node;

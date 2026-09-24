@@ -611,6 +611,7 @@ KERNEL_SOURCES := \
 	kernel/trace/tracefs.c \
 	kernel/trace/kprobe.c \
 	kernel/bpf/bpf_core.c \
+	kernel/bpf/bpf_btf.c \
 	kernel/bpf/bpf_jit_x86.c \
 	kernel/syscall/syscall.c \
 	kernel/syscall/linux_abi.c \
@@ -1382,12 +1383,24 @@ KALLSYMS_O := $(BUILD_DIR)/kallsyms.o
 #   pass 2 → final kernel.elf with the blob appended into .kallsyms
 # The blob lands after .text/.rodata/.data, so the pass-1 addresses it records
 # remain correct in the final image.
-$(KERNEL_ELF): $(OBJECTS) $(LINKER_SCRIPT) tools/toolchain/kernel/gen_kallsyms.sh
+#
+# The kernel's BTF is made from pass 1 the same way: pahole turns its DWARF into
+# BTF (types only, so the second pass cannot invalidate it) and the blob is
+# linked into .BTF. Without pahole the section is empty and the kernel says it
+# has no BTF rather than offering some other kernel's.
+BTF_S := $(BUILD_DIR)/btf.S
+BTF_O := $(BUILD_DIR)/btf.o
+BTF_BLOB := $(BUILD_DIR)/vmlinux.btf
+
+$(KERNEL_ELF): $(OBJECTS) $(LINKER_SCRIPT) tools/toolchain/kernel/gen_kallsyms.sh \
+               tools/toolchain/kernel/gen_btf.sh
 	@mkdir -p $(dir $@)
 	$(LD) $(ARCH_LDFLAGS) $(LD_ERROR_LIMIT) -T $(LINKER_SCRIPT) -o $@.stage1 $(OBJECTS)
 	NM='$(NM)' sh tools/toolchain/kernel/gen_kallsyms.sh $@.stage1 > $(KALLSYMS_S)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $(KALLSYMS_S) -o $(KALLSYMS_O)
-	$(LD) $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -o $@ $(OBJECTS) $(KALLSYMS_O)
+	sh tools/toolchain/kernel/gen_btf.sh $@.stage1 $(BTF_BLOB) > $(BTF_S)
+	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $(BTF_S) -o $(BTF_O)
+	$(LD) $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -o $@ $(OBJECTS) $(KALLSYMS_O) $(BTF_O)
 ifeq ($(ARCH),aarch64)
 	$(OBJCOPY) -O binary $@ $(BUILD_DIR)/Image
 endif

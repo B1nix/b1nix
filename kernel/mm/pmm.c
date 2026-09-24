@@ -2319,6 +2319,22 @@ u64 pmm_alloc_frame_node(int node, int strict) {
 u64 pmm_total_usable_memory(void) { return pmm.total_usable; }
 u64 pmm_phys_total_memory(void) { return pmm.phys_total; }
 
+/* May this frame be read through the direct map by code that does not own it
+ * (a tracing program's probe_read)? The kernel image, and RAM the allocator
+ * has handed out. The direct map also covers what lies between RAM regions --
+ * a device's registers, where a read is not free of side effects -- and a
+ * free frame is nobody's data. Answered without the lock: a frame freed a
+ * moment later is still RAM, and the caller only reads it. */
+int pmm_frame_readable(u64 phys) {
+  usize idx = phys / PAGE_SIZE;
+
+  if (phys >= pmm.kernel_start && phys < pmm.kernel_end)
+    return 1;
+  if (phys >= pmm.max_address || !pmm.frame_refcounts)
+    return 0;
+  return __atomic_load_n(&pmm.frame_refcounts[idx], __ATOMIC_RELAXED) != 0;
+}
+
 u64 pmm_free_memory_estimate(void) { return pmm.free_frames * PAGE_SIZE; }
 
 usize pmm_free_frame_count(void) { return (usize)pmm.free_frames; }

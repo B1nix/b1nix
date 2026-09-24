@@ -491,6 +491,9 @@ struct io_ring_ctx {
   /* IORING_REGISTER_IOWQ_MAX_WORKERS: bounded and reported truthfully — see
    * the note where it is handled. */
   u32 iowq_max[2];
+  /* IORING_REGISTER_IOWQ_AFF: the CPUs the ring's worker (the completion
+   * thread, iou_cq_thread) may run on; 0 = wherever the scheduler likes. */
+  u64 iowq_aff;
 
   /* Ring shape. IORING_SETUP_CQE32 and IORING_SETUP_SQE128 double the entry
    * size, so every index into cqes/sqes is a byte offset rather than an array
@@ -4602,17 +4605,17 @@ done:
  * than a share of the other's, which no program can tell apart -- there is no
  * io-wq whose workers could be shared either.
  *
- * What is still refused: IORING_SETUP_SQ_AFF (the submission thread is a
- * kernel thread, and kernel threads run on the boot CPU only, so a placement
- * on sq_thread_cpu is a promise that could not be kept), NO_MMAP,
- * REGISTERED_FD_ONLY, HYBRID_IOPOLL and CQE_MIXED. */
+ * IORING_SETUP_SQ_AFF pins the submission thread to sq_thread_cpu.
+ *
+ * What is still refused: NO_MMAP, REGISTERED_FD_ONLY, HYBRID_IOPOLL and
+ * CQE_MIXED. */
 #define IOU_SETUP_SUPPORTED                                                    \
   (IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP | IORING_SETUP_SUBMIT_ALL |        \
    IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG |                     \
    IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_R_DISABLED |                      \
    IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL | IORING_SETUP_SQE128 |           \
    IORING_SETUP_CQE32 | IORING_SETUP_NO_SQARRAY | IORING_SETUP_DEFER_TASKRUN | \
-   IORING_SETUP_ATTACH_WQ)
+   IORING_SETUP_ATTACH_WQ | IORING_SETUP_SQ_AFF)
 
 /* What is true here, and nothing more. IORING_FEAT_SINGLE_MMAP because both
  * rings share one region; NODROP because an overflow is kept; SUBMIT_STABLE
@@ -5218,14 +5221,26 @@ static void iou_async_kick(struct io_ring_ctx *ctx) {
   if (__atomic_exchange_n(&ctx->cq_started, 1, __ATOMIC_ACQ_REL))
     return; /* another submitter got there first */
   iou_ctx_get(ctx); /* the thread's reference */
-  tid = kthread_create("io_uring-cq", iou_cq_thread, ctx);
+  {
+    char name[24];
+
+    /* Linux's name for the thread that finishes a ring's async work. */
+    snprintf(name, sizeof(name), "iou-wrk-%lu", (unsigned long)ctx->owner_tgid);
+    tid = kthread_create_ap(name, iou_cq_thread, ctx);
+  }
   if (tid < 0) {
     /* No thread: the ring still works the way it always did, from inside
      * io_uring_enter. Leave the flag set so this is not retried per request. */
     iou_ctx_put(ctx);
     return;
   }
-  ctx->sq_tid = tid;
+  __atomic_store_n(&ctx->sq_tid, tid, __ATOMIC_RELEASE);
+  {
+    u64 aff = __atomic_load_n(&ctx->iowq_aff, __ATOMIC_ACQUIRE);
+
+    if (aff)
+      scheduler_set_affinity((usize)tid, aff);
+  }
 }
 
 /* Everything the ring still owns when its last descriptor goes away. */
@@ -5458,6 +5473,19 @@ static isize iou_setup(u32 entries, u64 uparams) {
   if ((p.flags & IORING_SETUP_SQPOLL) &&
       (!current_task || !current_task->pml4_phys))
     return -EINVAL;
+  /* A submission thread pinned to sq_thread_cpu: an online CPU, and one that
+   * runs process work (the secondaries do not until SMP bring-up hands them
+   * userspace). Without SQPOLL there is no thread to place. */
+  if (p.flags & IORING_SETUP_SQ_AFF) {
+    extern int get_online_cpu_count(void);
+    extern volatile int g_ap_userspace_enabled;
+    int online = get_online_cpu_count();
+
+    if (!(p.flags & IORING_SETUP_SQPOLL) || p.sq_thread_cpu >= 64 ||
+        (int)p.sq_thread_cpu >= (online < 1 ? 1 : online) ||
+        (p.sq_thread_cpu != 0 && !g_ap_userspace_enabled))
+      return -EINVAL;
+  }
   /* io_sq_offload_create's checks, in its order. */
   if (p.flags & IORING_SETUP_ATTACH_WQ) {
     struct vfs_handle *wq = scheduler_fd_get((int)p.wq_fd);
@@ -5589,12 +5617,21 @@ static isize iou_setup(u32 entries, u64 uparams) {
      * the field is left at zero is one second. */
     ctx->sq_idle_ms = p.sq_thread_idle ? p.sq_thread_idle : 1000u;
     iou_ctx_get(ctx); /* the thread's reference */
-    ctx->sq_tid = kthread_create("io_uring-sq", iou_sq_thread, ctx);
+    {
+      char name[24];
+
+      snprintf(name, sizeof(name), "iou-sqp-%lu",
+               (unsigned long)ctx->owner_tgid);
+      ctx->sq_tid = kthread_create_ap(name, iou_sq_thread, ctx);
+    }
     if (ctx->sq_tid < 0) {
       iou_ctx_put(ctx);
       vfs_close(fd);
       return -EAGAIN;
     }
+    /* Checked before anything was built; the placement cannot fail now. */
+    if (p.flags & IORING_SETUP_SQ_AFF)
+      scheduler_set_affinity((usize)ctx->sq_tid, 1ULL << p.sq_thread_cpu);
     /* The thread adopts the owner's address space before it does anything; if
      * that fails it clears sq_alive and stops, and the ring would then accept
      * submissions nothing ever consumes. Wait for the answer here, where it
@@ -6700,6 +6737,51 @@ static isize iou_register_probe(struct io_ring_ctx *ctx, u64 uaddr,
   return 0;
 }
 
+/* IORING_REGISTER_IOWQ_AFF, io_register_iowq_aff: a cpumask of `len` bytes
+ * naming the CPUs the ring's async work may run on; no mask (unregister)
+ * gives back every CPU. A CPU that is not there is EINVAL, as Linux's subset
+ * check answers. The work is done by the ring's completion thread, so that is
+ * the thread placed -- now if it runs, and when it starts otherwise. An SQPOLL
+ * ring's async work runs on its submission thread, whose place is
+ * IORING_SETUP_SQ_AFF's to decide, so there the mask is kept and applies to
+ * nothing, as a Linux ring's io-wq mask does before any worker exists. */
+static isize iou_register_iowq_aff(struct io_ring_ctx *ctx, u64 uaddr,
+                                   u32 len) {
+  extern int get_online_cpu_count(void);
+  int online = get_online_cpu_count();
+  u64 online_mask;
+  u64 mask = 0;
+  int tid;
+
+  if (online < 1)
+    online = 1;
+  online_mask = online >= 64 ? ~0ULL : (1ULL << online) - 1;
+  if (uaddr || len) {
+    u8 buf[128];
+
+    if (!uaddr || !len)
+      return -EINVAL;
+    if (len > sizeof(buf))
+      len = sizeof(buf);
+    memset(buf, 0, sizeof(buf));
+    if (syscall_copyin(buf, (const void *)(usize)uaddr, len) < 0)
+      return -EFAULT;
+    memcpy(&mask, buf, sizeof(mask));
+    for (u32 i = sizeof(mask); i < len; i++)
+      if (buf[i])
+        return -EINVAL;
+    if ((mask & ~online_mask) || !mask)
+      return -EINVAL;
+  }
+  __atomic_store_n(&ctx->iowq_aff, mask, __ATOMIC_RELEASE);
+  if (ctx->flags & IORING_SETUP_SQPOLL)
+    return 0;
+  tid = __atomic_load_n(&ctx->sq_tid, __ATOMIC_ACQUIRE);
+  if (tid > 0 && __atomic_load_n(&ctx->cq_started, __ATOMIC_ACQUIRE))
+    scheduler_set_affinity((usize)tid, mask ? mask : online_mask);
+  return 0;
+}
+
 static isize iou_register_mem_region(struct io_ring_ctx *ctx, u64 uaddr,
                                     u32 nr_args);
 static isize iou_register_resize_rings(struct io_ring_ctx *ctx, u64 uarg);
@@ -6928,6 +7010,12 @@ static isize iou_register_ctx(struct io_ring_ctx *ctx, u32 opcode, u64 arg,
     rc = 0;
     break;
   }
+  case IORING_REGISTER_IOWQ_AFF:
+    rc = iou_register_iowq_aff(ctx, arg, nr_args);
+    break;
+  case IORING_UNREGISTER_IOWQ_AFF:
+    rc = (arg || nr_args) ? -EINVAL : iou_register_iowq_aff(ctx, 0, 0);
+    break;
   case IORING_REGISTER_IOWQ_MAX_WORKERS: {
     /* There is no io-wq: a request that would block is armed on its file's
      * readiness and retried from io_uring_enter (M70), so the number of

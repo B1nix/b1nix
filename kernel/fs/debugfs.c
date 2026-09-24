@@ -17,6 +17,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/version.h>
 #include <b1nix/vfs.h>
+#include <b1nix/tracepoint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -376,9 +377,16 @@ static struct vfs_fs debugfs_fs = {
 	.flags = VFS_FS_NODEV,
 };
 
+/* tracefs is the tracing tree, not a second debugfs: see tracefs_root_get. */
+static struct vfs_node *tracefs_mount_cb(const char *source, u64 flags, void *data)
+{
+	(void)source; (void)flags; (void)data;
+	return tracefs_root_get();
+}
+
 static struct vfs_fs tracefs_fs = {
 	.name = "tracefs",
-	.mount = debugfs_mount_cb,
+	.mount = tracefs_mount_cb,
 	.flags = VFS_FS_NODEV,
 };
 

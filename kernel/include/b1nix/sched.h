@@ -570,6 +570,13 @@ int scheduler_owner_context_alive(usize owner_pid);
  * BKL). See struct task::ap_runnable. */
 int kthread_create_user(const char *name, kernel_thread_entry entry, void *arg,
                         int ap_runnable);
+/* A kernel thread that does a process's work in that process's address space
+ * (io_uring's submission and completion threads): the secondaries may run it
+ * as they run the process itself, once they run user work at all. */
+int kthread_create_ap(const char *name, kernel_thread_entry entry, void *arg);
+/* The CPU a task was last switched in on, and the note a switch makes of it. */
+int scheduler_task_cpu(const struct task *t);
+void sched_note_cpu(const struct task *t, int cpu);
 /* Create a stealable CPU-bound kernel worker (see struct task::stealable).
  * Returns the task id, or -1 on failure. The worker is enqueued READY on the
  * creating CPU's runqueue; an idle AP may steal and run it. */

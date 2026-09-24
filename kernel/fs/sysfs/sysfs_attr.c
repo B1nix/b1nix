@@ -207,9 +207,30 @@ static void materialise_dir(struct sysfs_dir *dir) {
     materialise_dir(c);
 }
 
+/* Forget the nodes of a tree that is not the live one any more. */
+static void forget_nodes(struct sysfs_dir *dir) {
+  dir->node = 0;
+  dir->adopted = 0;
+  for (struct sysfs_attr *a = dir->attrs; a; a = a->next)
+    a->node = 0;
+  for (struct sysfs_link *l = dir->links; l; l = l->next)
+    l->node = 0;
+  for (struct sysfs_dir *c = dir->children; c; c = c->sibling)
+    forget_nodes(c);
+}
+
 void sysfs_reg_attach_root(struct vfs_node *sys_root) {
   if (!sys_root)
     return;
+  /* Every mount of sysfs builds its own tree, and the registry follows the
+   * newest: the distribution's init mounts /sys again over what the kernel
+   * mounted first, and until now every registered directory -- /sys/bus/pci,
+   * the kprobe PMU -- stayed in the first tree, pointing at nodes the new one
+   * does not have, so the new one was built without them. The earlier tree
+   * keeps what it was given. */
+  if (g_root.node && g_root.node != sys_root)
+    for (struct sysfs_dir *c = g_root.children; c; c = c->sibling)
+      forget_nodes(c);
   g_root.node = sys_root;
   for (struct sysfs_dir *c = g_root.children; c; c = c->sibling)
     materialise_dir(c);

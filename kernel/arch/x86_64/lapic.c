@@ -735,6 +735,7 @@ void ap_main(u32 cpu_id) {
             pcpu->sched_return_ctx = &idle_ctx;
             /* OLD here is the AP idle context (stack-local cpu_context, no
              * task struct, never reaped) — pass NULL to skip the publish. */
+            sched_note_cpu(t, (int)pcpu->cpu_id);
             arch_context_switch(&idle_ctx, &t->context, (volatile int *)0);
             pcpu->cur_task = NULL;
             sched_ap_reap_worker(t);

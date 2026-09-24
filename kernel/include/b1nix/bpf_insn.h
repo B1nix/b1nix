@@ -63,6 +63,12 @@
 
 #define BPF_IMM 0x00
 #define BPF_MEM 0x60
+#define BPF_ATOMIC 0xc0
+
+/* BPF_STX | BPF_ATOMIC: the operation is in imm. */
+#define BPF_FETCH 0x01
+#define BPF_XCHG (0xe0 | BPF_FETCH)
+#define BPF_CMPXCHG (0xf0 | BPF_FETCH)
 
 #define INSN_DST(i) ((i)->dst_src & 0x0f)
 #define INSN_SRC(i) (((i)->dst_src >> 4) & 0x0f)
