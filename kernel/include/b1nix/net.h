@@ -34,6 +34,8 @@ void net_busy_poll(void);
  * drains it in a clean context. is_v6 picks ipv4_receive vs ipv6_receive. */
 void net_loopback_enqueue(const void *ip_pkt, usize len, int is_v6);
 void net_loopback_drain(void);
+/* Drain and wait until everything queued before the call is delivered. */
+void net_loopback_deliver_now(void);
 /* Hold loopback delivery: packets queue but nobody drains them until the
  * release, which drains. For self-tests that must see a sender's state before
  * the peer answers. */
@@ -265,11 +267,14 @@ int tcp_is_readable(struct tcp_conn *conn);
 usize tcp_bytes_available(struct tcp_conn *conn);
 int tcp_is_close_wait(struct tcp_conn *conn);
 int tcp_is_fin_wait(struct tcp_conn *conn);
+u32 tcp_send_room(struct tcp_conn *conn);
 int tcp_is_closed(struct tcp_conn *conn);
 int tcp_send(struct tcp_conn *conn, const void *data, usize len);
 /* SO_RCVBUF for an established connection: caps the receive buffer and the
  * window advertised from it, and stops the buffer auto-tuning past that. */
 void tcp_set_rcvbuf(struct tcp_conn *conn, u32 bytes);
+/* SO_SNDBUF: the send budget of a loopback connection. */
+void tcp_set_sndbuf(struct tcp_conn *conn, u32 bytes);
 /* Keepalive. `which` selects the parameter: 0 = idle, 1 = interval, 2 = count,
  * matching TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT. Seconds, as
  * setsockopt(2) takes them. */

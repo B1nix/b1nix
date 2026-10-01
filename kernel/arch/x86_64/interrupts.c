@@ -517,6 +517,18 @@ int irq_register_handler(u32 irq, irq_handler_fn fn, void *ctx) {
  * never sees a handler with a stale context. */
 static struct irq_action g_msi_actions[MSI_VECTOR_COUNT];
 
+#define IRQ_VECTOR_COUNTS 256
+static u64 g_vec_counts[IRQ_VECTOR_COUNTS];
+
+/* /proc/interrupts rows: indexed by vector on this port. */
+u64 arch_irq_count(u32 irq) {
+  return irq < IRQ_VECTOR_COUNTS
+             ? __atomic_load_n(&g_vec_counts[irq], __ATOMIC_RELAXED)
+             : 0;
+}
+
+u32 arch_irq_lines(void) { return IRQ_VECTOR_COUNTS; }
+
 int msi_alloc_vector(irq_handler_fn fn, void *ctx) {
   if (fn == 0)
     return -1;
@@ -825,6 +837,12 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
     scheduler_on_timer_tick();
     return;
   }
+
+  /* Per vector, for /proc/interrupts: the device lines and the message
+   * vectors, which is where a driver that lost its MSI-X after a sleep shows
+   * up as a count that stopped moving. */
+  if (frame->vector < IRQ_VECTOR_COUNTS)
+    __atomic_fetch_add(&g_vec_counts[frame->vector], 1, __ATOMIC_RELAXED);
 
   if (frame->vector == 33) {
     ps2_kbd_interrupt_handler();

@@ -91,6 +91,8 @@ static int ps2_mouse_command(u8 command)
 }
 
 
+static int mouse_program(void);
+
 void ps2_mouse_init(void)
 {
     const struct boot_info *bi = bootinfo_get();
@@ -111,6 +113,39 @@ void ps2_mouse_init(void)
      * mouse's ACK into ps2_mouse_handle_byte, which drops it — leaving our
      * poll to time out as a spurious "enable failed". (This is exactly what
      * regressed once the tick-poll keyboard fallback was added.) */
+    if (!mouse_program()) {
+        console_write("ps2_mouse: enable failed\n");
+        return;
+    }
+
+    /* Unmask only. ioapic_init already routed IRQ12 as the ISA line it is --
+     * edge-triggered, active high -- and x86_pic_unmask reprograms an IOAPIC
+     * entry with PCI semantics (level, active low), which left the mouse
+     * silent on every IOAPIC machine. */
+    if (ioapic_active())
+        ioapic_unmask_irq(12);
+    else
+        x86_pic_unmask(12);
+    mouse_ready = 1;
+    console_write("ps2_mouse: initialized on irq12\n");
+}
+
+/* After an S3 the mouse comes back reset, with data reporting off. */
+void ps2_mouse_resume(void)
+{
+    if (!mouse_ready)
+        return;
+    packet_index = 0;
+    if (mouse_program())
+        console_write("ps2: mouse back after the resume: reporting enabled\n");
+    else
+        console_write("ps2: mouse did not come back after the resume\n");
+}
+
+/* The controller's auxiliary port and the mouse: reset, defaults, reporting
+ * on. Non-zero when the device answered any of it. */
+static int mouse_program(void)
+{
     int irqs_were_on = interrupts_enabled();
     interrupts_disable();
 
@@ -147,21 +182,7 @@ void ps2_mouse_init(void)
      * treat the device as usable if reset OR either enable step succeeded.
      * The packet-sync check in ps2_mouse_handle_byte filters any noise on a
      * machine that genuinely has no mouse. */
-    if (!present && !defaults && !enabled) {
-        console_write("ps2_mouse: enable failed\n");
-        return;
-    }
-
-    /* Unmask only. ioapic_init already routed IRQ12 as the ISA line it is --
-     * edge-triggered, active high -- and x86_pic_unmask reprograms an IOAPIC
-     * entry with PCI semantics (level, active low), which left the mouse
-     * silent on every IOAPIC machine. */
-    if (ioapic_active())
-        ioapic_unmask_irq(12);
-    else
-        x86_pic_unmask(12);
-    mouse_ready = 1;
-    console_write("ps2_mouse: initialized on irq12\n");
+    return present || defaults || enabled;
 }
 
 extern void ps2_kbd_handle_byte(u8 scancode);

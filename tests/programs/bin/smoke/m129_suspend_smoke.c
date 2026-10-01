@@ -41,7 +41,9 @@
  *   M129-SUSPEND: done
  */
 #include <b1nix/drm.h>
+#include <dirent.h>
 #include <errno.h>
+#include <poll.h>
 #include <math.h>
 #include <stdint.h>
 #include <fcntl.h>
@@ -249,6 +251,78 @@ static int machine_alive(void) {
     return 0;
 
   return getpid() > 0;
+}
+
+/* The message-interrupt enable bits of every PCI function, from its config
+ * space: "<slot>:msi<0|1>/msix<0|1>" per function that has either capability.
+ * A sleep that resets the devices must hand them back as they were. */
+static void msi_state(char *out, int cap) {
+  DIR *d = opendir("/sys/bus/pci/devices");
+  struct dirent *de;
+  int len = 0;
+
+  out[0] = 0;
+  if (!d)
+    return;
+  while ((de = readdir(d))) {
+    unsigned char cfg[256];
+    char path[128];
+    int fd, n, msi = -1, msix = -1;
+
+    if (de->d_name[0] == '.')
+      continue;
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/config", de->d_name);
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+      continue;
+    n = (int)read(fd, cfg, sizeof(cfg));
+    close(fd);
+    if (n < 64 || !(cfg[6] & 0x10))
+      continue; /* no capability list */
+    for (int p = cfg[0x34] & 0xfc, hops = 0; p && p < n - 3 && hops < 48;
+         p = cfg[p + 1] & 0xfc, hops++) {
+      if (cfg[p] == 0x05)
+        msi = cfg[p + 2] & 1;
+      if (cfg[p] == 0x11)
+        msix = (cfg[p + 3] >> 7) & 1;
+    }
+    if (msi < 0 && msix < 0)
+      continue;
+    len += snprintf(out + len, cap > len ? (size_t)(cap - len) : 0,
+                    "%s%s:msi%d/msix%d", len ? " " : "", de->d_name + 8,
+                    msi < 0 ? 0 : msi, msix < 0 ? 0 : msix);
+  }
+  closedir(d);
+}
+
+/* Half a second of a sine at `hz` into one card. A machine without that card
+ * is not a failure here; a card that refuses the write is. */
+static int play_tone(const char *dev, int hz) {
+  static short tone[48000]; /* half a second, stereo, 48 kHz */
+  const int frames = 12000;
+  ssize_t wr;
+  int fd;
+
+  for (int i = 0; i < frames; i++) {
+    double t = (double)i / 48000.0;
+    short v = (short)(12000.0 * sin(2.0 * 3.14159265358979 * hz * t));
+
+    tone[i * 2] = v;
+    tone[i * 2 + 1] = v;
+  }
+  fd = open(dev, O_WRONLY);
+  if (fd < 0) {
+    printf("M129-SUSPEND: no audio device %s after the resume\n", dev);
+    fflush(stdout);
+    return 0;
+  }
+  wr = write(fd, (const char *)tone, (size_t)frames * 2 * sizeof(short));
+  printf("M129-SUSPEND: audio %dHz on %s wrote %ld bytes\n", hz, dev, (long)wr);
+  fflush(stdout);
+  /* Let the DMA run before the next card or the rest of the test. */
+  usleep(600000);
+  close(fd);
+  return wr > 0 ? 0 : -1;
 }
 
 int main(void) {
@@ -465,8 +539,9 @@ int main(void) {
     char states[64] = "";
     char proc[512] = "";
 
-    read_file("/sys/power/state", states, sizeof(states));
-    if (!strstr(states, "mem")) {
+    /* `mem` is always offered; mem_sleep says whether it is S3 ("deep"). */
+    read_file("/sys/power/mem_sleep", states, sizeof(states));
+    if (!strstr(states, "deep")) {
       read_file("/proc/b1nix-suspend", proc, sizeof(proc));
       {
         char *why = strstr(proc, "s3_absent ");
@@ -478,6 +553,7 @@ int main(void) {
       fflush(stdout);
     } else {
       long count_before_s3 = -1, count_after_s3 = -1, last_ms = -1;
+      char msi_before[512], msi_after[512];
       unsigned long long s3_elapsed;
       char *p;
 
@@ -509,9 +585,11 @@ int main(void) {
       if (rc != 0) {
         bad("s3-slept", "the alarm could not be armed for the S3 test", errno);
       } else {
+        msi_state(msi_before, sizeof(msi_before));
         t0 = now_ns();
         rc = write_state("mem");
         t1 = now_ns();
+        msi_state(msi_after, sizeof(msi_after));
         s3_elapsed = (t1 - t0) / 1000000ull;
         read_file("/proc/b1nix-suspend", proc, sizeof(proc));
         p = strstr(proc, "s3_count ");
@@ -535,6 +613,60 @@ int main(void) {
          * what the kernel saved, so a file round trip, a fork and a syscall all
          * have to work. */
         judge("s3-alive", machine_alive(), "post-S3", 0);
+
+        /* The message interrupts: every function that had MSI or MSI-X
+         * enabled before the sleep has it enabled after, as the config space
+         * itself says. */
+        printf("M129-SUSPEND: msi before %s\n", msi_before);
+        printf("M129-SUSPEND: msi after  %s\n", msi_after);
+        fflush(stdout);
+        /* The virtio console and the tablet, which the sleep reset: text
+         * written to /dev/hvc0 must still reach the host (the lane reads its
+         * file), and the tablet must still report what the host sends it. */
+        {
+          int fd = open("/dev/hvc0", O_WRONLY | O_NOCTTY);
+
+          if (fd >= 0) {
+            (void)!write(fd, "HVC-AFTER-S3: ok\n", 17);
+            close(fd);
+          }
+        }
+        {
+          /* Both virtio-input devices -- the host's absolute pointer is
+           * whichever of the two QEMU made active. */
+          struct pollfd p[2] = {
+              {open("/dev/input/event1", O_RDONLY | O_NONBLOCK), POLLIN, 0},
+              {open("/dev/input/event2", O_RDONLY | O_NONBLOCK), POLLIN, 0}};
+          int abs_seen = 0;
+
+          printf("M129-SUSPEND: move the tablet\n");
+          fflush(stdout);
+          for (int tries = 0; tries < 100 && !abs_seen; tries++) {
+            struct {
+              long long sec, usec;
+              unsigned short type, code;
+              int value;
+            } ev;
+
+            if (poll(p, 2, 100) <= 0)
+              continue;
+            for (int k = 0; k < 2; k++)
+              while (p[k].fd >= 0 &&
+                     read(p[k].fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev))
+                if (ev.type == 3 /* EV_ABS */)
+                  abs_seen = 1;
+          }
+          for (int k = 0; k < 2; k++)
+            if (p[k].fd >= 0)
+              close(p[k].fd);
+          judge("s3-tablet", abs_seen,
+                "the tablet reported nothing after the sleep: its virtqueue "
+                "was not rebuilt", 0);
+        }
+        judge("s3-msi-restored",
+              msi_before[0] && strcmp(msi_before, msi_after) == 0 &&
+                  strstr(msi_before, "msix1"),
+              "a function came back from the sleep with its MSI or MSI-X off", 0);
 
         /* And the DEVICES, which is the half of a suspend that is easy to
          * get wrong quietly: the machine can be perfectly alive with a disk
@@ -644,39 +776,23 @@ int main(void) {
             }
           }
           if (good) {
-            /* A tone, not silence, and at 880 Hz — a frequency nothing else in
-             * this lane plays (the audio test's own tone is 440). The lane's
-             * capture file is checked for it afterwards, so this proves the
-             * samples reached the emulated card AFTER the sleep rather than
-             * that a write returned a byte count. */
-            static short tone[48000];   /* half a second, stereo, 48 kHz */
-            const int frames = 12000;
+            /* A tone per card, not silence, each at a frequency nothing else
+             * in this lane plays (the audio test's own tone is 440): AC97
+             * 880 Hz, HDA 660 Hz, one after the other so the capture holds
+             * each alone. The lane's capture file is checked for both
+             * afterwards, so this proves the samples reached each emulated
+             * card AFTER the sleep rather than that a write returned a byte
+             * count. */
+            static const struct {
+              const char *dev;
+              int hz;
+            } cards[] = {{"/dev/dsp1", 880}, {"/dev/dsp", 660}};
 
-            for (int i = 0; i < frames; i++) {
-              double t = (double)i / 48000.0;
-              short v = (short)(12000.0 * sin(2.0 * 3.14159265358979 * 880.0 * t));
-
-              tone[i * 2] = v;
-              tone[i * 2 + 1] = v;
-            }
-            fd = open("/dev/dsp1", O_WRONLY);
-            if (fd < 0) {
-              /* A machine with no audio device is not a failure here. */
-              printf("M129-SUSPEND: no audio device after the resume\n");
-              fflush(stdout);
-            } else {
-              ssize_t wr = write(fd, (const char *)tone,
-                                 (size_t)frames * 2 * sizeof(short));
-
-              printf("M129-SUSPEND: audio 880Hz wrote %ld bytes\n", (long)wr);
-              fflush(stdout);
-              if (wr <= 0) {
+            for (unsigned c = 0; good && c < sizeof(cards) / sizeof(cards[0]); c++) {
+              if (play_tone(cards[c].dev, cards[c].hz) < 0) {
                 good = 0;
                 step = 9;
               }
-              /* Let the DMA run before the machine goes on to other things. */
-              usleep(600000);
-              close(fd);
             }
           }
           judge("s3-devices", good, "step", (long)step);

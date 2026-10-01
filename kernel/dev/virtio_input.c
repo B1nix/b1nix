@@ -27,6 +27,7 @@
 #include <b1nix/input.h>
 #include <b1nix/mm.h>
 #include <b1nix/pci.h>
+#include <b1nix/suspend.h>
 #include <b1nix/virtio.h>
 #include <string.h>
 
@@ -278,8 +279,66 @@ static int vi_find_nth(int index, struct pci_device_info *info)
     return 0;
 }
 
+/* After a sleep that reset the device (M135): the header is back already, so
+ * the handshake again and the event queue handed back -- the same ring and
+ * buffers, indices from zero, every buffer posted. */
+static int vi_resume(void *ctx)
+{
+    (void)ctx;
+    for (int i = 0; i < vi_ndevs; i++) {
+        struct vi_dev *d = &vi_devs[i];
+        u16 qsize = d->eventq.queue_size;
+        u64 desc_phys, avail_phys, used_phys;
+
+        if (!d->ready || !d->common_cfg)
+            continue;
+        d->ready = 0; /* the timer-tick poll keeps off it meanwhile */
+        d->common_cfg->device_status = 0;
+        d->common_cfg->device_status = VIRTIO_STATUS_ACKNOWLEDGE;
+        d->common_cfg->device_status |= VIRTIO_STATUS_DRIVER;
+        d->common_cfg->driver_feature_select = 0;
+        d->common_cfg->driver_feature = 0;
+        d->common_cfg->driver_feature_select = 1;
+        d->common_cfg->driver_feature = 0;
+        d->common_cfg->device_status |= VIRTIO_STATUS_FEATURES_OK;
+        if (!(d->common_cfg->device_status & VIRTIO_STATUS_FEATURES_OK))
+            continue;
+        d->common_cfg->queue_select = 0;
+        d->common_cfg->queue_size = qsize;
+        d->eventq.last_used_idx = 0;
+        d->eventq.used->idx = 0;
+        for (u16 k = 0; k < qsize; k++)
+            d->eventq.avail->ring[k] = k;
+        d->avail_idx = qsize;
+        d->eventq.avail->idx = d->avail_idx;
+        desc_phys = (u64)(usize)d->eventq.desc - vmm_direct_map_base();
+        avail_phys = (u64)(usize)d->eventq.avail - vmm_direct_map_base();
+        used_phys = (u64)(usize)d->eventq.used - vmm_direct_map_base();
+        d->common_cfg->queue_desc_lo = (u32)desc_phys;
+        d->common_cfg->queue_desc_hi = (u32)(desc_phys >> 32);
+        d->common_cfg->queue_avail_lo = (u32)avail_phys;
+        d->common_cfg->queue_avail_hi = (u32)(avail_phys >> 32);
+        d->common_cfg->queue_used_lo = (u32)used_phys;
+        d->common_cfg->queue_used_hi = (u32)(used_phys >> 32);
+        d->common_cfg->queue_enable = 1;
+        d->eventq_notify =
+            (volatile u16 *)(d->notify_base +
+                             (u32)d->common_cfg->queue_notify_off *
+                                 d->notify_off_multiplier);
+        d->common_cfg->device_status |= VIRTIO_STATUS_DRIVER_OK;
+        d->ready = 1;
+    }
+    return 0;
+}
+
 void virtio_input_init(void)
 {
+    static int resume_registered;
+
+    if (!resume_registered) {
+        suspend_register_device("virtio-input", vi_resume, 0);
+        resume_registered = 1;
+    }
     vi_ndevs = 0;
     memset(vi_devs, 0, sizeof(vi_devs));
 

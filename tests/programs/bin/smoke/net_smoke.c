@@ -960,7 +960,17 @@ static void test_tcp_waitall_zerocopy(void) {
     memset(&mh, 0, sizeof(mh));
     mh.msg_iov = &iv;
     mh.msg_iovlen = 1;
+    struct timespec t0, t1;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     bgot = recvmsg(acc, &mh, MSG_WAITALL);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    {
+      long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+
+      printf("TCP-SMOKE:   loopback: %zd bytes in %ld ms\n", bgot, ms);
+      fflush(stdout);
+    }
     big_ok = bgot == (ssize_t)BIG_MSG;
     for (unsigned i = 0; big_ok && i < BIG_MSG; i++)
       if (big[i] != (char)(i * 7u))

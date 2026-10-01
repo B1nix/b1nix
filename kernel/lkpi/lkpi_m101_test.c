@@ -28,13 +28,18 @@
 #include <b1nix/tlb.h>
 #include <lkpi/lkpi.h>
 
+#include <stdio.h>
+
 static void m101_report(const char *name, int ok, u64 detail)
 {
-	console_write(ok ? "M101-SMOKE: ok " : "M101-SMOKE: FAIL ");
-	console_write(name);
-	console_write(" detail=");
-	console_write_dec(detail);
-	console_write("\n");
+	char line[128];
+
+	/* One write: in pieces, a line another CPU printed meanwhile landed in
+	 * the middle of this one ("M101-SMOKE: ok <6>") and the marker the
+	 * harness looks for was never printed whole. */
+	snprintf(line, sizeof(line), "M101-SMOKE: %s %s detail=%llu\n",
+	         ok ? "ok" : "FAIL", name, (unsigned long long)detail);
+	console_write(line);
 }
 
 /* ── kref ───────────────────────────────────────────────────────── */

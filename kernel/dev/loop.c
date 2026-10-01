@@ -123,7 +123,14 @@ static int loop_flush(struct block_device *dev) {
         return 0;
     if (loop->readonly)
         return 0;
-    return vfs_node_fsync(loop->backing_node);
+    /* As for the reads and writes: the caller may be a filesystem mid-handle
+     * (ext4's lazy inode-table init flushes with its journal handle open), and
+     * the backing file's filesystem must not take that handle for its own.
+     * Linux never sees it because its loop I/O runs on the loop's own thread. */
+    void *fs_ctx = lkpi_fs_context_leave();
+    int ret = vfs_node_fsync(loop->backing_node);
+    lkpi_fs_context_restore(fs_ctx);
+    return ret;
 }
 
 /* Linux's two loop status structures, byte-for-byte. losetup reads the 64-bit

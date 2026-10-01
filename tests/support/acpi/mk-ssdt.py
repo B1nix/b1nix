@@ -107,6 +107,22 @@ def package(elements) -> bytes:
     return b"\x12" + pkg_length(len(body)) + body
 
 
+def if_(predicate: bytes, body: bytes) -> bytes:
+    inner = predicate + body
+    return b"\xA0" + pkg_length(len(inner)) + inner
+
+
+def lequal(a: bytes, b: bytes) -> bytes:
+    return b"\x93" + a + b
+
+
+def bmd_pkg(status: int) -> bytes:
+    """_BMD: status, capabilities (charging can be disabled, discharge on
+    AC), recalibrate count, quick and slow recalibrate times."""
+    return package([integer(status), integer(0x6), integer(0), integer(0),
+                    integer(0)])
+
+
 def name(path: str, value: bytes) -> bytes:
     return b"\x08" + name_string(path) + value
 
@@ -119,6 +135,25 @@ def scope(path: str, body: bytes) -> bytes:
 def device(path: str, body: bytes) -> bytes:
     inner = name_string(path) + body
     return b"\x5b\x82" + pkg_length(len(inner)) + inner
+
+
+def method(path: str, nargs: int, body: bytes) -> bytes:
+    inner = name_string(path) + bytes([nargs & 7]) + body
+    return b"\x14" + pkg_length(len(inner)) + inner
+
+
+def return_(value: bytes) -> bytes:
+    return b"\xa4" + value
+
+
+def store(src: bytes, dst: str) -> bytes:
+    return b"\x70" + src + name_string(dst)
+
+
+def power_resource(path: str, body: bytes) -> bytes:
+    # System level 0, resource order 0.
+    inner = name_string(path) + b"\x00" + b"\x00\x00" + body
+    return b"\x5b\x84" + pkg_length(len(inner)) + inner
 
 
 def thermal_zone(path: str, body: bytes) -> bytes:
@@ -152,6 +187,22 @@ P_STATES = [
      (600,  8000, 10, 10, 0x0600, 0x0600),
 ]
 
+# _PPC: the fastest state the platform allows now -- index 1, so the ceiling
+# the kernel honours is below what the processor can do, and a kernel that
+# ignored it would be caught running the first state.
+PPC = 1
+
+# _CST: C1 by HLT, and two deeper states entered by reading an I/O port --
+# ports nothing on the machine claims, so the read is harmless and the halt
+# the kernel follows it with is what idles the guest. Type, latency us, power
+# mW, and the register (None for C1's FFH halt).
+SPACE_FFH = 0x7F
+C_STATES = [
+    (1, 1, 1000, None),
+    (2, 20, 500, 0x0820),
+    (3, 100, 100, 0x0821),
+]
+
 BAT_DESIGN_CAPACITY = 5200        # mWh
 BAT_LAST_FULL = 5000              # mWh
 BAT_WARN = 500
@@ -159,7 +210,18 @@ BAT_LOW = 200
 BAT_REMAINING = 4200              # mWh, what _BST reports
 BAT_RATE = 1100                   # mW
 BAT_VOLTAGE = 11100               # mV
+BAT_CYCLES = 42                   # _BIX's cycle count
 TZ_TEMP_DK = 3182                 # tenths of a kelvin: 45.05 degrees C
+# The zone's trips, in tenths of a kelvin, in the order Linux lists them:
+# critical, hot, passive, then the active trips hottest first. _AC0 turns on
+# both fans, _AC1 only the first.
+TZ_CRT_DK = 3732
+TZ_HOT_DK = 3682
+TZ_PSV_DK = 3432
+TZ_AC_DK = [3532, 3382]
+TZ_AL = [["FAN0", "FAN1"], ["FAN0"]]
+TZ_TSP = 5                        # tenths of a second between passive steps
+FANS = ["FAN0", "FAN1"]
 
 
 def body() -> bytes:
@@ -174,7 +236,17 @@ def body() -> bytes:
                      package([integer(f), integer(p), integer(l), integer(b),
                               integer(c), integer(st)])
                      for (f, p, l, b, c, st) in P_STATES
-                 ])))
+                 ])) +
+                 name("_PPC", integer(PPC)) +
+                 name("_CST", package(
+                     [integer(len(C_STATES))] +
+                     [package([
+                         # FFH, vendor 1 (Intel), class 1: C1 by HLT.
+                         generic_register(SPACE_FFH, 1, 1, 0, 0)
+                         if port is None else
+                         generic_register(SPACE_SYSTEM_IO, 8, 0, 1, port),
+                         integer(t), integer(lat), integer(pw)])
+                      for (t, lat, pw, port) in C_STATES])))
 
     bat = device("BAT0",
                  name("_HID", integer(eisa_id("PNP0C0A"))) +
@@ -199,6 +271,46 @@ def body() -> bytes:
                      string("LION"),
                      string("b1nix"),
                  ])) +
+                 # _BIX (ACPI 4.0, revision 1): the same numbers after a
+                 # revision field, plus the cycle count, measurement accuracy,
+                 # sampling and averaging times, and the swapping capability.
+                 name("_BIX", package([
+                     integer(1),
+                     integer(0),
+                     integer(BAT_DESIGN_CAPACITY),
+                     integer(BAT_LAST_FULL),
+                     integer(1),
+                     integer(BAT_VOLTAGE),
+                     integer(BAT_WARN),
+                     integer(BAT_LOW),
+                     integer(BAT_CYCLES),
+                     integer(95000),
+                     integer(0xFFFFFFFF),
+                     integer(0xFFFFFFFF),
+                     integer(1000),
+                     integer(500),
+                     integer(10),
+                     integer(10),
+                     string("B1NIX-FIXTURE"),
+                     string("0001"),
+                     string("LION"),
+                     string("b1nix"),
+                     integer(0),
+                 ])) +
+                 # _BTP: the trip the firmware notifies at, kept where the
+                 # rest of the battery's AML could read it.
+                 name("BTPV", integer(0)) +
+                 method("_BTP", 1, store(b"\x68", "BTPV")) +
+                 # _BMC keeps what it was asked; _BMD reports it back as the
+                 # status (element 0) next to what the battery can do
+                 # (element 1: charging can be disabled, and it can be
+                 # discharged on AC).
+                 name("BMCV", integer(0)) +
+                 method("_BMC", 1, store(b"\x68", "BMCV")) +
+                 method("_BMD", 0,
+                        b"".join(if_(lequal(name_string("BMCV"), integer(v)),
+                                     return_(bmd_pkg(v))) for v in (2, 4)) +
+                        return_(bmd_pkg(0))) +
                  # _BST: state (1 = discharging), present rate, remaining
                  # capacity, present voltage.
                  name("_BST", package([
@@ -213,14 +325,39 @@ def body() -> bytes:
                  name("_UID", integer(0)) +
                  name("_PSR", integer(1)))
 
+    # A fan is switched by the power resource in its _PR0; the resource's
+    # _STA reads back what its _ON and _OFF stored.
+    fans = b""
+    for i, fan in enumerate(FANS):
+        pr = "PFN%d" % i
+        st = "FST%d" % i
+        fans += power_resource(pr,
+                               name(st, integer(0)) +
+                               method("_STA", 0, return_(name_string(st))) +
+                               method("_ON_", 0, store(integer(1), st)) +
+                               method("_OFF", 0, store(integer(0), st)))
+        fans += device(fan,
+                       name("_HID", integer(eisa_id("PNP0C0B"))) +
+                       name("_UID", integer(i)) +
+                       name("_PR0", package([name_string("\\_SB_." + pr)])))
+
+    trips = (name("_CRT", integer(TZ_CRT_DK)) +
+             name("_HOT", integer(TZ_HOT_DK)) +
+             name("_PSV", integer(TZ_PSV_DK)) +
+             name("_PSL", package([name_string("\\_SB_.BFRQ")])))
+    for i, (ac, al) in enumerate(zip(TZ_AC_DK, TZ_AL)):
+        trips += name("_AC%d" % i, integer(ac))
+        trips += name("_AL%d" % i,
+                      package([name_string("\\_SB_." + f) for f in al]))
+
     tz = thermal_zone("TZ1",
                       name("_TMP", integer(TZ_TEMP_DK)) +
-                      name("_CRT", integer(3732)) +
+                      trips +
                       name("_TC1", integer(2)) +
                       name("_TC2", integer(5)) +
-                      name("_TSP", integer(100)))
+                      name("_TSP", integer(TZ_TSP)))
 
-    return scope("\\_SB_", cpu + bat + adp + tz)
+    return scope("\\_SB_", cpu + bat + adp + fans + tz)
 
 
 def table(aml: bytes) -> bytes:
@@ -253,6 +390,10 @@ def declarations() -> str:
         'ACPI_FIXTURE_PSS_KHZ="%s"\n' % khz +
         'ACPI_FIXTURE_PSS_CONTROL="%s"\n' % ctrl +
         "ACPI_FIXTURE_PSS_COUNT=%d\n" % len(P_STATES) +
+        "ACPI_FIXTURE_PPC=%d\n" % PPC +
+        'ACPI_FIXTURE_CST="%s"\n' % " ".join(
+            "C%d:%d" % (t, lat) for (t, lat, _pw, _port) in C_STATES) +
+        "ACPI_FIXTURE_PPC_KHZ=%d\n" % (P_STATES[PPC][0] * 1000) +
         "ACPI_FIXTURE_PCT_PORT=0x%x\n" % PCT_PORT +
         "ACPI_FIXTURE_BAT_DESIGN_MWH=%d\n" % BAT_DESIGN_CAPACITY +
         "ACPI_FIXTURE_BAT_FULL_MWH=%d\n" % BAT_LAST_FULL +
@@ -261,10 +402,19 @@ def declarations() -> str:
         "ACPI_FIXTURE_BAT_FULL_UWH=%d\n" % (BAT_LAST_FULL * 1000) +
         "ACPI_FIXTURE_BAT_VOLTAGE_UV=%d\n" % (BAT_VOLTAGE * 1000) +
         "ACPI_FIXTURE_BAT_RATE_MW=%d\n" % BAT_RATE +
+        'ACPI_FIXTURE_BAT_INFO="cycles %d design %d vmin %d tech Li-ion '
+        'model B1NIX-FIXTURE serial 0001 maker b1nix"\n'
+        % (BAT_CYCLES, BAT_DESIGN_CAPACITY * 1000, BAT_VOLTAGE * 1000) +
         "ACPI_FIXTURE_BAT_VOLTAGE_MV=%d\n" % BAT_VOLTAGE +
         "ACPI_FIXTURE_BAT_CAPACITY_PCT=%d\n"
         % ((BAT_REMAINING * 100) // BAT_LAST_FULL) +
         "ACPI_FIXTURE_TZ_TEMP_DK=%d\n" % TZ_TEMP_DK +
+        'ACPI_FIXTURE_TZ_TRIPS="%s"\n' % " ".join(
+            "%s:%d" % (kind, dk * 100 - 273150) for (kind, dk) in
+            [("critical", TZ_CRT_DK), ("hot", TZ_HOT_DK),
+             ("passive", TZ_PSV_DK)] + [("active", a) for a in TZ_AC_DK]) +
+        'ACPI_FIXTURE_TZ_CDEVS="Processor %s"\n' % " ".join(
+            "Fan" for _ in FANS) +
         # Tenths of a kelvin to millidegrees Celsius: absolute zero is
         # -273.15 degrees, so the offset is 2731.5 tenths, not 2732.
         "ACPI_FIXTURE_TZ_TEMP_MC=%d\n" % (TZ_TEMP_DK * 100 - 273150)

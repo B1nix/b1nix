@@ -93,7 +93,7 @@ void aml_walk(aml_walk_fn fn, void *ctx);
 /* The result of an evaluation, flattened so a caller needs no allocator and
  * no knowledge of the interpreter's own object layout. */
 #define AML_RESULT_BYTES    256
-#define AML_RESULT_ELEMS    8
+#define AML_RESULT_ELEMS    24  /* _BIX has 21 */
 
 struct aml_result {
     int  type;                          /* AML_T_* of the returned object */
@@ -118,6 +118,11 @@ int aml_evaluate(const char *path, const u64 *args, int nargs,
  * AML_EARG when the object is not a package or has no such element. */
 int aml_evaluate_element(const char *path, const u64 *args, int nargs,
                          u32 index, struct aml_result *out);
+
+/* One element of one inner package: `_CST`'s states each carry their register
+ * as a buffer, which the flattened inner package cannot hold. */
+int aml_evaluate_subelement(const char *path, const u64 *args, int nargs,
+                            u32 index, u32 sub, struct aml_result *out);
 
 /* True when the namespace has an object at that path. */
 int aml_exists(const char *path);

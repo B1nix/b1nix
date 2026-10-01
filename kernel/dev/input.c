@@ -52,7 +52,12 @@ static struct input_device devs[INPUT_NDEVS] = {
   [INPUT_DEV_KBD] = {.name = "event0"},
   [INPUT_DEV_MOUSE] = {.name = "event1"},
   [INPUT_DEV_TOUCH] = {.name = "event2"},
+  [INPUT_DEV_PWRBTN] = {.name = "event3"},
+  [INPUT_DEV_SLPBTN] = {.name = "event4"},
+  [INPUT_DEV_LID] = {.name = "event5"},
 };
+/* The devices every machine has; the rest wait for input_register_optional. */
+#define INPUT_BASE_DEVS 3
 static spinlock_t input_lock;
 
 /* ── The Linux evdev view of these devices ──────────────────────────────
@@ -87,6 +92,8 @@ static spinlock_t input_lock;
 #define LX_EV_REL 0x02
 #define LX_EV_ABS 0x03
 #define LX_EV_MSC 0x04
+#define LX_EV_SW 0x05
+#define LX_BUS_HOST 0x19
 #define LX_EV_LED 0x11
 #define LX_EV_REP 0x14
 #define LX_REL_WHEEL 0x08
@@ -103,6 +110,9 @@ struct evdev_view {
   u64 abs[EVDEV_BITS(ABS_MAX_BITS)];
   u64 msc[EVDEV_BITS(MSC_MAX_BITS)];
   u64 led[EVDEV_BITS(LED_MAX_BITS)];
+  u64 sw[EVDEV_BITS(SW_MAX_BITS)];
+  u64 sw_state[EVDEV_BITS(SW_MAX_BITS)]; /* EVIOCGSW: switches now on */
+  const char *phys;
   i32 abs_max; /* ABS_X/ABS_Y range, when EV_ABS is offered */
 };
 static struct evdev_view g_view[INPUT_NDEVS];
@@ -134,6 +144,30 @@ static void evdev_view_init(void) {
   view_set(t->key, B1NIX_BTN_LEFT); view_set(t->key, B1NIX_BTN_RIGHT); view_set(t->key, B1NIX_BTN_MIDDLE);
   view_set(t->abs, B1NIX_ABS_X); view_set(t->abs, B1NIX_ABS_Y);
   t->abs_max = 32767;
+
+  /* The ACPI buttons, described as Linux's button driver describes them: on
+   * the host bus, product 1/3/5 for power/sleep/lid, and the phys udev and
+   * logind match ("LNXPWRBN/button/input0" for the fixed power button). */
+  struct evdev_view *pb = &g_view[INPUT_DEV_PWRBTN];
+  pb->name = "Power Button";
+  pb->phys = "LNXPWRBN/button/input0";
+  pb->bustype = LX_BUS_HOST; pb->vendor = 0; pb->product = 1; pb->version = 0;
+  view_set(pb->ev, LX_EV_SYN); view_set(pb->ev, LX_EV_KEY);
+  view_set(pb->key, B1NIX_KEY_POWER);
+
+  struct evdev_view *sb = &g_view[INPUT_DEV_SLPBTN];
+  sb->name = "Sleep Button";
+  sb->phys = "LNXSLPBN/button/input0";
+  sb->bustype = LX_BUS_HOST; sb->vendor = 0; sb->product = 3; sb->version = 0;
+  view_set(sb->ev, LX_EV_SYN); view_set(sb->ev, LX_EV_KEY);
+  view_set(sb->key, B1NIX_KEY_SLEEP);
+
+  struct evdev_view *ld = &g_view[INPUT_DEV_LID];
+  ld->name = "Lid Switch";
+  ld->phys = "PNP0C0D/button/input0";
+  ld->bustype = LX_BUS_HOST; ld->vendor = 0; ld->product = 5; ld->version = 0;
+  view_set(ld->ev, LX_EV_SYN); view_set(ld->ev, LX_EV_SW);
+  view_set(ld->sw, B1NIX_SW_LID);
 }
 
 /* A user program gets the 24-byte Linux record, and only the events the
@@ -151,6 +185,7 @@ static int view_offers(int dev, u16 type, u16 code) {
   case LX_EV_KEY: return code < KEY_MAX_BITS && view_test(v->key, code);
   case LX_EV_REL: return code < REL_MAX_BITS && view_test(v->rel, code);
   case LX_EV_ABS: return code < ABS_MAX_BITS && view_test(v->abs, code);
+  case LX_EV_SW: return code < SW_MAX_BITS && view_test(v->sw, code);
   default: return 1;
   }
 }
@@ -232,6 +267,15 @@ void input_tick(void) {
 void input_event_push(int dev, u16 type, u16 code, i32 value) {
   if (dev < 0 || dev >= INPUT_NDEVS || !devs[dev].registered)
     return;
+  /* A switch has a state as well as events: EVIOCGSW answers from it. */
+  if (type == B1NIX_EV_SW && code < SW_MAX_BITS) {
+    u64 *w = &g_view[dev].sw_state[code / 64];
+    u64 bit = 1ull << (code % 64);
+    if (value)
+      __atomic_fetch_or(w, bit, __ATOMIC_RELAXED);
+    else
+      __atomic_fetch_and(w, ~bit, __ATOMIC_RELAXED);
+  }
 
   __atomic_fetch_add(&input_stat_pushed, 1u, __ATOMIC_RELAXED);
 
@@ -589,6 +633,7 @@ static int input_ioctl_impl(struct vfs_handle *h, u64 request, void *arg) {
     case LX_EV_ABS: bits = v->abs; bytes = sizeof(v->abs); break;
     case LX_EV_MSC: bits = v->msc; bytes = sizeof(v->msc); break;
     case LX_EV_LED: bits = v->led; bytes = sizeof(v->led); break;
+    case LX_EV_SW: bits = v->sw; bytes = sizeof(v->sw); break;
     default: break;
     }
     if (!bits) {
@@ -615,12 +660,22 @@ static int input_ioctl_impl(struct vfs_handle *h, u64 request, void *arg) {
     usize l = strlen(v->name) + 1;
     return evdev_put(arg, v->name, l, len);
   }
-  case 0x07: case 0x08: /* PHYS, UNIQ: none */
+  case 0x07: /* EVIOCGPHYS */
+    if (!v->phys)
+      return -ENOENT;
+    return evdev_put(arg, v->phys, strlen(v->phys) + 1, len);
+  case 0x08: /* EVIOCGUNIQ: none */
     return -ENOENT;
   case 0x09: { static const u64 props[EVDEV_BITS(PROP_MAX_BITS)]; return evdev_put(arg, props, sizeof(props), len); }
   case 0x0a: /* EVIOCGMTSLOTS */
     return -EINVAL;
-  case 0x18: case 0x19: case 0x1a: case 0x1b: { /* current KEY/LED/SND/SW state: nothing held */
+  case 0x1b: { /* EVIOCGSW: the switches that are on */
+    u64 st[EVDEV_BITS(SW_MAX_BITS)];
+    for (usize i = 0; i < EVDEV_BITS(SW_MAX_BITS); i++)
+      st[i] = __atomic_load_n(&v->sw_state[i], __ATOMIC_RELAXED);
+    return evdev_put(arg, st, sizeof(st), len);
+  }
+  case 0x18: case 0x19: case 0x1a: { /* current KEY/LED/SND state: nothing held */
     static const u64 zero[EVDEV_BITS(KEY_MAX_BITS)]; return evdev_put(arg, zero, sizeof(zero), len);
   }
   case 0x90: case 0x91: case 0xa0: case 0x93: /* GRAB, REVOKE, SCLOCKID, SMASK */
@@ -912,7 +967,8 @@ static void input_sysfs_publish(int i) {
     return;
   snprintf(tmp, sizeof(tmp), "%s\n", v->name);
   input_sysfs_text_attr(dev, "name", tmp);
-  input_sysfs_text_attr(dev, "phys", "\n");
+  snprintf(tmp, sizeof(tmp), "%s\n", v->phys ? v->phys : "");
+  input_sysfs_text_attr(dev, "phys", tmp);
   input_sysfs_text_attr(dev, "uniq", "\n");
   input_sysfs_text_attr(dev, "properties", "0\n");
   struct sysfs_dir *id = sysfs_reg_dir(dev, "id");
@@ -922,13 +978,14 @@ static void input_sysfs_publish(int i) {
     snprintf(tmp, sizeof(tmp), "%04x\n", v->product); input_sysfs_text_attr(id, "product", tmp);
     snprintf(tmp, sizeof(tmp), "%04x\n", v->version); input_sysfs_text_attr(id, "version", tmp);
   }
-  char ev[64], key[256], rel[32], abs[64], msc[32], led[32];
+  char ev[64], key[256], rel[32], abs[64], msc[32], led[32], sw[32];
   bits_hex(ev, sizeof(ev), v->ev, EVDEV_BITS(EV_MAX_BITS));
   bits_hex(key, sizeof(key), v->key, EVDEV_BITS(KEY_MAX_BITS));
   bits_hex(rel, sizeof(rel), v->rel, EVDEV_BITS(REL_MAX_BITS));
   bits_hex(abs, sizeof(abs), v->abs, EVDEV_BITS(ABS_MAX_BITS));
   bits_hex(msc, sizeof(msc), v->msc, EVDEV_BITS(MSC_MAX_BITS));
   bits_hex(led, sizeof(led), v->led, EVDEV_BITS(LED_MAX_BITS));
+  bits_hex(sw, sizeof(sw), v->sw, EVDEV_BITS(SW_MAX_BITS));
   struct sysfs_dir *caps = sysfs_reg_dir(dev, "capabilities");
   if (caps) {
     snprintf(tmp, sizeof(tmp), "%s\n", ev);  input_sysfs_text_attr(caps, "ev", tmp);
@@ -937,7 +994,7 @@ static void input_sysfs_publish(int i) {
     snprintf(tmp, sizeof(tmp), "%s\n", abs); input_sysfs_text_attr(caps, "abs", tmp);
     snprintf(tmp, sizeof(tmp), "%s\n", msc); input_sysfs_text_attr(caps, "msc", tmp);
     snprintf(tmp, sizeof(tmp), "%s\n", led); input_sysfs_text_attr(caps, "led", tmp);
-    input_sysfs_text_attr(caps, "sw", "0\n");
+    snprintf(tmp, sizeof(tmp), "%s\n", sw); input_sysfs_text_attr(caps, "sw", tmp);
     input_sysfs_text_attr(caps, "ff", "0\n");
     input_sysfs_text_attr(caps, "snd", "0\n");
   }
@@ -947,8 +1004,9 @@ static void input_sysfs_publish(int i) {
     snprintf(u->devpath, sizeof(u->devpath), "/devices/virtual/input/%s", inputN);
     u->minor = -1;
     snprintf(u->text, sizeof(u->text),
-             "PRODUCT=%x/%x/%x/%x\nNAME=\"%s\"\nPROP=0\nEV=%s\nKEY=%s\nREL=%s\nABS=%s\nMSC=%s\nLED=%s\n",
-             v->bustype, v->vendor, v->product, v->version, v->name, ev, key, rel, abs, msc, led);
+             "PRODUCT=%x/%x/%x/%x\nNAME=\"%s\"\nPHYS=\"%s\"\nPROP=0\nEV=%s\nKEY=%s\nREL=%s\nABS=%s\nMSC=%s\nLED=%s\nSW=%s\n",
+             v->bustype, v->vendor, v->product, v->version, v->name,
+             v->phys ? v->phys : "", ev, key, rel, abs, msc, led, sw);
     if (sysfs_reg_attr(dev, "uevent", 0644, input_sysfs_show, input_sysfs_uevent_store, u, input_sysfs_free) != 0)
       kfree(u);
   }
@@ -985,6 +1043,50 @@ static void input_sysfs_publish(int i) {
   }
 }
 
+/* The /dev node and the sysfs view of one device, which is then live. */
+static int input_dev_node(int i) {
+  char path[32];
+  strcpy(path, "/dev/input/");
+  strcpy(path + 11, devs[i].name);
+  struct vfs_node *node = vfs_add_node(path, VFS_DEVICE, 0, 0, 0);
+  if (IS_ERR(node) || !node) {
+    console_write("input: failed to register /dev/input node\n");
+    return -ENOMEM;
+  }
+  /* Input events are sensitive (keystrokes): root-only access. */
+  node->inode->mode = 0600;
+  /* char 13:64+N, the numbers Linux gives event devices: elogind's
+   * TakeDevice and udev's /run/udev/data/c13:N key both go by them. */
+  node->inode->rdev = ((u64)13 << 8) | (u64)(64 + i);
+  devs[i].registered = 1;
+  vfs_node_put(node);
+  input_sysfs_publish(i);
+  return 0;
+}
+
+int input_register_optional(int dev, int lid_closed) {
+  char devpath[96], devname[24];
+  int rc;
+
+  if (dev < INPUT_BASE_DEVS || dev >= INPUT_NDEVS)
+    return -EINVAL;
+  if (devs[dev].registered)
+    return 0;
+  if (dev == INPUT_DEV_LID && lid_closed)
+    g_view[dev].sw_state[B1NIX_SW_LID / 64] |= 1ull << (B1NIX_SW_LID % 64);
+  rc = input_dev_node(dev);
+  if (rc < 0)
+    return rc;
+  /* Hotplugged, as far as userspace knows: say so, device then node. */
+  snprintf(devpath, sizeof(devpath), "/devices/virtual/input/input%d", dev);
+  uevent_post("add", devpath, "input", 0, 0, -1, -1);
+  snprintf(devpath, sizeof(devpath), "/devices/virtual/input/input%d/event%d",
+           dev, dev);
+  snprintf(devname, sizeof(devname), "input/event%d", dev);
+  uevent_post("add", devpath, "input", 0, devname, 13, 64 + dev);
+  return 0;
+}
+
 void input_init(void) {
   motion_wake_ms = bootinfo_get_u32("b1nix.input-wake-ms", INPUT_MOTION_WAKE_MS);
   input_stats_on = bootinfo_has_flag("b1nix.input-stats");
@@ -998,24 +1100,8 @@ void input_init(void) {
   if (!IS_ERR(dir) && dir)
     vfs_node_put(dir);
 
-  for (int i = 0; i < INPUT_NDEVS; i++) {
-    char path[32];
-    strcpy(path, "/dev/input/");
-    strcpy(path + 11, devs[i].name);
-    struct vfs_node *node = vfs_add_node(path, VFS_DEVICE, 0, 0, 0);
-    if (IS_ERR(node) || !node) {
-      console_write("input: failed to register /dev/input node\n");
-      continue;
-    }
-    /* Input events are sensitive (keystrokes): root-only access. */
-    node->inode->mode = 0600;
-    /* char 13:64+N, the numbers Linux gives event devices: elogind's
-     * TakeDevice and udev's /run/udev/data/c13:N key both go by them. */
-    node->inode->rdev = ((u64)13 << 8) | (u64)(64 + i);
-    devs[i].registered = 1;
-    vfs_node_put(node);
-    input_sysfs_publish(i);
-  }
+  for (int i = 0; i < INPUT_BASE_DEVS; i++)
+    (void)input_dev_node(i);
   console_write("input: /dev/input/event0 (kbd) + event1 (mouse) + event2 "
                 "(touch) ready\n");
 }

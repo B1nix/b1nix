@@ -12,6 +12,8 @@
 #include <b1nix/errno.h>
 #include <b1nix/lapic.h>
 #include <b1nix/cpufreq.h>
+#include <b1nix/hibernate.h>
+#include <b1nix/thermal.h>
 #include <b1nix/acpi_power.h>
 #include <b1nix/cpuidle.h>
 #include <b1nix/suspend.h>
@@ -35,6 +37,9 @@
 #include <string.h>
 
 typedef int (*sysfs_render)(char *buf, usize cap);
+/* The same, for a family of files that differ only by an index: the index
+ * rides in the node, so one function serves every CPU and state. */
+typedef int (*sysfs_render_ctx)(int ctx, char *buf, usize cap);
 
 /* The identity a writable `uevent` file re-announces. Held per node so a write
  * can rebuild the same message the device's own registration sent, rather than
@@ -53,6 +58,8 @@ struct sysfs_uevent {
 
 struct sysfs_node {
   sysfs_render render;
+  sysfs_render_ctx render_ctx;
+  int ctx;
   const char *content; /* if set: emitted verbatim (kmalloc'd, never freed) */
   int live_blk;        /* >=0: emit the live 512-sector count of blk_at(live_blk)
                         * (so e.g. losetup size changes are reflected); else -1 */
@@ -120,10 +127,11 @@ static isize sysfs_read_cb(struct vfs_node *node, u64 offset, char *buffer,
   }
   if (sn->content)
     return sysfs_emit(sn->content, strlen(sn->content), offset, buffer, size);
-  if (!sn->render)
+  if (!sn->render && !sn->render_ctx)
     return 0;
   char tmp[256];
-  int len = sn->render(tmp, sizeof(tmp));
+  int len = sn->render ? sn->render(tmp, sizeof(tmp))
+                       : sn->render_ctx(sn->ctx, tmp, sizeof(tmp));
   if (len < 0)
     return len;
   return sysfs_emit(tmp, (usize)len, offset, buffer, size);
@@ -159,6 +167,33 @@ static struct vfs_node *sysfs_mkchild(struct vfs_node *parent,
   n->refcount++;
   vfs_attach_child(parent, n);
   return n;
+}
+
+/* A file rendered by `fn(ctx, ...)`. */
+static struct vfs_node *sysfs_mkchild_ctx(struct vfs_node *parent,
+                                          const char *name,
+                                          sysfs_render_ctx fn, int ctx) {
+  struct vfs_node *n = sysfs_mkchild(parent, name, VFS_DEVICE, 0);
+  struct sysfs_node *sn;
+
+  if (!n)
+    return 0;
+  sn = kzalloc(sizeof(*sn));
+  if (sn) {
+    sn->render_ctx = fn;
+    sn->ctx = ctx;
+    sn->live_blk = -1;
+  }
+  n->inode->data = sn;
+  n->inode->read_cb = sysfs_read_cb;
+  return n;
+}
+
+static int sysfs_node_ctx(struct vfs_node *node) {
+  struct sysfs_node *sn =
+      node && node->inode ? (struct sysfs_node *)node->inode->data : 0;
+
+  return sn ? sn->ctx : -1;
 }
 
 /* Create a VFS_DEVICE node whose contents are a fixed string (printf-style).
@@ -420,10 +455,11 @@ static void sysfs_mk_uevent_at(struct vfs_node *dir, const char *devpath,
  * without it a device found by a scan has no subsystem, and every
  * SUBSYSTEM=="…" rule — including the one that tags block devices for systemd
  * — silently fails to match. */
-static void sysfs_mk_subsystem_link(struct vfs_node *dir, const char *target) {
-  if (!dir || sysfs_child(dir, "subsystem"))
+static void sysfs_mk_link(struct vfs_node *dir, const char *name,
+                          const char *target) {
+  if (!dir || sysfs_child(dir, name))
     return;
-  struct vfs_node *n = sysfs_mkchild(dir, "subsystem", VFS_SYMLINK, 0);
+  struct vfs_node *n = sysfs_mkchild(dir, name, VFS_SYMLINK, 0);
   if (!n)
     return;
   usize len = strlen(target);
@@ -434,6 +470,10 @@ static void sysfs_mk_subsystem_link(struct vfs_node *dir, const char *target) {
   n->inode->mode = 0777;
   n->inode->data = copy;
   n->inode->size = len;
+}
+
+static void sysfs_mk_subsystem_link(struct vfs_node *dir, const char *target) {
+  sysfs_mk_link(dir, "subsystem", target);
 }
 
 /* The `queue` directory a whole disk carries, and a partition does not.
@@ -1001,6 +1041,139 @@ static int g_cpu_min_freq(char *b, usize c) {
                   (unsigned long)(khz ? khz : arch_cpu_khz()));
 }
 
+/* scaling_{max,min}_freq: the policy's window (M135) -- the processor's range
+ * narrowed by what was written here and by the platform's _PPC. Without a
+ * driver there is no window, only the clock. */
+static int g_policy_max_freq(char *b, usize c) {
+  u32 khz = cpufreq_policy_max_khz();
+
+  return khz ? snprintf(b, c, "%lu\n", (unsigned long)khz)
+             : g_cpu_max_freq(b, c);
+}
+
+static int g_policy_min_freq(char *b, usize c) {
+  u32 khz = cpufreq_policy_min_khz();
+
+  return khz ? snprintf(b, c, "%lu\n", (unsigned long)khz)
+             : g_cpu_min_freq(b, c);
+}
+
+/* A decimal number written to a sysfs file, with an optional newline. */
+static int sysfs_parse_ulong(const char *buffer, usize size,
+                             unsigned long *out) {
+  char text[24];
+  usize n = size < sizeof(text) - 1 ? size : sizeof(text) - 1;
+  unsigned long v = 0;
+
+  if (!buffer || !size)
+    return -EINVAL;
+  memcpy(text, buffer, n);
+  text[n] = 0;
+  if (!text[0] || text[0] == '\n')
+    return -EINVAL;
+  for (usize i = 0; text[i] && text[i] != '\n'; i++) {
+    if (text[i] < '0' || text[i] > '9')
+      return -EINVAL;
+    v = v * 10 + (unsigned long)(text[i] - '0');
+  }
+  *out = v;
+  return 0;
+}
+
+static isize sysfs_policy_limit_write(struct vfs_node *node, int is_max,
+                                      const char *buffer, usize size) {
+  unsigned long v;
+
+  (void)node;
+  if (sysfs_parse_ulong(buffer, size, &v) != 0 || !v)
+    return -EINVAL;
+  if (cpufreq_set_policy_limit(is_max, (u32)v) != 0)
+    return -EINVAL;
+  return (isize)size;
+}
+
+static isize sysfs_policy_max_write(struct vfs_node *node, u64 offset,
+                                    const char *buffer, usize size, int flags) {
+  (void)offset;
+  (void)flags;
+  return sysfs_policy_limit_write(node, 1, buffer, size);
+}
+
+static isize sysfs_policy_min_write(struct vfs_node *node, u64 offset,
+                                    const char *buffer, usize size, int flags) {
+  (void)offset;
+  (void)flags;
+  return sysfs_policy_limit_write(node, 0, buffer, size);
+}
+
+/* bios_limit: what the platform allows now (_PPC), as acpi-cpufreq has it. */
+static int g_cpu_bios_limit(char *b, usize c) {
+  return snprintf(b, c, "%lu\n", (unsigned long)cpufreq_bios_limit_khz());
+}
+
+/* stats/time_in_state: "<kHz> <time in 10 ms units>" per state, and
+ * stats/total_trans, the way Linux's cpufreq stats print them. */
+static int g_cpu_time_in_state(char *b, usize c) {
+  int len = 0;
+
+  for (int i = 0; i < cpufreq_state_count(); i++)
+    len += snprintf(b + len, c > (usize)len ? c - (usize)len : 0, "%lu %lu\n",
+                    (unsigned long)cpufreq_state_khz(i),
+                    (unsigned long)(cpufreq_state_time_ms(i) / 10));
+  return len;
+}
+
+static int g_cpu_total_trans(char *b, usize c) {
+  return snprintf(b, c, "%lu\n", (unsigned long)cpufreq_transitions());
+}
+
+/* The CPUs the one policy covers: all of them. */
+static int g_policy_cpus(char *b, usize c) {
+  int n = (g_max_cpus > 0) ? g_max_cpus : 1;
+  int len = 0;
+
+  for (int i = 0; i < n; i++)
+    len += snprintf(b + len, c > (usize)len ? c - (usize)len : 0, "%s%d",
+                    i ? " " : "", i);
+  len += snprintf(b + len, c > (usize)len ? c - (usize)len : 0, "\n");
+  return len;
+}
+
+/* /sys/devices/system/cpu/cpufreq/ondemand: the governor's tunables. */
+static int g_od_sampling_rate(char *b, usize c) {
+  return snprintf(b, c, "%lu\n", (unsigned long)cpufreq_od_sampling_rate_us());
+}
+
+static int g_od_up_threshold(char *b, usize c) {
+  return snprintf(b, c, "%lu\n", (unsigned long)cpufreq_od_up_threshold());
+}
+
+static isize sysfs_od_rate_write(struct vfs_node *node, u64 offset,
+                                 const char *buffer, usize size, int flags) {
+  unsigned long v;
+
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (sysfs_parse_ulong(buffer, size, &v) != 0 ||
+      cpufreq_od_set_sampling_rate_us((u32)v) != 0)
+    return -EINVAL;
+  return (isize)size;
+}
+
+static isize sysfs_od_up_write(struct vfs_node *node, u64 offset,
+                               const char *buffer, usize size, int flags) {
+  unsigned long v;
+
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (sysfs_parse_ulong(buffer, size, &v) != 0 ||
+      cpufreq_od_set_up_threshold((u32)v) != 0)
+    return -EINVAL;
+  return (isize)size;
+}
+
 /* The frequencies the platform declared, in the order it declared them. Only
  * the ACPI driver has a list — HWP and the bus-ratio request describe a window,
  * and a made-up list is worse than an absent file, so the file is not created
@@ -1021,49 +1194,29 @@ static int g_cpu_avail_freqs(char *b, usize c) {
   return len;
 }
 
-/* scaling_setspeed: the frequency asked for, and a write asks the platform for
- * the declared state nearest what was written. */
+/* scaling_setspeed: the userspace governor's frequency, and a write asks for
+ * the slowest declared state at or above what was written. Under any other governor the
+ * governor chooses, and Linux says so. */
 static int g_cpu_setspeed(char *b, usize c) {
-  int sel = cpufreq_selected_state();
+  u32 khz = cpufreq_setspeed_khz();
 
-  if (sel < 0)
+  if (!khz)
     return snprintf(b, c, "<unsupported>\n");
-  return snprintf(b, c, "%lu\n", (unsigned long)cpufreq_state_khz(sel));
+  return snprintf(b, c, "%lu\n", (unsigned long)khz);
 }
 
 static isize sysfs_setspeed_write(struct vfs_node *node, u64 offset,
                                   const char *buffer, usize size, int flags) {
-  char text[24];
-  usize n = size < sizeof(text) - 1 ? size : sizeof(text) - 1;
   unsigned long want = 0;
-  int best = -1;
-  u32 best_delta = 0;
 
   (void)node;
   (void)offset;
   (void)flags;
-  if (!buffer || !size || cpufreq_state_count() == 0)
+  if (cpufreq_state_count() == 0 ||
+      sysfs_parse_ulong(buffer, size, &want) != 0 || !want)
     return -EINVAL;
-  memcpy(text, buffer, n);
-  text[n] = 0;
-  for (usize i = 0; text[i] && text[i] != '\n'; i++) {
-    if (text[i] < '0' || text[i] > '9')
-      return -EINVAL;
-    want = want * 10 + (unsigned long)(text[i] - '0');
-  }
-  if (!want)
+  if (cpufreq_set_speed((u32)want) != 0)
     return -EINVAL;
-  for (int i = 0; i < cpufreq_state_count(); i++) {
-    u32 khz = cpufreq_state_khz(i);
-    u32 delta = khz > (u32)want ? khz - (u32)want : (u32)want - khz;
-
-    if (best < 0 || delta < best_delta) {
-      best = i;
-      best_delta = delta;
-    }
-  }
-  if (best < 0 || cpufreq_request_state(best) != 0)
-    return -EIO;
   return (isize)size;
 }
 
@@ -1083,9 +1236,7 @@ static int g_cpu_driver(char *b, usize c) {
 static int g_cpu_governors(char *b, usize c) {
   /* Only what can really be asked for: a list naming governors nothing
    * implements is how a tuning daemon comes to believe it has set one. */
-  if (strcmp(cpufreq_driver_name(), "none") == 0)
-    return snprintf(b, c, "performance\n");
-  return snprintf(b, c, "performance powersave\n");
+  return snprintf(b, c, "%s\n", cpufreq_governors());
 }
 
 /* Writing scaling_governor asks the processor for it. A driver that is not
@@ -1107,6 +1258,42 @@ static isize sysfs_governor_write(struct vfs_node *node, u64 offset,
   if (cpufreq_set_governor(name) != 0)
     return -EINVAL;
   return (isize)size;
+}
+
+static void sysfs_build_cpuidle(struct vfs_node *cn, int cpu);
+
+/* /sys/devices/system/cpu/cpuN: its idle states (M129) and its link to the
+ * one cpufreq policy (M135). */
+static void sysfs_build_cpu(struct vfs_node *cpu, int i, int policy) {
+  char name[16];
+  struct vfs_node *cn;
+
+  snprintf(name, sizeof(name), "cpu%d", i);
+  if (sysfs_child(cpu, name))
+    return;
+  cn = sysfs_mkchild(cpu, name, VFS_DIRECTORY, 0);
+  if (!cn)
+    return;
+  sysfs_build_cpuidle(cn, i);
+  if (policy)
+    sysfs_mk_link(cn, "cpufreq", "../cpufreq/policy0");
+}
+
+/* The boot mount of /sys comes before the secondary CPUs: they get their
+ * directories when they are up. A later mount builds them all itself. */
+static struct vfs_node *g_sysfs_cpu_dir;
+static int g_sysfs_cpu_policy;
+static int g_sysfs_cpus_built;
+
+void sysfs_cpus_online(void) {
+  int ncpu = (g_max_cpus > 0) ? g_max_cpus : 1;
+
+  if (!g_sysfs_cpu_dir)
+    return;
+  for (int i = g_sysfs_cpus_built; i < ncpu; i++)
+    sysfs_build_cpu(g_sysfs_cpu_dir, i, g_sysfs_cpu_policy);
+  if (ncpu > g_sysfs_cpus_built)
+    g_sysfs_cpus_built = ncpu;
 }
 
 static int g_cpu_range(char *b, usize c) {
@@ -1257,110 +1444,123 @@ static void sysfs_build_nodes(struct vfs_node *sys) {
   }
 }
 
-/* ── /sys/devices/system/cpu/cpuN/cpuidle (M129) ─────────────────────────
+/* ── /sys/devices/system/cpu/cpuN/cpuidle (M129, M135) ──────────────────
  *
  * One directory per idle state, with the counters powertop and every
- * monitoring agent read. They are per CPU, so the attribute functions are
- * generated per (cpu, state) pair the same way the node attributes are. */
+ * monitoring agent read, and `disable`, which takes a state away from the
+ * governor on that CPU. The context of each file is cpu * 256 + state. */
 
-#define CPUIDLE_SYSFS_CPUS   8
-#define CPUIDLE_SYSFS_STATES 4
+enum { CI_NAME, CI_DESC, CI_USAGE, CI_TIME, CI_LAT, CI_RES, CI_POWER, CI_ABOVE,
+       CI_BELOW, CI_DISABLE };
 
-static int cpuidle_attr(int cpu, int state, int which, char *b, usize c) {
+static int cpuidle_attr(int which, int ctx, char *b, usize c) {
+  int cpu = ctx / 256, state = ctx % 256;
+
   switch (which) {
-  case 0:
+  case CI_NAME:
     return snprintf(b, c, "%s\n", cpuidle_state_name(state));
-  case 1:
+  case CI_DESC:
     return snprintf(b, c, "%s\n", cpuidle_state_desc(state));
-  case 2:
+  case CI_USAGE:
     return snprintf(b, c, "%lu\n",
                     (unsigned long)cpuidle_state_usage(cpu, state));
-  case 3:
+  case CI_TIME:
     return snprintf(b, c, "%lu\n",
                     (unsigned long)cpuidle_state_time_us(cpu, state));
-  default:
+  case CI_LAT:
     return snprintf(b, c, "%lu\n",
                     (unsigned long)cpuidle_state_latency_us(state));
+  case CI_RES:
+    return snprintf(b, c, "%lu\n",
+                    (unsigned long)cpuidle_state_residency_us(state));
+  case CI_POWER:
+    return snprintf(b, c, "%lu\n",
+                    (unsigned long)cpuidle_state_power_mw(state));
+  case CI_ABOVE:
+    return snprintf(b, c, "%lu\n",
+                    (unsigned long)cpuidle_state_above(cpu, state));
+  case CI_BELOW:
+    return snprintf(b, c, "%lu\n",
+                    (unsigned long)cpuidle_state_below(cpu, state));
+  default:
+    return snprintf(b, c, "%d\n", cpuidle_state_disabled(cpu, state));
   }
 }
 
-#define CPUIDLE_ONE(cpu, st)                                                 \
-  static int g_ci##cpu##_##st##_name(char *b, usize c) {                     \
-    return cpuidle_attr(cpu, st, 0, b, c);                                   \
-  }                                                                          \
-  static int g_ci##cpu##_##st##_desc(char *b, usize c) {                     \
-    return cpuidle_attr(cpu, st, 1, b, c);                                   \
-  }                                                                          \
-  static int g_ci##cpu##_##st##_usage(char *b, usize c) {                    \
-    return cpuidle_attr(cpu, st, 2, b, c);                                   \
-  }                                                                          \
-  static int g_ci##cpu##_##st##_time(char *b, usize c) {                     \
-    return cpuidle_attr(cpu, st, 3, b, c);                                   \
-  }                                                                          \
-  static int g_ci##cpu##_##st##_lat(char *b, usize c) {                      \
-    return cpuidle_attr(cpu, st, 4, b, c);                                   \
+#define CI_FN(tag, which)                                                    \
+  static int g_ci_##tag(int ctx, char *b, usize c) {                         \
+    return cpuidle_attr(which, ctx, b, c);                                   \
   }
+CI_FN(name, CI_NAME)
+CI_FN(desc, CI_DESC)
+CI_FN(usage, CI_USAGE)
+CI_FN(time, CI_TIME)
+CI_FN(lat, CI_LAT)
+CI_FN(res, CI_RES)
+CI_FN(power, CI_POWER)
+CI_FN(above, CI_ABOVE)
+CI_FN(below, CI_BELOW)
+CI_FN(disable, CI_DISABLE)
 
-#define CPUIDLE_CPU(cpu)                                                     \
-  CPUIDLE_ONE(cpu, 0)                                                        \
-  CPUIDLE_ONE(cpu, 1)                                                        \
-  CPUIDLE_ONE(cpu, 2)                                                        \
-  CPUIDLE_ONE(cpu, 3)
+static isize sysfs_cpuidle_disable_write(struct vfs_node *node, u64 offset,
+                                         const char *buffer, usize size,
+                                         int flags) {
+  int ctx = sysfs_node_ctx(node);
+  unsigned long v;
 
-CPUIDLE_CPU(0)
-CPUIDLE_CPU(1)
-CPUIDLE_CPU(2)
-CPUIDLE_CPU(3)
-CPUIDLE_CPU(4)
-CPUIDLE_CPU(5)
-CPUIDLE_CPU(6)
-CPUIDLE_CPU(7)
-
-struct cpuidle_attr_set {
-  int (*name)(char *, usize);
-  int (*desc)(char *, usize);
-  int (*usage)(char *, usize);
-  int (*time)(char *, usize);
-  int (*lat)(char *, usize);
-};
-
-#define CPUIDLE_SET(cpu, st)                                                 \
-  { g_ci##cpu##_##st##_name, g_ci##cpu##_##st##_desc,                        \
-    g_ci##cpu##_##st##_usage, g_ci##cpu##_##st##_time, g_ci##cpu##_##st##_lat }
-
-#define CPUIDLE_ROW(cpu)                                                     \
-  { CPUIDLE_SET(cpu, 0), CPUIDLE_SET(cpu, 1), CPUIDLE_SET(cpu, 2),           \
-    CPUIDLE_SET(cpu, 3) }
-
-static const struct cpuidle_attr_set
-    g_cpuidle_attrs[CPUIDLE_SYSFS_CPUS][CPUIDLE_SYSFS_STATES] = {
-        CPUIDLE_ROW(0), CPUIDLE_ROW(1), CPUIDLE_ROW(2), CPUIDLE_ROW(3),
-        CPUIDLE_ROW(4), CPUIDLE_ROW(5), CPUIDLE_ROW(6), CPUIDLE_ROW(7),
-};
+  (void)offset;
+  (void)flags;
+  if (ctx < 0 || sysfs_parse_ulong(buffer, size, &v) != 0 || v > 1)
+    return -EINVAL;
+  if (cpuidle_state_set_disabled(ctx / 256, ctx % 256, (int)v) != 0)
+    return -EINVAL;
+  return (isize)size;
+}
 
 static void sysfs_build_cpuidle(struct vfs_node *cpu_dir, int cpu) {
+  static const struct {
+    const char *name;
+    sysfs_render_ctx fn;
+  } files[] = {
+      {"name", g_ci_name},       {"desc", g_ci_desc},   {"usage", g_ci_usage},
+      {"time", g_ci_time},       {"latency", g_ci_lat}, {"residency", g_ci_res},
+      {"power", g_ci_power},     {"above", g_ci_above}, {"below", g_ci_below},
+  };
   struct vfs_node *ci;
   int n = cpuidle_state_count();
 
-  if (cpu < 0 || cpu >= CPUIDLE_SYSFS_CPUS || n <= 0)
+  if (cpu < 0 || cpu >= 256 || n <= 0)
     return;
   ci = sysfs_mkchild(cpu_dir, "cpuidle", VFS_DIRECTORY, 0);
   if (!ci)
     return;
-  for (int st = 0; st < n && st < CPUIDLE_SYSFS_STATES; st++) {
+  for (int st = 0; st < n && st < 256; st++) {
     char name[16];
-    struct vfs_node *sd;
+    struct vfs_node *sd, *f;
+    int ctx = cpu * 256 + st;
 
     snprintf(name, sizeof(name), "state%d", st);
     sd = sysfs_mkchild(ci, name, VFS_DIRECTORY, 0);
     if (!sd)
       continue;
-    sysfs_mkchild(sd, "name", VFS_DEVICE, g_cpuidle_attrs[cpu][st].name);
-    sysfs_mkchild(sd, "desc", VFS_DEVICE, g_cpuidle_attrs[cpu][st].desc);
-    sysfs_mkchild(sd, "usage", VFS_DEVICE, g_cpuidle_attrs[cpu][st].usage);
-    sysfs_mkchild(sd, "time", VFS_DEVICE, g_cpuidle_attrs[cpu][st].time);
-    sysfs_mkchild(sd, "latency", VFS_DEVICE, g_cpuidle_attrs[cpu][st].lat);
+    for (usize i = 0; i < sizeof(files) / sizeof(files[0]); i++)
+      sysfs_mkchild_ctx(sd, files[i].name, files[i].fn, ctx);
+    f = sysfs_mkchild_ctx(sd, "disable", g_ci_disable, ctx);
+    if (f && f->inode) {
+      f->inode->mode = 0644;
+      f->inode->write_cb = sysfs_cpuidle_disable_write;
+    }
   }
+}
+
+/* /sys/devices/system/cpu/cpuidle: which driver found the states and which
+ * governor picks among them. */
+static int g_cpuidle_driver(char *b, usize c) {
+  return snprintf(b, c, "%s\n", cpuidle_driver_name());
+}
+
+static int g_cpuidle_governor(char *b, usize c) {
+  return snprintf(b, c, "%s\n", cpuidle_governor_name());
 }
 
 static int g_memtotal(char *b, usize c) {
@@ -1504,57 +1704,201 @@ static isize sysfs_khugepaged_sleep_write(struct vfs_node *node, u64 offset,
  * charge is ever current; a method that refuses returns the error rather
  * than a number, and the file reads as an error too.
  */
-#define PS_BAT_RENDER(i, which, fn)                                          \
-  static int fn(char *b, usize c) {                                          \
-    return acpi_power_battery_attr(i, which, b, c);                          \
-  }
+/* /sys/class/power_supply/BATn: one render for every attribute, the battery
+ * and the attribute riding in the context as bat * 64 + which. */
+static int g_bat_attr(int ctx, char *b, usize c) {
+  return acpi_power_battery_attr(ctx / 64, ctx % 64, b, c);
+}
 
-#define PS_BAT_SET(i)                                                        \
-  PS_BAT_RENDER(i, ACPI_BAT_TYPE, g_bat##i##_type)                           \
-  PS_BAT_RENDER(i, ACPI_BAT_PRESENT, g_bat##i##_present)                     \
-  PS_BAT_RENDER(i, ACPI_BAT_STATUS, g_bat##i##_status)                       \
-  PS_BAT_RENDER(i, ACPI_BAT_CAPACITY, g_bat##i##_capacity)                   \
-  PS_BAT_RENDER(i, ACPI_BAT_NOW, g_bat##i##_now)                             \
-  PS_BAT_RENDER(i, ACPI_BAT_FULL, g_bat##i##_full)                           \
-  PS_BAT_RENDER(i, ACPI_BAT_VOLTAGE, g_bat##i##_voltage)                     \
-  PS_BAT_RENDER(i, ACPI_BAT_RATE, g_bat##i##_rate)
+static isize sysfs_bat_alarm_write(struct vfs_node *node, u64 offset,
+                                   const char *buffer, usize size, int flags) {
+  unsigned long v;
 
-PS_BAT_SET(0)
-PS_BAT_SET(1)
+  (void)offset;
+  (void)flags;
+  if (sysfs_parse_ulong(buffer, size, &v) != 0 ||
+      acpi_power_battery_set_alarm(sysfs_node_ctx(node) / 64, (u64)v) != 0)
+    return -EINVAL;
+  return (isize)size;
+}
 
-struct ps_bat_ops {
-  sysfs_render type, present, status, capacity, now, full, voltage, rate;
-};
+static isize sysfs_bat_charge_write(struct vfs_node *node, u64 offset,
+                                    const char *buffer, usize size, int flags) {
+  char mode[24];
+  usize n = size;
 
-static const struct ps_bat_ops g_ps_bat[ACPI_PS_MAX_BATTERY] = {
-    { g_bat0_type, g_bat0_present, g_bat0_status, g_bat0_capacity, g_bat0_now,
-      g_bat0_full, g_bat0_voltage, g_bat0_rate },
-    { g_bat1_type, g_bat1_present, g_bat1_status, g_bat1_capacity, g_bat1_now,
-      g_bat1_full, g_bat1_voltage, g_bat1_rate },
-};
+  (void)offset;
+  (void)flags;
+  while (n && (buffer[n - 1] == '\n' || buffer[n - 1] == ' '))
+    n--;
+  if (!n || n >= sizeof(mode))
+    return -EINVAL;
+  memcpy(mode, buffer, n);
+  mode[n] = 0;
+  if (acpi_power_battery_set_charge_behaviour(sysfs_node_ctx(node) / 64, mode) != 0)
+    return -EINVAL;
+  return (isize)size;
+}
 
 static int g_ac0_online(char *b, usize c) { return acpi_power_ac_attr(0, b, c); }
 static int g_ac0_type(char *b, usize c) { return snprintf(b, c, "Mains\n"); }
 
-#define PS_TZ_SET(i)                                                         \
-  static int g_tz##i##_type(char *b, usize c) {                              \
-    return acpi_power_thermal_attr(i, ACPI_TZ_TYPE, b, c);                   \
-  }                                                                          \
-  static int g_tz##i##_temp(char *b, usize c) {                              \
-    return acpi_power_thermal_attr(i, ACPI_TZ_TEMP, b, c);                   \
+/* /sys/class/thermal (M134, M135): a zone's files take the zone index as
+ * their context, a trip's take zone * 64 + trip, a binding's zone * 64 + k. */
+static int g_tz_type(int z, char *b, usize c) {
+  return acpi_power_thermal_attr(z, ACPI_TZ_TYPE, b, c);
+}
+
+static int g_tz_temp(int z, char *b, usize c) {
+  int mc;
+
+  if (thermal_trip_count(z) == 0 && thermal_zone_emul(z) == 0)
+    return acpi_power_thermal_attr(z, ACPI_TZ_TEMP, b, c);
+  if (thermal_zone_temp(z, &mc) != 0)
+    return -1;
+  return snprintf(b, c, "%d\n", mc);
+}
+
+static int g_tz_emul(int z, char *b, usize c) {
+  return snprintf(b, c, "%d\n", thermal_zone_emul(z));
+}
+
+static isize sysfs_tz_emul_write(struct vfs_node *node, u64 offset,
+                                 const char *buffer, usize size, int flags) {
+  unsigned long v;
+
+  (void)offset;
+  (void)flags;
+  if (sysfs_parse_ulong(buffer, size, &v) != 0 || v > 1000000ul ||
+      thermal_zone_set_emul(sysfs_node_ctx(node), (int)v) != 0)
+    return -EINVAL;
+  return (isize)size;
+}
+
+static int g_tz_mode(int z, char *b, usize c) {
+  (void)z;
+  return snprintf(b, c, "enabled\n");
+}
+
+static int g_tz_policy(int z, char *b, usize c) {
+  (void)z;
+  return snprintf(b, c, "step_wise\n");
+}
+
+static int g_trip_type(int ctx, char *b, usize c) {
+  const char *type;
+  int mc;
+
+  if (thermal_trip(ctx / 64, ctx % 64, &type, &mc) != 0)
+    return -1;
+  return snprintf(b, c, "%s\n", type);
+}
+
+static int g_trip_temp(int ctx, char *b, usize c) {
+  const char *type;
+  int mc;
+
+  if (thermal_trip(ctx / 64, ctx % 64, &type, &mc) != 0)
+    return -1;
+  return snprintf(b, c, "%d\n", mc);
+}
+
+static int g_trip_hyst(int ctx, char *b, usize c) {
+  (void)ctx;
+  return snprintf(b, c, "0\n");
+}
+
+static int g_bind_trip(int ctx, char *b, usize c) {
+  int cdev, trip;
+
+  if (thermal_zone_binding(ctx / 64, ctx % 64, &cdev, &trip) != 0)
+    return -1;
+  return snprintf(b, c, "%d\n", trip);
+}
+
+static int g_cdev_type(int cd, char *b, usize c) {
+  return snprintf(b, c, "%s\n", thermal_cdev_type(cd));
+}
+
+static int g_cdev_max(int cd, char *b, usize c) {
+  return snprintf(b, c, "%d\n", thermal_cdev_max_state(cd));
+}
+
+static int g_cdev_cur(int cd, char *b, usize c) {
+  return snprintf(b, c, "%d\n", thermal_cdev_cur_state(cd));
+}
+
+static isize sysfs_cdev_cur_write(struct vfs_node *node, u64 offset,
+                                  const char *buffer, usize size, int flags) {
+  unsigned long v;
+
+  (void)offset;
+  (void)flags;
+  if (sysfs_parse_ulong(buffer, size, &v) != 0 ||
+      thermal_cdev_set_state(sysfs_node_ctx(node), (int)v) != 0)
+    return -EINVAL;
+  return (isize)size;
+}
+
+static void sysfs_build_thermal(struct vfs_node *td, int ntz) {
+  for (int i = 0; i < ntz && i < ACPI_PS_MAX_THERMAL; i++) {
+    char name[32];
+    struct vfs_node *d, *f;
+
+    snprintf(name, sizeof(name), "thermal_zone%d", i);
+    d = sysfs_mkchild(td, name, VFS_DIRECTORY, 0);
+    if (!d)
+      continue;
+    sysfs_mkchild_ctx(d, "type", g_tz_type, i);
+    sysfs_mkchild_ctx(d, "temp", g_tz_temp, i);
+    if (thermal_trip_count(i) == 0)
+      continue; /* a zone nothing acts on: the M134 files only */
+    sysfs_mkchild_ctx(d, "mode", g_tz_mode, i);
+    sysfs_mkchild_ctx(d, "policy", g_tz_policy, i);
+    sysfs_mkchild_ctx(d, "available_policies", g_tz_policy, i);
+    f = sysfs_mkchild_ctx(d, "emul_temp", g_tz_emul, i);
+    if (f && f->inode) {
+      f->inode->mode = 0644;
+      f->inode->write_cb = sysfs_tz_emul_write;
+    }
+    for (int t = 0; t < thermal_trip_count(i) && t < 64; t++) {
+      snprintf(name, sizeof(name), "trip_point_%d_type", t);
+      sysfs_mkchild_ctx(d, name, g_trip_type, i * 64 + t);
+      snprintf(name, sizeof(name), "trip_point_%d_temp", t);
+      sysfs_mkchild_ctx(d, name, g_trip_temp, i * 64 + t);
+      snprintf(name, sizeof(name), "trip_point_%d_hyst", t);
+      sysfs_mkchild_ctx(d, name, g_trip_hyst, i * 64 + t);
+    }
+    for (int k = 0; k < 64; k++) {
+      char target[40];
+      int cdev, trip;
+
+      if (thermal_zone_binding(i, k, &cdev, &trip) != 0)
+        break;
+      snprintf(name, sizeof(name), "cdev%d", k);
+      snprintf(target, sizeof(target), "../cooling_device%d", cdev);
+      sysfs_mk_link(d, name, target);
+      snprintf(name, sizeof(name), "cdev%d_trip_point", k);
+      sysfs_mkchild_ctx(d, name, g_bind_trip, i * 64 + k);
+    }
   }
+  for (int cd = 0; cd < thermal_cdev_count(); cd++) {
+    char name[32];
+    struct vfs_node *d, *f;
 
-PS_TZ_SET(0)
-PS_TZ_SET(1)
-PS_TZ_SET(2)
-PS_TZ_SET(3)
-
-struct ps_tz_ops { sysfs_render type, temp; };
-
-static const struct ps_tz_ops g_ps_tz[ACPI_PS_MAX_THERMAL] = {
-    { g_tz0_type, g_tz0_temp }, { g_tz1_type, g_tz1_temp },
-    { g_tz2_type, g_tz2_temp }, { g_tz3_type, g_tz3_temp },
-};
+    snprintf(name, sizeof(name), "cooling_device%d", cd);
+    d = sysfs_mkchild(td, name, VFS_DIRECTORY, 0);
+    if (!d)
+      continue;
+    sysfs_mkchild_ctx(d, "type", g_cdev_type, cd);
+    sysfs_mkchild_ctx(d, "max_state", g_cdev_max, cd);
+    f = sysfs_mkchild_ctx(d, "cur_state", g_cdev_cur, cd);
+    if (f && f->inode) {
+      f->inode->mode = 0644;
+      f->inode->write_cb = sysfs_cdev_cur_write;
+    }
+  }
+}
 
 /* /sys/class already exists by the time this runs; find it rather than
  * attaching a second directory of the same name. */
@@ -1588,22 +1932,57 @@ static void sysfs_build_acpi_power(struct vfs_node *root) {
         d = sysfs_mkchild(psd, name, VFS_DIRECTORY, 0);
         if (!d)
           continue;
-        sysfs_mkchild(d, "type", VFS_DEVICE, g_ps_bat[i].type);
-        sysfs_mkchild(d, "present", VFS_DEVICE, g_ps_bat[i].present);
-        sysfs_mkchild(d, "status", VFS_DEVICE, g_ps_bat[i].status);
-        sysfs_mkchild(d, "capacity", VFS_DEVICE, g_ps_bat[i].capacity);
-        /* Linux names these after the unit the firmware chose, and a reader
-         * that divides one by the other has to be told which it got. */
-        if (acpi_power_battery_in_energy_units(i)) {
-          sysfs_mkchild(d, "energy_now", VFS_DEVICE, g_ps_bat[i].now);
-          sysfs_mkchild(d, "energy_full", VFS_DEVICE, g_ps_bat[i].full);
-          sysfs_mkchild(d, "power_now", VFS_DEVICE, g_ps_bat[i].rate);
-        } else {
-          sysfs_mkchild(d, "charge_now", VFS_DEVICE, g_ps_bat[i].now);
-          sysfs_mkchild(d, "charge_full", VFS_DEVICE, g_ps_bat[i].full);
-          sysfs_mkchild(d, "current_now", VFS_DEVICE, g_ps_bat[i].rate);
+        {
+          /* Linux names the capacity files after the unit the firmware
+           * chose, and a reader that divides one by the other has to be
+           * told which it got. */
+          int e = acpi_power_battery_in_energy_units(i);
+          const struct {
+            const char *name;
+            int which;
+          } files[] = {
+              {"type", ACPI_BAT_TYPE},
+              {"present", ACPI_BAT_PRESENT},
+              {"status", ACPI_BAT_STATUS},
+              {"capacity", ACPI_BAT_CAPACITY},
+              {"capacity_level", ACPI_BAT_CAPACITY_LEVEL},
+              {e ? "energy_now" : "charge_now", ACPI_BAT_NOW},
+              {e ? "energy_full" : "charge_full", ACPI_BAT_FULL},
+              {e ? "energy_full_design" : "charge_full_design",
+               ACPI_BAT_FULL_DESIGN},
+              {e ? "power_now" : "current_now", ACPI_BAT_RATE},
+              {"voltage_now", ACPI_BAT_VOLTAGE},
+              {"voltage_min_design", ACPI_BAT_VOLTAGE_MIN},
+              {"technology", ACPI_BAT_TECHNOLOGY},
+              {"model_name", ACPI_BAT_MODEL},
+              {"serial_number", ACPI_BAT_SERIAL},
+              {"manufacturer", ACPI_BAT_MANUFACTURER},
+          };
+          struct vfs_node *f;
+
+          for (usize k = 0; k < sizeof(files) / sizeof(files[0]); k++)
+            sysfs_mkchild_ctx(d, files[k].name, g_bat_attr,
+                              i * 64 + files[k].which);
+          if (acpi_power_battery_has(i, "_BIX"))
+            sysfs_mkchild_ctx(d, "cycle_count", g_bat_attr,
+                              i * 64 + ACPI_BAT_CYCLES);
+          if (acpi_power_battery_has(i, "_BTP")) {
+            f = sysfs_mkchild_ctx(d, "alarm", g_bat_attr,
+                                  i * 64 + ACPI_BAT_ALARM);
+            if (f && f->inode) {
+              f->inode->mode = 0644;
+              f->inode->write_cb = sysfs_bat_alarm_write;
+            }
+          }
+          if (acpi_power_battery_has_charge_control(i)) {
+            f = sysfs_mkchild_ctx(d, "charge_behaviour", g_bat_attr,
+                                  i * 64 + ACPI_BAT_CHARGE_BEHAVIOUR);
+            if (f && f->inode) {
+              f->inode->mode = 0644;
+              f->inode->write_cb = sysfs_bat_charge_write;
+            }
+          }
         }
-        sysfs_mkchild(d, "voltage_now", VFS_DEVICE, g_ps_bat[i].voltage);
       }
       if (nac > 0) {
         struct vfs_node *d = sysfs_mkchild(psd, "AC0", VFS_DIRECTORY, 0);
@@ -1617,18 +1996,9 @@ static void sysfs_build_acpi_power(struct vfs_node *root) {
 
   if (ntz > 0) {
     struct vfs_node *td = sysfs_mkchild(classp, "thermal", VFS_DIRECTORY, 0);
-    if (td) {
-      for (int i = 0; i < ntz && i < ACPI_PS_MAX_THERMAL; i++) {
-        char name[20];
-        struct vfs_node *d;
-        snprintf(name, sizeof(name), "thermal_zone%d", i);
-        d = sysfs_mkchild(td, name, VFS_DIRECTORY, 0);
-        if (!d)
-          continue;
-        sysfs_mkchild(d, "type", VFS_DEVICE, g_ps_tz[i].type);
-        sysfs_mkchild(d, "temp", VFS_DEVICE, g_ps_tz[i].temp);
-      }
-    }
+
+    if (td)
+      sysfs_build_thermal(td, ntz);
   }
 }
 
@@ -1683,6 +2053,161 @@ static isize sysfs_power_state_write(struct vfs_node *node, u64 offset,
   if (rc < 0)
     return rc;
   return (isize)size;
+}
+
+/* /sys/power/mem_sleep and wakeup_count (M135). */
+static int g_power_mem_sleep(char *b, usize c) {
+  return snprintf(b, c, "%s\n", suspend_mem_sleep());
+}
+
+static isize sysfs_mem_sleep_write(struct vfs_node *node, u64 offset,
+                                   const char *buffer, usize size, int flags) {
+  char name[16];
+  usize n = size < sizeof(name) - 1 ? size : sizeof(name) - 1;
+
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (!buffer || !size)
+    return -EINVAL;
+  memcpy(name, buffer, n);
+  name[n] = 0;
+  while (n && (name[n - 1] == '\n' || name[n - 1] == ' '))
+    name[--n] = 0;
+  return suspend_set_mem_sleep(name) == 0 ? (isize)size : -EINVAL;
+}
+
+/* /sys/power/disk and /sys/power/resume (M135): what follows the image, and
+ * where it goes. */
+static int g_power_disk(char *b, usize c) {
+  return snprintf(b, c, "%s\n", hibernate_disk_modes());
+}
+
+static int g_power_resume(char *b, usize c) {
+  return snprintf(b, c, "%s\n", hibernate_resume_device());
+}
+
+static isize sysfs_power_word_write(const char *buffer, usize size,
+                                    int (*set)(const char *)) {
+  char w[64];
+  usize n = size < sizeof(w) - 1 ? size : sizeof(w) - 1;
+
+  if (!buffer || !size)
+    return -EINVAL;
+  memcpy(w, buffer, n);
+  w[n] = 0;
+  while (n && (w[n - 1] == '\n' || w[n - 1] == ' '))
+    w[--n] = 0;
+  return set(w) == 0 ? (isize)size : -EINVAL;
+}
+
+static isize sysfs_disk_write(struct vfs_node *node, u64 offset,
+                              const char *buffer, usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)flags;
+  return sysfs_power_word_write(buffer, size, hibernate_set_disk_mode);
+}
+
+static isize sysfs_resume_write(struct vfs_node *node, u64 offset,
+                                const char *buffer, usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)flags;
+  return sysfs_power_word_write(buffer, size, hibernate_set_resume_device);
+}
+
+static int g_power_sync_on_suspend(char *b, usize c) {
+  return snprintf(b, c, "%d\n", suspend_sync_on_suspend());
+}
+
+static isize sysfs_sync_on_suspend_write(struct vfs_node *node, u64 offset,
+                                         const char *buffer, usize size,
+                                         int flags) {
+  unsigned long v;
+
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (sysfs_parse_ulong(buffer, size, &v) != 0 || v > 1)
+    return -EINVAL;
+  suspend_set_sync_on_suspend((int)v);
+  return (isize)size;
+}
+
+static int g_power_wakeup_count(char *b, usize c) {
+  return snprintf(b, c, "%lu\n", (unsigned long)suspend_event_count());
+}
+
+static isize sysfs_wakeup_count_write(struct vfs_node *node, u64 offset,
+                                      const char *buffer, usize size,
+                                      int flags) {
+  unsigned long v;
+
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (sysfs_parse_ulong(buffer, size, &v) != 0)
+    return -EINVAL;
+  return suspend_save_event_count((u64)v) == 0 ? (isize)size : -EINVAL;
+}
+
+/* /sys/class/wakeup/wakeupN: one per wake source, with Linux's counters. An
+ * event here is instantaneous (nothing holds the machine awake for a
+ * while), so the active and prevent-suspend times are truly zero. */
+static int g_wk_name(int i, char *b, usize c) {
+  return snprintf(b, c, "%s\n", suspend_source_name(i));
+}
+
+static int g_wk_events(int i, char *b, usize c) {
+  return snprintf(b, c, "%lu\n",
+                  (unsigned long)suspend_source_stat(i, SUSPEND_STAT_EVENTS));
+}
+
+static int g_wk_wakeups(int i, char *b, usize c) {
+  return snprintf(b, c, "%lu\n",
+                  (unsigned long)suspend_source_stat(i, SUSPEND_STAT_WAKEUPS));
+}
+
+static int g_wk_last(int i, char *b, usize c) {
+  return snprintf(b, c, "%lu\n",
+                  (unsigned long)suspend_source_stat(i, SUSPEND_STAT_LAST_MS));
+}
+
+static int g_wk_zero(int i, char *b, usize c) {
+  (void)i;
+  return snprintf(b, c, "0\n");
+}
+
+static void sysfs_build_wakeup(struct vfs_node *root) {
+  struct vfs_node *classp, *wk;
+  int n = suspend_source_count();
+
+  if (n <= 0)
+    return;
+  classp = sysfs_class_dir(root);
+  wk = classp ? sysfs_mkchild(classp, "wakeup", VFS_DIRECTORY, 0) : 0;
+  if (!wk)
+    return;
+  for (int i = 0; i < n; i++) {
+    static const char *const zeros[] = {"expire_count", "active_time_ms",
+                                        "total_time_ms", "max_time_ms",
+                                        "prevent_suspend_time_ms"};
+    char name[24];
+    struct vfs_node *d;
+
+    snprintf(name, sizeof(name), "wakeup%d", i);
+    d = sysfs_mkchild(wk, name, VFS_DIRECTORY, 0);
+    if (!d)
+      continue;
+    sysfs_mkchild_ctx(d, "name", g_wk_name, i);
+    sysfs_mkchild_ctx(d, "event_count", g_wk_events, i);
+    sysfs_mkchild_ctx(d, "active_count", g_wk_events, i);
+    sysfs_mkchild_ctx(d, "wakeup_count", g_wk_wakeups, i);
+    sysfs_mkchild_ctx(d, "last_change_ms", g_wk_last, i);
+    for (usize k = 0; k < sizeof(zeros) / sizeof(zeros[0]); k++)
+      sysfs_mkchild_ctx(d, zeros[k], g_wk_zero, i);
+  }
 }
 
 /* SYSFS_MAGIC. statfs on a synthetic filesystem used to report ENOSYS, which
@@ -1792,6 +2317,35 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
       st->inode->mode = 0644;
       st->inode->write_cb = sysfs_power_state_write;
     }
+    st = pw ? sysfs_mkchild(pw, "mem_sleep", VFS_DEVICE, g_power_mem_sleep) : 0;
+    if (st && st->inode) {
+      st->inode->mode = 0644;
+      st->inode->write_cb = sysfs_mem_sleep_write;
+    }
+    st = pw ? sysfs_mkchild(pw, "disk", VFS_DEVICE, g_power_disk) : 0;
+    if (st && st->inode) {
+      st->inode->mode = 0644;
+      st->inode->write_cb = sysfs_disk_write;
+    }
+    st = pw ? sysfs_mkchild(pw, "resume", VFS_DEVICE, g_power_resume) : 0;
+    if (st && st->inode) {
+      st->inode->mode = 0644;
+      st->inode->write_cb = sysfs_resume_write;
+    }
+    st = pw ? sysfs_mkchild(pw, "sync_on_suspend", VFS_DEVICE,
+                            g_power_sync_on_suspend)
+            : 0;
+    if (st && st->inode) {
+      st->inode->mode = 0644;
+      st->inode->write_cb = sysfs_sync_on_suspend_write;
+    }
+    st = pw ? sysfs_mkchild(pw, "wakeup_count", VFS_DEVICE,
+                            g_power_wakeup_count)
+            : 0;
+    if (st && st->inode) {
+      st->inode->mode = 0644;
+      st->inode->write_cb = sysfs_wakeup_count_write;
+    }
   }
 
   struct vfs_node *dev = sysfs_mkchild(root, "devices", VFS_DIRECTORY, 0);
@@ -1800,55 +2354,102 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
   sysfs_mkchild(cpu, "possible", VFS_DEVICE, g_cpu_range);
   sysfs_mkchild(cpu, "online", VFS_DEVICE, g_cpu_range);
   sysfs_mkchild(cpu, "present", VFS_DEVICE, g_cpu_range);
+  if (cpuidle_state_count() > 0) {
+    struct vfs_node *cid = sysfs_mkchild(cpu, "cpuidle", VFS_DIRECTORY, 0);
 
-  /* Per-CPU clock under /sys/devices/system/cpu/cpuN/cpufreq. Crash
-   * reporters and monitoring tools read these; they exist only once the clock
-   * has actually been measured. */
+    if (cid) {
+      sysfs_mkchild(cid, "current_driver", VFS_DEVICE, g_cpuidle_driver);
+      sysfs_mkchild(cid, "current_governor", VFS_DEVICE, g_cpuidle_governor);
+      sysfs_mkchild(cid, "current_governor_ro", VFS_DEVICE,
+                    g_cpuidle_governor);
+      sysfs_mkchild(cid, "available_governors", VFS_DEVICE,
+                    g_cpuidle_governor);
+    }
+  }
+
+  /* The clock under /sys/devices/system/cpu/cpufreq/policy0, and each CPU's
+   * cpufreq a link to it, as Linux lays it out (M135): one policy, because
+   * every driver here moves every CPU at once. Crash reporters and monitoring
+   * tools read these; they exist only once the clock has actually been
+   * measured. */
   {
     int ncpu = (g_max_cpus > 0) ? g_max_cpus : 1;
+    struct vfs_node *pol = 0;
 
-    for (int i = 0; i < ncpu; i++) {
-      char name[16];
-      snprintf(name, sizeof(name), "cpu%d", i);
-      struct vfs_node *cn = sysfs_mkchild(cpu, name, VFS_DIRECTORY, 0);
-      if (!cn)
-        continue;
-      /* The idle states this CPU really has, and their counters (M129). */
-      sysfs_build_cpuidle(cn, i);
-      if (!arch_cpu_khz())
-        continue; /* a clock that was never measured gets no cpufreq */
-      struct vfs_node *cf = sysfs_mkchild(cn, "cpufreq", VFS_DIRECTORY, 0);
-      if (!cf)
-        continue;
-      sysfs_mkchild(cf, "scaling_cur_freq", VFS_DEVICE, g_cpu_cur_freq);
-      sysfs_mkchild(cf, "scaling_max_freq", VFS_DEVICE, g_cpu_max_freq);
-      sysfs_mkchild(cf, "scaling_min_freq", VFS_DEVICE, g_cpu_min_freq);
-      sysfs_mkchild(cf, "cpuinfo_cur_freq", VFS_DEVICE, g_cpu_cur_freq);
-      sysfs_mkchild(cf, "cpuinfo_max_freq", VFS_DEVICE, g_cpu_max_freq);
-      sysfs_mkchild(cf, "cpuinfo_min_freq", VFS_DEVICE, g_cpu_min_freq);
-      {
-        struct vfs_node *gov =
-            sysfs_mkchild(cf, "scaling_governor", VFS_DEVICE, g_cpu_governor);
+    if (arch_cpu_khz()) {
+      struct vfs_node *cfd = sysfs_mkchild(cpu, "cpufreq", VFS_DIRECTORY, 0);
 
-        if (gov && gov->inode)
-          gov->inode->write_cb = sysfs_governor_write;
-      }
-      sysfs_mkchild(cf, "scaling_driver", VFS_DEVICE, g_cpu_driver);
-      sysfs_mkchild(cf, "scaling_available_governors", VFS_DEVICE,
-                    g_cpu_governors);
-      /* Only where the platform really declared a list of them (M129). */
-      if (cpufreq_state_count() > 0) {
-        struct vfs_node *sp;
+      pol = cfd ? sysfs_mkchild(cfd, "policy0", VFS_DIRECTORY, 0) : 0;
+      if (cfd && strstr(cpufreq_governors(), "ondemand")) {
+        struct vfs_node *od = sysfs_mkchild(cfd, "ondemand", VFS_DIRECTORY, 0);
+        struct vfs_node *f;
 
-        sysfs_mkchild(cf, "scaling_available_frequencies", VFS_DEVICE,
-                      g_cpu_avail_freqs);
-        sp = sysfs_mkchild(cf, "scaling_setspeed", VFS_DEVICE, g_cpu_setspeed);
-        if (sp && sp->inode) {
-          sp->inode->mode = 0644;
-          sp->inode->write_cb = sysfs_setspeed_write;
+        f = od ? sysfs_mkchild(od, "sampling_rate", VFS_DEVICE,
+                               g_od_sampling_rate)
+               : 0;
+        if (f && f->inode) {
+          f->inode->mode = 0644;
+          f->inode->write_cb = sysfs_od_rate_write;
+        }
+        f = od ? sysfs_mkchild(od, "up_threshold", VFS_DEVICE,
+                               g_od_up_threshold)
+               : 0;
+        if (f && f->inode) {
+          f->inode->mode = 0644;
+          f->inode->write_cb = sysfs_od_up_write;
         }
       }
     }
+    if (pol) {
+      struct vfs_node *f;
+
+      sysfs_mkchild(pol, "scaling_cur_freq", VFS_DEVICE, g_cpu_cur_freq);
+      f = sysfs_mkchild(pol, "scaling_max_freq", VFS_DEVICE, g_policy_max_freq);
+      if (f && f->inode && strcmp(cpufreq_driver_name(), "none")) {
+        f->inode->mode = 0644;
+        f->inode->write_cb = sysfs_policy_max_write;
+      }
+      f = sysfs_mkchild(pol, "scaling_min_freq", VFS_DEVICE, g_policy_min_freq);
+      if (f && f->inode && strcmp(cpufreq_driver_name(), "none")) {
+        f->inode->mode = 0644;
+        f->inode->write_cb = sysfs_policy_min_write;
+      }
+      sysfs_mkchild(pol, "cpuinfo_cur_freq", VFS_DEVICE, g_cpu_cur_freq);
+      sysfs_mkchild(pol, "cpuinfo_max_freq", VFS_DEVICE, g_cpu_max_freq);
+      sysfs_mkchild(pol, "cpuinfo_min_freq", VFS_DEVICE, g_cpu_min_freq);
+      f = sysfs_mkchild(pol, "scaling_governor", VFS_DEVICE, g_cpu_governor);
+      if (f && f->inode)
+        f->inode->write_cb = sysfs_governor_write;
+      sysfs_mkchild(pol, "scaling_driver", VFS_DEVICE, g_cpu_driver);
+      sysfs_mkchild(pol, "scaling_available_governors", VFS_DEVICE,
+                    g_cpu_governors);
+      sysfs_mkchild(pol, "affected_cpus", VFS_DEVICE, g_policy_cpus);
+      sysfs_mkchild(pol, "related_cpus", VFS_DEVICE, g_policy_cpus);
+      /* Only where the platform really declared a list of them (M129). */
+      if (cpufreq_state_count() > 0) {
+        struct vfs_node *st;
+
+        sysfs_mkchild(pol, "scaling_available_frequencies", VFS_DEVICE,
+                      g_cpu_avail_freqs);
+        f = sysfs_mkchild(pol, "scaling_setspeed", VFS_DEVICE, g_cpu_setspeed);
+        if (f && f->inode) {
+          f->inode->mode = 0644;
+          f->inode->write_cb = sysfs_setspeed_write;
+        }
+        sysfs_mkchild(pol, "bios_limit", VFS_DEVICE, g_cpu_bios_limit);
+        st = sysfs_mkchild(pol, "stats", VFS_DIRECTORY, 0);
+        if (st) {
+          sysfs_mkchild(st, "time_in_state", VFS_DEVICE, g_cpu_time_in_state);
+          sysfs_mkchild(st, "total_trans", VFS_DEVICE, g_cpu_total_trans);
+        }
+      }
+    }
+    g_sysfs_cpu_dir = cpu;
+    g_sysfs_cpu_policy = pol != 0;
+    g_sysfs_cpus_built = 0;
+    for (int i = 0; i < ncpu; i++)
+      sysfs_build_cpu(cpu, i, pol != 0);
+    g_sysfs_cpus_built = ncpu;
   }
 
   sysfs_build_nodes(sys);
@@ -1859,6 +2460,7 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
   sysfs_build_block(root);
   sysfs_build_net(root);
   sysfs_build_acpi_power(root);
+  sysfs_build_wakeup(root);
   /* M96: /sys/module/<name>/ — refcnt, initstate and a parameters directory —
    * for whatever is loaded now; later loads and unloads maintain the tree
    * themselves. */

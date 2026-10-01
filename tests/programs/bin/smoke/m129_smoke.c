@@ -195,21 +195,26 @@ int main(void) {
    * the name and the counters. */
   if (read_file("/sys/devices/system/cpu/cpu0/cpuidle/state0/name", buf,
                 sizeof(buf)) > 0) {
-    char usage[64], time_us[64], desc[128];
-    long used = -1;
+    char usage[64], desc[128];
+    long used = 0;
 
     desc[0] = 0;
     read_file("/sys/devices/system/cpu/cpu0/cpuidle/state0/desc", desc,
               sizeof(desc));
-    if (read_file("/sys/devices/system/cpu/cpu0/cpuidle/state0/usage", usage,
-                  sizeof(usage)) > 0)
-      used = strtol(usage, 0, 10);
-    time_us[0] = 0;
-    read_file("/sys/devices/system/cpu/cpu0/cpuidle/state0/time", time_us,
-              sizeof(time_us));
+    /* Summed over the states: with more than one, a governor chooses, and
+     * the shallowest may rightly never be picked on a quiet machine. */
+    for (int st = 0; st < 8; st++) {
+      char path[64];
+
+      snprintf(path, sizeof(path),
+               "/sys/devices/system/cpu/cpu0/cpuidle/state%d/usage", st);
+      if (read_file(path, usage, sizeof(usage)) <= 0)
+        break;
+      used += strtol(usage, 0, 10);
+    }
     judge("cpuidle-sysfs", buf[0] && desc[0] && used > 0,
-          "the idle state is published but its counters never moved, so the "
-          "kernel is not going through it",
+          "the idle states are published but their counters never moved, so "
+          "the kernel is not going through them",
           used);
   } else {
     bad("cpuidle-sysfs", "/sys/devices/system/cpu/cpu0/cpuidle is missing", -1);
@@ -343,9 +348,11 @@ int main(void) {
       {
         char mx[32] = "", mn[32] = "";
 
-        read_file("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", mx,
+        /* cpuinfo_*: what the processor can do. scaling_max_freq may sit
+         * lower, where the platform's _PPC caps it (M135's check). */
+        read_file("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", mx,
                   sizeof(mx));
-        read_file("/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq", mn,
+        read_file("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq", mn,
                   sizeof(mn));
         good = good && strtol(mx, 0, 10) == first_khz &&
                strtol(mn, 0, 10) == last_khz;
@@ -356,14 +363,21 @@ int main(void) {
 
       /* Asking for the slowest state by frequency: the kernel must select the
        * state the firmware declared for it, and report what the register did
-       * with the request rather than assuming. */
+       * with the request rather than assuming. scaling_setspeed belongs to
+       * the userspace governor, as on Linux. */
       {
-        int fd = open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_setspeed",
+        int fd = open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
                       O_WRONLY);
         char text[32];
         int wrote = -1;
         long sel = -1, cur = -1, took = -1;
 
+        if (fd >= 0) {
+          (void)!write(fd, "userspace", 9);
+          close(fd);
+        }
+        fd = open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_setspeed",
+                  O_WRONLY);
         snprintf(text, sizeof(text), "%ld", last_khz);
         if (fd >= 0) {
           wrote = (int)write(fd, text, strlen(text));
@@ -387,11 +401,10 @@ int main(void) {
               "the request did not reach the register the firmware named",
               took);
         /* Put the machine back where it was found. */
-        fd = open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_setspeed",
+        fd = open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
                   O_WRONLY);
         if (fd >= 0) {
-          snprintf(text, sizeof(text), "%ld", first_khz);
-          (void)!write(fd, text, strlen(text));
+          (void)!write(fd, "performance", 11);
           close(fd);
         }
       }

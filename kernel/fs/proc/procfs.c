@@ -1456,7 +1456,11 @@ void mountinfo_poll_stats(u64 *calls, u64 *reports, usize *last_pid) {
 static int mountinfo_poll(struct vfs_handle *h, struct vfs_node *node,
                           struct b1nix_pollfd *pfd) {
   (void)node;
-  pfd->revents = 0;
+  /* Always readable, as Linux's mounts_poll says (EPOLLIN | EPOLLRDNORM), and
+   * a change on top of that. Reporting the change alone made Go's poller see
+   * an error-only event on a file it was about to read -- podman's "read
+   * /proc/self/mountinfo: not pollable". */
+  pfd->revents = B1NIX_POLLIN | B1NIX_POLLRDNORM;
   __atomic_fetch_add(&g_mi_poll_calls, 1, __ATOMIC_RELAXED);
   {
     u64 gen = vfs_mount_generation();
@@ -1730,12 +1734,10 @@ static int r_cmdline(usize pid, struct sbuf *s) {
  * fired only. Linux prints a column per CPU and the controller's name; one
  * total is what telling "the interrupt arrives" from "it does not" needs.
  *
- * The per-line counters are the aarch64 GIC's; x86_64 keeps none per line yet
- * and prints only the row below, which is the one a reader of this file on
- * this kernel is usually after. */
+ * The per-line counters are the aarch64 GIC's lines and x86_64's vectors
+ * (device lines 32-47, message interrupts 48-63). */
 static int r_interrupts(usize pid, struct sbuf *s) {
   (void)pid;
-#if defined(__aarch64__)
   {
     extern u64 arch_irq_count(u32 irq);
     extern u32 arch_irq_lines(void);
@@ -1746,7 +1748,6 @@ static int r_interrupts(usize pid, struct sbuf *s) {
         sb_addf(s, "%4u: %10lu\n", i, (unsigned long)n);
     }
   }
-#endif
   /* The RTC alarm, named rather than numbered: it is IRQ 8 on x86_64 and a
    * GIC SPI on aarch64, and what a reader wants to know is whether the alarm
    * that was armed actually interrupted anything (M129). */
@@ -1818,7 +1819,11 @@ static int r_b1nix_cpufreq(usize pid, struct sbuf *s) {
     sb_addf(s, "selected %d\n", sel);
     sb_addf(s, "request_took %d\n", cpufreq_request_took());
     sb_addf(s, "status_value 0x%lx\n", (unsigned long)cpufreq_status_value());
+    sb_addf(s, "ppc %d\n", cpufreq_ppc());
+    sb_addf(s, "transitions %lu\n", (unsigned long)cpufreq_transitions());
   }
+  if (strstr(cpufreq_governors(), "ondemand"))
+    sb_addf(s, "ondemand_load %lu\n", (unsigned long)cpufreq_od_load());
   return 0;
 }
 
@@ -2109,8 +2114,15 @@ static int r_pid_status(usize pid, struct sbuf *s) {
   {
     usize ppid = t->parent_id;
 
-    if (t->pml4_phys == 0 && t->id > 2)
+    if (t->pml4_phys == 0 && t->id > 2) {
       ppid = 2;
+    } else {
+      /* The parent process, not the thread of it that forked. */
+      struct task *p = scheduler_task_by_pid(ppid);
+
+      if (p && task_tgid(p))
+        ppid = task_tgid(p);
+    }
     sb_addf(s, "PPid:\t%lu\n", (unsigned long)namespace_pid_to_user(ppid));
   }
   /* Thread-group identity and size. A crash reporter reads Tgid to map a thread
@@ -2178,6 +2190,40 @@ static int r_pid_status(usize pid, struct sbuf *s) {
         nthreads++;
     }
     sb_addf(s, "Threads:\t%lu\n", (unsigned long)(nthreads ? nthreads : 1));
+  }
+  /* The signal masks, as Linux prints them: pending (this thread's, then the
+   * process's), blocked, ignored and caught -- bit n-1 for signal n, the real
+   * time signals included. What ps's STAT and every "why does it not die"
+   * question read. */
+  {
+    extern const struct sigaction *scheduler_rt_action_of(const struct task *t,
+                                                          int sig);
+    struct task *leader = scheduler_task_by_pid(task_tgid(t));
+    u64 ign = 0, cgt = 0;
+
+    for (int sig = 1; sig <= NSIG_MAX; sig++) {
+      const struct sigaction *sa =
+          SIG_IS_RT(sig) ? scheduler_rt_action_of(t, sig)
+                         : (sig <= 31 ? &t->sigactions[sig - 1] : 0);
+
+      if (!sa)
+        continue;
+      if (sa->sa_handler == SIG_IGN)
+        ign |= 1ULL << (sig - 1);
+      else if (sa->sa_handler != SIG_DFL)
+        cgt |= 1ULL << (sig - 1);
+    }
+    sb_addf(s, "SigPnd:\t%016llx\n",
+            (unsigned long long)__atomic_load_n(&t->pending_signals,
+                                                __ATOMIC_RELAXED));
+    sb_addf(s, "ShdPnd:\t%016llx\n",
+            (unsigned long long)(leader && leader != t
+                                     ? __atomic_load_n(&leader->pending_signals,
+                                                       __ATOMIC_RELAXED)
+                                     : 0));
+    sb_addf(s, "SigBlk:\t%016llx\n", (unsigned long long)t->blocked_signals);
+    sb_addf(s, "SigIgn:\t%016llx\n", (unsigned long long)ign);
+    sb_addf(s, "SigCgt:\t%016llx\n", (unsigned long long)cgt);
   }
   /* Heap span as VmData; the mapped span and the resident set as VmSize and
    * VmRSS.

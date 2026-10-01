@@ -162,6 +162,9 @@ u64 acpi_lapic_address(void);
  * jumps to on wake is written. All three come out of the FADT, and all three
  * are zero on a machine that has no FADT at all — a sleep is then refused
  * rather than attempted against port zero. */
+/* A field of the FADT, little-endian, `width` bytes at byte offset `off`; 0
+ * past the table's end or without one. */
+u64 acpi_fadt_read(u32 off, int width);
 u16 acpi_pm1a_cnt_port(void);
 u16 acpi_pm1b_cnt_port(void);
 u8  acpi_pm1_cnt_len(void);

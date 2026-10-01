@@ -119,7 +119,7 @@ void udp_send_net_oif(struct ipv4_addr dst, u16 src_port_net, u16 dst_port_net,
 	 * drain the loopback queue immediately: this lets recv() see the packet
 	 * right away (required for sendto-self + recv ordering tests). */
 	if (is_loopback)
-		net_loopback_drain();
+		net_loopback_deliver_now();
 }
 
 void udp_send(struct ipv4_addr dst, u16 src_port, u16 dst_port, const void *payload, usize size)
@@ -169,6 +169,15 @@ void udp6_send(struct in6_addr_k dst, u16 src_port_net, u16 dst_port_net,
 
 	net_proto_ipv6_send(dst, 17 /* UDP */, buffer, total_size);
 	kfree(buffer);
+	{
+		/* ::1: delivered before the send returns, as for 127/8. */
+		int lo = dst.bytes[15] == 1;
+
+		for (int i = 0; i < 15 && lo; i++)
+			lo = dst.bytes[i] == 0;
+		if (lo)
+			net_loopback_deliver_now();
+	}
 }
 
 /* M84: in-kernel consumers of well-known IPv6 UDP ports (DHCPv6 is the first

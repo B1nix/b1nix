@@ -418,6 +418,20 @@ static void timerfd_note_deadline(u64 tick) {
          !__atomic_compare_exchange_n(&g_timerfd_due, &cur, tick, 0,
                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
     ;
+  /* And the scheduler's: the tick hook that wakes the pollers only runs when
+   * there IS a tick, and a tickless idle machine programs its timer for the
+   * scheduler's next deadline. Without this it slept straight past the
+   * timerfd's -- an epoll_wait on a 300 ms timer woke 17 s late. */
+  if (tick && tick != ~0ull)
+    sched_note_deadline(tick);
+}
+
+/* The earliest timerfd deadline still ahead, or ~0: the scheduler folds it
+ * into the deadline it recomputes, so it is not dropped when that is. */
+u64 eventpoll_next_deadline(void) {
+  if (__atomic_load_n(&g_armed_timerfds, __ATOMIC_RELAXED) == 0)
+    return ~0ull;
+  return __atomic_load_n(&g_timerfd_due, __ATOMIC_ACQUIRE);
 }
 
 /* Compute and fold in any expirations that have elapsed since the last update.
@@ -429,8 +443,20 @@ static void timerfd_advance(struct timerfd_state *t) {
     /* The caller's clock decides. */
     u64 now_ns = ktime_user_monotonic_ns();
 
-    if (now_ns < t->deadline_ns)
+    if (now_ns < t->deadline_ns) {
+      /* Looked at before the deadline -- the tick count and the clock do not
+       * run in lockstep -- so look again when the rest has passed, or the
+       * timer is never looked at again. */
+      u64 tick_ns = 1000000000ull / TICKS_PER_SEC;
+      u64 now_tick = scheduler_get_uptime_ticks();
+
+      if (t->next_tick <= now_tick) {
+        t->next_tick =
+            now_tick + (t->deadline_ns - now_ns + tick_ns - 1) / tick_ns;
+        timerfd_note_deadline(t->next_tick);
+      }
       return;
+    }
     if (t->interval_ns == 0) {
       t->expirations += 1;
       t->next_tick = 0;
@@ -759,13 +785,15 @@ int vfs_timerfd_settime(int fd, int flags,
       u64 want_ns = want_ns_signed > 0 ? (u64)want_ns_signed : 0;
       u64 tick_ns = 1000000000ull / TICKS_PER_SEC;
       u64 delay_ns = want_ns > now_ns ? want_ns - now_ns : 0;
-      u64 kernel_now_ns = ktime_monotonic_ns();
 
       value = (delay_ns + tick_ns - 1) / tick_ns;
       if (value == 0)
         value = 1; /* already due: fire on the next tick, not never */
-      if (delay_ns < ~0ull - kernel_now_ns)
-        target_tick = (kernel_now_ns + delay_ns + tick_ns - 1) / tick_ns;
+      /* Counted from the tick it is now, not from the nanosecond clock
+       * divided into ticks: the two drift apart (a tickless port's count
+       * lagged its clock by seventeen seconds), and a tick number computed
+       * from one and compared against the other fired that much late. */
+      target_tick = scheduler_get_uptime_ticks() + value;
       /* And the deadline itself, kept in the caller's own units: that is what
        * decides whether the timer has expired. The tick only decides when to
        * look. */
@@ -784,7 +812,9 @@ int vfs_timerfd_settime(int fd, int flags,
 
     if (new_value->it_value.tv_sec >= 0 && new_value->it_value.tv_nsec >= 0 &&
         delay_ns < ~0ull - now_ns) {
-      u64 want = (now_ns + delay_ns + tick_ns - 1) / tick_ns;
+      /* From the current tick, for the reason given above. */
+      u64 want = scheduler_get_uptime_ticks() +
+                 (delay_ns + tick_ns - 1) / tick_ns;
 
       if (want <= TIMERFD_TICKS_MAX)
         target_tick = want;
@@ -856,7 +886,18 @@ void eventpoll_timer_tick(void) {
   for (struct timerfd_state *t = g_timerfds; t; t = t->all_next) {
     u64 d = t->next_tick;
 
-    if (t->armed && d > now && d < next)
+    if (!t->armed)
+      continue;
+    /* Its tick has come and its clock's deadline has not (see
+     * timerfd_advance): the rest of the wait, in ticks from now. */
+    if (t->deadline_ns && d <= now) {
+      u64 nns = ktime_user_monotonic_ns();
+      u64 tick_ns = 1000000000ull / TICKS_PER_SEC;
+
+      if (nns < t->deadline_ns)
+        d = now + (t->deadline_ns - nns + tick_ns - 1) / tick_ns;
+    }
+    if (d > now && d < next)
       next = d;
   }
   timerfd_list_release(flags);

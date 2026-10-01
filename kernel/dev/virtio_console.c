@@ -23,10 +23,10 @@
 #include <b1nix/serial.h>
 #include <b1nix/serial_tty.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/suspend.h>
 #include <b1nix/virtio.h>
 #include <b1nix/virtio_console.h>
 #include <string.h>
-#include <b1nix/suspend.h>
 
 #define VIRTIO_VENDOR_ID 0x1AF4
 #define VIRTIO_CONSOLE_DEVICE_ID_MODERN 0x1043 /* virtio device type 3 */
@@ -344,6 +344,84 @@ void virtio_console_poll(void)
 	}
 }
 
+/* The feature handshake, shared by probe and resume: VERSION_1 and nothing
+ * else. 0, or -1 when the device will not take it. */
+static int vc_negotiate(void)
+{
+	vc_cfg->device_status = 0;
+	vc_cfg->device_status = VIRTIO_STATUS_ACKNOWLEDGE;
+	vc_cfg->device_status |= VIRTIO_STATUS_DRIVER;
+	vc_cfg->device_feature_select = 1;
+	u32 hi = vc_cfg->device_feature;
+	vc_cfg->driver_feature_select = 0;
+	vc_cfg->driver_feature = 0;
+	vc_cfg->driver_feature_select = 1;
+	vc_cfg->driver_feature = hi & (1u << (VIRTIO_F_VERSION_1_BIT - 32));
+	vc_cfg->device_status |= VIRTIO_STATUS_FEATURES_OK;
+	return (vc_cfg->device_status & VIRTIO_STATUS_FEATURES_OK) ? 0 : -1;
+}
+
+/* Hand a queue the device forgot back to it: the same ring and buffers, the
+ * indices from zero, every receive buffer posted again and every transmit
+ * buffer free. Whatever the device had not sent is still in vc_ring. */
+static void vc_rebind_queue(u16 index, struct vc_queue *q, int device_writes)
+{
+	u16 qsize = q->vq.queue_size;
+	u64 ring_phys = (u64)(usize)q->vq.desc - vmm_direct_map_base();
+	u64 avail_phys = (u64)(usize)q->vq.avail - vmm_direct_map_base();
+	u64 used_phys = (u64)(usize)q->vq.used - vmm_direct_map_base();
+
+	vc_cfg->queue_select = index;
+	vc_cfg->queue_size = qsize;
+	q->vq.last_used_idx = 0;
+	q->vq.used->idx = 0;
+	q->nfree = 0;
+	for (u16 i = 0; i < qsize; i++) {
+		q->vq.desc[i].len = PAGE_SIZE;
+		if (device_writes)
+			q->vq.avail->ring[i] = i;
+		else
+			q->free[q->nfree++] = i;
+	}
+	q->avail_idx = device_writes ? qsize : 0;
+	q->vq.avail->idx = q->avail_idx;
+	vc_cfg->queue_desc_lo = (u32)ring_phys;
+	vc_cfg->queue_desc_hi = (u32)(ring_phys >> 32);
+	vc_cfg->queue_avail_lo = (u32)avail_phys;
+	vc_cfg->queue_avail_hi = (u32)(avail_phys >> 32);
+	vc_cfg->queue_used_lo = (u32)used_phys;
+	vc_cfg->queue_used_hi = (u32)(used_phys >> 32);
+	vc_cfg->queue_enable = 1;
+	q->notify = (volatile u16 *)(vc_notify_base +
+	                             (u32)vc_cfg->queue_notify_off * vc_notify_mult);
+}
+
+/* After a sleep that reset the device (M135): the PCI header is back already
+ * (pci-config resumes first), the device itself is at reset, so the
+ * handshake and both queues are done again. */
+static int vc_resume(void *ctx)
+{
+	u64 flags;
+	int rc = 0;
+
+	(void)ctx;
+	if (!vc_ready)
+		return 0;
+	spin_lock_irqsave(&vc_lock, &flags);
+	vc_ready = 0;
+	if (vc_negotiate() != 0) {
+		rc = -1;
+	} else {
+		vc_rebind_queue(0, &vc_rx, 1);
+		vc_rebind_queue(1, &vc_tx, 0);
+		vc_cfg->device_status |= VIRTIO_STATUS_DRIVER_OK;
+		vc_ready = 1;
+		vc_pump();
+	}
+	spin_unlock_irqrestore(&vc_lock, flags);
+	return rc;
+}
+
 void virtio_console_init(void)
 {
 	struct pci_device_info pci;
@@ -361,18 +439,8 @@ void virtio_console_init(void)
 		console_write("virtio-console: missing config capabilities\n");
 		return;
 	}
-	vc_cfg->device_status = 0;
-	vc_cfg->device_status = VIRTIO_STATUS_ACKNOWLEDGE;
-	vc_cfg->device_status |= VIRTIO_STATUS_DRIVER;
 	/* Nothing but VERSION_1: no multiport, no size, no emergency write. */
-	vc_cfg->device_feature_select = 1;
-	u32 hi = vc_cfg->device_feature;
-	vc_cfg->driver_feature_select = 0;
-	vc_cfg->driver_feature = 0;
-	vc_cfg->driver_feature_select = 1;
-	vc_cfg->driver_feature = hi & (1u << (VIRTIO_F_VERSION_1_BIT - 32));
-	vc_cfg->device_status |= VIRTIO_STATUS_FEATURES_OK;
-	if (!(vc_cfg->device_status & VIRTIO_STATUS_FEATURES_OK)) {
+	if (vc_negotiate() != 0) {
 		console_write("virtio-console: features rejected\n");
 		return;
 	}
@@ -384,6 +452,7 @@ void virtio_console_init(void)
 	vc_cfg->device_status |= VIRTIO_STATUS_DRIVER_OK;
 	pci_bind_driver(&pci, "virtio-console");
 	vc_ready = 1;
+	suspend_register_device("virtio-console", vc_resume, 0);
 	serial_tty_hvc_attach();
 	console_write("virtio-console: /dev/hvc0 ready\n");
 	/* Proof for the harness, which reads the host side of the console. */

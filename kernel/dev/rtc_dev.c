@@ -414,7 +414,7 @@ void rtc_wake_source_init(void) {
    * the platform wakes on, so this source can end an S3 as well as an idle
    * suspend (see SUSPEND_WAKE_DEEP). */
   suspend_register_wake_source_flags("rtc", rtc_wake_armed_cb, 0,
-                                     SUSPEND_WAKE_DEEP);
+                                     SUSPEND_WAKE_DEEP | SUSPEND_WAKE_EVENTS);
 }
 
 u64 rtc_wake_irq_count(void) {
@@ -742,7 +742,7 @@ void rtc_wake_source_init(void) {
    * the platform wakes on, so this source can end an S3 as well as an idle
    * suspend (see SUSPEND_WAKE_DEEP). */
   suspend_register_wake_source_flags("rtc", rtc_wake_armed_cb, 0,
-                                     SUSPEND_WAKE_DEEP);
+                                     SUSPEND_WAKE_DEEP | SUSPEND_WAKE_EVENTS);
 }
 
 u64 rtc_wake_irq_count(void) {

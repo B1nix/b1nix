@@ -56,6 +56,16 @@ elif grep -q 'b1nix.smoke=pku' /proc/cmdline 2>/dev/null; then
     /bin/m124_smoke
     ( /bin/usleep 200000; /bin/reboot -f ) &
     exit 0
+elif grep -q 'b1nix.smoke=hib' /proc/cmdline 2>/dev/null; then
+    # M135 hibernation: the one test, which writes an image, reboots, and
+    # carries on in the resumed machine; then a power-off.
+    mkdir -p /mnt/host 2>/dev/null || true
+    mount -t 9p hostshare /mnt/host 2>/dev/null || true
+    [ -x /mnt/host/bin/m135_hib_smoke ] && cp -f /mnt/host/bin/m135_hib_smoke /bin/m135_hib_smoke
+    /bin/m135_hib_smoke
+    echo "B1NIX-TEST: done"
+    ( /bin/usleep 200000; /bin/poweroff -f ) &
+    exit 0
 elif grep -q 'b1nix.smoke=iommu' /proc/cmdline 2>/dev/null; then
     # The IOMMU instances: the kernel's self-tests are the whole check and they
     # have run by the time userspace is up. End by RESTARTING through the real
@@ -67,6 +77,13 @@ elif grep -q 'b1nix.smoke=iommu' /proc/cmdline 2>/dev/null; then
     # restart, so both commands stay covered.
     # Both boot the same ISO, so the lane is told apart by the unit the
     # kernel found, not by the command line.
+    # First an S3 (M135): the unit comes back reset, and the NVMe
+    # controller's remapped interrupts must arrive after the resume.
+    mkdir -p /mnt/host 2>/dev/null || true
+    mount -t 9p hostshare /mnt/host 2>/dev/null || true
+    [ -x /mnt/host/bin/m135_iommu_s3_smoke ] &&
+        cp -f /mnt/host/bin/m135_iommu_s3_smoke /bin/m135_iommu_s3_smoke
+    /bin/m135_iommu_s3_smoke
     if ! dmesg 2>/dev/null | grep -q 'amdvi: unit at' &&
        [ -x /bin/reboot2_smoke ]; then
         ( /bin/usleep 200000; /bin/reboot2_smoke bootloader; /bin/reboot -f ) &
@@ -265,6 +282,9 @@ run_test /bin/m129_suspend_smoke posix
 # I/O port and read a status bit back, so it runs where nothing else is
 # poking at the same hardware.
 run_test /bin/m134_aml_smoke posix
+# M135: ACPI events. The host presses the power button and changes the VM
+# generation when it asks, so it runs where nothing else is waiting on input.
+run_test /bin/m135_acpi_smoke posix
 # M123: the same namespaces through Alpine's unshare, nsenter and bubblewrap.
 if [ "$SMOKE_POSIX" = "1" ] && [ -x /etc/m123-tools-smoke.sh ]; then
     /bin/sh /etc/m123-tools-smoke.sh
@@ -319,4 +339,15 @@ echo "B1NIX-TEST: done"
 # markers still on it.
 grep -q 'b1nix.keep-running' /proc/cmdline 2>/dev/null && exit 0
 
-( sleep 1; /bin/poweroff -f || /bin/halt -f ) &
+# The posix lane ends on a thermal zone past its critical trip instead, where
+# the firmware declares one (M135): the kernel's orderly power-off is then the
+# only way the machine goes down, and the host checks that it did.
+TZ=/sys/class/thermal/thermal_zone0
+if grep -q 'b1nix.smoke=posix' /proc/cmdline 2>/dev/null &&
+   [ "$(cat $TZ/trip_point_0_type 2>/dev/null)" = critical ] &&
+   [ -w $TZ/emul_temp ]; then
+    echo "SMOKE: past the critical trip"
+    ( sleep 1; echo $(( $(cat $TZ/trip_point_0_temp) + 1000 )) > $TZ/emul_temp ) &
+else
+    ( sleep 1; /bin/poweroff -f || /bin/halt -f ) &
+fi

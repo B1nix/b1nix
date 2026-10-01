@@ -40,7 +40,10 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
 	[ "$seen" = "0 m123-nsenter " ] && break
 	/bin/usleep 100000
 done
-kill "$target" 2>/dev/null
+# KILL, not TERM: this script can run with SIGTERM ignored (OpenRC's local
+# service), the sleep inherits that across its execs, and a TERM then left it
+# sleeping out its thirty seconds.
+kill -KILL "$target" 2>/dev/null
 wait "$target" 2>/dev/null
 if [ "$seen" = "0 m123-nsenter " ]; then
 	echo "M123-TOOLS: ok nsenter-userns"

@@ -31,6 +31,7 @@
 struct ps_dev {
     char path[PS_PATH_MAX];
     int  energy_units;      /* battery only: 0 = mAh, 1 = mWh */
+    u64  alarm;             /* battery only: the _BTP trip last set, milli- */
 };
 
 static struct ps_dev g_bat[ACPI_PS_MAX_BATTERY];
@@ -143,6 +144,70 @@ static int eval_int(const char *base, const char *method, u64 *out) {
     return 0;
 }
 
+/* A battery's static information, from _BIX (ACPI 4.0 and later) where the
+ * firmware has it and _BIF otherwise. The two carry the same numbers at
+ * different offsets -- _BIX puts a revision first -- and _BIX adds the cycle
+ * count. `str` is where the four strings begin: model, serial, type, OEM. */
+struct bat_info {
+    u64 unit, design, full, tech, design_mv, warn, low;
+    i64 cycles;          /* -1: _BIF has none */
+    const char *method;  /* "_BIX" or "_BIF" */
+    u32 str;
+};
+
+static int bat_info(int idx, struct bat_info *bi) {
+    struct aml_result r;
+    const char *base = g_bat[idx].path;
+
+    memset(bi, 0, sizeof(*bi));
+    if (eval_pkg(base, "_BIX", &r) == 0 && r.elems >= 20) {
+        bi->method = "_BIX";
+        bi->unit = r.elem_int[1];
+        bi->design = r.elem_int[2];
+        bi->full = r.elem_int[3];
+        bi->tech = r.elem_int[4];
+        bi->design_mv = r.elem_int[5];
+        bi->warn = r.elem_int[6];
+        bi->low = r.elem_int[7];
+        bi->cycles = r.elem_int[8] == 0xFFFFFFFFULL ? -1 : (i64)r.elem_int[8];
+        bi->str = 16;
+        return 0;
+    }
+    if (eval_pkg(base, "_BIF", &r) == 0 && r.elems >= 13) {
+        bi->method = "_BIF";
+        bi->unit = r.elem_int[0];
+        bi->design = r.elem_int[1];
+        bi->full = r.elem_int[2];
+        bi->tech = r.elem_int[3];
+        bi->design_mv = r.elem_int[4];
+        bi->warn = r.elem_int[5];
+        bi->low = r.elem_int[6];
+        bi->cycles = -1;
+        bi->str = 9;
+        return 0;
+    }
+    return -1;
+}
+
+/* One of the four strings, trimmed of trailing blanks and NULs. */
+static int bat_string(int idx, const struct bat_info *bi, u32 which,
+                      char *out, usize cap) {
+    char p[PS_PATH_MAX + 8];
+    struct aml_result r;
+    usize n;
+
+    path_join(p, sizeof(p), g_bat[idx].path, bi->method);
+    if (aml_evaluate_element(p, 0, 0, bi->str + which, &r) != AML_OK ||
+        r.type != AML_T_STRING)
+        return -1;
+    n = r.bytes_copied < cap - 1 ? r.bytes_copied : cap - 1;
+    memcpy(out, r.bytes, n);
+    while (n && (out[n - 1] == ' ' || out[n - 1] == 0))
+        n--;
+    out[n] = 0;
+    return (int)n;
+}
+
 #define PS_SCAN_MAX_DEV 256
 #define PS_SCAN_MAX_TZ  32
 
@@ -188,14 +253,14 @@ void acpi_power_init(void) {
     kfree(sc.dev);
     kfree(sc.tz);
 
-    /* The unit the firmware reports in is _BIF element 0: 0 means mW/mWh
-     * (energy), 1 means mA/mAh (charge). Read once — it does not change. */
+    /* The unit the firmware reports in is the power unit of _BIX or _BIF:
+     * 0 means mW/mWh (energy), 1 means mA/mAh (charge). Read once — it does
+     * not change. */
     for (int i = 0; i < g_nbat; i++) {
-        struct aml_result r;
+        struct bat_info bi;
         g_bat[i].energy_units = 1;
-        if (eval_pkg(g_bat[i].path, "_BIF", &r) == 0 && r.elems >= 1 &&
-            r.elem_type[0] == AML_T_INTEGER)
-            g_bat[i].energy_units = r.elem_int[0] == 0 ? 1 : 0;
+        if (bat_info(i, &bi) == 0)
+            g_bat[i].energy_units = bi.unit == 0 ? 1 : 0;
         k_info("acpi", "battery %s (%s units)", g_bat[i].path,
                g_bat[i].energy_units ? "energy" : "charge");
     }
@@ -228,6 +293,93 @@ const char *acpi_power_thermal_path(int idx) {
 /* _BST element 0 is a bit mask: 1 discharging, 2 charging, 4 critical. */
 #define BST_DISCHARGING 1u
 #define BST_CHARGING    2u
+#define BST_CRITICAL    4u
+
+/* ── charge_behaviour: _BMD and _BMC (ACPI battery maintenance) ────────── */
+
+/* _BMD capability flags (element 1) and status flags (element 0) share these
+ * two bits, and _BMC takes them as its argument. */
+#define BMD_DISABLE_CHARGING   (1u << 1)
+#define BMD_DISCHARGE_ON_AC    (1u << 2)
+
+static const struct {
+    const char *name;
+    u64 bmc;
+} g_charge_modes[] = {
+    {"auto", 0},
+    {"inhibit-charge", BMD_DISABLE_CHARGING},
+    {"force-discharge", BMD_DISCHARGE_ON_AC},
+};
+
+static int bat_bmd(int idx, u64 *status, u64 *caps) {
+    struct aml_result r;
+
+    if (!acpi_power_battery_has(idx, "_BMD") ||
+        eval_pkg(g_bat[idx].path, "_BMD", &r) < 0 || r.elems < 2)
+        return -1;
+    *status = r.elem_int[0];
+    *caps = r.elem_int[1];
+    return 0;
+}
+
+int acpi_power_battery_has_charge_control(int idx) {
+    u64 status, caps;
+
+    if (idx < 0 || idx >= g_nbat || !acpi_power_battery_has(idx, "_BMC") ||
+        bat_bmd(idx, &status, &caps) < 0)
+        return 0;
+    return (caps & (BMD_DISABLE_CHARGING | BMD_DISCHARGE_ON_AC)) != 0;
+}
+
+/* Every mode the firmware can do, the one it reports now in brackets --
+ * Linux's format for this file. */
+static int bat_charge_behaviour(int idx, char *buf, usize cap) {
+    u64 status, caps, cur;
+    usize n = 0;
+
+    if (bat_bmd(idx, &status, &caps) < 0)
+        return -1;
+    cur = status & (BMD_DISABLE_CHARGING | BMD_DISCHARGE_ON_AC);
+    if (cur & BMD_DISCHARGE_ON_AC)
+        cur = BMD_DISCHARGE_ON_AC;
+    for (usize k = 0; k < sizeof(g_charge_modes) / sizeof(g_charge_modes[0]); k++) {
+        u64 bit = g_charge_modes[k].bmc;
+        int w;
+
+        if (bit && !(caps & bit))
+            continue;
+        w = snprintf(buf + n, cap - n, bit == cur ? "%s[%s]" : "%s%s",
+                     n ? " " : "", g_charge_modes[k].name);
+        if (w < 0 || (usize)w >= cap - n)
+            return -1;
+        n += (usize)w;
+    }
+    if (n + 1 >= cap)
+        return -1;
+    buf[n++] = '\n';
+    buf[n] = 0;
+    return (int)n;
+}
+
+int acpi_power_battery_set_charge_behaviour(int idx, const char *name) {
+    char p[PS_PATH_MAX + 8];
+    struct aml_result r;
+    u64 status, caps, arg;
+
+    if (!acpi_power_battery_has_charge_control(idx) ||
+        bat_bmd(idx, &status, &caps) < 0)
+        return -1;
+    for (usize k = 0; k < sizeof(g_charge_modes) / sizeof(g_charge_modes[0]); k++) {
+        if (strcmp(name, g_charge_modes[k].name))
+            continue;
+        arg = g_charge_modes[k].bmc;
+        if (arg && !(caps & arg))
+            return -1;          /* a mode this firmware cannot do */
+        path_join(p, sizeof(p), g_bat[idx].path, "_BMC");
+        return aml_evaluate(p, &arg, 1, &r) == AML_OK ? 0 : -1;
+    }
+    return -1;
+}
 
 int acpi_power_battery_attr(int idx, int which, char *buf, usize cap) {
     if (idx < 0 || idx >= g_nbat)
@@ -248,6 +400,62 @@ int acpi_power_battery_attr(int idx, int which, char *buf, usize cap) {
         return snprintf(buf, cap, "%u\n", (sta & 0x10) ? 1u : 0u);
     }
 
+    struct bat_info bi;
+    if (bat_info(idx, &bi) < 0)
+        return -1;
+
+    /* The static ones first: they need no _BST. */
+    switch (which) {
+    case ACPI_BAT_FULL_DESIGN:
+        if (!bi.design || bi.design == 0xFFFFFFFFULL)
+            return -1;
+        return snprintf(buf, cap, "%llu\n",
+                        (unsigned long long)(bi.design * 1000));
+    case ACPI_BAT_VOLTAGE_MIN:
+        if (!bi.design_mv || bi.design_mv == 0xFFFFFFFFULL)
+            return -1;
+        return snprintf(buf, cap, "%llu\n",
+                        (unsigned long long)(bi.design_mv * 1000));
+    case ACPI_BAT_CYCLES:
+        if (bi.cycles < 0)
+            return -1;
+        return snprintf(buf, cap, "%lld\n", (long long)bi.cycles);
+    case ACPI_BAT_TECHNOLOGY: {
+        /* Linux reads the chemistry from the type string. */
+        static const struct { const char *acpi, *name; } chem[] = {
+            {"LION", "Li-ion"}, {"LI-ION", "Li-ion"}, {"LIP", "Li-poly"},
+            {"LI-POLY", "Li-poly"}, {"NIMH", "NiMH"}, {"NICD", "NiCd"},
+            {"LIFE", "LiFe"}, {"LIMN", "LiMn"},
+        };
+        char t[16];
+        if (bat_string(idx, &bi, 2, t, sizeof(t)) < 0)
+            return snprintf(buf, cap, "Unknown\n");
+        for (usize k = 0; t[k]; k++)
+            if (t[k] >= 'a' && t[k] <= 'z')
+                t[k] = (char)(t[k] - 32);
+        for (usize k = 0; k < sizeof(chem) / sizeof(chem[0]); k++)
+            if (!strcmp(t, chem[k].acpi))
+                return snprintf(buf, cap, "%s\n", chem[k].name);
+        return snprintf(buf, cap, "Unknown\n");
+    }
+    case ACPI_BAT_MODEL:
+    case ACPI_BAT_SERIAL:
+    case ACPI_BAT_MANUFACTURER: {
+        char t[64];
+        u32 k = which == ACPI_BAT_MODEL ? 0 : which == ACPI_BAT_SERIAL ? 1 : 3;
+        if (bat_string(idx, &bi, k, t, sizeof(t)) < 0)
+            return -1;
+        return snprintf(buf, cap, "%s\n", t);
+    }
+    case ACPI_BAT_ALARM:
+        return snprintf(buf, cap, "%llu\n",
+                        (unsigned long long)(g_bat[idx].alarm * 1000));
+    case ACPI_BAT_CHARGE_BEHAVIOUR:
+        return bat_charge_behaviour(idx, buf, cap);
+    default:
+        break;
+    }
+
     struct aml_result bst;
     if (eval_pkg(base, "_BST", &bst) < 0 || bst.elems < 4)
         return -1;
@@ -262,22 +470,19 @@ int acpi_power_battery_attr(int idx, int which, char *buf, usize cap) {
         return snprintf(buf, cap, "%s\n", s);
     }
 
-    struct aml_result bif;
-    if (eval_pkg(base, "_BIF", &bif) < 0 || bif.elems < 3)
-        return -1;
-    u64 full = bif.elem_int[2];             /* last full charge capacity */
+    u64 full = bi.full;                     /* last full charge capacity */
     if (full == 0 || full == 0xFFFFFFFFULL)
-        full = bif.elem_int[1];             /* fall back to the design value */
+        full = bi.design;                   /* fall back to the design value */
 
     switch (which) {
     case ACPI_BAT_VOLTAGE: {
-        /* _BST's present voltage in mV, or _BIF's design voltage when the
+        /* _BST's present voltage in mV, or the design voltage when the
          * battery will not say. upower reads this and a laptop's battery
          * indicator is wrong without it. */
         u64 mv = bst.elem_int[3];
 
         if (!mv || mv == 0xFFFFFFFFULL)
-            mv = bif.elems > 4 ? bif.elem_int[4] : 0;
+            mv = bi.design_mv;
         if (!mv || mv == 0xFFFFFFFFULL)
             return -1;
         return snprintf(buf, cap, "%llu\n", (unsigned long long)(mv * 1000));
@@ -296,6 +501,21 @@ int acpi_power_battery_attr(int idx, int which, char *buf, usize cap) {
             return -1;
         return snprintf(buf, cap, "%llu\n",
                         (unsigned long long)(remaining * 100 / full));
+    case ACPI_BAT_CAPACITY_LEVEL: {
+        /* As Linux's acpi battery decides it: critical from _BST, low at or
+         * under the alarm the firmware was given, full at the last full
+         * charge, normal otherwise. */
+        const char *lvl;
+        if (state & BST_CRITICAL)
+            lvl = "Critical";
+        else if (g_bat[idx].alarm && remaining <= g_bat[idx].alarm)
+            lvl = "Low";
+        else if (full && remaining >= full)
+            lvl = "Full";
+        else
+            lvl = "Normal";
+        return snprintf(buf, cap, "%s\n", lvl);
+    }
     case ACPI_BAT_NOW:
         if (remaining == 0xFFFFFFFFULL)
             return -1;
@@ -309,6 +529,30 @@ int acpi_power_battery_attr(int idx, int which, char *buf, usize cap) {
     default:
         return -1;
     }
+}
+
+int acpi_power_battery_has(int idx, const char *method) {
+    char p[PS_PATH_MAX + 8];
+
+    if (idx < 0 || idx >= g_nbat)
+        return 0;
+    path_join(p, sizeof(p), g_bat[idx].path, method);
+    return aml_exists(p);
+}
+
+/* _BTP: the firmware notifies when the remaining capacity crosses this. */
+int acpi_power_battery_set_alarm(int idx, u64 micro) {
+    char p[PS_PATH_MAX + 8];
+    struct aml_result r;
+    u64 milli = micro / 1000;
+
+    if (idx < 0 || idx >= g_nbat || !acpi_power_battery_has(idx, "_BTP"))
+        return -1;
+    path_join(p, sizeof(p), g_bat[idx].path, "_BTP");
+    if (aml_evaluate(p, &milli, 1, &r) != AML_OK)
+        return -1;
+    g_bat[idx].alarm = milli;
+    return 0;
 }
 
 int acpi_power_ac_attr(int idx, char *buf, usize cap) {

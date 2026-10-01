@@ -603,9 +603,9 @@ static isize sock_recv_once(struct vfs_handle *h, void *buf, usize len,
    * pending before saying there is nothing. */
   if (s->type == B1NIX_SOCK_DGRAM && s->udp_q_count == 0 &&
       (s->domain == B1NIX_AF_INET || s->domain == B1NIX_AF_INET6)) {
-    extern void net_loopback_drain(void);
+    extern void net_loopback_deliver_now(void);
 
-    net_loopback_drain();
+    net_loopback_deliver_now();
   }
 
   if (s->domain == B1NIX_AF_UNIX) {
@@ -993,6 +993,32 @@ usize vfs_socket_last_srcaddr(int fd, void *addr, usize cap) {
  * vfs_socket_last_srcaddr above, so no receive path has to grow an argument. */
 /* Whether the descriptor is a datagram socket (UDP, raw, AF_UNIX datagram):
  * the kind whose recv can report a message's real length with MSG_TRUNC. */
+int vfs_socket_accept_pending(struct vfs_handle *h) {
+  struct vfs_socket_state *s;
+  extern int unix_pending_connections(struct vfs_socket_state *s);
+
+  if (!h || h->kind != VFS_HANDLE_SOCKET)
+    return 0;
+  s = (struct vfs_socket_state *)h->private_data;
+  if (!s->listening)
+    return 0;
+  if (s->domain == B1NIX_AF_UNIX)
+    return unix_pending_connections(s);
+  return tcp_pending_connections_af(ntoh16(s->local.in.sin_port), s->domain,
+                                    s->ipv6_v6only);
+}
+
+u32 vfs_socket_send_room(struct vfs_handle *h) {
+  struct vfs_socket_state *s;
+
+  if (!h || h->kind != VFS_HANDLE_SOCKET)
+    return 0;
+  s = (struct vfs_socket_state *)h->private_data;
+  if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn)
+    return tcp_send_room((struct tcp_conn *)s->tcp_conn);
+  return 0xffffffffu;
+}
+
 int vfs_socket_is_dgram(int fd) {
   struct vfs_handle *h = scheduler_fd_get(fd);
   if (!h || h->kind != VFS_HANDLE_SOCKET)
@@ -2120,6 +2146,8 @@ int vfs_accept_h(struct vfs_handle *h, void *addr, usize *addrlen) {
   /* An accepted socket inherits the listener's buffer sizes, as on Linux. */
   new_s->so_rcvbuf = s->so_rcvbuf;
   new_s->rcvbuf_locked = s->rcvbuf_locked;
+  new_s->so_sndbuf = s->so_sndbuf;
+  new_s->sndbuf_locked = s->sndbuf_locked;
   /* An accepted connection inherits what the listening socket asked for. */
   new_s->so_passpidfd = s->so_passpidfd;
   new_s->so_no_passrights = s->so_no_passrights;
@@ -2402,6 +2430,8 @@ static void sock_apply_tcp_opts(struct vfs_socket_state *s) {
    * before reading). Linux does the same: SOCK_RCVBUF_LOCK. */
   if (s->rcvbuf_locked && s->so_rcvbuf > 0)
     tcp_set_rcvbuf((struct tcp_conn *)s->tcp_conn, (u32)s->so_rcvbuf);
+  if (s->sndbuf_locked && s->so_sndbuf > 0)
+    tcp_set_sndbuf((struct tcp_conn *)s->tcp_conn, 2u * (u32)s->so_sndbuf);
   if (s->tcp_syncnt > 0)
     tcp_set_syncnt((struct tcp_conn *)s->tcp_conn, (u32)s->tcp_syncnt);
   if (s->tcp_user_timeout_ms > 0)
@@ -2843,6 +2873,10 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
       s->so_sndbuf = (optname == SOCK_SO_SNDBUFFORCE)
                          ? sock_clamp_mem(v, (u32)-1)
                          : sock_clamp_mem(v, sock_wmem_max());
+      s->sndbuf_locked = 1;
+      if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn)
+        tcp_set_sndbuf((struct tcp_conn *)s->tcp_conn,
+                       2u * (u32)s->so_sndbuf); /* doubled, as Linux stores it */
       return 0;
     case SOCK_SO_RCVBUF:
     case SOCK_SO_RCVBUFFORCE:

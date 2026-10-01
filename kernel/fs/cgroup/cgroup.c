@@ -867,6 +867,16 @@ static usize cg_mem_over_limit(struct cgroup *cg, u64 max_pages) {
    * than by measuring again, because measuring walks the page tables of every
    * member and doing that per round would cost more than the reclaim. */
   usize total = 0;
+  u64 usage = now;
+  u64 flags;
+
+  /* For the report, if it comes to a kill: whether the attempt below was cut
+   * short by a dry result a moment ago, and how much it looked at. */
+  spin_lock_irqsave(&cg_lock, &flags);
+  u64 dry = cg->mem_reclaim_dry_at_ns;
+  u64 scan0 = cg->mem_pgscan;
+  spin_unlock_irqrestore(&cg_lock, flags);
+  int cooled = dry && ktime_monotonic_ns() - dry < CG_MEM_ACTION_COOLDOWN_NS;
 
   for (usize round = 0; round < CG_RECLAIM_ROUNDS && now > max_pages; round++) {
     usize freed = cg_reclaim(cg, now - max_pages > CG_RECLAIM_BATCH
@@ -885,9 +895,9 @@ static usize cg_mem_over_limit(struct cgroup *cg, u64 max_pages) {
   }
 
   usize victim = cgroup_oom_victim(cg);
-  u64 flags;
 
   spin_lock_irqsave(&cg_lock, &flags);
+  u64 scanned = cg->mem_pgscan - scan0;
   cg->mem_ev_max++;
   cg->mem_ev_oom++;
   if (victim)
@@ -896,8 +906,18 @@ static usize cg_mem_over_limit(struct cgroup *cg, u64 max_pages) {
   spin_unlock_irqrestore(&cg_lock, flags);
 
   if (victim) {
+    char why[160];
+
+    /* What Linux's memcg OOM report says first: usage against the limit, and
+     * what reclaim managed before it came to this. */
+    snprintf(why, sizeof(why),
+             " (usage %lu of %lu pages; reclaim freed %lu, scanned %lu%s)",
+             (unsigned long)usage, (unsigned long)max_pages,
+             (unsigned long)total, (unsigned long)scanned,
+             cooled ? ", skipped: dry a moment ago" : "");
     console_write("[OOM-KILL] cgroup over memory.max — killing pid ");
     console_write_dec(victim);
+    console_write(why);
     console_write("\n");
     scheduler_kill(victim, SIGKILL);
   }

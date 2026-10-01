@@ -923,6 +923,11 @@ usize vfs_socket_origdstaddr(int fd, void *addr, usize cap);
 /* SO_TIMESTAMP: 0 = off, 1 = SO_TIMESTAMP, 2 = SO_TIMESTAMPNS. */
 int vfs_socket_timestamp_enabled(int fd);
 int vfs_socket_is_dgram(int fd);
+/* Bytes a non-blocking send on this socket accepts now; UINT32_MAX for a
+ * socket that is not window-limited TCP. */
+u32 vfs_socket_send_room(struct vfs_handle *h);
+/* Connections queued on a listening socket, not yet accepted. */
+int vfs_socket_accept_pending(struct vfs_handle *h);
 /* The oldest MSG_ZEROCOPY completion range of socket `fd`, taken off its error
  * queue: 0 and the range, -EAGAIN when the queue is empty. `family` gets the
  * socket's address family, which decides the control message it goes in. */
@@ -1179,6 +1184,9 @@ struct vfs_socket_state {
   /* SO_RCVBUF was set by the program (Linux's SOCK_RCVBUF_LOCK): only then is
    * so_rcvbuf a ceiling on a TCP receive buffer; otherwise it auto-tunes. */
   u8 rcvbuf_locked;
+  /* SO_SNDBUF was set by the program (Linux's SOCK_SNDBUF_LOCK): only then is
+   * it a loopback sender's budget; otherwise that autotunes. */
+  u8 sndbuf_locked;
   int so_sndbuf;
   /* SO_RCVTIMEO / SO_SNDTIMEO, in milliseconds; 0 means "no timeout", which is
    * what a socket starts with. A blocking recv/send that reaches the deadline

@@ -35,6 +35,7 @@
 #include <b1nix/ktime.h>
 #include <b1nix/mm.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/acpi_event.h>
 #include <b1nix/types.h>
 #include <stdio.h>
 #include <string.h>
@@ -96,6 +97,26 @@ static u32   g_skipped;
 static int   g_ready;
 static int   g_int_bits = 64;           /* 32 for a revision-1 DSDT */
 static spinlock_t g_aml_lock = SPINLOCK_INIT;
+
+/* The absolute path of a node, "\\_SB_.PCI0", as aml_walk spells it. */
+static void node_abs_path(const struct aml_node *n, char *out, usize cap) {
+    const struct aml_node *chain[32];
+    int depth = 0;
+    usize l = 0;
+
+    for (; n && n->parent && depth < 32; n = n->parent)
+        chain[depth++] = n;
+    if (cap)
+        out[l++] = '\\';
+    for (int i = depth - 1; i >= 0 && l + 6 < cap; i--) {
+        if (i != depth - 1)
+            out[l++] = '.';
+        for (int k = 0; k < 4; k++)
+            out[l++] = chain[i]->seg[k];
+    }
+    if (cap)
+        out[l < cap ? l : cap - 1] = 0;
+}
 
 /* Which address spaces this interpreter refused, one bit per space, so the
  * boot log and /proc can say so once instead of per access. */
@@ -1679,7 +1700,17 @@ static struct aml_obj *eval_term(struct aml_ctx *c) {
                 const u8 *before = c->p;
                 if (parse_name(c, &np) != AML_OK) { c->p = before; break; }
                 struct aml_node *nd = ns_resolve(c->scope, &np, 0);
-                if (nd && nd->val) {
+                int t = nd && nd->val ? nd->val->type : AML_T_UNINIT;
+                if (t == AML_T_DEVICE || t == AML_T_POWER ||
+                    t == AML_T_PROCESSOR || t == AML_T_THERMAL) {
+                    /* A package naming a device is a list for the OS to
+                     * follow -- _PR0, _ALx, _PSL, _PRT -- and what it needs
+                     * is where the device is, which the object alone does
+                     * not say. */
+                    char buf[160];
+                    node_abs_path(nd, buf, sizeof(buf));
+                    res->u.pkg.e[i] = obj_str(buf);
+                } else if (nd && nd->val) {
                     res->u.pkg.e[i] = aml_ref(nd->val);
                 } else {
                     char buf[40];
@@ -2095,7 +2126,9 @@ static struct aml_obj *eval_term(struct aml_ctx *c) {
         char path[128];
         if (lv.kind == LV_NODE && lv.node) {
             ns_path(lv.node, path, sizeof(path));
-            k_info("aml", "Notify(%s, 0x%llx)", path, (unsigned long long)v);
+            /* The OS's side of it runs later, in kacpid: this is under the
+             * interpreter's lock. */
+            acpi_event_notify(path, v);
         }
         lv_clear(&lv);
         break;
@@ -2949,7 +2982,7 @@ static void fill_result(struct aml_obj *o, struct aml_result *out) {
  * handing the caller the interpreter's own object layout instead would mean
  * handing out a pointer whose lifetime is the interpreter's lock. */
 static int aml_evaluate_at(const char *path, const u64 *args, int nargs,
-                           int elem, struct aml_result *out) {
+                           int elem, int sub, struct aml_result *out) {
     if (!out)
         return AML_EARG;
     memset(out, 0, sizeof(*out));
@@ -3000,7 +3033,14 @@ static int aml_evaluate_at(const char *path, const u64 *args, int nargs,
             fill_result(res, out);
         } else if (res && res->type == AML_T_PACKAGE &&
                    (u32)elem < res->u.pkg.n) {
-            fill_result(res->u.pkg.e[elem], out);
+            struct aml_obj *e = res->u.pkg.e[elem];
+
+            if (sub < 0)
+                fill_result(e, out);
+            else if (e && e->type == AML_T_PACKAGE && (u32)sub < e->u.pkg.n)
+                fill_result(e->u.pkg.e[sub], out);
+            else
+                err = AML_EARG;
         } else {
             err = AML_EARG;
         }
@@ -3012,11 +3052,16 @@ static int aml_evaluate_at(const char *path, const u64 *args, int nargs,
 
 int aml_evaluate(const char *path, const u64 *args, int nargs,
                  struct aml_result *out) {
-    return aml_evaluate_at(path, args, nargs, -1, out);
+    return aml_evaluate_at(path, args, nargs, -1, -1, out);
 }
 
 int aml_evaluate_element(const char *path, const u64 *args, int nargs,
                          u32 index, struct aml_result *out) {
-    return aml_evaluate_at(path, args, nargs, (int)index, out);
+    return aml_evaluate_at(path, args, nargs, (int)index, -1, out);
+}
+
+int aml_evaluate_subelement(const char *path, const u64 *args, int nargs,
+                            u32 index, u32 sub, struct aml_result *out) {
+    return aml_evaluate_at(path, args, nargs, (int)index, (int)sub, out);
 }
 

@@ -345,6 +345,9 @@ struct iou_req {
    * armed again until the buffer is full, and reports the total (Linux's
    * io_sr_msg::done_io). */
   u32 done_io;
+  /* A send bundle whose last send left the buffer ring empty: that
+   * completion is its last (no IORING_CQE_F_MORE), as io_send_finish has it. */
+  u8 bundle_empty;
 
   u16 poll_mask; /* what readiness this request is armed on; 0 = none */
 
@@ -545,6 +548,9 @@ struct io_ring_ctx {
    * It sleeps on the readiness channel, which a completion posted by another
    * thread (the ring's own, say) does not wake; that poster wakes it by id. */
   usize waiter_tid;
+
+  /* A multishot request took its turn in the current sweep: see iou_progress. */
+  u8 mshot_again;
 
   u64 napi_busy_ns;
   u8 napi_prefer;
@@ -1504,6 +1510,104 @@ static int iou_buf_select(struct io_ring_ctx *ctx, u16 bgid,
   }
   iou_unlock(ctx);
   return rc;
+}
+
+/* A bundle (IORING_RECVSEND_BUNDLE): every buffer the program has published in
+ * a ring group, up to `max`, taken at once; Linux's io_buffers_select. The
+ * buffers are reserved (the ring head moves past them) so that no other
+ * request picks the same ones while this one does its I/O; what it did not
+ * use goes back with iou_bundle_return. A legacy group gives one buffer, as a
+ * bundle there would on Linux. Returns how many, or -ENOBUFS / -EFAULT. */
+static int iou_bundle_take(struct io_ring_ctx *ctx, u16 bgid,
+                           struct iou_pbuf *out, int max) {
+  struct iou_bgroup *g;
+  int n = 0;
+
+  iou_lock(ctx);
+  g = iou_bgroup_find(ctx, bgid);
+  if (!g) {
+    iou_unlock(ctx);
+    return -ENOBUFS;
+  }
+  if (!g->is_ring) {
+    iou_unlock(ctx);
+    return iou_buf_select(ctx, bgid, out) < 0 ? -ENOBUFS : 1;
+  }
+  {
+    u16 tail = 0;
+
+    if (syscall_copyin(&tail,
+                       (const void *)(usize)(g->ring_addr +
+                                             IOU_PBUF_RING_TAIL_OFF),
+                       sizeof(tail)) < 0) {
+      iou_unlock(ctx);
+      return -EFAULT;
+    }
+    while (n < max && (u16)(g->ring_head + n) != tail) {
+      struct io_uring_buf ent;
+      u64 at = g->ring_addr +
+               (u64)((u16)(g->ring_head + n) & g->ring_mask) * sizeof(ent);
+
+      if (syscall_copyin(&ent, (const void *)(usize)at, sizeof(ent)) < 0)
+        break;
+      out[n].addr = ent.addr;
+      out[n].len = ent.len;
+      out[n].bid = ent.bid;
+      n++;
+    }
+    g->ring_head = (u16)(g->ring_head + n);
+  }
+  iou_unlock(ctx);
+  return n ? n : -ENOBUFS;
+}
+
+/* Hand back the last `unused` buffers a bundle took, when nothing has been
+ * taken from the group since; otherwise they stay consumed, which is what a
+ * Linux ring does with buffers a completion did not need either. */
+static void iou_bundle_return(struct io_ring_ctx *ctx, u16 bgid, u16 end,
+                              int unused) {
+  struct iou_bgroup *g;
+
+  if (unused <= 0)
+    return;
+  iou_lock(ctx);
+  g = iou_bgroup_find(ctx, bgid);
+  if (g && g->is_ring && g->ring_head == end)
+    g->ring_head = (u16)(g->ring_head - unused);
+  else if (g && !g->is_ring && g->head >= (u32)unused)
+    g->head -= (u32)unused; /* a classic list: the one buffer it gave */
+  iou_unlock(ctx);
+}
+
+/* How many buffers the program has published and nobody has taken. */
+static int iou_bundle_left(struct io_ring_ctx *ctx, u16 bgid) {
+  struct iou_bgroup *g;
+  u16 tail = 0;
+  int left = 0;
+
+  iou_lock(ctx);
+  g = iou_bgroup_find(ctx, bgid);
+  if (g && g->is_ring &&
+      syscall_copyin(&tail,
+                     (const void *)(usize)(g->ring_addr + IOU_PBUF_RING_TAIL_OFF),
+                     sizeof(tail)) == 0)
+    left = (u16)(tail - g->ring_head);
+  else if (g && !g->is_ring)
+    left = (int)(g->nr - g->head);
+  iou_unlock(ctx);
+  return left;
+}
+
+static u16 iou_bundle_end(struct io_ring_ctx *ctx, u16 bgid) {
+  struct iou_bgroup *g;
+  u16 end = 0;
+
+  iou_lock(ctx);
+  g = iou_bgroup_find(ctx, bgid);
+  if (g && g->is_ring)
+    end = g->ring_head;
+  iou_unlock(ctx);
+  return end;
 }
 
 /* Give a buffer back when the request that took it did nothing with it. */
@@ -3164,7 +3268,7 @@ static int iou_op_takes_buffer(u8 opcode) {
   case IORING_OP_RECV:
   case IORING_OP_RECVMSG:
   case IORING_OP_READ_MULTISHOT:
-  case IORING_OP_RECV_ZC:
+  case IORING_OP_SEND: /* send from a provided buffer (Linux 6.10) */
     return 1;
   default:
     return 0;
@@ -3174,12 +3278,142 @@ static int iou_op_takes_buffer(u8 opcode) {
 /* Perform the request, choosing a provided buffer for it first if that is what
  * IOSQE_BUFFER_SELECT asked for. The buffer that was used is reported in the
  * completion's flags; one that turned out not to be needed goes back. */
+#define IOU_BUNDLE_MAX 256
+#define IOU_BUNDLE_BYTES (1u << 20)
+
+/* A SEND or RECV with IORING_RECVSEND_BUNDLE: the data goes out of, or into,
+ * as many ring buffers as it takes, in order, in one call; the completion
+ * names the first buffer and the byte count says how many followed it. */
+static i32 iou_perform_bundle(struct iou_req *req, u32 *cflags) {
+  struct io_ring_ctx *ctx = req->ctx;
+  struct iou_pbuf *b = kmalloc(sizeof(*b) * IOU_BUNDLE_MAX);
+  int send = req->sqe.opcode == IORING_OP_SEND;
+  int n, used = 0;
+  u16 end;
+  usize total = 0;
+  char *bounce;
+  isize r;
+
+  if (!b)
+    return -ENOMEM;
+  if (!req->file) {
+    kfree(b);
+    return -EBADF;
+  }
+  n = iou_bundle_take(ctx, req->buf_group, b, IOU_BUNDLE_MAX);
+  if (n < 0) {
+    kfree(b);
+    return n;
+  }
+  end = iou_bundle_end(ctx, req->buf_group);
+  if (send) {
+    /* Whole buffers only, as many as the socket takes now: a buffer sent in
+     * part would be consumed with its tail unsent, which this TCP -- it
+     * queues nothing past its window -- would do on every full window. */
+    u32 room = vfs_socket_send_room(req->file);
+    int fit = 0;
+
+    for (; fit < n && total + b[fit].len <= room; fit++)
+      total += b[fit].len;
+    if (!fit) {
+      iou_bundle_return(ctx, req->buf_group, end, n);
+      kfree(b);
+      return -EAGAIN;
+    }
+    iou_bundle_return(ctx, req->buf_group, end, n - fit);
+    n = fit;
+    end = iou_bundle_end(ctx, req->buf_group); /* the head now ends after them */
+  } else {
+    for (int i = 0; i < n; i++) {
+      total += b[i].len;
+      if ((req->sel_len && total >= req->sel_len) || total >= IOU_BUNDLE_BYTES)
+        break;
+    }
+  }
+  if (req->sel_len && total > req->sel_len)
+    total = req->sel_len;
+  if (total > IOU_BUNDLE_BYTES)
+    total = IOU_BUNDLE_BYTES;
+  bounce = kmalloc(total ? total : 1);
+  if (!bounce) {
+    iou_bundle_return(ctx, req->buf_group, end, n);
+    kfree(b);
+    return -ENOMEM;
+  }
+  if (send) {
+    usize at = 0;
+
+    r = 0;
+    for (int i = 0; i < n && at < total; i++) {
+      usize k = b[i].len < total - at ? b[i].len : total - at;
+
+      if (k && syscall_copyin(bounce + at, (const void *)(usize)b[i].addr, k) <
+                   0) {
+        r = -EFAULT;
+        break;
+      }
+      at += k;
+    }
+    if (r == 0)
+      r = iou_send_to(req, req->file, bounce, total);
+  } else {
+    r = vfs_socket_recv_h(req->file, bounce, total, iou_sock_flags(req));
+  }
+  if (r > 0) {
+    usize at = 0;
+
+    for (; used < n && at < (usize)r; used++) {
+      usize k = b[used].len < (usize)r - at ? b[used].len : (usize)r - at;
+
+      if (!send && k &&
+          syscall_copyout((void *)(usize)b[used].addr, bounce + at, k) < 0) {
+        r = -EFAULT;
+        used = 0;
+        break;
+      }
+      at += k;
+    }
+  }
+  iou_bundle_return(ctx, req->buf_group, end, n - used);
+  if (send)
+    req->bundle_empty = iou_bundle_left(ctx, req->buf_group) == 0;
+  if (r > 0)
+    *cflags |= IORING_CQE_F_BUFFER | ((u32)b[0].bid << IORING_CQE_BUFFER_SHIFT);
+  kfree(bounce);
+  kfree(b);
+  return (i32)r;
+}
+
+static i32 iou_perform_capped(struct iou_req *req, u32 *cflags);
+
 static i32 iou_perform(struct iou_req *req, u32 *cflags) {
+  i32 res;
+
+  *cflags = 0;
+  /* A multishot receive with a total (sqe->optlen) takes no more than what is
+   * left of it in any one go. */
+  if (req->multishot && req->sqe.opcode == IORING_OP_RECV && req->sqe.optlen) {
+    u32 rem = req->sqe.optlen > req->done_io ? req->sqe.optlen - req->done_io
+                                             : 1;
+    u32 saved = req->sel_len;
+
+    if (!req->sel_len || req->sel_len > rem)
+      req->sel_len = rem;
+    res = iou_perform_capped(req, cflags);
+    req->sel_len = saved;
+    return res;
+  }
+  return iou_perform_capped(req, cflags);
+}
+
+static i32 iou_perform_capped(struct iou_req *req, u32 *cflags) {
   struct iou_pbuf b;
   int selected = 0;
   i32 res;
 
-  *cflags = 0;
+  if (req->buf_select && (req->sqe.ioprio & IORING_RECVSEND_BUNDLE) &&
+      (req->sqe.opcode == IORING_OP_RECV || req->sqe.opcode == IORING_OP_SEND))
+    return iou_perform_bundle(req, cflags);
   if (req->buf_select && iou_op_takes_buffer(req->sqe.opcode)) {
     int rc = iou_buf_select(req->ctx, req->buf_group, &b);
 
@@ -3211,6 +3445,11 @@ static i32 iou_perform(struct iou_req *req, u32 *cflags) {
     }
   }
   res = iou_perform_op(req);
+  /* IORING_CQE_F_SOCK_NONEMPTY on an accept: more connections are waiting,
+   * so the program need not go back to poll before accepting again. */
+  if (res >= 0 && req->sqe.opcode == IORING_OP_ACCEPT && req->file &&
+      vfs_socket_accept_pending(req->file) > 0)
+    *cflags |= IORING_CQE_F_SOCK_NONEMPTY;
   if (selected) {
     if (res <= 0)
       iou_buf_recycle(req->ctx, req->buf_group);
@@ -3249,6 +3488,12 @@ static void iou_cancel_chain(struct iou_req *req) {
 
 static int iou_issue(struct iou_req *req);
 static void iou_issue_chain(struct iou_req *head);
+
+/* Is the caller the ring's own thread -- its completion worker, or its
+ * submission thread? */
+static int iou_on_worker(const struct io_ring_ctx *ctx) {
+  return current_task && current_task == ctx->sq_self;
+}
 
 /* Finish a request: post its CQE, release the link timeout watching it, and
  * start the next link of the chain. */
@@ -3482,11 +3727,26 @@ static int iou_run_once(struct iou_req *req) {
     default:
       break;
     }
+  if (req->multishot && !last && req->bundle_empty)
+    last = 1;
+  /* IORING_RECV_MULTISHOT with sqe->optlen: the multishot's total, after
+   * which it ends (Linux's mshot_total_len). */
+  if (req->multishot && !last && res > 0 &&
+      req->sqe.opcode == IORING_OP_RECV && req->sqe.optlen) {
+    req->done_io += (u32)res;
+    if (req->done_io >= req->sqe.optlen)
+      last = 1;
+  }
   if (req->multishot && !last && iou_cq_full(req->ctx))
     last = 1; /* no room for another F_MORE completion: see iou_cq_full */
   if (req->multishot && !last) {
     iou_post_req_cqe(req, res, cflags | IORING_CQE_F_MORE);
     req->state = IOU_ST_ARMED;
+    /* One turn per sweep: the other requests ready on this ring go before
+     * this one goes again, which is the fairness Linux's per-iteration
+     * limit gives several multishot receives (liburing's recv-mshot-fair). */
+    req->eagain_sweep = req->ctx->sweep_gen;
+    req->ctx->mshot_again = 1;
     iou_evlog(req->ctx, IOU_EV_ARM, req->sqe.opcode, req->sqe.user_data, 0);
     return 1;
   }
@@ -3763,6 +4023,13 @@ static int iou_issue(struct iou_req *req) {
   if (req->poll_mask && iou_pollable(req->file)) {
     u16 rev = iou_poll_now(req->file, req->poll_mask);
 
+    /* IOSQE_ASYNC: never attempted here, always handed to the ring's worker
+     * (Linux's io-wq), which is also what IORING_REGISTER_IOWQ_AFF places. */
+    if ((sqe->flags & IOSQE_ASYNC) && !iou_on_worker(req->ctx)) {
+      req->state = IOU_ST_ARMED;
+      iou_evlog(req->ctx, IOU_EV_ARM, req->sqe.opcode, req->sqe.user_data, 0);
+      return 1;
+    }
     if (!(rev & (req->poll_mask | B1NIX_POLLERR | B1NIX_POLLHUP))) {
       req->state = IOU_ST_ARMED;
       iou_evlog(req->ctx, IOU_EV_ARM, req->sqe.opcode, req->sqe.user_data, 0);
@@ -4024,6 +4291,8 @@ static int iou_progress(struct io_ring_ctx *ctx) {
   /* One pass over the ring. A request that finds nothing waits for the next
    * pass rather than being run again inside this one. */
   ctx->sweep_gen++;
+  ctx->mshot_again = 0;
+  int rounds = 0;
 
   for (;;) {
     struct iou_req *victim = 0;
@@ -4042,6 +4311,9 @@ static int iou_progress(struct io_ring_ctx *ctx) {
     iou_lock(ctx);
     for (struct iou_req *r = ctx->live; r; r = r->next) {
       if (r->state != IOU_ST_ARMED)
+        continue;
+      /* See iou_issue: an IOSQE_ASYNC request is the worker's alone. */
+      if ((r->sqe.flags & IOSQE_ASYNC) && r->poll_mask && !iou_on_worker(ctx))
         continue;
 
       if (r->is_timeout) {
@@ -4184,8 +4456,19 @@ static int iou_progress(struct io_ring_ctx *ctx) {
       victim->state = IOU_ST_QUEUED;
     iou_unlock(ctx);
 
-    if (!victim)
+    if (!victim) {
+      /* A multishot that took its turn this pass may have more waiting: go
+       * round again, so each ready request gets one turn per pass and none
+       * waits for a wakeup that is not coming. A full completion ring ends a
+       * multishot, which is what stops this; the bound only guards against
+       * a stream that never runs dry into a ring that is being drained. */
+      if (ctx->mshot_again && ++rounds < 4096) {
+        ctx->mshot_again = 0;
+        ctx->sweep_gen++;
+        continue;
+      }
       break;
+    }
 
     did = 1;
 
@@ -4489,6 +4772,13 @@ static int iou_op_is_multishot(const struct io_uring_sqe *sqe) {
   case IORING_OP_RECV:
   case IORING_OP_RECVMSG:
     return (sqe->ioprio & IORING_RECV_MULTISHOT) ? 1 : 0;
+  /* A send bundle goes on sending while the program keeps the buffer ring
+   * filled, a completion per send. */
+  case IORING_OP_SEND:
+    return (sqe->ioprio & IORING_RECVSEND_BUNDLE) &&
+                   (sqe->flags & IOSQE_BUFFER_SELECT)
+               ? 1
+               : 0;
   case IORING_OP_READ_MULTISHOT:
     return 1;
   default:
@@ -5066,7 +5356,8 @@ done:
    IORING_FEAT_RW_CUR_POS | IORING_FEAT_CUR_PERSONALITY |                      \
    IORING_FEAT_FAST_POLL | IORING_FEAT_POLL_32BITS | IORING_FEAT_EXT_ARG |     \
    IORING_FEAT_CQE_SKIP | IORING_FEAT_LINKED_FILE |                            \
-   IORING_FEAT_SQPOLL_NONFIXED | IORING_FEAT_NO_IOWAIT)
+   IORING_FEAT_SQPOLL_NONFIXED | IORING_FEAT_NO_IOWAIT |                      \
+   IORING_FEAT_RECVSEND_BUNDLE)
 
 static u32 iou_roundup_pow2(u32 v) {
   u32 p = 1;

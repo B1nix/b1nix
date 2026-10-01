@@ -603,8 +603,13 @@ static u8    g_task_kcrit[TASK_SLOTS];
 static u8 g_task_frozen[TASK_SLOTS];
 static int g_frozen_tasks;
 
+/* Frozen, and out of the picker -- but not inside a driver's critical
+ * section (g_task_kcrit): a task that holds a device, with a command in flight,
+ * runs until it lets go, or the sleep would take the device down under a
+ * request that nobody then completes. */
 static inline int sched_task_frozen(usize index) {
-  return __atomic_load_n(&g_task_frozen[index], __ATOMIC_ACQUIRE) != 0;
+  return __atomic_load_n(&g_task_frozen[index], __ATOMIC_ACQUIRE) != 0 &&
+         !__atomic_load_n(&g_task_kcrit[index], __ATOMIC_ACQUIRE);
 }
 
 void scheduler_kcrit_enter(void) {
@@ -2025,8 +2030,10 @@ int sched_freeze_userspace(u64 timeout_ms) {
          */
         __atomic_store_n(&g_task_frozen[i], 1, __ATOMIC_RELEASE);
       }
-      /* Outstanding until it is really off every CPU. */
-      if (t && task_running_somewhere(t))
+      /* Outstanding until it is really off every CPU, and out of any
+       * driver's critical section. */
+      if (t && (task_running_somewhere(t) ||
+                __atomic_load_n(&g_task_kcrit[i], __ATOMIC_ACQUIRE)))
         on_cpu++;
       else
         marked++;
@@ -2824,6 +2831,14 @@ static void wake_sleepers(void) {
    * lowered the bound below `next`, and raising it over that would lose the
    * wakeup. Leaving the armed (lower) value costs one extra scan, which is the
    * safe direction. */
+  {
+    extern u64 eventpoll_next_deadline(void);
+    u64 tfd = eventpoll_next_deadline();
+
+    /* A timerfd's deadline is a deadline too (see timerfd_note_deadline). */
+    if (tfd != ~0ull && tfd > scheduler_ticks && (next == 0 || tfd < next))
+      next = tfd;
+  }
   if (__atomic_load_n(&g_wake_deadline_gen, __ATOMIC_ACQUIRE) == gen)
     __atomic_store_n(&g_wake_deadline, next, __ATOMIC_RELEASE);
 
@@ -2834,20 +2849,86 @@ static void wake_sleepers(void) {
   if (woken > 0) ipi_reschedule_all();
 }
 
+/* The parent is a process, not the thread that forked: any thread of its group
+ * may be the one blocked in wait (Go forks on one OS thread and waits on
+ * another). So the wake goes to the forking thread and to every thread of its
+ * group parked in a wait -- a wait has no channel, which is what tells it from
+ * a thread blocked on something else. */
+/* Per slot: the task is inside waitpid/waitid, parked for a child. Only such
+ * a sibling is woken for a child's event -- other threads of the group may be
+ * blocked without a channel too (a sleep), and a wake that lands on one of
+ * those left a stale run-queue entry that later resumed a dead task. */
+static u8 g_task_waiting_child[TASK_SLOTS];
+
 static int scheduler_wake_blocked_parent(usize parent_id) {
+  usize tgid = 0;
+  int woke = 0;
+
+  for (usize i = 0; i < g_task_hwm; i++)
+    if (T(i)->id == parent_id && T(i)->state != TASK_UNUSED) {
+      tgid = task_tgid(T(i));
+      break;
+    }
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->id != parent_id)
+    struct task *t = T(i);
+
+    if (t->state == TASK_UNUSED)
+      continue;
+    if (t->id != parent_id &&
+        !(tgid && task_tgid(t) == tgid && t->wait_chan == 0 &&
+          __atomic_load_n(&g_task_waiting_child[task_index(t)],
+                          __ATOMIC_ACQUIRE)))
       continue;
 
     enum task_state expected = TASK_BLOCKED;
-    if (__atomic_compare_exchange_n(&T(i)->state, &expected,
+    if (__atomic_compare_exchange_n(&t->state, &expected,
                                     TASK_READY, 0,
                                     __ATOMIC_RELEASE,
                                     __ATOMIC_RELAXED)) {
-      sched_wake_enqueue(T(i));
-      return 1;
+      sched_wake_enqueue(t);
+      woke = 1;
     }
-    return 0;
+  }
+  return woke;
+}
+
+/* The threads of the waiter's own process, collected once per scan: a child
+ * forked by any of them is the waiter's child, as Linux's do_wait walks every
+ * thread of the group. */
+#define WAIT_GROUP_MAX 64
+struct wait_group {
+  usize ids[WAIT_GROUP_MAX];
+  int n;
+  int overflow;
+  usize tgid;
+};
+
+static void wait_group_collect(struct wait_group *g) {
+  g->n = 0;
+  g->overflow = 0;
+  g->tgid = task_tgid(current_task);
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+
+    if (t->state == TASK_UNUSED || task_tgid(t) != g->tgid)
+      continue;
+    if (g->n < WAIT_GROUP_MAX)
+      g->ids[g->n++] = t->id;
+    else
+      g->overflow = 1;
+  }
+}
+
+static int wait_group_has(const struct wait_group *g, usize id) {
+  if (id == current_task->id)
+    return 1;
+  for (int k = 0; k < g->n; k++)
+    if (g->ids[k] == id)
+      return 1;
+  if (g->overflow) {
+    struct task *p = scheduler_task_by_pid(id);
+
+    return p && task_tgid(p) == g->tgid;
   }
   return 0;
 }
@@ -7169,6 +7250,25 @@ static void serial_silence_watchdog(void) {
     console_write_hex64((u64)(usize)t->wait_chan);
     console_write(" ");
     console_write(t->name);
+    {
+      extern void *vfs_poll_chan;
+      extern void poll_watch_dump(usize slot);
+
+      if (t->wait_chan == vfs_poll_chan) {
+        usize len = 0;
+        const char *argv = task_cmdline(t, &len);
+
+        /* Which program, with its arguments: a shell's comm is only /bin/sh. */
+        console_write("\n      argv:");
+        for (usize k = 0; argv && k < len && k < 160; k++) {
+          char ch[2] = {argv[k] ? argv[k] : ' ', 0};
+
+          console_write(ch);
+        }
+        console_write("\n");
+        poll_watch_dump(i);
+      }
+    }
     /* WHERE it is parked, which is the one thing every dump so far has left
      * out. A task that is not on a CPU has its resume point on top of the
      * saved context.rsp and its frame chain in context.rbp, so a few frames of that chain say which
@@ -7783,6 +7883,22 @@ int scheduler_get_child_subreaper(struct task *t) {
 static usize find_new_reaper(struct task *exiting, usize orphan_pid) {
   u32 ns = namespace_task_id(exiting, NS_PID);
   usize p = exiting->parent_id;
+  usize tgid = task_tgid(exiting);
+
+  /* First another live thread of the same process (Linux's
+   * find_alive_thread): a thread that forked and then exited leaves its
+   * children to the process, which may still wait for them from any thread. */
+  if (tgid) {
+    for (usize i = 0; i < g_task_hwm; i++) {
+      struct task *t = T(i);
+
+      if (t == exiting || t->state == TASK_UNUSED || t->state == TASK_DEAD ||
+          t->state == TASK_REAPING || task_tgid(t) != tgid ||
+          g_task_exiting[task_index(t)])
+        continue;
+      return t->id;
+    }
+  }
   for (int depth = 0; p > 1 && depth < 128; depth++) {
     struct task *a = find_live_task(p);
     if (!a || namespace_task_id(a, NS_PID) != ns)
@@ -8559,6 +8675,12 @@ void scheduler_exit_current(int exit_code) {
       current_task->cred = 0;
     }
     interrupts_disable();
+    /* A thread's children are the process's: hand them to a sibling before
+     * this thread is gone, as every exiting task does. Skipped, a child
+     * forked by a thread kept pointing at a dead thread and the orphan reaper
+     * took it -- the process's waitpid then said ECHILD for a child it had
+     * (Go forks on one thread and waits on another: podman's crun). */
+    reparent_children_and_signal_orphans(current_task);
     current_task->exit_code = exit_code;
     task_lease_clear(current_task, __func__);
     /* A dying task must not leave an inode write-locked: every waiter
@@ -8688,7 +8810,7 @@ static int wait_interrupted_by_signal(void) {
   return 0;
 }
 
-int scheduler_waitpid(usize pid, int *status, int options) {
+static int scheduler_waitpid_inner(usize pid, int *status, int options) {
   if (current_task == 0)
     return -ECHILD;
 
@@ -8735,12 +8857,16 @@ int scheduler_waitpid(usize pid, int *status, int options) {
     }
 
     int has_children = 0;
+    struct wait_group grp;
+
+    wait_group_collect(&grp);
     for (usize i = 0; i < g_task_hwm; i++) {
       /* ptrace(2): a tracer waits for its tracee's stops even when it is not
        * the tracee's parent — without that it could attach but never drive it.
        * Exit status still belongs to the real parent (see the reap path
        * below), so a tracer only ever consumes stop reports. */
-      int is_child = (T(i)->parent_id == current_task->id);
+      int is_child = T(i)->state != TASK_UNUSED &&
+                     wait_group_has(&grp, T(i)->parent_id);
       int is_tracee = !is_child &&
                       ptrace_tracer_pid(T(i)) == current_task->id;
       if (T(i)->state != TASK_UNUSED && (is_child || is_tracee)) {
@@ -8961,10 +9087,13 @@ int scheduler_waitid_probe(idtype_t idtype, usize id, int options) {
   if (!current_task)
     return -ECHILD;
   u64 flags = interrupts_save();
+  struct wait_group grp;
+
+  wait_group_collect(&grp);
   for (usize i = 0; i < g_task_hwm; i++) {
     struct task *child = T(i);
 
-    if (child->state == TASK_UNUSED || child->parent_id != current_task->id)
+    if (child->state == TASK_UNUSED || !wait_group_has(&grp, child->parent_id))
       continue;
     if (idtype == P_PID) {
       if (child->id != id)
@@ -8987,7 +9116,8 @@ int scheduler_waitid_probe(idtype_t idtype, usize id, int options) {
   return has_children ? 0 : -ECHILD;
 }
 
-int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
+static int scheduler_waitid_inner(idtype_t idtype, usize id, siginfo_t *infop,
+                                  int options) {
   if (current_task == 0)
     return -ECHILD;
   /* A caller may pass no siginfo: it is then a wait for the event and nothing
@@ -9026,9 +9156,12 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
     }
 
     int has_children = 0;
+    struct wait_group grp;
+
+    wait_group_collect(&grp);
     for (usize i = 0; i < g_task_hwm; i++) {
       struct task *child = T(i);
-      if (child->state != TASK_UNUSED && child->parent_id == current_task->id) {
+      if (child->state != TASK_UNUSED && wait_group_has(&grp, child->parent_id)) {
         int match = 0;
         if (idtype == P_ALL) {
           match = 1;
@@ -10315,6 +10448,26 @@ int scheduler_oom_kill_current(void) {
   return 1;
 }
 
+const struct sigaction *scheduler_rt_action_of(const struct task *t, int sig);
+
+/* Would `sig` be thrown away if sent to `t` now? Ignored by its handler, not
+ * blocked (a blocked signal waits: the handler may change before it is
+ * unblocked), not traced (the tracer sees everything), and not one of the two
+ * that cannot be ignored. */
+static int sig_ignored_now(const struct task *t, int sig) {
+  const struct sigaction *sa;
+
+  if (sig == SIGKILL || sig == SIGSTOP || sig < 1 || sig > NSIG_MAX)
+    return 0;
+  if (t->blocked_signals & (1ULL << (sig - 1)))
+    return 0;
+  if (ptrace_is_traced((struct task *)t))
+    return 0;
+  sa = SIG_IS_RT(sig) ? scheduler_rt_action_of(t, sig)
+                      : (sig <= 31 ? &t->sigactions[sig - 1] : 0);
+  return sa && sa->sa_handler == SIG_IGN;
+}
+
 int scheduler_kill(usize task_id, int sig) {
   if (sig < 0 || sig > NSIG_MAX)
     return -EINVAL;
@@ -10353,6 +10506,14 @@ int scheduler_kill(usize task_id, int sig) {
                sig == SIGTTOU)
         __atomic_fetch_and(&T(i)->pending_signals, ~(1ULL << (SIGCONT - 1)),
                            __ATOMIC_RELEASE);
+      /* An ignored signal is discarded when it is sent, as Linux's
+       * sig_ignored() does: left pending, it sat in SigPnd for the life of the
+       * process and was taken by whatever handler was installed next. SIGCONT
+       * is exempt -- continuing the process is its effect even when ignored. */
+      if (sig != SIGCONT && sig_ignored_now(T(i), sig)) {
+        interrupts_restore(flags);
+        return 0;
+      }
       /* SIGKILL and SIGSTOP cannot be blocked/ignored. Atomic RMW: post-BKL
        * the target task (or another killer) may concurrently set/clear its own
        * pending bits, so a plain |= would drop a racing update. */
@@ -10627,6 +10788,16 @@ int scheduler_rt_dequeue_current(int sig, int *si_code, union sigval *value,
   }
   spin_unlock(&g_rt_lock);
   return ret;
+}
+
+/* Any task's RT handler for `sig`, or NULL: /proc/<pid>/status reads it. */
+const struct sigaction *scheduler_rt_action_of(const struct task *t, int sig) {
+  struct rt_state *rs;
+
+  if (!t || !SIG_IS_RT(sig))
+    return 0;
+  rs = g_rt_state[task_index(t)];
+  return rs ? &rs->action[sig - SIGRTMIN] : 0;
 }
 
 /* The current task's RT handler for `sig`, or NULL if none registered. */
@@ -12746,4 +12917,31 @@ void scheduler_preempt_user_ap(void) {
   if (current_task->state == TASK_RUNNING &&
       g_task_preempt_depth[task_index(current_task)] == 0)
     scheduler_yield();
+}
+
+/* The waits, marked for their duration (see g_task_waiting_child). */
+int scheduler_waitpid(usize pid, int *status, int options) {
+  usize idx;
+  int rc;
+
+  if (!current_task)
+    return -ECHILD;
+  idx = task_index(current_task);
+  __atomic_store_n(&g_task_waiting_child[idx], 1, __ATOMIC_RELEASE);
+  rc = scheduler_waitpid_inner(pid, status, options);
+  __atomic_store_n(&g_task_waiting_child[idx], 0, __ATOMIC_RELEASE);
+  return rc;
+}
+
+int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
+  usize idx;
+  int rc;
+
+  if (!current_task)
+    return -ECHILD;
+  idx = task_index(current_task);
+  __atomic_store_n(&g_task_waiting_child[idx], 1, __ATOMIC_RELEASE);
+  rc = scheduler_waitid_inner(idtype, id, infop, options);
+  __atomic_store_n(&g_task_waiting_child[idx], 0, __ATOMIC_RELEASE);
+  return rc;
 }

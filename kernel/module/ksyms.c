@@ -28,6 +28,7 @@
 #include <b1nix/rtc.h>
 #include <b1nix/sched.h>
 #include <b1nix/sound.h>
+#include <b1nix/suspend.h>
 #include <b1nix/vfs.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -158,6 +159,10 @@ EXPORT_SYMBOL(sound_get_default);
 EXPORT_SYMBOL(sound_mixer_ioctl);
 EXPORT_SYMBOL(sound_register_hooks);
 EXPORT_SYMBOL(sound_unregister_hooks);
+
+/* ── system sleep ────────────────────────────────────────────────────────── */
+EXPORT_SYMBOL(suspend_register_device);
+EXPORT_SYMBOL(suspend_unregister_device);
 
 /* ── networking core ─────────────────────────────────────────────────────── */
 EXPORT_SYMBOL(proto_register);

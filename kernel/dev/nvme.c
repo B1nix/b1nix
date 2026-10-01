@@ -41,6 +41,8 @@ static inline void smmuv3_fault_last(u64 *addr, u32 *sid, u8 *type)
 #include <b1nix/sched.h>
 #include <string.h>
 #include <b1nix/suspend.h>
+#include <b1nix/runtime_pm.h>
+#include <stdio.h>
 
 /* Ceiling on the queue depth this driver will ask a controller for. Linux uses
  * 1024 entries per NVMe queue by default and clamps that to CAP.MQES; the depth
@@ -113,6 +115,9 @@ struct nvme_device {
 };
 
 static struct nvme_device nvme;
+/* Runtime PM (M135): -1 until the controller registers, and on a function
+ * with no PM capability, where rpm_get/rpm_put do nothing. */
+static int g_nvme_rpm = -1;
 
 /* Controllers bound so far — the "nvme<N>" half of the block-device name. */
 static usize nvme_controller_count;
@@ -159,11 +164,20 @@ static void nvme_io_lock(struct nvme_device *dev) {
         scheduler_yield();
     }
     dev->io_owner = current_task ? (u64)current_task->id : 0;
+    /* Held, so a critical section: neither a fatal signal nor the freezer
+     * takes the task until the command it is about to issue has completed
+     * (the guard goes up after the wait, as in virtio_blk_lock). */
+    scheduler_kcrit_enter();
+}
+
+static void nvme_io_release(struct nvme_device *dev) {
+    dev->io_owner = 0;
+    __sync_lock_release(&dev->io_busy);
 }
 
 static void nvme_io_unlock(struct nvme_device *dev) {
-    dev->io_owner = 0;
-    __sync_lock_release(&dev->io_busy);
+    nvme_io_release(dev);
+    scheduler_kcrit_leave();
 }
 
 /* Called from the exit path with the dying task's id.
@@ -198,7 +212,7 @@ void nvme_release_io_lock_of(u64 pid)
     console_write(" completions=");
     console_write_dec(g_nvme_io_completions);
     console_write("); releasing it\n");
-    nvme_io_unlock(dev);
+    nvme_io_release(dev); /* the owner's guard went with it */
 }
 
 /* M70: I/O completion interrupt handler. Runs in IRQ context. The controller's
@@ -654,14 +668,22 @@ static int nvme_blk_read(struct block_device *dev, u64 lba, u32 count, void *buf
 {
     struct nvme_device *nd = (struct nvme_device *)dev->priv;
     if (!nd) return -1;
-    return nvme_io_transfer(nd, lba, count, buffer, 0);
+    if (rpm_get(g_nvme_rpm) != 0)
+        return -1;
+    int rc = nvme_io_transfer(nd, lba, count, buffer, 0);
+    rpm_put(g_nvme_rpm);
+    return rc;
 }
 
 static int nvme_blk_write(struct block_device *dev, u64 lba, u32 count, const void *buffer)
 {
     struct nvme_device *nd = (struct nvme_device *)dev->priv;
     if (!nd) return -1;
-    return nvme_io_transfer(nd, lba, count, (void *)buffer, 1);
+    if (rpm_get(g_nvme_rpm) != 0)
+        return -1;
+    int rc = nvme_io_transfer(nd, lba, count, (void *)buffer, 1);
+    rpm_put(g_nvme_rpm);
+    return rc;
 }
 
 /* Commit the namespace's volatile write cache. Writes are acknowledged as soon
@@ -672,6 +694,8 @@ static int nvme_blk_flush(struct block_device *dev)
 {
     struct nvme_device *nd = (struct nvme_device *)dev->priv;
     if (!nd) return -1;
+    if (rpm_get(g_nvme_rpm) != 0)
+        return -1;
 
     nvme_io_lock(nd);
     struct nvme_sqe sqe;
@@ -680,6 +704,7 @@ static int nvme_blk_flush(struct block_device *dev)
     sqe.nsid = NVME_NSID;
     int ret = nvme_io_submit(nd, &sqe);
     nvme_io_unlock(nd);
+    rpm_put(g_nvme_rpm);
     return ret == 0 ? 0 : -1;
 }
 
@@ -688,10 +713,25 @@ static int nvme_blk_flush(struct block_device *dev)
  * block count is a full 32 bits and is not zero-based), so the list is always a
  * single entry and always fits in prp1's one page. Only installed when the
  * controller's ONCS says DSM exists. */
+static int nvme_blk_discard_locked(struct nvme_device *nd, u64 lba,
+                                   u32 count);
+
 static int nvme_blk_discard(struct block_device *dev, u64 lba, u32 count)
 {
     struct nvme_device *nd = (struct nvme_device *)dev->priv;
+    int rc;
+
     if (!nd || count == 0) return -1;
+    if (rpm_get(g_nvme_rpm) != 0)
+        return -1;
+    rc = nvme_blk_discard_locked(nd, lba, count);
+    rpm_put(g_nvme_rpm);
+    return rc;
+}
+
+static int nvme_blk_discard_locked(struct nvme_device *nd, u64 lba,
+                                   u32 count)
+{
 
     u64 list_phys = pmm_alloc_frames(1);
     if (!list_phys) return -1;
@@ -751,6 +791,15 @@ static int nvme_resume(void *ctx) {
     memset(nvme.admin_cq, 0, nvme.queue_size * sizeof(struct nvme_cqe));
     memset(nvme.io_sq, 0, nvme.queue_size * sizeof(struct nvme_sqe));
     memset(nvme.io_cq, 0, nvme.queue_size * sizeof(struct nvme_cqe));
+    /* And every completion slot marked empty the way this driver marks it:
+     * status 0xFFFF, as at boot. A zeroed slot reads as a successful
+     * completion, so every command after the resume "finished" the moment it
+     * was submitted, and its buffer was freed and reused while the controller
+     * was still reading it -- a write landed with the next write's data. */
+    for (u32 i = 0; i < nvme.queue_size; i++) {
+        nvme.admin_cq[i].status = 0xFFFF;
+        nvme.io_cq[i].status = 0xFFFF;
+    }
     nvme.admin_sq_tail = 0;
     nvme.admin_cq_head = 0;
     nvme.io_sq_tail = 0;
@@ -766,6 +815,19 @@ static int nvme_resume(void *ctx) {
     if (nvme_create_io_cq(&nvme) < 0 || nvme_create_io_sq(&nvme) < 0)
         return -1;
     return 0;
+}
+
+/* Runtime PM: idle, the function goes to D3hot; used again, it comes back to
+ * D0 and the controller is rebuilt exactly as after an S3. */
+static int nvme_runtime_suspend(void *ctx) {
+    (void)ctx;
+    return pci_set_d3hot(nvme.pci_bus, nvme.pci_slot, nvme.pci_func);
+}
+
+static int nvme_runtime_resume(void *ctx) {
+    if (pci_set_d0(nvme.pci_bus, nvme.pci_slot, nvme.pci_func) != 0)
+        return -1;
+    return nvme_resume(ctx);
 }
 
 void nvme_init(void)
@@ -1150,6 +1212,16 @@ void nvme_init(void)
     nvme.blk_dev.limits.max_segments = NVME_PAGE_SIZE / sizeof(u64);
     nvme.blk_dev.limits.queue_depth = 1;
     blk_register(&nvme.blk_dev);
+    if (g_nvme_rpm < 0 &&
+        pci_power_state(nvme.pci_bus, nvme.pci_slot, nvme.pci_func) >= 0) {
+        static char dir[48];
+
+        snprintf(dir, sizeof(dir), "devices/pci0000:00/0000:%02x:%02x.%u",
+                 (unsigned)nvme.pci_bus, (unsigned)nvme.pci_slot,
+                 (unsigned)nvme.pci_func);
+        g_nvme_rpm = rpm_register("nvme", nvme_runtime_suspend,
+                                  nvme_runtime_resume, 0, dir, 2000);
+    }
     
     console_write("nvme: dataset-management=");
     console_write(nvme.blk_dev.discard ? "yes" : "no");

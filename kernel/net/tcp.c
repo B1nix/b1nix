@@ -117,11 +117,17 @@ struct tcp_header {
   (TCP_RECV_BUF_SIZE > 65535 ? 65535 : TCP_RECV_BUF_SIZE)
 #define TCP_SEND_BUF_SIZE 4096
 #define TCP_MSS 1460
-/* Initial congestion window. RFC 6928 raised it to 10 segments and Linux has
- * shipped that as TCP_INIT_CWND for a decade: one segment per RTT of ramp made
- * every short transfer — a page fetch, an HTTP request — pay several round
- * trips before the link was used at all. */
-#define TCP_INIT_CWND (10u * TCP_MSS)
+/* The MSS on loopback: Linux's lo has a 65536-byte MTU and advertises 65476
+ * after the IPv6 and TCP headers (the IPv4 figure is larger; this one fits
+ * both). A loopback connection segmented at an Ethernet MSS moved a 32 MiB
+ * transfer 1460 bytes at a time through the net task, which is what made
+ * liburing's send-zerocopy outlast its timeout. */
+#define TCP_LO_MSS 65476u
+/* Initial congestion window: 10 segments of the connection's own MSS
+ * (tcp_mss_local). RFC 6928 raised it to 10 and Linux has shipped that as
+ * TCP_INIT_CWND for a decade: one segment per RTT of ramp made every short
+ * transfer — a page fetch, an HTTP request — pay several round trips before
+ * the link was used at all. */
 /* Ceiling on the congestion window. The old 65535 was a 64 KiB cap on the data
  * in flight, which pinned throughput to 64 KiB per round trip however large the
  * receiver's window was — it silently undid the 1 MiB receive buffer. Linux has
@@ -308,6 +314,10 @@ struct tcp_conn {
   u32 ssthresh;
   int dup_acks;
   u8 *recv_buf; /* recv_cap bytes, grown on demand — see tcp_recv_grow() */
+  /* SO_SNDBUF as set (already doubled, as Linux stores it), or 0 while the
+   * send buffer is left to autotune. Only a loopback sender uses it: see
+   * tcp_lo_budget. */
+  u32 snd_budget;
   u32 recv_cap; /* current size of recv_buf */
   /* Ceiling on recv_cap. TCP_RECV_BUF_MAX by default, which is what lets the
    * buffer auto-tune; SO_RCVBUF lowers it, and as on Linux setting it is what
@@ -356,6 +366,10 @@ struct tcp_conn {
   u32 ooo_bytes;
   u32 ooo_segs;
   int handed_to_user;
+  /* The peer is this machine (127/8 or ::1): segments go at TCP_LO_MSS. */
+  u8 lo;
+  /* Counted in g_tcp_budget_waiters: the last send found no budget. */
+  u8 budget_wait;
   /* shutdown(SHUT_WR): our FIN went out while the socket stays open. The
    * connection outlives TIME_WAIT until the socket is closed -- its reader may
    * still be draining what the peer sent -- and a close sends no second FIN. */
@@ -495,11 +509,63 @@ static void tcp_parse_options(const void *segment, usize data_offset,
 }
 
 /* Fill the TCP_SYN_OPT_LEN option area of a SYN / SYN-ACK. */
-static void tcp_build_syn_options(u8 *opt) {
+/* The largest segment this side sends or invites on the connection. */
+static u32 tcp_mss_local(const struct tcp_conn *c) {
+  return c->lo ? TCP_LO_MSS : TCP_MSS;
+}
+
+/* The largest segment actually sent: ours, capped by what the peer took. */
+static u32 tcp_mss_eff(const struct tcp_conn *c) {
+  u32 local = tcp_mss_local(c);
+
+  return c->snd_mss && c->snd_mss < local ? c->snd_mss : local;
+}
+
+/* Loopback senders currently held back by their send budget. */
+static int g_tcp_budget_waiters;
+extern void *vfs_poll_chan;
+
+static struct tcp_conn *tcp_find_conn_af(u8 family, struct ipv4_addr v4,
+                                         const struct in6_addr_k *v6,
+                                         u16 remote_port, u16 local_port);
+
+/* What a loopback sender may still put on the wire. This TCP queues nothing
+ * past its window, so the peer's receive buffer, which grows as data arrives,
+ * is all the buffering there is -- and a writer with no reader would fill it to
+ * its ceiling. Linux bounds the same thing by the SENDER's buffer: SO_SNDBUF
+ * as set (doubled), or autotuned up to tcp_wmem's 4 MiB, on top of the
+ * receiver's default 128 KiB. A test that writes 1 MiB before it reads relies
+ * on the second, one that fills a socket to EAGAIN on the first. Called under
+ * the TCP lock. */
+#define TCP_LO_SND_AUTO (4u * 1024u * 1024u)
+#define TCP_LO_RCV_DEFAULT (128u * 1024u)
+static u32 tcp_lo_budget(struct tcp_conn *conn, u32 inflight) {
+  struct tcp_conn *peer = tcp_find_conn_af(conn->family, conn->remote_ip,
+                                           &conn->remote_ip6, conn->local_port,
+                                           conn->remote_port);
+  u32 budget = (conn->snd_budget ? conn->snd_budget : TCP_LO_SND_AUTO) +
+               TCP_LO_RCV_DEFAULT;
+  u32 queued = inflight;
+
+  if (peer && peer->used)
+    queued += peer->recv_len - peer->recv_read;
+  return queued < budget ? budget - queued : 0;
+}
+
+static int tcp_peer_is_local(u8 family, struct ipv4_addr v4,
+                             const struct in6_addr_k *v6) {
+  static const u8 lo6[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+
+  if (family == B1NIX_AF_INET6)
+    return v6 && memcmp(v6->bytes, lo6, 16) == 0;
+  return ipv4_is_loopback(v4);
+}
+
+static void tcp_build_syn_options(u8 *opt, u32 mss) {
   opt[0] = TCP_OPT_MSS;
   opt[1] = 4;
-  opt[2] = (u8)(TCP_MSS >> 8);
-  opt[3] = (u8)(TCP_MSS & 0xFF);
+  opt[2] = (u8)(mss >> 8);
+  opt[3] = (u8)(mss & 0xFF);
   opt[4] = TCP_OPT_SACK_PERM;
   opt[5] = 2;
   opt[6] = TCP_OPT_WSCALE;
@@ -516,6 +582,26 @@ static u32 tcp_recv_cap_max(const struct tcp_conn *conn) {
   return conn->recv_cap_max ? conn->recv_cap_max : TCP_RECV_BUF_MAX;
 }
 
+/* Receive-buffer room: capacity less what the application has not read yet.
+ * Bytes it has read may still sit at the front of the buffer until the next
+ * compaction (see tcp_recv), and they are free space all the same. */
+static u32 tcp_rcv_free(const struct tcp_conn *conn, u32 cap) {
+  u32 unread = conn->recv_len - conn->recv_read;
+
+  return cap > unread ? cap - unread : 0;
+}
+
+/* Move the unread bytes to the front of the buffer. */
+static void tcp_recv_compact(struct tcp_conn *conn) {
+  if (!conn->recv_read)
+    return;
+  if (conn->recv_read < conn->recv_len)
+    memmove(conn->recv_buf, conn->recv_buf + conn->recv_read,
+            conn->recv_len - conn->recv_read);
+  conn->recv_len -= conn->recv_read;
+  conn->recv_read = 0;
+}
+
 /* The window we advertise, already shifted by our own scale factor. */
 static u16 tcp_adv_window(const struct tcp_conn *conn) {
   u32 cap = conn->recv_cap;
@@ -524,7 +610,7 @@ static u16 tcp_adv_window(const struct tcp_conn *conn) {
    * the peer to send; the buffer itself is not shrunk under live data. */
   if (cap > limit)
     cap = limit;
-  u32 free_wnd = cap > conn->recv_len ? cap - conn->recv_len : 0;
+  u32 free_wnd = tcp_rcv_free(conn, cap);
   u32 scaled = free_wnd >> conn->rcv_wscale;
   if (scaled > 65535)
     scaled = 65535;
@@ -586,6 +672,7 @@ static void tcp_recv_grow(struct tcp_conn *conn) {
   bigger = kmalloc(want);
   if (!bigger)
     return;
+  tcp_recv_compact(conn);
   memcpy(bigger, conn->recv_buf, conn->recv_len);
   kfree(conn->recv_buf);
   conn->recv_buf = bigger;
@@ -598,6 +685,10 @@ static u32 tcp_recv_append(struct tcp_conn *conn, const u8 *data, u32 len) {
   if (!conn->recv_buf)
     return 0; /* buffer allocation failed — behave as a zero window */
   u32 space = conn->recv_cap - conn->recv_len;
+  if (len > space && conn->recv_read) {
+    tcp_recv_compact(conn); /* the read bytes at the front are room too */
+    space = conn->recv_cap - conn->recv_len;
+  }
   if (len > space)
     len = space;
   if (len == 0)
@@ -611,7 +702,7 @@ static u32 tcp_recv_append(struct tcp_conn *conn, const u8 *data, u32 len) {
    * segment's room that never comes. Growing only when exactly full never
    * happened: a writer ahead of its reader blocked for ever a few hundred
    * bytes short. */
-  if (conn->recv_cap - conn->recv_len < TCP_MSS)
+  if (tcp_rcv_free(conn, conn->recv_cap) < TCP_MSS)
     tcp_recv_grow(conn);
   return len;
 }
@@ -815,8 +906,8 @@ static void tcp_enter_recovery(struct tcp_conn *conn) {
   conn->prior_cwnd = conn->cwnd;
   conn->prior_ssthresh = conn->ssthresh;
   conn->ssthresh = conn->cwnd / 2;
-  if (conn->ssthresh < 2 * TCP_MSS)
-    conn->ssthresh = 2 * TCP_MSS;
+  if (conn->ssthresh < 2 * tcp_mss_local(conn))
+    conn->ssthresh = 2 * tcp_mss_local(conn);
   conn->cwnd = conn->ssthresh;
   conn->in_recovery = 1;
   conn->recovery_point = conn->snd_nxt;
@@ -1111,6 +1202,7 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
   conn->remote_ip6 = v6;
   conn->remote_port = dst_port;
   conn->local_port = tcp_alloc_port();
+  conn->lo = (u8)tcp_peer_is_local(family, v4, &v6);
 
   tcp_iss_counter += 1000;
   conn->iss = tcp_iss_counter;
@@ -1118,7 +1210,7 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
   conn->snd_nxt = conn->iss;
   /* M32: initial flow/congestion-control state. */
   conn->snd_wnd = TCP_RECV_BUF_INIT;  /* assume peer advertises >=1 segment */
-  conn->cwnd = TCP_INIT_CWND;          /* slow start: RFC 6928 IW10 */
+  conn->cwnd = 10u * tcp_mss_local(conn); /* slow start: RFC 6928 IW10 */
   /* Slow start runs until a loss says otherwise. Starting the threshold at
    * 65535 ended it at 64 KiB in flight even on a clean link; Linux starts at
    * TCP_INFINITE_SSTHRESH for exactly that reason, and our equivalent of
@@ -1144,7 +1236,8 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
   tcp->data_offset = (u8)((5 + TCP_SYN_OPT_LEN / 4) << 4);
   tcp->flags = TCP_SYN;
   tcp->window = bswap16(TCP_SYN_WINDOW);
-  tcp_build_syn_options(packet + sizeof(struct tcp_header));
+  tcp_build_syn_options(packet + sizeof(struct tcp_header),
+                        tcp_mss_local(conn));
 
   conn->state = TCP_SYN_SENT;
 
@@ -1262,6 +1355,29 @@ int tcp_connect_error(struct tcp_conn *conn) {
   return err;
 }
 
+/* How much one non-blocking send would put on the wire now: what is left of
+ * the smaller of the peer's and the congestion window. This TCP queues
+ * nothing past its window, so this is also all a send can accept. */
+u32 tcp_send_room(struct tcp_conn *conn) {
+  u64 irq;
+  u32 room = 0;
+
+  if (!conn)
+    return 0;
+  irq = irq_save();
+  tcp_lock();
+  if (conn->used && conn->state == TCP_ESTABLISHED) {
+    u32 window = conn->snd_wnd < conn->cwnd ? conn->snd_wnd : conn->cwnd;
+    u32 inflight = conn->in_recovery ? tcp_pipe(conn)
+                                     : (conn->snd_nxt - conn->snd_una);
+
+    room = window > inflight ? window - inflight : 0;
+  }
+  tcp_unlock();
+  irq_restore(irq);
+  return room;
+}
+
 int tcp_is_established(struct tcp_conn *conn) {
   if (!conn)
     return 0;
@@ -1366,6 +1482,18 @@ static usize tcp_build_keepalive(struct tcp_conn *conn, u8 *pkt) {
   struct tcp_header *h = (struct tcp_header *)pkt;
   h->seq_num = bswap32(conn->snd_nxt - 1);
   return len;
+}
+
+void tcp_set_sndbuf(struct tcp_conn *conn, u32 bytes) {
+  u64 irq;
+
+  if (!conn)
+    return;
+  irq = irq_save();
+  tcp_lock();
+  conn->snd_budget = bytes;
+  tcp_unlock();
+  irq_restore(irq);
 }
 
 void tcp_set_rcvbuf(struct tcp_conn *conn, u32 bytes) {
@@ -1618,7 +1746,7 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
 
   /* Pre-allocate packet and retransmit packet buffers BEFORE taking the lock
    * to avoid heap_lock deadlock. */
-  usize to_alloc = len > TCP_MSS ? TCP_MSS : len;
+  usize to_alloc = len > tcp_mss_local(conn) ? tcp_mss_local(conn) : len;
   usize packet_len = sizeof(struct tcp_header) + to_alloc;
   u8 *packet = kzalloc(packet_len);
   if (!packet)
@@ -1672,14 +1800,35 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
     return -EAGAIN;
   }
   u32 usable = window - inflight;
+  if (conn->lo) {
+    u32 room = tcp_lo_budget(conn, inflight);
+
+    if (!room) {
+      tcp_unlock();
+      irq_restore(irq);
+      kfree(rp->data);
+      kfree(rp);
+      kfree(packet);
+      conn->budget_wait = 1;
+      __atomic_fetch_add(&g_tcp_budget_waiters, 1, __ATOMIC_ACQ_REL);
+      return -EAGAIN;
+    }
+    if (conn->budget_wait) {
+      conn->budget_wait = 0;
+      __atomic_fetch_sub(&g_tcp_budget_waiters, 1, __ATOMIC_ACQ_REL);
+    }
+    if (usable > room)
+      usable = room;
+  }
   /* M84: never emit a segment larger than the MSS the peer advertised. */
-  u32 eff_mss = conn->snd_mss && conn->snd_mss < TCP_MSS ? conn->snd_mss
-                                                         : TCP_MSS;
+  u32 eff_mss = tcp_mss_eff(conn);
   usize to_send = len;
   if (to_send > eff_mss)
     to_send = eff_mss;
   if (to_send > usable)
     to_send = usable;
+  if (to_send > to_alloc)
+    to_send = to_alloc; /* the buffers above were sized for this much */
   if (to_send == 0) {
     tcp_unlock();
     irq_restore(irq);
@@ -1760,6 +1909,9 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags) {
   int send_wnd_update = 0;
   if (!(flags & B1NIX_MSG_PEEK)) {
     conn->recv_read += (u32)avail;
+    /* A loopback sender held back by its send budget waits for exactly this. */
+    if (conn->lo && __atomic_load_n(&g_tcp_budget_waiters, __ATOMIC_ACQUIRE))
+      scheduler_wake_all(vfs_poll_chan);
 
     /*
      * Compact what has been read out of the buffer, not merely when it happens
@@ -1773,14 +1925,16 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags) {
      * past that point, and the failure looked like a corrupt package rather
      * than a stalled connection.
      */
+    /* ...but not on every read: moving the unread tail down each time made
+     * a reader that takes small pieces of a large backlog quadratic -- 43% of
+     * a loopback transfer's samples sat here. Read bytes count as free space
+     * (tcp_rcv_free), and the move happens once half the buffer has been
+     * read, or when arriving data needs the room (tcp_recv_append). */
     if (conn->recv_read >= conn->recv_len) {
       conn->recv_len = 0;
       conn->recv_read = 0;
-    } else if (conn->recv_read > 0) {
-      memmove(conn->recv_buf, conn->recv_buf + conn->recv_read,
-              conn->recv_len - conn->recv_read);
-      conn->recv_len -= conn->recv_read;
-      conn->recv_read = 0;
+    } else if (conn->recv_read > conn->recv_cap / 2) {
+      tcp_recv_compact(conn);
     }
 
     /* If we had throttled the peer below 1 MSS and the app has now freed at
@@ -1793,7 +1947,7 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags) {
      * 64 KiB buffer still looked like it had ~1 MiB free, so wnd_closed was
      * never set and this window update — the whole point of which is to keep
      * the peer off its zero-window persist timer — never fired. */
-    u32 free_wnd = conn->recv_cap - conn->recv_len;
+    u32 free_wnd = tcp_rcv_free(conn, conn->recv_cap);
     if (conn->wnd_closed && free_wnd >= TCP_MSS) {
       conn->wnd_closed = 0;
       memset(wnd_update_pkt, 0, sizeof(wnd_update_pkt));
@@ -2136,11 +2290,12 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         /* No growth inside recovery: the pipe estimate governs sending. */
       } else if (conn->cwnd < conn->ssthresh) {
         /* Slow start: exponential — +MSS per new ACK. */
-        conn->cwnd += TCP_MSS;
+        conn->cwnd += tcp_mss_local(conn);
       } else {
         /* Congestion avoidance: additive — +MSS²/cwnd per RTT
          * (approximated per-ACK as MSS/cwnd-segments). */
-        u32 inc = (TCP_MSS * TCP_MSS) / (conn->cwnd ? conn->cwnd : 1);
+        u32 m = tcp_mss_local(conn);
+        u32 inc = (u32)(((u64)m * m) / (conn->cwnd ? conn->cwnd : 1));
         if (inc < 1) inc = 1;
         conn->cwnd += inc;
       }
@@ -2177,6 +2332,7 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
           new_conn->remote_ip6 = v6src;
           new_conn->remote_port = src_port;
           new_conn->local_port = dst_port;
+          new_conn->lo = (u8)tcp_peer_is_local(family, v4src, &v6src);
 
           tcp_iss_counter += 1000;
           new_conn->iss = tcp_iss_counter;
@@ -2186,7 +2342,7 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
           new_conn->irs = seq;
           /* M32: initialise flow/congestion state on the accepted side too. */
           new_conn->snd_wnd = bswap16(tcp->window);
-          new_conn->cwnd = TCP_INIT_CWND;
+          new_conn->cwnd = 10u * tcp_mss_local(new_conn);
           new_conn->ssthresh = TCP_CWND_MAX;
           new_conn->dup_acks = 0;
 
@@ -2222,7 +2378,7 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
           tcp_hdr->window = bswap16(TCP_SYN_WINDOW);
           if (new_conn->wscale_ok || new_conn->sack_ok) {
             u8 *sopts = packet + sizeof(struct tcp_header);
-            tcp_build_syn_options(sopts);
+            tcp_build_syn_options(sopts, tcp_mss_local(new_conn));
             /* RFC 2018: only offer SACK back if the client asked for it; RFC
              * 7323: same for window scaling. */
             if (!new_conn->sack_ok) {
@@ -2535,7 +2691,7 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
       } else if (seg_len > 0 && (i32)(seg_seq - conn->rcv_nxt) > 0) {
         /* Past a hole. Only buffer what fits inside the window we advertised;
          * anything beyond it the peer should not have sent. */
-        u32 wnd = conn->recv_cap - conn->recv_len;
+        u32 wnd = tcp_rcv_free(conn, conn->recv_cap);
         if ((u32)(seg_seq - conn->rcv_nxt) + seg_len <= wnd &&
             conn->ooo_segs < TCP_OOO_MAX_SEGS &&
             conn->ooo_bytes + seg_len <= TCP_OOO_MAX_BYTES) {
@@ -2594,7 +2750,7 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
          * arrived and retransmits only the hole. */
         u8 ack_pkt[TCP_ACK_MAX_LEN];
         usize ack_len = tcp_build_ack(conn, ack_pkt, 1, ooo_recent);
-        u32 adv_wnd = conn->recv_cap - conn->recv_len;
+        u32 adv_wnd = tcp_rcv_free(conn, conn->recv_cap);
         /* Remember if we just throttled the peer below 1 MSS so tcp_recv() knows
          * to send an unsolicited window-update once the app drains the buffer,
          * instead of leaving the peer parked on its zero-window persist timer. */
@@ -3058,7 +3214,8 @@ void tcp_robustness_smoke(void) {
 
   /* Both SYNs carried our MSS, window-scale and SACK-permitted options, so
    * each side learned the other's. */
-  if (cli->snd_mss == TCP_MSS && acc->snd_mss == TCP_MSS && cli->wscale_ok &&
+  if (cli->snd_mss == tcp_mss_local(acc) && acc->snd_mss == tcp_mss_local(cli) &&
+      cli->wscale_ok &&
       acc->wscale_ok && cli->sack_ok && acc->sack_ok)
     k_info(NULL, "M84-TCP: ok mss-negotiated");
   else
@@ -3311,14 +3468,15 @@ void tcp_robustness_smoke(void) {
       u32 pipe = tcp_pipe(cli2);
       int head_lost = head && head->lost;
       u32 sacked = cli2->sacked_bytes;
-      cli2->cwnd = 8 * TCP_MSS;
+      cli2->cwnd = 8 * tcp_mss_local(cli2);
       tcp_enter_recovery(cli2);
       u32 cwnd = cli2->cwnd, ssthresh = cli2->ssthresh;
       tcp_unlock();
       irq_restore(irq);
 
       sb_ok = sb_ok && n >= 4 && head_lost && sacked == total - head->dlen &&
-              pipe == 0 && cwnd == ssthresh && cwnd == 4 * TCP_MSS;
+              pipe == 0 && cwnd == ssthresh &&
+              cwnd == 4 * tcp_mss_local(cli2);
       if (sb_ok) {
         console_write("M84-TCP: ok scoreboard-pipe\n");
       } else {

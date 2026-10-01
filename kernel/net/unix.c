@@ -178,6 +178,19 @@ static void unix_unlock(struct unix_socket_data *u) {
   __atomic_clear(&u->lock, __ATOMIC_RELEASE);
 }
 
+/* Connections waiting on a listening socket to be accepted. */
+int unix_pending_connections(struct vfs_socket_state *s) {
+  struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
+  int n;
+
+  if (!u)
+    return 0;
+  unix_lock(u);
+  n = u->backlog_count;
+  unix_unlock(u);
+  return n;
+}
+
 static void unix_data_get(struct unix_socket_data *u) {
   if (u) __atomic_add_fetch(&u->refcount, 1, __ATOMIC_RELAXED);
 }

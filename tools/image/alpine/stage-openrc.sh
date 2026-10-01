@@ -63,3 +63,12 @@ mkdir -p "$ROOTFS/var/lib/misc"
 
 # Left behind by the from-source port, which installed under /libexec/openrc.
 rm -rf "$ROOTFS/libexec/openrc" "$ROOTFS/sbin/openrc-init" "$ROOTFS/sbin/openrc-shutdown"
+# And its halt/poweroff/reboot/shutdown wrappers, never configured
+# ("exec @SBINDIR@/openrc-shutdown"): they shadowed BusyBox's applets at the
+# path the kernel's orderly power-off runs, /sbin/poweroff.
+for cmd in halt poweroff reboot shutdown; do
+	if grep -qs 'openrc-shutdown' "$ROOTFS/sbin/$cmd"; then
+		rm -f "$ROOTFS/sbin/$cmd"
+		[ "$cmd" = shutdown ] || ln -s /bin/busybox "$ROOTFS/sbin/$cmd"
+	fi
+done

@@ -14,6 +14,8 @@
 #include <b1nix/errno.h>
 #include <string.h>
 #include <b1nix/suspend.h>
+#include <b1nix/sched.h>
+#include <b1nix/virtio.h>
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
@@ -66,16 +68,24 @@ u32 pci_config_read32(u8 bus, u8 slot, u8 func, u8 offset)
 	volatile u32 *p = pci_ecam_slot(bus, slot, func, offset);
 	return p ? *p : 0xFFFFFFFFu;
 }
+
+/* ECAM reads are not cached: nothing to forget. */
+static void pci_slot_forget_empty(u8 bus, u8 slot)
+{
+	(void)bus;
+	(void)slot;
+}
 #else
 /* Slots the boot enumeration found empty.
  *
  * Each driver that looks for its device walks every bus and slot itself, and
  * each read of an empty slot is two port writes the hypervisor has to trap:
  * sixteen such walks cost a KVM guest more than a second of its boot in
- * outl/inl. A slot with nothing at function 0 has nothing at any function, and
- * nothing appears later -- there is no hot-plug here -- so once pci_init has
- * looked, a read of an empty slot's identity answers "no device" without
- * touching the ports. Every other read still goes to the hardware. */
+ * outl/inl. A slot with nothing at function 0 has nothing at any function, so
+ * once pci_init has looked, a read of an empty slot's identity answers "no
+ * device" without touching the ports. Every other read still goes to the
+ * hardware. A hotplug slot the firmware says something arrived in is struck
+ * off the list first (pci_hotplug_slot). */
 static u8 g_pci_slot_empty[256 * 32 / 8];
 static int g_pci_slot_map_ready;
 
@@ -84,6 +94,14 @@ static inline int pci_slot_known_empty(u8 bus, u8 slot)
 	u32 bit = (u32)bus * 32u + slot;
 
 	return g_pci_slot_map_ready && (g_pci_slot_empty[bit / 8] >> (bit % 8)) & 1;
+}
+
+static void pci_slot_forget_empty(u8 bus, u8 slot)
+{
+	u32 bit = (u32)bus * 32u + slot;
+
+	__atomic_fetch_and(&g_pci_slot_empty[bit / 8], (u8)~(1u << (bit % 8)),
+	                   __ATOMIC_RELAXED);
 }
 
 static void pci_mark_slot_empty(u8 bus, u8 slot)
@@ -286,16 +304,151 @@ static void pci_assign_bars(u8 bus, u8 slot, u8 func)
  * header is known to be the one the drivers went on to use.
  */
 #define PCI_SAVED_MAX 64
+/* MSI-X entries kept per function: every driver here asks for a handful. */
+#define PCI_SAVED_MSIX 32
 
 struct pci_saved_dev {
 	u8 bus, slot, func, used;
 	u32 bar[6];
 	u16 command;
 	u8 cacheline, latency, irq_line;
+	/* The message interrupts (M135), as the driver left them: taken again
+	 * just before the sleep, because the scan came before any driver asked
+	 * for one. A device reset by the sleep comes back with MSI off and its
+	 * MSI-X table masked, and a driver that resumes on top of that polls
+	 * without knowing why. */
+	u8 msi_cap, msix_cap;
+	u16 msi_ctrl, msix_ctrl;
+	u32 msi_addr_lo, msi_addr_hi, msi_mask;
+	u16 msi_data;
+	u16 msix_n;
+	volatile u32 *msix_tbl;   /* mapped once, reused on every sleep */
+	u32 msix_entry[PCI_SAVED_MSIX][4];
 };
 
 static struct pci_saved_dev g_pci_saved[PCI_SAVED_MAX];
 static int g_pci_saved_count;
+
+#define PCI_MSI_CTRL_64BIT_ 0x0080u
+#define PCI_MSI_CTRL_PVM_   0x0100u   /* per-vector masking */
+#define PCI_MSI_CTRL_EN_    0x0001u
+#define PCI_MSIX_CTRL_EN_   0x8000u
+#define PCI_MSIX_CTRL_MASK_ 0x4000u
+
+static volatile u32 *pci_msix_table_map(u8 bus, u8 slot, u8 func, u8 cap,
+                                        u16 n)
+{
+	u32 tbl = pci_config_read32(bus, slot, func, (u8)(cap + 0x04));
+	struct pci_bar bar;
+	u64 span = (u64)n * 16u;
+
+	if (pci_bar_read(bus, slot, func, (u8)(tbl & 0x7), &bar) < 0 ||
+	    !bar.valid || bar.is_io || (u64)(tbl & ~0x7u) + span > bar.size)
+		return 0;
+	return (volatile u32 *)vmm_map_mmio(bar.base + (tbl & ~0x7u), (usize)span,
+	                                    VMM_WRITABLE | VMM_PCD |
+	                                        VMM_NO_EXECUTE);
+}
+
+/* The message-interrupt state, live. */
+static void pci_save_msi(struct pci_saved_dev *d)
+{
+	u8 b = d->bus, s = d->slot, f = d->func;
+
+	d->msi_cap = pci_find_capability(b, s, f, PCI_CAP_ID_MSI);
+	if (d->msi_cap) {
+		u8 c = d->msi_cap;
+
+		d->msi_ctrl = pci_config_read16(b, s, f, (u8)(c + 0x02));
+		d->msi_addr_lo = pci_config_read32(b, s, f, (u8)(c + 0x04));
+		if (d->msi_ctrl & PCI_MSI_CTRL_64BIT_) {
+			d->msi_addr_hi = pci_config_read32(b, s, f, (u8)(c + 0x08));
+			d->msi_data = pci_config_read16(b, s, f, (u8)(c + 0x0C));
+			if (d->msi_ctrl & PCI_MSI_CTRL_PVM_)
+				d->msi_mask = pci_config_read32(b, s, f, (u8)(c + 0x10));
+		} else {
+			d->msi_data = pci_config_read16(b, s, f, (u8)(c + 0x08));
+			if (d->msi_ctrl & PCI_MSI_CTRL_PVM_)
+				d->msi_mask = pci_config_read32(b, s, f, (u8)(c + 0x0C));
+		}
+	}
+	d->msix_cap = pci_find_capability(b, s, f, PCI_CAP_ID_MSIX);
+	d->msix_n = 0;
+	if (d->msix_cap) {
+		u16 n;
+
+		d->msix_ctrl = pci_config_read16(b, s, f, (u8)(d->msix_cap + 0x02));
+		n = (u16)((d->msix_ctrl & 0x07FFu) + 1);
+		if (n > PCI_SAVED_MSIX)
+			n = PCI_SAVED_MSIX;
+		/* Only an enabled table is worth keeping, and only with memory
+		 * decoding on can it be read at all. */
+		if (!(d->msix_ctrl & PCI_MSIX_CTRL_EN_) || !(d->command & 0x2))
+			return;
+		if (!d->msix_tbl)
+			d->msix_tbl = pci_msix_table_map(b, s, f, d->msix_cap, n);
+		if (!d->msix_tbl)
+			return;
+		for (u16 i = 0; i < n; i++)
+			for (int w = 0; w < 4; w++)
+				d->msix_entry[i][w] = d->msix_tbl[i * 4 + w];
+		d->msix_n = n;
+	}
+}
+
+static void pci_restore_msi(const struct pci_saved_dev *d)
+{
+	u8 b = d->bus, s = d->slot, f = d->func;
+
+	if (d->msi_cap && (d->msi_ctrl & PCI_MSI_CTRL_EN_)) {
+		u8 c = d->msi_cap;
+
+		pci_config_write32(b, s, f, (u8)(c + 0x04), d->msi_addr_lo);
+		if (d->msi_ctrl & PCI_MSI_CTRL_64BIT_) {
+			pci_config_write32(b, s, f, (u8)(c + 0x08), d->msi_addr_hi);
+			pci_config_write16(b, s, f, (u8)(c + 0x0C), d->msi_data);
+			if (d->msi_ctrl & PCI_MSI_CTRL_PVM_)
+				pci_config_write32(b, s, f, (u8)(c + 0x10), d->msi_mask);
+		} else {
+			pci_config_write16(b, s, f, (u8)(c + 0x08), d->msi_data);
+			if (d->msi_ctrl & PCI_MSI_CTRL_PVM_)
+				pci_config_write32(b, s, f, (u8)(c + 0x0C), d->msi_mask);
+		}
+		pci_config_write16(b, s, f, (u8)(c + 0x02), d->msi_ctrl);
+	}
+	if (d->msix_cap && d->msix_n && d->msix_tbl) {
+		u8 c = d->msix_cap;
+
+		/* As Linux restores it: enabled with every vector masked while the
+		 * table is written, then the control word as it was. */
+		pci_config_write16(b, s, f, (u8)(c + 0x02),
+		                   (u16)(d->msix_ctrl | PCI_MSIX_CTRL_EN_ |
+		                         PCI_MSIX_CTRL_MASK_));
+		for (u16 i = 0; i < d->msix_n; i++) {
+			volatile u32 *e = d->msix_tbl + i * 4;
+
+			e[3] = 1u;
+			e[0] = d->msix_entry[i][0];
+			e[1] = d->msix_entry[i][1];
+			e[2] = d->msix_entry[i][2];
+			e[3] = d->msix_entry[i][3];
+		}
+		pci_config_write16(b, s, f, (u8)(c + 0x02), d->msix_ctrl);
+	}
+}
+
+static void pci_snapshot(struct pci_saved_dev *d)
+{
+	u8 bus = d->bus, slot = d->slot, func = d->func;
+
+	for (int i = 0; i < 6; i++)
+		d->bar[i] = pci_config_read32(bus, slot, func, (u8)(0x10 + i * 4));
+	d->command = pci_config_read16(bus, slot, func, 0x04);
+	d->cacheline = pci_config_read8(bus, slot, func, 0x0C);
+	d->latency = pci_config_read8(bus, slot, func, 0x0D);
+	d->irq_line = pci_config_read8(bus, slot, func, 0x3C);
+	pci_save_msi(d);
+}
 
 static void pci_save_config(u8 bus, u8 slot, u8 func)
 {
@@ -307,17 +460,136 @@ static void pci_save_config(u8 bus, u8 slot, u8 func)
 	d->bus = bus;
 	d->slot = slot;
 	d->func = func;
-	for (int i = 0; i < 6; i++)
-		d->bar[i] = pci_config_read32(bus, slot, func, (u8)(0x10 + i * 4));
-	d->command = pci_config_read16(bus, slot, func, 0x04);
-	d->cacheline = pci_config_read8(bus, slot, func, 0x0C);
-	d->latency = pci_config_read8(bus, slot, func, 0x0D);
-	d->irq_line = pci_config_read8(bus, slot, func, 0x3C);
+	pci_snapshot(d);
 	d->used = 1;
+}
+
+/* ── device power states (M135 runtime PM) ────────────────────────────────
+ *
+ * The PM capability's control/status register holds the function's D-state in
+ * its low two bits. D3hot keeps the function on the bus but lets it drop to
+ * its lowest power; leaving it takes 10 ms (PCI PM 1.2, 5.6.1) and, unless the
+ * function says No_Soft_Reset, resets its configuration -- so the state is
+ * saved going down and written back coming up, as for an S3. */
+#define PCI_PM_CTRL 0x04
+#define PCI_PM_NO_SOFT_RESET 0x0008u
+
+static struct pci_saved_dev *pci_saved_find(u8 bus, u8 slot, u8 func)
+{
+	for (int i = 0; i < g_pci_saved_count; i++)
+		if (g_pci_saved[i].used && g_pci_saved[i].bus == bus &&
+		    g_pci_saved[i].slot == slot && g_pci_saved[i].func == func)
+			return &g_pci_saved[i];
+	return 0;
+}
+
+int pci_power_state(u8 bus, u8 slot, u8 func)
+{
+	u8 cap = pci_find_capability(bus, slot, func, PCI_CAP_ID_PM);
+
+	if (!cap)
+		return -1;
+	return pci_config_read16(bus, slot, func, (u8)(cap + PCI_PM_CTRL)) & 3;
+}
+
+int pci_set_d3hot(u8 bus, u8 slot, u8 func)
+{
+	u8 cap = pci_find_capability(bus, slot, func, PCI_CAP_ID_PM);
+	struct pci_saved_dev *d = pci_saved_find(bus, slot, func);
+	u16 pmcsr;
+
+	if (!cap || !d)
+		return -1;
+	pci_snapshot(d);
+	pmcsr = pci_config_read16(bus, slot, func, (u8)(cap + PCI_PM_CTRL));
+	pci_config_write16(bus, slot, func, (u8)(cap + PCI_PM_CTRL),
+	                   (u16)((pmcsr & ~3u) | 3u));
+	return (pci_config_read16(bus, slot, func, (u8)(cap + PCI_PM_CTRL)) & 3) == 3
+	           ? 0 : -1;
+}
+
+int pci_set_d0(u8 bus, u8 slot, u8 func)
+{
+	u8 cap = pci_find_capability(bus, slot, func, PCI_CAP_ID_PM);
+	struct pci_saved_dev *d = pci_saved_find(bus, slot, func);
+	u16 pmcsr;
+
+	if (!cap || !d)
+		return -1;
+	pmcsr = pci_config_read16(bus, slot, func, (u8)(cap + PCI_PM_CTRL));
+	if ((pmcsr & 3) == 0)
+		return 0;
+	pci_config_write16(bus, slot, func, (u8)(cap + PCI_PM_CTRL),
+	                   (u16)(pmcsr & ~3u));
+	scheduler_sleep_ticks(SCHED_MS_TO_TICKS(10));
+	if (!(pmcsr & PCI_PM_NO_SOFT_RESET)) {
+		for (int b = 0; b < 6; b++)
+			pci_config_write32(bus, slot, func, (u8)(0x10 + b * 4), d->bar[b]);
+		pci_config_write8(bus, slot, func, 0x0C, d->cacheline);
+		pci_config_write8(bus, slot, func, 0x0D, d->latency);
+		pci_config_write8(bus, slot, func, 0x3C, d->irq_line);
+		pci_config_write16(bus, slot, func, 0x04, d->command);
+		pci_restore_msi(d);
+	}
+	return (pci_config_read16(bus, slot, func, (u8)(cap + PCI_PM_CTRL)) & 3) == 0
+	           ? 0 : -1;
+}
+
+/* Hibernation (M135): the boot kernel is about to write every page of the image
+ * over its own memory, and a device still doing DMA would write into the image
+ * after it. Stop them all: a legacy virtio function is reset through its status
+ * register, which also forgets the queue addresses, and every function but a
+ * bridge loses bus mastering. The image's own resume path restores the
+ * command registers it saved and re-initialises its devices. */
+void pci_quiesce_all(void)
+{
+	for (int i = 0; i < g_pci_saved_count; i++) {
+		struct pci_saved_dev *d = &g_pci_saved[i];
+		u16 vendor, cmd;
+
+		if (!d->used)
+			continue;
+		vendor = pci_config_read16(d->bus, d->slot, d->func, 0);
+		if (vendor == 0xFFFF ||
+		    pci_config_read8(d->bus, d->slot, d->func, 0x0B) == 0x06 /* bridge */)
+			continue;
+		cmd = pci_config_read16(d->bus, d->slot, d->func, 0x04);
+		if (vendor == VIRTIO_PCI_VENDOR && (cmd & 1)) {
+			u32 bar0 = pci_config_read32(d->bus, d->slot, d->func, 0x10);
+
+			if (bar0 & 1)
+				outb((u16)((bar0 & ~3u) + VIRTIO_PCI_STATUS), 0);
+		}
+		pci_config_write16(d->bus, d->slot, d->func, 0x04,
+		                   (u16)(cmd & ~PCI_CMD_BUS_MASTER));
+	}
+}
+
+/* Just before the sleep: the header and the interrupts as they are now, with
+ * every driver's changes since the scan. */
+static int pci_suspend_all(void *ctx)
+{
+	int msix = 0;
+
+	(void)ctx;
+	for (int i = 0; i < g_pci_saved_count; i++) {
+		struct pci_saved_dev *d = &g_pci_saved[i];
+
+		if (!d->used ||
+		    pci_config_read16(d->bus, d->slot, d->func, 0) == 0xFFFF)
+			continue;
+		pci_snapshot(d);
+		msix += d->msix_n ? 1 : 0;
+	}
+	k_info("pci", "saved %d configuration headers, %d MSI-X table(s)",
+	       g_pci_saved_count, msix);
+	return 0;
 }
 
 static int pci_resume_all(void *ctx)
 {
+	int msi = 0;
+
 	(void)ctx;
 	for (int i = 0; i < g_pci_saved_count; i++) {
 		struct pci_saved_dev *d = &g_pci_saved[i];
@@ -332,12 +604,15 @@ static int pci_resume_all(void *ctx)
 		pci_config_write8(d->bus, d->slot, d->func, 0x0C, d->cacheline);
 		pci_config_write8(d->bus, d->slot, d->func, 0x0D, d->latency);
 		pci_config_write8(d->bus, d->slot, d->func, 0x3C, d->irq_line);
-		/* The command register last: the decoding is only turned on once the
-		 * addresses it decodes to are back. */
+		/* The command register once the addresses it decodes to are back,
+		 * and before the MSI-X table, which lives behind one of them. */
 		pci_config_write16(d->bus, d->slot, d->func, 0x04, d->command);
+		pci_restore_msi(d);
+		msi += ((d->msi_cap && (d->msi_ctrl & PCI_MSI_CTRL_EN_)) ||
+		        d->msix_n) ? 1 : 0;
 	}
-	k_info("pci", "restored %d configuration headers after the sleep",
-	       g_pci_saved_count);
+	k_info("pci", "restored %d configuration headers after the sleep, %d "
+	       "with message interrupts", g_pci_saved_count, msi);
 	return 0;
 }
 
@@ -345,7 +620,8 @@ void pci_init(void)
 {
 	/* First in the resume order, because every driver's resume writes to a
 	 * device that only decodes its registers once this has run. */
-	suspend_register_device("pci-config", pci_resume_all, 0);
+	suspend_register_device_ops("pci-config", pci_suspend_all, pci_resume_all,
+	                            0);
 
 #ifdef __aarch64__
 	/* Nothing is scanned until the tree says there is something to scan. A
@@ -1851,6 +2127,18 @@ static void pci_sysfs_attr(struct sysfs_dir *dir, const char *name,
 		kfree(text);
 }
 
+static isize pci_sysfs_config_read(void *ctx, char *buf, usize cap,
+                                   u64 offset)
+{
+	u32 bdf = (u32)(usize)ctx;
+	u8 bus = (u8)(bdf >> 16), slot = (u8)(bdf >> 8), func = (u8)bdf;
+	usize n = 0;
+
+	for (u64 off = offset; off < 256 && n < cap; off++, n++)
+		buf[n] = (char)pci_config_read8(bus, slot, func, (u8)off);
+	return (isize)n;
+}
+
 static void pci_sysfs_publish_one(u8 bus, u8 slot, u8 func) {
 	char slotname[20], buf[224];
 
@@ -1935,6 +2223,13 @@ static void pci_sysfs_publish_one(u8 bus, u8 slot, u8 func) {
 		}
 	}
 
+	/* config: the configuration header, which lspci reads. 256 bytes, as a
+	 * conventional access reaches. */
+	(void)sysfs_reg_attr_at(dev, "config", 0444, pci_sysfs_config_read, 0,
+	                        (void *)(usize)(((u32)bus << 16) |
+	                                        ((u32)slot << 8) | func),
+	                        0);
+
 	(void)sysfs_reg_link(dev, "subsystem", "../../../bus/pci");
 
 	/* The other view userspace walks: /sys/bus/pci/devices/<addr>. */
@@ -1948,6 +2243,38 @@ static void pci_sysfs_publish_one(u8 bus, u8 slot, u8 func) {
 		         slotname);
 		(void)sysfs_reg_link(busdev, slotname, target);
 	}
+}
+
+int pci_hotplug_slot(u8 bus, u8 slot) {
+	int added = 0;
+	u8 max_func;
+
+	pci_slot_forget_empty(bus, slot);
+
+	if (pci_config_read16(bus, slot, 0, 0) == 0xFFFF)
+		return 0;
+	max_func = (pci_config_read8(bus, slot, 0, 0x0E) & 0x80) ? 8 : 1;
+	for (u8 func = 0; func < max_func; func++) {
+		char slotname[20], devpath[64];
+		struct sysfs_dir *dev;
+
+		if (pci_config_read16(bus, slot, func, 0) == 0xFFFF)
+			continue;
+		snprintf(slotname, sizeof(slotname), "%04x:%02x:%02x.%u", 0,
+		         (unsigned)bus, (unsigned)slot, (unsigned)func);
+		dev = sysfs_reg_dir(sysfs_reg_dir(sysfs_reg_dir(0, "devices"),
+		                                  "pci0000:00"), slotname);
+		if (!dev || sysfs_reg_find(dev, "vendor"))
+			continue; /* there since boot, or already announced */
+		pci_sysfs_publish_one(bus, slot, func);
+		k_info("pci", "%s %04x:%04x hot-added", slotname,
+		       (unsigned)pci_config_read16(bus, slot, func, 0x00),
+		       (unsigned)pci_config_read16(bus, slot, func, 0x02));
+		snprintf(devpath, sizeof(devpath), "/devices/pci0000:00/%s", slotname);
+		uevent_post("add", devpath, "pci", 0, 0, -1, -1);
+		added++;
+	}
+	return added;
 }
 
 void pci_sysfs_publish_all(void) {

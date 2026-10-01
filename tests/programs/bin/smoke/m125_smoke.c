@@ -3719,6 +3719,9 @@ static void check_affinity(void) {
   sqe->len = sizeof(buf);
   sqe->off = (unsigned long long)-1;
   sqe->user_data = 0x77;
+  /* Forced to the worker, as Linux forces it to io-wq: otherwise the read of
+   * a pipe is finished by the task that wrote into it, on its own CPU. */
+  sqe->flags = IOSQE_ASYNC;
   io_uring_enter_(r.fd, 1, 0, 0, 0, 0);
   snprintf(name, sizeof(name), "iou-wrk-%d", (int)getpid());
   int wrk = -1;

@@ -25,6 +25,7 @@
 #include <b1nix/mm.h>
 
 #include <b1nix/spinlock.h>
+#include <b1nix/suspend.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -992,6 +993,68 @@ static int choose_agaw(void)
 	return -1;
 }
 
+/* The root table handed to the unit and translation switched on: at boot,
+ * and after an S3 that reset the unit (M135). */
+static void vtd_program_translation(void)
+{
+	vtd_write64(VTD_RTADDR, root_table_phys);
+	gcmd_write(GCMD_SRTP, 0);
+	while (!(vtd_read32(VTD_GSTS) & GSTS_RTPS))
+		;
+	vtd_flush_context_global();
+	vtd_flush_iotlb_global();
+
+	gcmd_write(0, GCMD_TE);
+	while (!(vtd_read32(VTD_GSTS) & GSTS_TES))
+		;
+}
+
+/* The interrupt remapping table, likewise. */
+static void vtd_program_ir(void)
+{
+	/* IRTA: table address plus log2(entries) - 1 in the low bits. */
+	u64 size_field = 7; /* 256 entries */
+
+	vtd_write64(VTD_IRTA, ir_table_phys | size_field);
+	gcmd_write(GCMD_SIRTP, 0);
+	while (!(vtd_read32(VTD_GSTS) & GSTS_IRTPS))
+		;
+	/* CFI keeps compatibility-format interrupts (the IOAPIC's, and every
+	 * driver still on the legacy message) working, the same way pass-through
+	 * kept DMA working when translation went on. */
+	gcmd_write(0, GCMD_CFI | GCMD_IRE);
+	while (!(vtd_read32(VTD_GSTS) & GSTS_IRES))
+		;
+	ir_flush();
+}
+
+/* After S3 the unit is back at its reset state: translation and remapping
+ * off, no root table, no remapping table. The tables themselves are ours and
+ * unchanged; the unit is only told about them again, in the boot order. A
+ * device resumed before this would DMA untranslated and raise its remapped
+ * message interrupts into nothing, hence the early registration. */
+static int vtd_resume(void *ctx)
+{
+	u32 gsts;
+	char line[112];
+
+	(void)ctx;
+	if (!vtd_enabled)
+		return 0;
+	gcmd_shadow = 0;
+	vtd_program_translation();
+	if (ir_enabled)
+		vtd_program_ir();
+	gsts = vtd_read32(VTD_GSTS);
+	snprintf(line, sizeof(line),
+	         "iommu: VT-d back after the resume: translation %s, "
+	         "interrupt remapping %s\n",
+	         (gsts & GSTS_TES) ? "on" : "OFF",
+	         !ir_enabled ? "unused" : (gsts & GSTS_IRES) ? "on" : "OFF");
+	console_write(line);
+	return 0;
+}
+
 void iommu_init(void)
 {
 	const struct acpi_sdt_header *hdr = acpi_find_table("DMAR");
@@ -1093,16 +1156,7 @@ void iommu_init(void)
 				return;
 	}
 
-	vtd_write64(VTD_RTADDR, root_table_phys);
-	gcmd_write(GCMD_SRTP, 0);
-	while (!(vtd_read32(VTD_GSTS) & GSTS_RTPS))
-		;
-	vtd_flush_context_global();
-	vtd_flush_iotlb_global();
-
-	gcmd_write(0, GCMD_TE);
-	while (!(vtd_read32(VTD_GSTS) & GSTS_TES))
-		;
+	vtd_program_translation();
 	vtd_enabled = 1;
 
 	/* Decide, once and out loud, which ports keep their children apart. Every
@@ -1116,21 +1170,11 @@ void iommu_init(void)
 	if (vtd_ecap & (1ULL << 3)) {
 		ir_table = (struct ir_entry *)alloc_table_page(&ir_table_phys);
 		if (ir_table) {
-			/* IRTA: table address plus log2(entries) - 1 in the low bits. */
-			u64 size_field = 7; /* 256 entries */
-			vtd_write64(VTD_IRTA, ir_table_phys | size_field);
-			gcmd_write(GCMD_SIRTP, 0);
-			while (!(vtd_read32(VTD_GSTS) & GSTS_IRTPS))
-				;
-			/* CFI keeps compatibility-format interrupts (the IOAPIC's, and
-			 * every driver still on the legacy message) working, the same way
-			 * pass-through kept DMA working when translation went on. */
-			gcmd_write(0, GCMD_CFI | GCMD_IRE);
-			while (!(vtd_read32(VTD_GSTS) & GSTS_IRES))
-				;
+			vtd_program_ir();
 			ir_enabled = 1;
 		}
 	}
+	suspend_register_device_early("vt-d", vtd_resume, 0);
 
 	char line[128];
 	snprintf(line, sizeof(line),

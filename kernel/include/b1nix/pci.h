@@ -231,6 +231,11 @@ int pci_intel_stolen_decode(u16 ggc, u32 bdsm, u32 bgsm,
  * is read from config space; nothing is defaulted, and no `driver` link is
  * written because this kernel records no binding. */
 void pci_sysfs_publish_all(void);
+/* A function that appeared in `slot` after boot (ACPI's device check on a
+ * hotplug slot): published in sysfs and announced with an "add" uevent, as
+ * Linux's acpiphp does for a card it has just enabled. Returns how many
+ * functions were new. */
+int pci_hotplug_slot(u8 bus, u8 slot);
 
 /* The kernel address a device's memory BAR is reachable at.
  *
@@ -246,5 +251,14 @@ void *pci_map_mmio(u64 phys, usize size);
 /* M98 in-kernel self-test (BAR sizing, capability walk, bus master, MSI/MSI-X
  * programming readback, stolen memory). No-op outside b1nix.test=1. */
 void pci_selftest(void);
+
+/* M135 runtime PM: the function's D-state from its PM capability (-1 when it
+ * has none), and the D3hot / D0 transitions, which save the configuration
+ * going down and restore it coming up. */
+int pci_power_state(u8 bus, u8 slot, u8 func);
+int pci_set_d3hot(u8 bus, u8 slot, u8 func);
+/* Stop every function's DMA (hibernation restore). */
+void pci_quiesce_all(void);
+int pci_set_d0(u8 bus, u8 slot, u8 func);
 
 #endif

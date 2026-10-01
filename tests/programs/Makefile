@@ -388,6 +388,10 @@ BINARIES += $(BUILD)/bin/m129_smoke
 BINARIES += $(BUILD)/bin/m129_suspend_smoke
 # M134: the AML interpreter, against the firmware's own DSDT and SSDTs.
 BINARIES += $(BUILD)/bin/m134_aml_smoke
+# M135: ACPI events -- the SCI, the power button, a GPE and its Notify().
+BINARIES += $(BUILD)/bin/m135_acpi_smoke
+BINARIES += $(BUILD)/bin/m135_hib_smoke
+BINARIES += $(BUILD)/bin/m135_iommu_s3_smoke
 # reboot(RESTART2, "bootloader"): the iommu lane ends through it.
 BINARIES += $(BUILD)/bin/reboot2_smoke
 BINARIES += $(BUILD)/bin/m42_w5pre_smoke

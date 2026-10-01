@@ -28,6 +28,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/errno.h>
 #include <b1nix/io.h>
+#include <b1nix/suspend.h>
 #include <string.h>
 
 /* ── HDA global registers (byte offsets into MMIO BAR0) ──────────────────── */
@@ -236,6 +237,27 @@ static int hda_muted;
 
 /* ── Coarse delay via wall clock ─────────────────────────────────────────── */
 static inline u32 hda_wallclock(void) { return *(volatile u32 *)(hda_regs + HDA_WALLCLK); }
+
+/* A playback wait gives up after two seconds. Measured with the kernel's
+ * clock where it runs: the controller's wall clock stands still while the
+ * controller is in reset -- after a sleep that nothing brought it back from --
+ * and a wait measured only with it never ended. */
+struct hda_wait {
+	u64 t0;
+	u32 wc0;
+};
+
+static struct hda_wait hda_wait_start(void) {
+	struct hda_wait w = {ktime_monotonic_ns(), hda_wallclock()};
+
+	return w;
+}
+
+static int hda_wait_over(const struct hda_wait *w) {
+	if (w->t0)
+		return ktime_monotonic_ns() - w->t0 > 2000000000ull;
+	return (u32)(hda_wallclock() - w->wc0) > 2000;
+}
 
 static void hda_delay_ms(int ms) {
 	/* Against the calibrated clock, not against a guess at how long an I/O
@@ -477,6 +499,8 @@ static void hda_controller_reset(void) {
 }
 
 /* ── CORB/RIRB DMA setup ─────────────────────────────────────────────────── */
+static int hda_program_corb_rirb(void);
+
 static int hda_setup_corb_rirb(void) {
 	/* Allocate CORB: 256 entries × 4 bytes = 1 KiB, 128-byte aligned */
 	hda_corb_phys = pmm_alloc_frames(1);
@@ -487,7 +511,12 @@ static int hda_setup_corb_rirb(void) {
 	hda_rirb_phys = pmm_alloc_frames(1);
 	hda_rirb = (u32 *)(usize)(hda_rirb_phys + vmm_direct_map_base());
 	memset((void *)hda_rirb, 0, PAGE_SIZE);
+	return hda_program_corb_rirb();
+}
 
+/* Both rings pointed at their pages and started: at probe, and again after a
+ * sleep that reset the controller (M135). */
+static int hda_program_corb_rirb(void) {
 	hda_corb_wp = 0;
 
 	/* Stop DMA before programming addresses */
@@ -762,6 +791,8 @@ static void hda_configure_output(void) {
 }
 
 /* ── Output stream DMA setup ─────────────────────────────────────────────── */
+static void hda_program_stream(void);
+
 static int hda_setup_output_stream(u32 buf_size) {
 	/* Round up to 4 KiB page boundary, minimum 4 KiB */
 	buf_size = (buf_size + 4095) & ~4095u;
@@ -783,6 +814,14 @@ static int hda_setup_output_stream(u32 buf_size) {
 	hda_bdl[0].address = hda_dam_buf_phys;
 	hda_bdl[0].length  = buf_size;
 	hda_bdl[0].flags    = 0; /* no IOC, normal BDI */
+	hda_program_stream();
+	return 0;
+}
+
+/* The output stream descriptor and the converter's stream tag: at probe, and
+ * again after a sleep that reset both (M135). */
+static void hda_program_stream(void) {
+	u32 buf_size = hda_dam_buf_sz;
 
 	/* Stream tag = 1, stream 0 (SDO0) */
 	u8 stream_tag = 1;
@@ -836,7 +875,27 @@ static int hda_setup_output_stream(u32 buf_size) {
 	 * in the high nibble and the first channel in the low one. */
 	hda_corb_send_wait(HDA_VERB(hda_codec_addr, hda_output_nid, 0x706,
 	                            (u32)stream_tag << 4));
+}
 
+/* After S3 the controller is back in reset with every register at its
+ * default, and the codec has lost its widget settings. Nothing is allocated
+ * again -- the rings, the descriptor list and the buffer are still ours, at
+ * the addresses they had -- they are only handed back to the hardware. */
+static int hda_resume(void *ctx) {
+	(void)ctx;
+	if (!hda_inited)
+		return 0;
+	while (__sync_lock_test_and_set(&hda_play_lock, 1))
+		scheduler_yield();
+	hda_controller_reset();
+	if (hda_program_corb_rirb() < 0) {
+		__sync_lock_release(&hda_play_lock);
+		return -EIO;
+	}
+	if (hda_output_nid)
+		hda_configure_output();
+	hda_program_stream();
+	__sync_lock_release(&hda_play_lock);
 	return 0;
 }
 
@@ -913,11 +972,11 @@ static isize hda_dsp_write(struct vfs_node *node, u64 offset, const char *buffer
 		hda_w8(sdo_off + HDA_SDO_STS, HDA_SDO_STS_BCIS); /* clear a stale one */
 		hda_w32(sdo_off + HDA_SDO_CTL0, (ctl0 & ~HDA_SDO_CTL0_SRST) | HDA_SDO_CTL0_RUN);
 
-		/* Bounded by the wall clock: the chunk is at most the buffer, which
-		 * is well under a second of audio. */
-		u32 start = hda_wallclock();
+		/* Bounded: the chunk is at most the buffer, which is well under a
+		 * second of audio. */
+		struct hda_wait w = hda_wait_start();
 		while (!(hda_r8(sdo_off + HDA_SDO_STS) & HDA_SDO_STS_BCIS)) {
-			if ((u32)(hda_wallclock() - start) > 2000) break;
+			if (hda_wait_over(&w)) break;
 			scheduler_yield();
 		}
 		hda_w32(sdo_off + HDA_SDO_CTL0, ctl0 & ~(HDA_SDO_CTL0_RUN | HDA_SDO_CTL0_SRST));
@@ -982,9 +1041,9 @@ static isize hda_sound_write(struct sound_device *dev, const void *buf, usize le
 			hda_w32(sdo_off + HDA_SDO_CTL0, ctl0 | HDA_SDO_CTL0_RUN);
 
 		/* Wait for playback to complete */
-		u32 start = hda_wallclock();
+		struct hda_wait w = hda_wait_start();
 		while (hda_r32(sdo_off + HDA_SDO_LPIB) < chunk) {
-			if ((u32)(hda_wallclock() - start) > 2000) break;
+			if (hda_wait_over(&w)) break;
 			scheduler_yield();
 		}
 		written += chunk;
@@ -1156,6 +1215,7 @@ void hda_init(void) {
 	hda_sound_dev.set_volume = hda_sound_set_volume;
 	hda_sound_dev.get_volume = hda_sound_get_volume;
 	sound_register(&hda_sound_dev);
+	suspend_register_device("hda", hda_resume, 0);
 
 	console_write("hda: initialized 48kHz stereo 16-bit, /dev/dsp ready\n");
 }
@@ -1371,6 +1431,7 @@ static int hda_module_init(void) {
 
 static void hda_module_exit(void) {
 	sound_unregister_hooks(&hda_hooks);
+	suspend_unregister_device(hda_resume);
 	if (hda_inited)
 		sound_unregister(&hda_sound_dev);
 	hda_inited = 0;

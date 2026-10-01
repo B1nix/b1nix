@@ -41,9 +41,25 @@ struct b1nix_input_event {
 #define INPUT_DEV_KBD 0
 #define INPUT_DEV_MOUSE 1
 #define INPUT_DEV_TOUCH 2 /* /dev/input/event2 — virtio touchscreen (wl_touch) */
-#define INPUT_NDEVS 3
+/* The ACPI buttons (M135): present only when the firmware declares them, and
+ * registered by acpi_event_init with input_register_optional. */
+#define INPUT_DEV_PWRBTN 3
+#define INPUT_DEV_SLPBTN 4
+#define INPUT_DEV_LID 5
+#define INPUT_NDEVS 6
+
+/* Linux key and switch codes the ACPI buttons report. */
+#define B1NIX_EV_SW 0x05
+#define B1NIX_KEY_POWER 116
+#define B1NIX_KEY_SLEEP 142
+#define B1NIX_SW_LID 0x00
 
 void input_init(void);
+
+/* Bring up one of the optional devices above: its /dev node, its sysfs view
+ * and an "add" uevent. `lid_closed` is the switch's initial state for the lid
+ * (ignored otherwise). Returns 0, or -errno. */
+int input_register_optional(int dev, int lid_closed);
 
 /* Producer API (IRQ-safe): queue one event on every open client of `dev`.
  * A B1NIX_EV_SYN event marks the end of one hardware report. */

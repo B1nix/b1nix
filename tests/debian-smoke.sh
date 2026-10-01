@@ -117,24 +117,47 @@ fi
 RUN_DIR="$PROJECT_DIR/smoke_run/debian-run-$$"
 RUN_IMG="$RUN_DIR/root.img"
 mkdir -p "$RUN_DIR"
-_t=$(now)
-cp --reflink=auto "$IMG" "$RUN_IMG" 2>/dev/null || cp "$IMG" "$RUN_IMG"
-echo "[TIME] image-copy $(since "$_t")s"
 # Put the current harness into the copy.
 #
 # The script inside the image is whatever the image was built with, which may
 # be months old; debugfs writes the working-tree version into the scratch copy
 # without root and without rebuilding the image, so the test always runs the
 # harness that sits beside it in the repository.
+#
+# The injected image is kept beside the pristine one and reused while neither
+# the image nor the harness changes: two debugfs writes into an 800 MB image
+# measured 5 to 73 s from run to run (the disk they go through is shared with
+# builds), against 0.1 s for a reflink copy of an image already injected.
 STAGE="$PROJECT_DIR/tools/image/debian-stage.sh"
+INJECTED="${IMG%.ext4}-injected.ext4"
+INJECT_KEY=""
 if [ -f "$STAGE" ] && command -v debugfs >/dev/null 2>&1; then
-	_t=$(now)
-	if debugfs -w -R "rm /b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1 &&
-		debugfs -w -R "write $STAGE b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1; then
-		echo "  (harness injected from tools/image/debian-stage.sh)"
-		echo "[TIME] harness-inject $(since "$_t")s"
-	else
-		printf "  ${YELLOW}note${NC}: could not inject the harness; using the one in the image\n"
+	INJECT_KEY="$(stat -c '%s %Y' "$IMG") $(sha256sum "$STAGE" | cut -c1-16)"
+fi
+_t=$(now)
+if [ -n "$INJECT_KEY" ] && [ -f "$INJECTED" ] &&
+	[ "$(cat "$INJECTED.key" 2>/dev/null)" = "$INJECT_KEY" ]; then
+	cp --reflink=auto "$INJECTED" "$RUN_IMG" 2>/dev/null || cp "$INJECTED" "$RUN_IMG"
+	echo "  (harness from the cached injected image)"
+	echo "[TIME] image-copy $(since "$_t")s"
+else
+	cp --reflink=auto "$IMG" "$RUN_IMG" 2>/dev/null || cp "$IMG" "$RUN_IMG"
+	echo "[TIME] image-copy $(since "$_t")s"
+	if [ -n "$INJECT_KEY" ]; then
+		_t=$(now)
+		if debugfs -w -R "rm /b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1 &&
+			debugfs -w -R "write $STAGE b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1; then
+			echo "  (harness injected from tools/image/debian-stage.sh)"
+			echo "[TIME] harness-inject $(since "$_t")s"
+			rm -f "$INJECTED" "$INJECTED.key"
+			if cp --reflink=auto "$RUN_IMG" "$INJECTED" 2>/dev/null; then
+				echo "$INJECT_KEY" >"$INJECTED.key"
+			else
+				rm -f "$INJECTED"
+			fi
+		else
+			printf "  ${YELLOW}note${NC}: could not inject the harness; using the one in the image\n"
+		fi
 	fi
 fi
 cleanup() {
@@ -256,7 +279,9 @@ boot_stop() { # name why
 	kill -9 "$_pid" 2>/dev/null || true
 	wait "$_pid" 2>/dev/null || true
 	rm -f "$RUN_DIR/$1.pid" "$RUN_DIR/$1.qcow2"
-	echo "[TIME] $1 qemu-run $(since "$(cat "$RUN_DIR/$1.t0")")s"
+	_dur=$(since "$(cat "$RUN_DIR/$1.t0")")
+	echo "[TIME] $1 qemu-run ${_dur}s"
+	echo "$1 $_dur" >>"$RUN_DIR/times"
 }
 
 # One look at a running boot: print its new harness lines, and stop it when it
@@ -297,7 +322,17 @@ boot_poll() { # name
 }
 
 echo "[RUN] $(echo $BOOTS | wc -w | tr -d ' ') boot(s), $DEBIAN_JOBS at a time"
-_queue="$BOOTS"
+# Longest first. With the boots two at a time, the lane ends when the last
+# one does, and the order decides how much of that is one boot running alone:
+# measured, the 60 s part started at the 59th second and finished alone at the
+# 120th. The durations are the last run's, per boot; one never timed goes
+# first, so that it is timed.
+BOOT_TIMES="$PROJECT_DIR/smoke_run/debian-boot-times-$ARCH"
+_queue=$(for _b in $BOOTS; do
+	_d=$(awk -v b="$_b" '$1 == b { d = $2 } END { print (d == "" ? 99999 : d) }' \
+		"$BOOT_TIMES" 2>/dev/null || true)
+	echo "${_d:-99999} $_b"
+done | sort -rn | awk '{ print $2 }' | tr '\n' ' ')
 _running=""
 while [ -n "$_queue" ] || [ -n "$_running" ]; do
 	for _b in $_running; do
@@ -317,6 +352,13 @@ done
 for _b in $BOOTS; do
 	cat "$RUN_DIR/$_b.log" >>"$LOG"
 done
+# Keep this run's durations for the next run's order; boots this run did not
+# start keep theirs.
+if [ -f "$RUN_DIR/times" ]; then
+	{ awk 'NR == FNR { new[$1] = 1; next } !($1 in new)' "$RUN_DIR/times" \
+		"$BOOT_TIMES" 2>/dev/null || true; cat "$RUN_DIR/times"; } >"$BOOT_TIMES.new" &&
+		mv "$BOOT_TIMES.new" "$BOOT_TIMES"
+fi
 
 # ── Check ──────────────────────────────────────────────────────────────────
 echo "[TIME] lane-total $(since "$LANE_T0")s"

@@ -23,6 +23,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/pci.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/suspend.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -331,6 +332,46 @@ void amdvi_fault_clear(void)
 
 /* ── bring-up ───────────────────────────────────────────────────── */
 
+/* The tables and rings handed to the unit and translation switched on: at
+ * boot, and after an S3 that reset the unit (M135). */
+static void amdvi_program_unit(void)
+{
+	usize dt_pages = (DEV_TABLE_ENTRIES * 32) / PAGE_SIZE;
+
+	/* Base registers carry the size as a power-of-two code in the low bits. */
+	reg_write64(AMDVI_DEV_TABLE_BASE,
+	            (dev_table_phys & 0x000FFFFFFFFFF000ULL) | (dt_pages - 1));
+	reg_write64(AMDVI_CMD_BUF_BASE,
+	            (cmd_ring_phys & 0x000FFFFFFFFFF000ULL) | (8ULL << 56));
+	reg_write64(AMDVI_EVENT_BASE,
+	            (event_ring_phys & 0x000FFFFFFFFFF000ULL) | (8ULL << 56));
+	reg_write64(AMDVI_CMD_HEAD, 0);
+	reg_write64(AMDVI_CMD_TAIL, 0);
+	reg_write64(AMDVI_EVENT_HEAD, 0);
+	reg_write64(AMDVI_EVENT_TAIL, 0);
+	event_head = 0;
+
+	reg_write64(AMDVI_CONTROL, CTRL_CMD_BUF_EN | CTRL_EVENT_LOG_EN);
+	reg_write64(AMDVI_CONTROL,
+	            CTRL_CMD_BUF_EN | CTRL_EVENT_LOG_EN | CTRL_IOMMU_EN);
+	amdvi_invalidate_all_pages();
+}
+
+/* After S3 the unit is back at its reset state, with its base registers and
+ * ring pointers cleared. The tables are ours and unchanged; the unit is only
+ * told about them again, before any other device resumes. */
+static int amdvi_resume(void *ctx)
+{
+	(void)ctx;
+	if (!amdvi_enabled)
+		return 0;
+	amdvi_program_unit();
+	console_write((reg_read64(AMDVI_CONTROL) & CTRL_IOMMU_EN)
+	                  ? "amdvi: unit back after the resume: translation on\n"
+	                  : "amdvi: unit did not come back after the resume\n");
+	return 0;
+}
+
 void amdvi_init(void)
 {
 	const struct acpi_sdt_header *hdr = acpi_find_table("IVRS");
@@ -383,25 +424,9 @@ void amdvi_init(void)
 	for (u32 i = 0; i < DEV_TABLE_ENTRIES; i++)
 		dte_set((u16)i, 0);
 
-	/* Base registers carry the size as a power-of-two code in the low bits. */
-	reg_write64(AMDVI_DEV_TABLE_BASE,
-	            (dev_table_phys & 0x000FFFFFFFFFF000ULL) | (dt_pages - 1));
-	reg_write64(AMDVI_CMD_BUF_BASE,
-	            (cmd_ring_phys & 0x000FFFFFFFFFF000ULL) | (8ULL << 56));
-	reg_write64(AMDVI_EVENT_BASE,
-	            (event_ring_phys & 0x000FFFFFFFFFF000ULL) | (8ULL << 56));
-	reg_write64(AMDVI_CMD_HEAD, 0);
-	reg_write64(AMDVI_CMD_TAIL, 0);
-	reg_write64(AMDVI_EVENT_HEAD, 0);
-	reg_write64(AMDVI_EVENT_TAIL, 0);
-	event_head = 0;
-
-	reg_write64(AMDVI_CONTROL, CTRL_CMD_BUF_EN | CTRL_EVENT_LOG_EN);
-	reg_write64(AMDVI_CONTROL,
-	            CTRL_CMD_BUF_EN | CTRL_EVENT_LOG_EN | CTRL_IOMMU_EN);
+	amdvi_program_unit();
 	amdvi_enabled = 1;
-
-	amdvi_invalidate_all_pages();
+	suspend_register_device_early("amd-vi", amdvi_resume, 0);
 
 	char line[128];
 	snprintf(line, sizeof(line),

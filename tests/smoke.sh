@@ -483,8 +483,15 @@ run_qemu() {
 		if [ "$ARCH" = "x86_64" ]; then
 			set -- ${qemu_bin} ${accel_args} ${mem_args} ${cpu_args} \
 				${kernel_args} \
-				-serial stdio -serial null -display ${GPU_DISPLAY:-none} -monitor none -no-reboot \
+				-serial stdio -serial null -display ${GPU_DISPLAY:-none} -monitor none ${SMOKE_NO_REBOOT--no-reboot} \
 				-device isa-debug-exit,iobase=0xf4,iosize=0x04
+			# The hibernation lane's resume device: a swap area of its own,
+			# made fresh for every run so no image outlives the run that wrote
+			# it.
+			if [ -n "${SMOKE_HIB_IMG:-}" ] && [ -f "$SMOKE_HIB_IMG" ]; then
+				set -- "$@" -drive if=none,file="$SMOKE_HIB_IMG",format=raw,id=vhib \
+					-device virtio-blk-pci,drive=vhib
+			fi
 
 			# The root filesystem, as a disk rather than inside the image.
 			#
@@ -997,7 +1004,7 @@ else
 		# root disk; no command line opens an ISO. Building the lane ISOs there
 		# repacked seven images (two of them 268 MB), ~10 s, on every kernel
 		# change. What the lanes do use is the kernel and the checked root.
-		LANE_TARGETS="iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-iommu iso-pku iso-init iso-switchroot"
+		LANE_TARGETS="iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-iommu iso-pku iso-hib iso-init iso-switchroot"
 		[ "${SMOKE_LA57:-0}" = "1" ] && LANE_TARGETS="$LANE_TARGETS iso-la57"
 		[ "$ARCH" = "aarch64" ] && LANE_TARGETS="check-dynamic build/$ARCH/kernel.elf"
 		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
@@ -1090,7 +1097,7 @@ _mkimg() {  # mkimg <instance-suffix>
 }
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
-    _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg pku; _mkimg smp; _mkimg switchroot
+    _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg pku; _mkimg hib; _mkimg smp; _mkimg switchroot
     [ "${SMOKE_BIGMEM:-0}" = "1" ] && _mkimg bigmem
     [ "${SMOKE_LA57:-0}" = "1" ] && _mkimg la57
 }
@@ -1109,6 +1116,7 @@ SWITCHROOT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-switchroot-$ARCH.log"
 IOMMU_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-iommu-$ARCH.log"
 AMDVI_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-amdvi-$ARCH.log"
 PKU_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-pku-$ARCH.log"
+HIB_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-hib-$ARCH.log"
 BIGMEM_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-bigmem-$ARCH.log"
 LA57_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-la57-$ARCH.log"
 RASPI_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-raspi-$ARCH.log"
@@ -1433,9 +1441,21 @@ launch_posix() {
 			python3 "$PROJECT_DIR/tests/support/acpi/s3-waker.py" \
 				"$SMOKE_QMP_SOCK" "$POSIX_LOG" 3 300 \
 				>>"$POSIX_LOG" 2>&1 &
+			# M135: the power button and a hotplugged card, when
+			# m135_acpi_smoke asks.
+			python3 "$PROJECT_DIR/tests/support/acpi/acpi-actor.py" \
+				"$SMOKE_QMP_SOCK" "$POSIX_LOG" 600 \
+				>"$PROJECT_DIR/smoke_run/acpi-actor-posix.log" 2>&1 &
 		fi
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[posix] "
+		# The guest powers itself off a second after it is done. Waiting for
+		# that is how the lane proves \_S5 (M135): QEMU leaves on its own only
+		# if the firmware's sleep type reached PM1 control.
+		if [ "$ARCH" = "x86_64" ]; then
+			SMOKE_DONE_SETTLE=15
+			export SMOKE_DONE_SETTLE
+		fi
 		run_qemu "$POSIX_LOG"
 	) &
 	pid_posix=$!
@@ -1566,6 +1586,18 @@ launch_raspi() {
 	pid_raspi=$!
 }
 
+# M135: the IOMMU lanes sleep in S3 once; the wake comes over QMP, as in the
+# posix lane (see tests/support/acpi/s3-waker.py). Run inside the lane's
+# subshell, so SMOKE_QMP_SOCK reaches run_qemu.
+start_s3_waker() {
+	command -v python3 >/dev/null 2>&1 || return 0
+	SMOKE_QMP_SOCK="$PROJECT_DIR/smoke_run/qmp-$2-$$.sock"
+	export SMOKE_QMP_SOCK
+	rm -f "$SMOKE_QMP_SOCK"
+	python3 "$PROJECT_DIR/tests/support/acpi/s3-waker.py" \
+		"$SMOKE_QMP_SOCK" "$1" 3 300 >>"$1" 2>&1 &
+}
+
 launch_iommu() {
 	[ "$ARCH" = "aarch64" ] && return 0
 	(
@@ -1606,6 +1638,7 @@ launch_iommu() {
 		SMOKE_DONE_SETTLE=10
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[iommu]"
+		start_s3_waker "$IOMMU_LOG" iommu
 		run_qemu "$IOMMU_LOG"
 	) &
 	pid_iommu=$!
@@ -1626,6 +1659,7 @@ launch_amdvi() {
 		SMOKE_DONE_SETTLE=10
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[amdvi]"
+		start_s3_waker "$AMDVI_LOG" amdvi
 		run_qemu "$AMDVI_LOG"
 	) &
 	pid_amdvi=$!
@@ -1654,6 +1688,34 @@ launch_pku() {
 		run_qemu "$PKU_LOG"
 	) &
 	pid_pku=$!
+}
+
+# M135 hibernation: the test writes its image and asks for a reboot, and the
+# same QEMU process then boots again and resumes it -- so this instance, and
+# only this one, runs without -no-reboot. A crash that resets the machine is
+# caught by the done pattern and the stall timeout as usual.
+launch_hib() {
+	[ "$ARCH" = "aarch64" ] && return 0
+	command -v mkswap >/dev/null 2>&1 || return 0
+	(
+		SMOKE_HIB_IMG="$PROJECT_DIR/smoke_run/hib-$ARCH.img"
+		rm -f "$SMOKE_HIB_IMG"
+		truncate -s 1536M "$SMOKE_HIB_IMG" &&
+			mkswap -L b1hib "$SMOKE_HIB_IMG" >/dev/null 2>&1 || exit 0
+		SATA_IMG=$(disk_img sata hib)
+		AHCI_IMG=$(disk_img ahci hib)
+		NVME_IMG=$(disk_img nvme hib)
+		SWAP_IMG=$(disk_img swap hib)
+		B1NIX_ISO_NAME=b1nix-hib.iso
+		SMOKE_NO_REBOOT=""
+		SMOKE_DONE_SETTLE=5
+		STALL_TIMEOUT=${SMOKE_HIB_STALL:-180}
+		TIMEOUT=${SMOKE_HIB_TIMEOUT:-400}
+		PROGRESS_PREFIX="[hib]  "
+		export SMOKE_HIB_IMG SMOKE_NO_REBOOT
+		run_qemu "$HIB_LOG"
+	) &
+	pid_hib=$!
 }
 
 # M128: a guest with more RAM than the host has.
@@ -1821,7 +1883,7 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	# in the bootloader, before the guest clock starts: switchroot does 4 s of
 	# work and takes 37 s. Ordered by guest time they started last and the whole
 	# suite ended when they did.
-	_inst_list="pku switchroot blk sysnet posix sys gfx iommu init amdvi"
+	_inst_list="pku hib switchroot blk sysnet posix sys gfx iommu init amdvi"
 	# The Raspberry Pi lane is off by default, and not because it is broken.
 	#
 	# It is the one instance no accelerator can take: HVF needs -cpu host and
@@ -1852,14 +1914,14 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	if [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMOKE_INSTANCES " | grep -q " smp "; then
 		_ran_list="$_ran_list smp"
 	fi
-	for _known in sys sysnet blk posix gfx init switchroot iommu amdvi pku bigmem la57 raspi smp; do
+	for _known in sys sysnet blk posix gfx init switchroot iommu amdvi pku hib bigmem la57 raspi smp; do
 		case " $_ran_list " in
 		*" $_known "*) continue ;;
 		esac
 		rm -f "$PROJECT_DIR/smoke_run/b1nix-smoke-$_known-$ARCH.log"
 	done
 	run_slot_pool $SMOKE_MAX_CONCURRENT $_inst_list
-	cat "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$PKU_LOG" "$RASPI_LOG" 2>/dev/null >"$LOG" || true
+	cat "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$PKU_LOG" "$HIB_LOG" "$RASPI_LOG" 2>/dev/null >"$LOG" || true
 else
 	launch_sys
 	launch_smp_solo
@@ -2769,6 +2831,8 @@ check_output "$LOG" "M29-PTHREAD: start" "M29 pthread smoke starts"
 check_output "$LOG" "M29-PTHREAD: ok create-join" "pthread_create + pthread_join works"
 check_output "$LOG" "M29-PTHREAD: ok attr" "pthread_attr stack size + detach state are honored"
 check_output "$LOG" "M29-PTHREAD: ok mutex" "pthread mutex serialises two threads"
+check_output "$LOG" "M29-PTHREAD: ok thread-fork-wait" "a child forked by a thread is the process's child: the main thread's waitpid reaps it"
+check_output "$LOG" "M29-PTHREAD: ok thread-fork-ppid" "a child forked by a thread sees the process's pid as getppid()"
 check_output "$LOG" "M29-PTHREAD: ok condvar" "pthread condvar signal/wait works"
 check_output "$LOG" "M29-PTHREAD: ok thread-local" "real ELF __thread storage is per-thread in spawned pthreads"
 check_output "$LOG" "M29-PTHREAD: ok tls" "SYS_SET_TLS + %fs:0 round-trip works"
@@ -3315,7 +3379,7 @@ check_output "$POSIX_LOG" "M129-SMOKE: ok cpuidle-sysfs" "/sys/devices/system/cp
 if [ -n "$ACPI_FIXTURE" ] && [ "$ARCH" = "x86_64" ]; then
 	check_output "$POSIX_LOG" "M129-PSTATE: khz $ACPI_FIXTURE_PSS_KHZ" "the frequencies the kernel read out of _PSS are exactly the ones the firmware declared, in the order it declared them"
 	check_output "$POSIX_LOG" "M129-PSTATE: control $ACPI_FIXTURE_PSS_CONTROL" "so are the control values — the number written to the register _PCT names to ask for each state, which is the only part of a P-state the kernel cannot invent"
-	check_output "$POSIX_LOG" "M129-SMOKE: ok pstates-declared" "/sys/.../scaling_available_frequencies lists those states and scaling_max_freq/scaling_min_freq are their two ends"
+	check_output "$POSIX_LOG" "M129-SMOKE: ok pstates-declared" "/sys/.../scaling_available_frequencies lists those states and cpuinfo_max_freq/cpuinfo_min_freq are their two ends"
 	check_output "$POSIX_LOG" "M129-SMOKE: ok pstates-selected" "writing scaling_setspeed picks the state the firmware declared for that frequency, the kernel writes its control value to the declared register, and /proc/b1nix-cpufreq reports that the write was accepted"
 else
 	skipped "M129-PSTATE: khz" "no ACPI fixture: this port has no ACPI at all (aarch64), or the host has no python3 to generate the table"
@@ -3345,6 +3409,11 @@ if grep -qa "M129-SUSPEND: no-s3" "$POSIX_LOG"; then
 	skipped "M129-SUSPEND: ok s3-alive" "same"
 	skipped "M129-SUSPEND: ok s3-devices" "same"
 else
+	check_output "$POSIX_LOG" "ps2: keyboard back after the resume: self-test passed, translation on, irq1 armed" "the i8042 keyboard, reset by the S3, passed its self-test again and the controller kept scancode translation on: without it the set-1 map would read set-2 codes (M135)"
+	check_output "$POSIX_LOG" "ps2: mouse back after the resume: reporting enabled" "the PS/2 mouse, reset by the S3 with reporting off, answered its reset and has reporting on again (M135)"
+	check_output "$POSIX_LOG" "M129-SUSPEND: ok s3-tablet" "the virtio tablet, reset by the S3, reports the host's input afterwards: its driver rebuilt the queue (M135)"
+	check_output "${POSIX_LOG%.log}-hvc.out" "HVC-AFTER-S3: ok" "text written to /dev/hvc0 after the S3 still reaches the host (QEMU keeps this device's state across the sleep, so this shows the console works afterwards, not that its resume rebuilt it)"
+	check_output "$POSIX_LOG" "M129-SUSPEND: ok s3-msi-restored" "every PCI function that had MSI or MSI-X enabled before the S3 has it after: the table is saved just before the sleep and written back behind the restored header (M135)"
 	check_output "$POSIX_LOG" "M129-SUSPEND: ok s3-slept" "writing mem to /sys/power/state really entered ACPI S3: the kernel's S3 counter moved (it counts only the path that writes SLP_TYP into PM1_CNT and returns through the real-mode wake-up trampoline), and the machine was down for about the interval the RTC alarm was armed for"
 	check_output "$POSIX_LOG" "M129-SUSPEND: ok s3-alive" "and the processor was rebuilt from what the kernel saved: a file round-trip, a fork that is waited for and a syscall all work after the resume"
 	check_output "$POSIX_LOG" "M129-SUSPEND: ok s3-devices" "and the devices came back with it: an evdev node answers, the display takes a whole modeset (create a dumb buffer, add it as a framebuffer, set the CRTC — the last of those sends a scanout command to the device, so a virtio-gpu whose queues did not come back fails it), and the audio device takes a buffer"
@@ -3364,24 +3433,29 @@ else
 		fi
 	fi
 
-	# What the emulator actually played AFTER the resume. The tone is 880 Hz —
-	# nothing else in this lane plays that (the audio test's own is 440) — so
-	# finding it in the capture proves samples reached the card on the far side
-	# of the sleep rather than that a write returned a byte count.
+	# What the emulator actually played AFTER the resume, card by card: AC97
+	# plays 880 Hz and Intel HDA 660 Hz — nothing else in this lane plays
+	# either (the audio test's own is 440) — so finding each in the capture
+	# proves samples reached that card on the far side of the sleep rather
+	# than that a write returned a byte count.
 	_s3_wav="${POSIX_LOG%.log}-audio.wav"
-	if [ -f "$_s3_wav" ] && command -v python3 >/dev/null 2>&1; then
-		_s3_audio="$(python3 "$PROJECT_DIR/tests/support/verify-tone-wav.py" "$_s3_wav" 880 2>&1)"
-		case "$_s3_audio" in
-		"AUDIO-WAV: ok"*)
-			pass "the sound card played after the resume: the capture holds the 880 Hz tone the test wrote once the machine was back ($_s3_audio)"
-			;;
-		*)
-			fail "s3-audio" "$_s3_audio"
-			;;
-		esac
-	else
-		skipped "s3-audio" "no capture file for this lane, or no python3 to read it"
-	fi
+	for _s3_card in "ac97 880" "hda 660"; do
+		_s3_name="${_s3_card% *}"
+		_s3_hz="${_s3_card#* }"
+		if [ -f "$_s3_wav" ] && command -v python3 >/dev/null 2>&1; then
+			_s3_audio="$(python3 "$PROJECT_DIR/tests/support/verify-tone-wav.py" "$_s3_wav" "$_s3_hz" 2>&1)"
+			case "$_s3_audio" in
+			"AUDIO-WAV: ok"*)
+				pass "the $_s3_name card played after the resume: the capture holds the $_s3_hz Hz tone the test wrote once the machine was back ($_s3_audio)"
+				;;
+			*)
+				fail "s3-audio-$_s3_name" "$_s3_audio"
+				;;
+			esac
+		else
+			skipped "s3-audio-$_s3_name" "no capture file for this lane, or no python3 to read it"
+		fi
+	done
 fi
 check_output "$POSIX_LOG" "M129-SUSPEND: done" "the suspend smoke completes"
 check_output "$POSIX_LOG" "power: freeze," "the kernel reports the freeze, how many tasks it is holding and which wake source is armed"
@@ -3418,6 +3492,76 @@ else
 	check_output "$POSIX_LOG" "M134-AML: ok no-acpi-firmware" "a machine with no ACPI at all -- every board on this architecture -- reports exactly that: the interpreter is there, it built only the predefined roots, and it publishes no battery and no thermal zone rather than inventing either"
 fi
 check_output "$POSIX_LOG" "M134-AML: done" "the AML smoke completes"
+# M135: ACPI events, pressed from outside by tests/support/acpi/acpi-actor.py.
+if [ "$ARCH" = "x86_64" ]; then
+	check_output "$POSIX_LOG" "M135-ACPI: ok interrupts-sysfs" "/sys/firmware/acpi/interrupts counts the SCI, the GPEs and the fixed events"
+	check_output "$POSIX_LOG" "M135-ACPI: ok power-button-device" "the fixed power button is an input device named \"Power Button\""
+	check_output "$POSIX_LOG" "M135-ACPI: ok power-button" "QEMU's power button arrives through the SCI as KEY_POWER down and up, counted in ff_pwr_btn"
+	check_output "$POSIX_LOG" "M135-ACPI: ok pci-hotplug" "a card hotplugged into the pc machine raises a GPE whose method notifies its slot; the new function appears in /sys/bus/pci with an add uevent"
+	check_output "$POSIX_LOG" "M135-ACPI: ok wakeup-count" "the power button press is a wakeup event: /sys/power/wakeup_count moves, /sys/class/wakeup counts it, and writing back a count it has overtaken is refused (the handshake systemd suspends with)"
+	check_output "$POSIX_LOG" "M135-ACPI: ok wakeup-count-aborts" "with the count written back, an RTC alarm firing before the suspend makes the suspend refuse with EBUSY"
+	check_output "$POSIX_LOG" "M135-ACPI: done" "the ACPI events smoke completes"
+fi
+# M135: the frequency policy over the fixture's P-states.
+if [ -n "$ACPI_FIXTURE" ] && [ "$ARCH" = "x86_64" ]; then
+	check_output "$POSIX_LOG" "M135-ACPI: ok cpufreq-policy-layout" "cpufreq lives in /sys/devices/system/cpu/cpufreq/policy0, and every CPU's cpufreq is a link to it"
+	check_output "$POSIX_LOG" "M135-CPUFREQ: ppc $ACPI_FIXTURE_PPC bios_limit $ACPI_FIXTURE_PPC_KHZ" "the kernel read the firmware's _PPC and publishes its frequency as bios_limit"
+	check_output "$POSIX_LOG" "M135-ACPI: ok cpufreq-ppc-ceiling" "_PPC caps scaling_max_freq, and the performance governor runs at the platform's ceiling rather than above it"
+	check_output "$POSIX_LOG" "M135-ACPI: ok cpufreq-setspeed-refused" "scaling_setspeed is refused unless the userspace governor is in force"
+	check_output "$POSIX_LOG" "M135-ACPI: ok cpufreq-policy-limit" "writing scaling_max_freq narrows the policy and the clock follows; writing it back returns to the platform's ceiling"
+	check_output "$POSIX_LOG" "M135-ACPI: ok cpufreq-ondemand" "the ondemand governor drops to the slowest state when idle and raises the clock to the ceiling while a CPU spins"
+	check_output "$POSIX_LOG" "M135-BAT: $ACPI_FIXTURE_BAT_INFO" "the battery publishes what _BIX declares: cycle count, design capacity and voltage, chemistry, model, serial and maker"
+	check_output "$POSIX_LOG" "M135-ACPI: ok battery-alarm" "writing alarm hands the trip to the firmware's _BTP, and capacity_level reads Low below it"
+	check_output "$POSIX_LOG" "M135-ACPI: ok charge-behaviour" "charge_behaviour offers what _BMD says the battery can do, hands a choice to _BMC, and reads back what _BMD then reports; a mode that does not exist is refused"
+	check_output "$POSIX_LOG" "M135-THERMAL: trips $ACPI_FIXTURE_TZ_TRIPS" "the zone's trip points are the firmware's _CRT, _HOT, _PSV and _ACx, in Linux's order"
+	check_output "$POSIX_LOG" "M135-THERMAL: cdevs $ACPI_FIXTURE_TZ_CDEVS" "the cooling devices are the processor and the fans the zone's _ALx lists name"
+	check_output "$POSIX_LOG" "M135-ACPI: ok thermal-passive" "past _PSV the processor is slowed step by step through its P-states (ACPI's _TC1/_TC2 formula every _TSP)"
+	check_output "$POSIX_LOG" "M135-ACPI: ok thermal-active" "past each _ACx the fans its _ALx names come on, switched through their _PR0 power resources and read back from _STA"
+	check_output "$POSIX_LOG" "M135-ACPI: ok thermal-release" "below the trips the fans go off and the processor gets its clock back"
+	check_output "$POSIX_LOG" "critical temperature reached" "the lane ends past the critical trip, and the kernel says so"
+	check_absent "$POSIX_LOG" "the orderly power-off did not finish" "the orderly power-off went through /sbin/poweroff and init, not the kernel's forced fallback"
+	check_absent "$POSIX_LOG" "no /sbin/poweroff: powering off now" "userspace had a /sbin/poweroff to run"
+	check_output "$POSIX_LOG" "M135-IDLE: driver acpi_idle governor menu states $ACPI_FIXTURE_CST" "the idle states are the firmware's _CST, with its latencies, under the menu governor"
+	check_output "$POSIX_LOG" "M135-ACPI: ok runtime-pm" "with power/control=auto an idle NVMe controller autosuspends to D3hot (its PM capability says so) and a read brings it back to D0 and works; control=on keeps it up"
+	check_output "$POSIX_LOG" "M135-ACPI: ok idle-cst" "each _CST state publishes its residency, twice its exit latency as Linux's acpi_idle sets it"
+	check_output "$POSIX_LOG" "M135-ACPI: ok idle-deep-when-quiet" "a quiet machine sleeps in its deepest state"
+	check_output "$POSIX_LOG" "M135-ACPI: ok idle-disable" "stateN/disable takes a state from the governor, which picks the next deepest instead"
+	if grep -aq "M135-IDLE: skip idle-follows-prediction" "$POSIX_LOG"; then
+		skipped "M135-ACPI: ok idle-follows-prediction" "the host was too loaded for the paced ping-pong to make short idles (the log gives the mean)"
+	else
+		check_output "$POSIX_LOG" "M135-ACPI: ok idle-follows-prediction" "a CPU woken over and over by a paced pipe ping-pong stops taking its deepest state: the governor predicts short idles from the recent ones"
+	fi
+fi
+# ── M135: hibernation (the hib instance) ──
+# The image is written to a swap area of the instance's own, the machine
+# reboots in the same QEMU process, and the boot finds the image and goes back
+# to it: the log holds two boots, and the process that hibernated carries on
+# with its memory and its /tmp as they were.
+if [ "$ARCH" = "x86_64" ] && command -v mkswap >/dev/null 2>&1; then
+	check_output "$HIB_LOG" "M135-HIB: ok disk-offered" "/sys/power/state offers disk where a resume device is named (resume=LABEL= on the command line)"
+	check_output "$HIB_LOG" "hibernate: image written" "the snapshot of every used page is written to the resume device"
+	check_output "$HIB_LOG" "hibernate: image saved, rebooting" "the machine reboots once the image is on disk, as /sys/power/disk asked"
+	if [ "$(grep -ac 'pmm: kernel 0x' "$HIB_LOG" 2>/dev/null)" -ge 2 ] 2>/dev/null; then
+		pass "the resume came through a real second boot"
+	else
+		if log_wedged "$HIB_LOG"; then
+			blocked "the resume came through a real second boot" "instance died before this ran"
+		else
+			fail "the resume came through a real second boot" "the log holds fewer than two boots"
+		fi
+	fi
+	check_output "$HIB_LOG" "hibernate: restoring" "the second boot finds the image before it mounts anything"
+	check_output "$HIB_LOG" "hibernate: resumed from the image" "the boot kernel copies the image home and jumps into it"
+	check_output "$HIB_LOG" "M135-HIB: ok resumed" "the process that hibernated returns from its write with its memory and its /tmp token intact"
+else
+	skipped "M135-HIB: ok resumed" "x86_64 only, and the host needs mkswap to make the resume device"
+fi
+
+# The posix lane waits for its guest's poweroff -f: QEMU exiting by itself is
+# the firmware's \_S5 reached through PM1 control (M135).
+if [ "$ARCH" = "x86_64" ]; then
+	check_output "$POSIX_LOG" "SMOKE-WATCHDOG: qemu-exited-after-done" "the machine turns itself off through \\_S5 -- here from the critical thermal trip, by way of /sbin/poweroff and init: QEMU exits on its own"
+fi
 check_absent "$POSIX_LOG" "M134-AML: fail" "no AML check failed"
 
 # M128: the >64 GiB claim, when the bigmem lane ran (SMOKE_BIGMEM=1). The
@@ -4019,6 +4163,16 @@ check_iommu "$AMDVI_LOG" "M100D-SMOKE: ok amdvi-map" "M100d: a mapping is what t
 check_iommu "$AMDVI_LOG" "M100D-SMOKE: ok amdvi-unmap" "M100d: unmapping removes the translation"
 check_iommu "$AMDVI_LOG" "M100D-SMOKE: ok nvme-translated" "M100d: NVMe runs in a domain AMD-Vi translates, reads a block, and the event log stays empty"
 check_iommu "$AMDVI_LOG" "M100D-SMOKE: ok amdvi-command-ring" "M100d: the unit consumes commands from the ring, so invalidation is real"
+# M135: each unit through an S3. The machine resets the unit; its resume
+# hands it the same tables again before any other device resumes.
+check_iommu "$IOMMU_LOG" "M135-IOMMU: ok s3-slept" "M135: the VT-d machine went through a real ACPI S3 (the kernel's S3 counter moved)"
+check_iommu "$IOMMU_LOG" "iommu: VT-d back after the resume: translation on, interrupt remapping on" "M135: after the S3 the unit reads back translation and interrupt remapping on"
+check_iommu "$IOMMU_LOG" "M135-IOMMU: ok nvme-irq-after-s3" "M135: the NVMe controller's remapped completion interrupts arrive after the resume -- the remapping table is the unit's again"
+check_iommu "$IOMMU_LOG" "M135-IOMMU: ok io-across-s3" "M135: a task writing and syncing the NVMe disk through the S3 keeps going afterwards and its last write reads back -- the freezer let it finish the command it had in flight"
+check_iommu "$AMDVI_LOG" "M135-IOMMU: ok io-across-s3" "M135: the same disk writer comes through the S3 on the AMD-Vi machine"
+check_iommu "$AMDVI_LOG" "M135-IOMMU: ok s3-slept" "M135: the AMD-Vi machine went through a real ACPI S3"
+check_iommu "$AMDVI_LOG" "amdvi: unit back after the resume: translation on" "M135: after the S3 the AMD unit reads back translation on, with its device table and rings handed back"
+check_iommu "$AMDVI_LOG" "M135-IOMMU: ok nvme-irq-after-s3" "M135: NVMe completions still interrupt after the resume on the AMD-Vi machine"
 check_iommu "$AMDVI_LOG" "reboot: restarting" "M100d: the machine boots and restarts with AMD-Vi translating"
 check_iommu "$IOMMU_LOG" "SMOKE-WATCHDOG: qemu-exited-after-done" "M100b: the machine still boots and resets with translation on"
 check_output "$INIT_LOG" "M108-SMOKE: done-init" "M108 BusyBox-init instance completes"

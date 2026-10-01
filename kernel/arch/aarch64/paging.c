@@ -1272,7 +1272,12 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
    * what PERF_COUNT_SW_PAGE_FAULTS* reads. A fault the handler refused is a
    * signal, not a fault the task took. */
   if (rc == 0 && current_task && fault_addr < USER_SPACE_LIMIT) {
+    extern void uprobe_page_mapped(u64 va);
+
     task_count_fault(current_task, major);
+    /* A page of a file with a uprobe in it gets its breakpoint as it comes
+     * in (M135: uprobes on this port). */
+    uprobe_page_mapped(fault_addr);
 
     /* And the page joins the eviction ring, which is what makes it a
      * candidate for reclaim -- machine-wide and for the cgroup that owns it.
@@ -1318,6 +1323,111 @@ u64 paging_user_phys(u64 pml4_phys, u64 vaddr) {
   u64 frame = paging_user_frame(pml4_phys, vaddr);
   if (!frame) return 0;
   return frame | (vaddr & (PAGE_SIZE - 1));
+}
+
+/* Is `va` a kernel address: mapped, and not to EL0? On this port the kernel's
+ * windows sit inside the same numeric range as user space, so the address
+ * alone cannot say; the page's access permission (AP[1], bit 6) does. Blocks
+ * at L1 and L2 carry the same bit. */
+int paging_is_kernel_va(u64 va) {
+  u64 *l0 = get_l0_for_va(va);
+  u64 e;
+
+  if (!l0)
+    return 0;
+  e = l0[l0_index(va)];
+  if ((e & 0x3ULL) != D_TABLE)
+    return 0;
+  e = table_from_entry(e)[l1_index(va)];
+  if ((e & 0x3ULL) == D_BLOCK)
+    return !(e & (1ULL << 6));
+  if ((e & 0x3ULL) != D_TABLE)
+    return 0;
+  e = table_from_entry(e)[l2_index(va)];
+  if ((e & 0x3ULL) == D_BLOCK)
+    return !(e & (1ULL << 6));
+  if ((e & 0x3ULL) != D_TABLE)
+    return 0;
+  e = table_from_entry(e)[l3_index(va)];
+  return (e & 0x3ULL) == D_PAGE && !(e & (1ULL << 6));
+}
+
+/* Make freshly written instructions visible to instruction fetch: clean the
+ * data line to the point of unification, then invalidate the instruction
+ * caches of every CPU (the line may be cached under another alias). */
+void aarch64_sync_icache(u64 addr) {
+  __asm__ volatile("dc cvau, %0\n\tdsb ish\n\tic ialluis\n\tdsb ish\n\tisb"
+                   :
+                   : "r"(addr)
+                   : "memory");
+}
+
+/* One instruction word of user text in the address space at `pml4_phys`, the
+ * way a uprobe plants and lifts its BRK (the x86_64 port's byte-wide
+ * paging_user_poke_text). A frame anybody else holds -- the page cache's copy,
+ * a parent's page after fork -- gets a private copy first, so the breakpoint
+ * is this address space's alone. The previous word is returned in *old. */
+int paging_user_poke_text32(u64 pml4_phys, u64 va, u32 val, u32 *old) {
+  u64 spare = pmm_alloc_frame();
+  u64 f, *slot = 0, frame, gone = 0;
+  u64 *l0;
+
+  if (!pml4_phys || (va & 3) || va >= 0x0001000000000000ULL) {
+    if (spare)
+      pmm_free_frame(spare);
+    return -EFAULT;
+  }
+  vmm_write_acquire(&f);
+  l0 = phys_to_virt(pml4_phys);
+  if ((l0[l0_index(va)] & 0x3ULL) == D_TABLE) {
+    u64 *l1 = table_from_entry(l0[l0_index(va)]);
+
+    if ((l1[l1_index(va)] & 0x3ULL) == D_TABLE) {
+      u64 *l2 = table_from_entry(l1[l1_index(va)]);
+
+      if ((l2[l2_index(va)] & 0x3ULL) == D_TABLE) {
+        u64 *l3 = table_from_entry(l2[l2_index(va)]);
+
+        slot = &l3[l3_index(va)];
+      }
+    }
+  }
+  /* A leaf page mapped to EL0 (AP[1], bit 6). */
+  if (!slot || (*slot & 0x3ULL) != D_PAGE || !(*slot & (1ULL << 6))) {
+    vmm_write_release(f);
+    if (spare)
+      pmm_free_frame(spare);
+    return -EFAULT;
+  }
+  frame = *slot & ADDR_MASK;
+  if (frame == pmm_zero_page() || pmm_get_refcount(frame) != 1) {
+    if (!spare) {
+      vmm_write_release(f);
+      return -ENOMEM;
+    }
+    memcpy(phys_to_virt(spare), phys_to_virt(frame), PAGE_SIZE);
+    *slot = spare | (*slot & ~ADDR_MASK & ~SW_SHARED);
+    gone = frame;
+    frame = spare;
+    spare = 0;
+  }
+  {
+    u32 *p = (u32 *)(usize)(frame + (va & (PAGE_SIZE - 1)));
+
+    if (old)
+      *old = *p;
+    *p = val;
+    aarch64_sync_icache((u64)(usize)p);
+  }
+  vmm_write_release(f);
+  /* `tlbi vmalle1is` reaches every CPU and address space: see
+   * tlb_shootdown_mm. */
+  tlb_flush_all();
+  if (gone && gone != pmm_zero_page())
+    pmm_free_frame(gone);
+  if (spare)
+    pmm_free_frame(spare);
+  return 0;
 }
 
 static void mprotect_page_in_l0(u64 *l0, u64 virtual_address, u64 flags) {
@@ -2020,7 +2130,6 @@ void tlb_shootdown_current_mm(void) { tlb_flush_all(); }
  * address space at once, so naming one costs nothing here and changes
  * nothing. */
 void tlb_shootdown_mm(u64 pml4_phys) {
-  (void)pml4_phys;
   tlb_flush_all();
 }
 

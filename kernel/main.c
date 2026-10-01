@@ -50,6 +50,8 @@
 #include <b1nix/tracepoint.h>
 #include <b1nix/tarfs.h>
 #include <b1nix/procfs.h>
+#include <b1nix/hibernate.h>
+#include <b1nix/thermal.h>
 #include <b1nix/ahci.h>
 #include <b1nix/amdvi.h>
 #include <b1nix/iommu.h>
@@ -82,6 +84,7 @@
 #include <b1nix/lapic.h>
 #include <b1nix/video.h>
 #include <b1nix/acpi.h>
+#include <b1nix/acpi_event.h>
 #include <b1nix/aml.h>
 #include <b1nix/acpi_power.h>
 #include <b1nix/ioapic.h>
@@ -1174,6 +1177,16 @@ void kernel_main(usize arg0, usize arg1)
 	kmsg_init();            /* M107 /dev/kmsg record ring */
 	rtc_dev_init();         /* M107 /dev/rtc0 */
 	suspend_init();         /* M129 s2idle + the RTC alarm wake source */
+	/* M135: the SCI, the fixed buttons, GPEs and Notify(). After input (the
+	 * buttons are input devices), the scheduler (methods run in kacpid) and
+	 * suspend (the buttons are a wake source). */
+	acpi_event_init();
+	/* Acting on the thermal zones: needs the events, cpufreq and a thread. */
+	thermal_init();
+	/* A hibernation image, if the resume device holds one (M135): after the
+	 * block drivers, before anything mounts a filesystem or starts the other
+	 * CPUs. Returns only when there is no image to go back to. */
+	hibernate_resume_from_disk();
 	watchdog_init();        /* M107 /dev/watchdog */
 	i2c_init();             /* M107 SMBus host controller, if one exists */
 	blk_create_dev_nodes(); /* /dev/<blkdev> nodes for blkid/fdisk/loopN */
@@ -1544,12 +1557,15 @@ void kernel_main(usize arg0, usize arg1)
 	 * M28 heap-benchmark checks exercise. */
 	BOOTMARK(69);
 	smp_boot_aps();
+	sysfs_cpus_online();
 	BOOTMARK(70);
 #endif
 
 #if defined(__x86_64__)
 	/* Bring up Application Processors */
 	smp_boot_aps();
+	/* /sys is already mounted, with only the boot CPU in it. */
+	sysfs_cpus_online();
 
 	/* Each AP turns CR4.SMEP on for itself and stays quiet about it (its line
 	 * would land inside the one smp_boot_aps is writing). Report the tally here

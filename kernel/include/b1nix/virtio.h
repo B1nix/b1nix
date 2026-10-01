@@ -11,6 +11,7 @@
 #define VIRTIO_PCI_QUEUE_SEL      0x0E
 #define VIRTIO_PCI_QUEUE_NOTIFY   0x10
 #define VIRTIO_PCI_STATUS         0x12
+#define VIRTIO_PCI_VENDOR         0x1AF4
 #define VIRTIO_PCI_ISR            0x13
 
 #define VIRTIO_STATUS_ACKNOWLEDGE 1

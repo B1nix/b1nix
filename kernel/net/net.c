@@ -5,6 +5,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/namespace.h>
 #include <b1nix/net.h>
+#include <b1nix/ktime.h>
 #include <b1nix/netproto.h>
 #include <b1nix/netdev.h>
 #include <b1nix/netlink.h>
@@ -1479,6 +1480,11 @@ static int net_loopback_pending(void)
 }
 static volatile int net_lb_lock;
 static volatile int net_lb_draining = 0;
+/* Packets queued and packets delivered, ever, and who is delivering now: a
+ * sender that must see its datagram delivered before it returns waits for
+ * the delivered count to pass its own, whoever happens to be draining. */
+static volatile u64 net_lb_enq_seq, net_lb_done_seq;
+static struct task *volatile net_lb_owner;
 
 void net_loopback_enqueue(const void *ip_pkt, usize len, int is_v6)
 {
@@ -1502,6 +1508,7 @@ void net_loopback_enqueue(const void *ip_pkt, usize len, int is_v6)
 	net_loopback_q[net_lb_tail].is_v6 = is_v6;
 	net_loopback_q[net_lb_tail].ns = namespace_net_context();
 	net_lb_tail = next;
+	__atomic_fetch_add(&net_lb_enq_seq, 1, __ATOMIC_RELEASE);
 	if (!__atomic_load_n(&net_lb_draining, __ATOMIC_ACQUIRE))
 		kick_net_task = 1;
 	__atomic_clear(&net_lb_lock, __ATOMIC_RELEASE);
@@ -1517,9 +1524,11 @@ void net_loopback_drain(void)
 	if (__atomic_test_and_set(&net_lb_draining, __ATOMIC_ACQUIRE)) {
 		return;
 	}
+	net_lb_owner = current_task;
 	while (1) {
 		while (__atomic_test_and_set(&net_lb_lock, __ATOMIC_ACQUIRE)) { }
 		if (net_lb_head == net_lb_tail) {
+			net_lb_owner = 0;
 			__atomic_clear(&net_lb_draining, __ATOMIC_RELEASE);
 			__atomic_clear(&net_lb_lock, __ATOMIC_RELEASE);
 			break;
@@ -1542,6 +1551,34 @@ void net_loopback_drain(void)
 			ipv4_receive(data, len);
 		namespace_net_pop_context(saved_ns);
 		kfree(data);
+		__atomic_fetch_add(&net_lb_done_seq, 1, __ATOMIC_RELEASE);
+	}
+}
+
+/* Deliver everything queued so far before returning, as Linux delivers a
+ * loopback datagram inside the sender's own send. The plain drain returns at
+ * once when another task is draining -- the net task, perhaps preempted in the
+ * middle of it -- and the datagram was then still queued when sendto()
+ * returned: a program reading its own socket without blocking right after got
+ * EAGAIN. Bounded, so a drainer stuck behind something this task holds costs
+ * a few milliseconds rather than a deadlock; and a send made from inside the
+ * drain itself returns at once, since the loop it is in delivers it next. */
+void net_loopback_deliver_now(void)
+{
+	u64 want = __atomic_load_n(&net_lb_enq_seq, __ATOMIC_ACQUIRE);
+	u64 deadline = 0;
+
+	for (;;) {
+		net_loopback_drain();
+		if (__atomic_load_n(&net_lb_done_seq, __ATOMIC_ACQUIRE) >= want)
+			return;
+		if (net_lb_owner == current_task)
+			return;
+		if (!deadline)
+			deadline = ktime_monotonic_ns() + 10000000ull;
+		else if (ktime_monotonic_ns() > deadline)
+			return;
+		scheduler_yield();
 	}
 }
 

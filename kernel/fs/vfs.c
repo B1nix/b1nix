@@ -5047,7 +5047,15 @@ static int node_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   if (h->node->inode->poll_cb)
     return h->node->inode->poll_cb(h, h->node, pfd);
   pfd->revents = 0;
-  if (h->node->inode->type == VFS_FILE) {
+  /* A file with no poll of its own is always ready, as Linux's
+   * DEFAULT_POLLMASK says -- and that includes the attribute files of procfs,
+   * sysfs and cgroupfs, which are device-shaped here but regular to everyone
+   * reading them. Reporting nothing made BusyBox's `read`, which polls first,
+   * wait for ever on `while read ...; done < /sys/fs/cgroup/.../cgroup.events`:
+   * that is how OpenRC's shutdown hung after killprocs. */
+  if (h->node->inode->type == VFS_FILE ||
+      h->node->inode->type == VFS_DIRECTORY ||
+      (h->node->inode->flags & VFS_NODE_PSEUDO_REG)) {
     pfd->revents |= B1NIX_POLLIN | B1NIX_POLLOUT;
   }
   return 0;

@@ -1199,6 +1199,38 @@ static int trace_counter(int map, int type, int off, int want, int always) {
   return prog_load_type(prog, sizeof(prog) / sizeof(prog[0]), type);
 }
 
+/* A KPROBE program that counts its hits and keeps the first 8 bytes its
+ * probed function's first argument points at (bpf_probe_read_kernel), so the
+ * test can check it found the argument by what it points to rather than by
+ * what a kernel address looks like on one architecture. */
+static int kprobe_arg_reader(int map) {
+  struct insn prog[] = {
+      MOV64_REG(6, 1),                          /* 0: r6 = ctx */
+      LDX_MEM(SZ_DW, 7, 6, REGS_ARG0 * 8),      /* 1: r7 = first argument */
+      MOV64_REG(1, 10),                         /* 2 */
+      ADD64_IMM(1, -16),                        /* 3: r1 = fp - 16 */
+      MOV64_IMM(2, 8),                          /* 4: r2 = 8 */
+      MOV64_REG(3, 7),                          /* 5: r3 = the argument */
+      CALL(BPF_FUNC_probe_read_kernel),         /* 6 */
+      ST_MEM(SZ_W, 10, -4, 0),                  /* 7: key = 0 */
+      MOV64_REG(2, 10),                         /* 8 */
+      ADD64_IMM(2, -4),                         /* 9 */
+      LD_MAP_FD(1, map),                        /* 10, 11 */
+      CALL(BPF_FUNC_map_lookup_elem),           /* 12 */
+      JMP_IMM(0x10, 0, 0, 5),                   /* 13: null -> 19 */
+      LDX_MEM(SZ_DW, 1, 10, -16),               /* 14: the bytes read */
+      STX_MEM(SZ_DW, 0, 1, 8),                  /* 15: value[1] */
+      MOV64_IMM(1, 1),                          /* 16 */
+      ATOMIC_DW(0, 1, 0, 0x00),                 /* 17: value[0] += 1 */
+      JA(0),                                    /* 18 */
+      MOV64_IMM(0, 0),                          /* 19 */
+      EXIT(),                                   /* 20 */
+  };
+
+  return prog_load_type(prog, sizeof(prog) / sizeof(prog[0]),
+                        BPF_PROG_TYPE_KPROBE);
+}
+
 static int trace_open(long id) {
   struct perf_event_attr attr;
 
@@ -1296,7 +1328,7 @@ static void check_trace_programs(void) {
     kid = armed ? tracefs_id("kprobes", "b1bpf") : -1;
     val[0] = val[1] = 0;
     map_update(map, &key, val, 0);
-    kprog = trace_counter(map, BPF_PROG_TYPE_KPROBE, REGS_ARG0 * 8, 0, 1);
+    kprog = kprobe_arg_reader(map);
     kp = kid > 0 ? trace_open(kid) : -1;
     if (kp >= 0 && kprog >= 0 && ioctl(kp, PERF_EVENT_IOC_SET_BPF, kprog) == 0) {
       ioctl(kp, PERF_EVENT_IOC_ENABLE, 0);
@@ -1304,10 +1336,14 @@ static void check_trace_programs(void) {
         (void)access("/proc/self/stat", F_OK);
       ioctl(kp, PERF_EVENT_IOC_DISABLE, 0);
       map_lookup(map, &key, val);
-      note("kprobe program: %llu hits, first argument %#llx",
-           (unsigned long long)val[0], (unsigned long long)val[1]);
-      /* The probed lookup's first argument is a path: a kernel pointer. */
-      judge("kprobe-prog", val[0] >= 20 && val[1] >= 0xffff800000000000ull,
+      char head[9];
+
+      memcpy(head, &val[1], 8);
+      head[8] = 0;
+      note("kprobe program: %llu hits, first argument points at \"%s\"",
+           (unsigned long long)val[0], head);
+      /* The probed lookup's first argument is the path being looked up. */
+      judge("kprobe-prog", val[0] >= 20 && memcmp(head, "/proc/", 6) == 0,
             "the program on the kprobe did not run, or did not see the "
             "probed function's first argument in its pt_regs",
             (long)val[0]);

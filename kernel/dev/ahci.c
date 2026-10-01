@@ -59,10 +59,14 @@ static void ahci_port_lock(struct ahci_port_state *port) {
   while (__sync_lock_test_and_set(&port->busy, 1)) {
     scheduler_yield();
   }
+  /* Held: a critical section no fatal signal or freezer cuts short while a
+   * command is in flight (see virtio_blk_lock). */
+  scheduler_kcrit_enter();
 }
 
 static void ahci_port_unlock(struct ahci_port_state *port) {
   __sync_lock_release(&port->busy);
+  scheduler_kcrit_leave();
 }
 
 static u64 ahci_pci_bar5 = 0;

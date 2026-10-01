@@ -2335,6 +2335,30 @@ int pmm_frame_readable(u64 phys) {
   return __atomic_load_n(&pmm.frame_refcounts[idx], __ATOMIC_RELAXED) != 0;
 }
 
+/* Hibernation (M135): does this frame hold anything the allocator or its
+ * owner would miss -- a frame handed out, or the first frame of a free buddy
+ * block, which carries the block's list links. */
+int pmm_frame_used(u64 phys) {
+  usize idx;
+
+  if (phys >= pmm.max_address)
+    return 0;
+  idx = frame_index(phys);
+  return bitmap_get(idx) || head_get(idx);
+}
+
+/* An allocated frame whose contents came from elsewhere (a frame the image
+ * never saved, back after a resume): wipe the marker slots, so the next free
+ * does not take a stale poison or zero marker for a double free. */
+void pmm_frame_adopt(u64 phys) {
+  u64 *marker = (u64 *)(usize)(phys + DIRECT_MAP_BASE);
+
+  marker[PMM_POISON_CANARY_OFF / 8] = 0;
+  marker[PMM_ZERO_MAGIC_OFF / 8] = 0;
+}
+
+u64 pmm_max_phys(void) { return pmm.max_address; }
+
 u64 pmm_free_memory_estimate(void) { return pmm.free_frames * PAGE_SIZE; }
 
 usize pmm_free_frame_count(void) { return (usize)pmm.free_frames; }

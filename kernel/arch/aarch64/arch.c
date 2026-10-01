@@ -447,6 +447,34 @@ static void psci_call(u32 fn)
 		                   "x16", "x17", "memory");
 }
 
+/* PSCI_FEATURES: 0 when the firmware implements `fn`, negative when not. */
+#define PSCI_FEATURES_FN        0x8400000Au
+#define PSCI_SYSTEM_SUSPEND64   0xC400000Eu
+
+long arch_psci_features(u32 fn)
+{
+	extern int fdt_psci_use_smc(void);
+	register u64 x0 __asm__("x0") = PSCI_FEATURES_FN;
+	register u64 x1 __asm__("x1") = fn;
+
+	if (fdt_psci_use_smc())
+		__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1) :
+		                 : "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
+		                   "x10", "x11", "x12", "x13", "x14", "x15", "x16",
+		                   "x17", "memory");
+	else
+		__asm__ volatile("hvc #0" : "+r"(x0), "+r"(x1) :
+		                 : "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
+		                   "x10", "x11", "x12", "x13", "x14", "x15", "x16",
+		                   "x17", "memory");
+	return (long)(i32)x0;
+}
+
+long arch_psci_system_suspend_supported(void)
+{
+	return arch_psci_features(PSCI_SYSTEM_SUSPEND64);
+}
+
 #include <b1nix/bcm2835.h>
 #include "platform.h"
 

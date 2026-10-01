@@ -61,6 +61,10 @@ typedef int (*suspend_wake_armed_fn)(void *ctx);
  * a dead machine, and there is no software ceiling once the power is gone. */
 #define SUSPEND_WAKE_IDLE 0u
 #define SUSPEND_WAKE_DEEP 1u
+/* SUSPEND_WAKE_EVENTS: what this source reports is a wakeup event even with
+ * the machine awake (a power button, an alarm), and counts in wakeup_count;
+ * without it only an event that ends a suspend counts (a keypress). */
+#define SUSPEND_WAKE_EVENTS 2u
 
 int suspend_register_wake_source_flags(const char *name,
                                        suspend_wake_armed_fn armed, void *ctx,
@@ -84,6 +88,19 @@ int suspend_register_wake_source(const char *name, suspend_wake_armed_fn armed,
 typedef int (*suspend_resume_fn)(void *ctx);
 int suspend_register_device(const char *name, suspend_resume_fn resume,
                             void *ctx);
+/* The same with a callback before the sleep as well: to take state that only
+ * exists once drivers have run (a PCI function's MSI-X table), or to quiesce.
+ * A non-zero return refuses the sleep. Called with userspace frozen and the
+ * other CPUs parked, in the reverse of the resume order. */
+int suspend_register_device_ops(const char *name, suspend_resume_fn suspend,
+                                suspend_resume_fn resume, void *ctx);
+void suspend_unregister_device(suspend_resume_fn resume);
+/* Resumed before every other device (an IOMMU). */
+int suspend_register_device_early(const char *name, suspend_resume_fn resume,
+                                  void *ctx);
+/* /sys/power/sync_on_suspend: sync the filesystems before a sleep. */
+int suspend_sync_on_suspend(void);
+void suspend_set_sync_on_suspend(int on);
 /* Call every registered resume callback. Returns how many reported failure. */
 int suspend_resume_devices(void);
 
@@ -100,6 +117,25 @@ void suspend_wake_event(const char *source);
  * Read by /proc/interrupts and by the suspend smoke. */
 u64 suspend_wake_count(void);
 const char *suspend_last_wake_source(void);
+
+/* ── /sys/power and /sys/class/wakeup (M135) ──────────────────────────────
+ *
+ * mem_sleep: "[s2idle]", or "s2idle [deep]" where S3 exists, the bracket on
+ * what `mem` enters; set with "s2idle" or "deep". */
+const char *suspend_mem_sleep(void);
+int suspend_set_mem_sleep(const char *name);
+/* wakeup_count: the events so far; writing it back arms the check that
+ * aborts the next suspend (-EBUSY) if another arrives first. -EINVAL when the
+ * count written is already stale. */
+u64 suspend_event_count(void);
+int suspend_save_event_count(u64 count);
+/* The wake sources, for /sys/class/wakeup/wakeupN. */
+#define SUSPEND_STAT_EVENTS 0
+#define SUSPEND_STAT_WAKEUPS 1
+#define SUSPEND_STAT_LAST_MS 2
+int suspend_source_count(void);
+const char *suspend_source_name(int i);
+u64 suspend_source_stat(int i, int which);
 
 /* Register the wake sources and publish the state list. Called once at boot,
  * after /dev/rtc0 exists. */

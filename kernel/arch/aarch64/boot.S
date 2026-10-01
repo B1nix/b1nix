@@ -154,6 +154,12 @@ _start_kernel:
 	msr cpacr_el1, x0
 	isb
 
+	// OSLAR_EL1 = 0: release the OS lock. Reset leaves it set on many
+	// implementations, and while it is set no debug exception is taken --
+	// the single step a kprobe or uprobe relies on (M135) would never come.
+	msr oslar_el1, xzr
+	isb
+
 	// Setup MAIR_EL1: Attr0 = 0x04 (Device-nGnRE), Attr1 = 0xFF (Normal WB),
 	// Attr2 = 0x44 (Normal Non-cacheable inner+outer). Attr2 is what
 	// ioremap_wc() asks for: ARM has no "write-combining" memory type by that
@@ -431,6 +437,8 @@ _ap_start:
 
 	mov x0, #(0b11 << 20)		// CPACR_EL1.FPEN: EL0/EL1 may use FP/SIMD
 	msr cpacr_el1, x0
+	isb
+	msr oslar_el1, xzr		// OS lock off: debug exceptions (see above)
 	isb
 
 	ldr x0, =0x000000000044ff04	// MAIR: Device-nGnRE / Normal WB / Normal-NC

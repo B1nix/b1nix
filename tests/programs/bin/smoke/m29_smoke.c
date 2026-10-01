@@ -8,6 +8,7 @@
 
 #include <pthread.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -770,6 +771,112 @@ static int test_cancel(void) {
   return 0;
 }
 
+/* ── a child forked by a thread belongs to the process ──
+ *
+ * The thread forks; the main thread waits for the child. On Linux the parent
+ * is the process, so any thread of it may wait (Go forks on one OS thread and
+ * waits on another), and the child's getppid() is the process's pid. */
+static pid_t g_fork_child = -1;
+static volatile int g_fork_ppid_ok;
+
+static void *fork_thread_entry(void *arg) {
+  pid_t c = fork();
+
+  (void)arg;
+  if (c == 0)
+    _exit(7);
+  g_fork_child = c;
+  return 0;
+}
+
+static int test_thread_fork_wait(void) {
+  pthread_t t;
+  int status = 0;
+  pid_t r;
+
+  if (pthread_create(&t, 0, fork_thread_entry, 0) != 0) {
+    fail("thread-fork-wait");
+    return 1;
+  }
+  pthread_join(t, 0);
+  if (g_fork_child <= 0) {
+    fail("thread-fork-wait");
+    return 1;
+  }
+  r = waitpid(g_fork_child, &status, 0);
+  if (r == g_fork_child && WIFEXITED(status) && WEXITSTATUS(status) == 7) {
+    ok("thread-fork-wait");
+    return 0;
+  }
+  {
+    char line[512];
+    int e = errno;
+    char st[512] = "";
+    char path[64];
+    int fd, n;
+
+    snprintf(path, sizeof(path), "/proc/%d/status", (int)g_fork_child);
+    fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+      n = (int)read(fd, st, sizeof(st) - 1);
+      st[n > 0 ? n : 0] = 0;
+      close(fd);
+      for (char *q = st; *q; q++)
+        if (*q == '\n')
+          *q = ' ';
+    }
+    n = snprintf(line, sizeof(line),
+                 "M29-PTHREAD: FAIL thread-fork-wait (waitpid %d errno %d, "
+                 "child %d: %.300s)\n",
+                 (int)r, e, (int)g_fork_child, st[0] ? st : "gone");
+    write(1, line, (size_t)n);
+  }
+  return 1;
+}
+
+/* The child's parent is the process, even when a thread forked it. */
+static void *ppid_thread_entry(void *arg) {
+  pid_t want = *(pid_t *)arg;
+  int pfd[2];
+  pid_t c;
+  char v = 0;
+
+  if (pipe(pfd) != 0)
+    return 0;
+  c = fork();
+  if (c == 0) {
+    char b = (char)(getppid() == want ? 1 : 0);
+
+    (void)!write(pfd[1], &b, 1);
+    _exit(0);
+  }
+  close(pfd[1]);
+  if (c > 0 && read(pfd[0], &v, 1) == 1 && v == 1)
+    g_fork_ppid_ok = 1;
+  close(pfd[0]);
+  if (c > 0)
+    waitpid(c, 0, 0);
+  return 0;
+}
+
+static int test_thread_fork_ppid(void) {
+  pthread_t t;
+  pid_t me = getpid();
+
+  g_fork_ppid_ok = 0;
+  if (pthread_create(&t, 0, ppid_thread_entry, &me) != 0) {
+    fail("thread-fork-ppid");
+    return 1;
+  }
+  pthread_join(t, 0);
+  if (g_fork_ppid_ok) {
+    ok("thread-fork-ppid");
+    return 0;
+  }
+  fail("thread-fork-ppid");
+  return 1;
+}
+
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "exec-probe") == 0)
     return exec_probe_main(argc > 2 ? argv[2] : 0);
@@ -800,6 +907,8 @@ int main(int argc, char **argv) {
   rc |= test_time_hammer();
   rc |= test_cancel();
   rc |= test_exec_threads();
+  rc |= test_thread_fork_wait();
+  rc |= test_thread_fork_ppid();
   emit("M29-PTHREAD: done\n");
   return rc ? 1 : 0;
 }

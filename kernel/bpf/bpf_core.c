@@ -1456,10 +1456,14 @@ static void bpf_frame_origin(const void *frame_v, u64 *ip, u64 *fp) {
 #define BPF_USER_TOP 0x0000800000000000ull
 
 static int bpf_read_nofault(void *dst, u64 src, u64 len, int user) {
+  extern int paging_is_kernel_va(u64 va);
   u8 *d = dst;
 
-  if (user ? (src >= BPF_USER_TOP || src + len > BPF_USER_TOP)
-           : (src < 0xffff800000000000ull))
+  /* The kernel test is the page's, not the number's: on aarch64 the kernel's
+   * windows share the numeric range user space uses. */
+  if (user ? (src >= BPF_USER_TOP || src + len > BPF_USER_TOP ||
+              paging_is_kernel_va(src))
+           : !paging_is_kernel_va(src))
     return -EFAULT;
   if (src + len < src)
     return -EFAULT;

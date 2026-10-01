@@ -393,6 +393,17 @@ void x86_s3_restore_cpu(void) {
   console_write("s3: processor and interrupt hardware restored\n");
 }
 
+/* Hibernation (M135) takes the same processor state an S3 does and puts it
+ * back the same way: the image continues on a processor the boot kernel set
+ * up, which is as good as a reset one. */
+void x86_hib_save_cpu(void) {
+  s3_save_cpu();
+  g_mono_before_ns = arch_tsc_monotonic_ns();
+  g_wall_before_s = rtc_hw_unix_seconds();
+}
+
+void x86_hib_restore_cpu(void) { x86_s3_restore_cpu(); }
+
 int arch_s3_supported(void) {
   u8 a = 0, b = 0;
 

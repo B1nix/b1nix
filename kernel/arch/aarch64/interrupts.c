@@ -13,6 +13,7 @@
 #include <b1nix/spinlock.h>
 #include <b1nix/mm.h>
 #include <b1nix/arch.h>
+#include <b1nix/kprobe.h>
 #include <b1nix/ptrace.h>
 #include <b1nix/watchdog.h>
 #include <b1nix/bootinfo.h>
@@ -765,6 +766,8 @@ static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 #define EC_DATA_ABORT_LOWER 0x24
 #define EC_DATA_ABORT_SAME  0x25
 #define EC_BRK              0x3c
+#define EC_SOFTSTP_LOWER    0x32
+#define EC_SOFTSTP_SAME     0x33
 
 static void decode_aarch64_exception(u64 esr, u64 elr, u64 far)
 {
@@ -1072,6 +1075,15 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 				panic("kstack mismatch: EL0 frame built on another task's stack");
 		}
 	}
+
+	/* M135: kprobes and uprobes -- a BRK with their immediate, and the single
+	 * step that follows it. Claimed before anything else looks at a BRK. */
+	if (ec == EC_BRK &&
+	    (from_el0 ? uprobe_handle_bp(frame) : kprobe_handle_bp(frame)))
+		return;
+	if ((ec == EC_SOFTSTP_LOWER || ec == EC_SOFTSTP_SAME) &&
+	    (from_el0 ? uprobe_handle_db(frame) : kprobe_handle_db(frame)))
+		return;
 
 	/* M36: BRK is this arch's int3 — route it to the GDB serial stub when the
 	 * kernel was booted with b1nix.gdb. Off by default, so an ordinary or test

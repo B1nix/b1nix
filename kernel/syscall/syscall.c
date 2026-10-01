@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <b1nix/ktime.h>
 #include <b1nix/arch.h>
+#include <b1nix/acpi_event.h>
 #include <b1nix/console.h>
 #include <b1nix/cgroup.h>
 #include <b1nix/dirent.h>
@@ -3269,6 +3270,70 @@ static int select_poll_signal_pending(void) {
  * deadline is kept in nanoseconds on the same counter clock_gettime answers
  * from; only the sleep between scans is expressed in ticks, and it is never
  * shorter than the wait that remains. */
+/* What each task is parked in poll for: the first few descriptors, what they
+ * are and what was asked of them, noted when it goes to sleep. The shared poll
+ * channel says a task is in poll and nothing about the wait; a wedge dump
+ * (sched_dump_all_tasks) prints this beside it. */
+#define POLL_WATCH_SLOTS 4096
+#define POLL_WATCH_FDS 4
+struct poll_watch {
+  u8 n;
+  u32 nfds;
+  struct {
+    int fd;
+    u16 events;
+    i8 kind;
+    void *obj;
+  } fd[POLL_WATCH_FDS];
+};
+static struct poll_watch g_poll_watch[POLL_WATCH_SLOTS];
+
+static void poll_watch_note(const struct b1nix_pollfd *fds, u64 nfds) {
+  usize slot = scheduler_current_slot();
+  struct poll_watch *w;
+
+  if (slot >= POLL_WATCH_SLOTS)
+    return;
+  w = &g_poll_watch[slot];
+  w->nfds = (u32)nfds;
+  w->n = 0;
+  for (u64 i = 0; i < nfds && w->n < POLL_WATCH_FDS; i++) {
+    struct vfs_handle *h = fds[i].fd >= 0 ? scheduler_fd_get(fds[i].fd) : 0;
+
+    w->fd[w->n].fd = fds[i].fd;
+    w->fd[w->n].events = (u16)fds[i].events;
+    w->fd[w->n].kind = h ? (i8)h->kind : -1;
+    w->fd[w->n].obj = h ? (h->private_data ? h->private_data : h->node) : 0;
+    w->n++;
+  }
+}
+
+static void poll_watch_clear(void) {
+  usize slot = scheduler_current_slot();
+
+  if (slot < POLL_WATCH_SLOTS)
+    g_poll_watch[slot].nfds = 0;
+}
+
+void poll_watch_dump(usize slot) {
+  const struct poll_watch *w;
+  char line[200];
+  usize pos;
+
+  if (slot >= POLL_WATCH_SLOTS || !g_poll_watch[slot].nfds)
+    return;
+  w = &g_poll_watch[slot];
+  pos = (usize)snprintf(line, sizeof(line), "      poll nfds=%u:",
+                        (unsigned)w->nfds);
+  for (int i = 0; i < w->n && pos < sizeof(line) - 48; i++)
+    pos += (usize)snprintf(line + pos, sizeof(line) - pos,
+                           " fd%d kind%d ev=%x obj=%p", w->fd[i].fd,
+                           (int)w->fd[i].kind, (unsigned)w->fd[i].events,
+                           w->fd[i].obj);
+  snprintf(line + pos, sizeof(line) - pos, "\n");
+  console_write(line);
+}
+
 static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
                        u64 timeout_ns, int infinite) {
   /* As many descriptors as the caller actually passed.
@@ -3340,6 +3405,7 @@ static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
     if (ready > 0 || (!infinite && timeout_ns == 0) || timed_out) {
       scheduler_wait_cancel();
       current_task->wake_tick = 0;
+      poll_watch_clear();
       syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
       if (timed_out && timeout_ns >= 100000000ull &&
           bootinfo_has_flag("b1nix.trace-timeouts")) {
@@ -3395,6 +3461,7 @@ static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
     if (select_poll_signal_pending()) {
       scheduler_wait_cancel();
       current_task->wake_tick = 0;
+      poll_watch_clear();
       kfree(heap_fds);
       return (u64)-ERESTARTNOHAND;
     }
@@ -3416,6 +3483,7 @@ static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
       sched_note_deadline(current_task->wake_tick);
     }
 
+    poll_watch_note(fds, nfds);
     scheduler_wait_commit();
   }
 }
@@ -10507,9 +10575,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_GETPPID:
     /* A namespace's own pid 1 has a parent outside it. Linux reports 0 there,
      * because there is no number in this namespace that names it. */
-    return (u64)(current_task
-                     ? namespace_pid_to_user(current_task->parent_id)
-                     : 0);
+    /* The parent PROCESS: a child forked by a thread other than its group's
+     * leader still has the group's pid as its parent, as on Linux. */
+    if (!current_task)
+      return 0;
+    {
+      struct task *p = scheduler_task_by_pid(current_task->parent_id);
+      usize ppid = p ? task_tgid(p) : current_task->parent_id;
+
+      return (u64)namespace_pid_to_user(ppid ? ppid : current_task->parent_id);
+    }
   case SYS_ALARM:
     return (u64)sys_alarm((unsigned int)arg0);
   case SYS_FCHDIR:
@@ -11535,11 +11610,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       return (u64)-EPERM;
     if ((int)arg0 == B1NIX_REBOOT_POWEROFF) {
       console_write("reboot: powering off\n");
-      /* QEMU/Bochs ACPI shutdown ports - no full ACPI parsing needed. */
+      /* The firmware's own way: \_S5's sleep type into PM1 control. Guessing
+       * at QEMU's ports powered QEMU off and nothing else. */
 #if defined(__x86_64__)
-      outw(0x604, 0x2000);  /* QEMU >= 2.0 */
-      outw(0xB004, 0x2000); /* Bochs / older QEMU */
-      outw(0x4004, 0x3400); /* QEMU microvm/newer */
+      acpi_poweroff();
 #elif defined(__aarch64__)
       arch_psci_poweroff();
 #endif

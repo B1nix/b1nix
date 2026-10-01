@@ -38,6 +38,11 @@
 
 #include <b1nix/aml.h>
 #include <b1nix/console.h>
+#include <b1nix/kprof.h>
+#include <b1nix/ktime.h>
+#include <b1nix/lapic.h>
+#include <b1nix/sched.h>
+#include <b1nix/spinlock.h>
 #include <b1nix/types.h>
 
 #include <stdio.h>
@@ -65,7 +70,6 @@ enum { DRV_NONE = 0, DRV_HWP, DRV_EIST, DRV_PSS };
 static int g_driver;
 static u32 g_min_khz, g_max_khz;
 static u8 g_hwp_lowest, g_hwp_highest;
-static const char *g_governor = "performance";
 
 /* ── ACPI _PSS ────────────────────────────────────────────────────────────
  *
@@ -97,6 +101,42 @@ static u8 g_pct_ctrl_width, g_pct_stat_width;
 static u64 g_pct_ctrl_addr, g_pct_stat_addr;
 static int g_pss_sel = -1;    /* index of the state last asked for */
 static int g_pss_write_ok;    /* did that request reach the register? */
+
+/* ── the policy (M135) ────────────────────────────────────────────────────
+ *
+ * What Linux calls a cpufreq policy: the limits a frequency may be chosen
+ * from and the governor that chooses it. There is one, because every driver
+ * here moves the whole machine at once (a _PSS request is one register, and
+ * the MSR drivers are programmed identically on every CPU).
+ *
+ * The ceiling is the lowest of three: what the processor can do, what an
+ * administrator wrote to scaling_max_freq, and what the platform allows now —
+ * `_PPC`, the index of the fastest _PSS state the firmware will currently
+ * honour, which it lowers on battery or when hot and announces with
+ * Notify(processor, 0x80).
+ */
+enum { GOV_PERFORMANCE, GOV_POWERSAVE, GOV_ONDEMAND, GOV_USERSPACE, GOV_COUNT };
+static const char *const g_gov_names[GOV_COUNT] = {
+    "performance", "powersave", "ondemand", "userspace"};
+static int g_gov = GOV_PERFORMANCE;
+static spinlock_t g_policy_lock = SPINLOCK_INIT;
+static u32 g_user_min_khz, g_user_max_khz; /* scaling_{min,max}_freq writes */
+static u32 g_setspeed_khz;                 /* the userspace governor's ask */
+static int g_ppc;                          /* _PPC: fastest state allowed */
+static int g_thermal;                      /* the passive cooling's limit */
+
+/* ondemand: Linux's defaults, and its tunables under the same names. */
+#define OD_MAX_CPUS 256
+static u32 g_od_rate_us = 50000;
+static u32 g_od_up = 80;
+static u32 g_od_load;
+static int g_od_started;
+static int g_od_chan;
+
+/* stats/time_in_state and stats/total_trans, for the _PSS driver. */
+static u64 g_state_ns[PSS_MAX_STATES];
+static u64 g_state_since;
+static u64 g_trans;
 
 static void cpuid_count(u32 leaf, u32 sub, u32 *a, u32 *b, u32 *c, u32 *d) {
   __asm__ volatile("cpuid"
@@ -366,14 +406,6 @@ const char *cpufreq_pct_space_name(void) {
   return "unsupported";
 }
 
-int cpufreq_request_state(int idx) {
-  if (g_driver != DRV_PSS || idx < 0 || idx >= g_pss_n)
-    return -1;
-  g_pss_write_ok = pss_write_control(g_pss[idx].control) == 0;
-  g_pss_sel = idx;
-  return g_pss_write_ok ? 0 : -1;
-}
-
 int cpufreq_selected_state(void) { return g_driver == DRV_PSS ? g_pss_sel : -1; }
 int cpufreq_request_took(void) { return g_driver == DRV_PSS ? g_pss_write_ok : 0; }
 
@@ -409,6 +441,10 @@ void cpufreq_init(void) {
   /* Start where the machine was: nothing here has asked for anything yet, and
    * a boot that quietly clamped the processor would be a performance bug
    * nobody looks for. */
+  g_user_min_khz = g_min_khz;
+  g_user_max_khz = g_max_khz;
+  g_state_since = ktime_monotonic_ns();
+  cpufreq_ppc_changed();
   cpufreq_set_governor("performance");
   console_write("cpufreq: driver ");
   console_write(cpufreq_driver_name());
@@ -424,6 +460,10 @@ void cpufreq_init(void) {
     console_write(g_pss_path);
     console_write("._PSS via ");
     console_write(cpufreq_pct_space_name());
+    if (g_ppc) {
+      console_write(", _PPC ");
+      console_write_dec((u64)g_ppc);
+    }
   }
   console_write("\n");
 }
@@ -476,52 +516,413 @@ u32 cpufreq_cur_khz(void) {
 
 u32 cpufreq_max_khz(void) { return g_max_khz; }
 u32 cpufreq_min_khz(void) { return g_min_khz; }
-const char *cpufreq_governor(void) { return g_driver ? g_governor : "none"; }
+const char *cpufreq_governor(void) {
+  return g_driver ? g_gov_names[__atomic_load_n(&g_gov, __ATOMIC_ACQUIRE)]
+                  : "none";
+}
 
-int cpufreq_set_governor(const char *name) {
-  int perf;
-
-  if (!g_driver)
-    return -1;
-  if (!strcmp(name, "performance"))
-    perf = 1;
-  else if (!strcmp(name, "powersave"))
-    perf = 0;
-  else
-    return -1;
-
-  if (g_driver == DRV_PSS) {
-    /* _PSS is declared fastest first, so the two governors are its two ends.
-     * A request the register refuses is a failure: the caller asked for a
-     * frequency and did not get one. */
-    if (cpufreq_request_state(perf ? 0 : g_pss_n - 1) != 0)
-      return -1;
-    g_governor = perf ? "performance" : "powersave";
+/* Which governors this driver can honour. HWP picks its own frequency inside
+ * the window it is given, so it has only the two ends (as intel_pstate does);
+ * a governor that chooses a frequency needs a driver that takes one, and
+ * userspace needs a list of them to choose from. */
+static int gov_ok(int g) {
+  switch (g_driver) {
+  case DRV_HWP:
+    return g == GOV_PERFORMANCE || g == GOV_POWERSAVE;
+  case DRV_EIST:
+    return g != GOV_USERSPACE;
+  case DRV_PSS:
+    return 1;
+  default:
     return 0;
+  }
+}
+
+const char *cpufreq_governors(void) {
+  switch (g_driver) {
+  case DRV_HWP:
+    return "performance powersave";
+  case DRV_EIST:
+    return "performance powersave ondemand";
+  case DRV_PSS:
+    return "performance powersave ondemand userspace";
+  default:
+    return "performance";
+  }
+}
+
+static u32 ppc_khz(void) {
+  if (g_driver == DRV_PSS && g_ppc > 0 && g_ppc < g_pss_n)
+    return g_pss[g_ppc].mhz * 1000u;
+  return g_max_khz;
+}
+
+/* The thermal ceiling: state k of the processor cooling device is the k-th
+ * _PSS state, so its highest state is the slowest the platform has. */
+static u32 thermal_khz(void) {
+  if (g_driver == DRV_PSS && g_thermal > 0 && g_thermal < g_pss_n)
+    return g_pss[g_thermal].mhz * 1000u;
+  return g_max_khz;
+}
+
+static u32 eff_max(void) {
+  u32 m = g_user_max_khz < ppc_khz() ? g_user_max_khz : ppc_khz();
+
+  if (thermal_khz() < m)
+    m = thermal_khz();
+
+  return m < g_min_khz ? g_min_khz : m;
+}
+
+static u32 eff_min(void) {
+  u32 m = eff_max();
+
+  return g_user_min_khz < m ? g_user_min_khz : m;
+}
+
+u32 cpufreq_policy_max_khz(void) { return g_driver ? eff_max() : 0; }
+u32 cpufreq_policy_min_khz(void) { return g_driver ? eff_min() : 0; }
+u32 cpufreq_bios_limit_khz(void) { return g_driver == DRV_PSS ? ppc_khz() : 0; }
+int cpufreq_ppc(void) { return g_driver == DRV_PSS ? g_ppc : -1; }
+
+/* The slowest state at or above `khz` inside the policy (Linux's
+ * CPUFREQ_RELATION_L), or the fastest the policy allows when none is. */
+static int pss_pick(u32 khz) {
+  u32 lo = eff_min(), hi = eff_max();
+  int best = -1, top = -1, below = -1;
+
+  if (khz < lo)
+    khz = lo;
+  if (khz > hi)
+    khz = hi;
+  for (int i = 0; i < g_pss_n; i++) {
+    u32 f = g_pss[i].mhz * 1000u;
+
+    if (f <= hi && (below < 0 || f > g_pss[below].mhz * 1000u))
+      below = i;
+    if (f > hi || f < lo)
+      continue;
+    if (f >= khz && (best < 0 || f < g_pss[best].mhz * 1000u))
+      best = i;
+    if (top < 0 || f > g_pss[top].mhz * 1000u)
+      top = i;
+  }
+  if (best >= 0)
+    return best;
+  if (top >= 0)
+    return top;
+  /* Limits that fall between two states: the fastest one under the ceiling,
+   * and the slowest state of all when even that does not exist. */
+  return below >= 0 ? below : g_pss_n - 1;
+}
+
+static int pss_set_locked(int idx) {
+  u64 now = ktime_monotonic_ns();
+
+  if (g_pss_sel >= 0 && g_pss_sel < g_pss_n)
+    g_state_ns[g_pss_sel] += now - g_state_since;
+  g_state_since = now;
+  if (idx != g_pss_sel)
+    g_trans++;
+  g_pss_write_ok = pss_write_control(g_pss[idx].control) == 0;
+  g_pss_sel = idx;
+  return g_pss_write_ok ? 0 : -1;
+}
+
+static u8 hwp_perf(u32 khz) {
+  u32 r = khz / CPUFREQ_BUS_KHZ;
+
+  if (r < g_hwp_lowest)
+    r = g_hwp_lowest;
+  if (r > g_hwp_highest)
+    r = g_hwp_highest;
+  return (u8)r;
+}
+
+/* Ask the hardware for `khz`, inside the policy. Called with the lock held. */
+static int drive_locked(u32 khz) {
+  if (g_driver == DRV_PSS) {
+    int idx = pss_pick(khz);
+
+    if (idx == g_pss_sel && g_pss_write_ok)
+      return 0;
+    return pss_set_locked(idx);
   }
   if (g_driver == DRV_HWP) {
     /* min, max, desired, energy-performance preference. Performance pins the
      * window to the top and asks for performance; powersave opens the window
      * and lets the processor choose, which is what HWP is for. */
-    u64 req = perf ? ((u64)g_hwp_highest | ((u64)g_hwp_highest << 8) |
-                      ((u64)0x00 << 24))
-                   : ((u64)g_hwp_lowest | ((u64)g_hwp_highest << 8) |
+    int perf = g_gov == GOV_PERFORMANCE;
+    u64 hi = hwp_perf(eff_max());
+    u64 req = perf ? (hi | (hi << 8) | ((u64)0x00 << 24))
+                   : ((u64)hwp_perf(eff_min()) | (hi << 8) |
                       ((u64)0x80 << 24));
 
-    if (arch_wrmsr_safe(MSR_IA32_HWP_REQUEST, req) != 0)
-      return -1;
-  } else {
+    return arch_wrmsr_safe(MSR_IA32_HWP_REQUEST, req) != 0 ? -1 : 0;
+  }
+  if (g_driver == DRV_EIST) {
     u64 ctl = 0;
-    u32 ratio = perf ? (g_max_khz / CPUFREQ_BUS_KHZ)
-                     : (g_min_khz / CPUFREQ_BUS_KHZ);
+    u32 lo = eff_min(), hi = eff_max();
+    u32 ratio;
 
+    if (khz < lo)
+      khz = lo;
+    if (khz > hi)
+      khz = hi;
+    ratio = (khz + CPUFREQ_BUS_KHZ - 1) / CPUFREQ_BUS_KHZ;
     if (arch_rdmsr_safe(MSR_IA32_PERF_CTL, &ctl) != 0)
       return -1;
     ctl = (ctl & ~0xff00ull) | ((u64)(ratio & 0xff) << 8);
-    if (arch_wrmsr_safe(MSR_IA32_PERF_CTL, ctl) != 0)
-      return -1;
+    return arch_wrmsr_safe(MSR_IA32_PERF_CTL, ctl) != 0 ? -1 : 0;
   }
-  g_governor = perf ? "performance" : "powersave";
+  return -1;
+}
+
+/* Re-apply the governor after its limits moved. ondemand is left to its next
+ * sample, which reads the new limits. */
+static int apply_locked(void) {
+  switch (g_gov) {
+  case GOV_PERFORMANCE:
+    return drive_locked(eff_max());
+  case GOV_POWERSAVE:
+    return drive_locked(eff_min());
+  case GOV_USERSPACE:
+    return drive_locked(g_setspeed_khz);
+  default:
+    return 0;
+  }
+}
+
+/* ondemand, as Linux's: every sampling period take the busiest CPU's load
+ * over the period; above up_threshold ask for the ceiling, below it for a
+ * frequency proportional to the load, rounded up to a state. */
+static void od_main(void *arg) {
+  static u64 prev_busy[OD_MAX_CPUS];
+  u64 prev_ns = 0;
+
+  (void)arg;
+  for (;;) {
+    int ncpu = g_max_cpus > 0 ? g_max_cpus : 1;
+    u32 hz = sched_tick_hz() ? sched_tick_hz() : 100;
+    u64 now, span;
+    u32 load = 0;
+
+    if (__atomic_load_n(&g_gov, __ATOMIC_ACQUIRE) != GOV_ONDEMAND) {
+      scheduler_wait_prepare(&g_od_chan);
+      if (__atomic_load_n(&g_gov, __ATOMIC_ACQUIRE) != GOV_ONDEMAND)
+        scheduler_wait_commit();
+      else
+        scheduler_wait_cancel();
+      prev_ns = 0;
+      continue;
+    }
+    if (ncpu > OD_MAX_CPUS)
+      ncpu = OD_MAX_CPUS;
+    now = ktime_monotonic_ns();
+    span = now - prev_ns;
+    for (int c = 0; c < ncpu; c++) {
+      u64 u, k, i, busy;
+
+      kprof_tick_cpu((unsigned)c, &u, &k, &i);
+      busy = u + k;
+      /* Busy ticks against wall time: an idle CPU without a tick stops
+       * counting idle ticks, but a busy one keeps its tick. */
+      if (prev_ns && span) {
+        u64 bns = (busy - prev_busy[c]) * 1000000000ull / hz;
+        u32 l = bns >= span ? 100 : (u32)(bns * 100 / span);
+
+        if (l > load)
+          load = l;
+      }
+      prev_busy[c] = busy;
+    }
+    if (prev_ns) {
+      u64 flags;
+
+      spin_lock_irqsave(&g_policy_lock, &flags);
+
+      __atomic_store_n(&g_od_load, load, __ATOMIC_RELAXED);
+      if (g_gov == GOV_ONDEMAND) {
+        u32 target = load > g_od_up
+                         ? eff_max()
+                         : g_min_khz + (u32)((u64)load *
+                                             (g_max_khz - g_min_khz) / 100);
+
+        (void)drive_locked(target);
+      }
+      spin_unlock_irqrestore(&g_policy_lock, flags);
+    }
+    prev_ns = now;
+    scheduler_sleep_ticks(SCHED_MS_TO_TICKS((g_od_rate_us + 999) / 1000));
+  }
+}
+
+static int od_start(void) {
+  if (__atomic_load_n(&g_od_started, __ATOMIC_ACQUIRE))
+    return 0;
+  if (__atomic_exchange_n(&g_od_started, 1, __ATOMIC_ACQ_REL))
+    return 0;
+  if (kthread_create("kondemand", od_main, 0) < 0) {
+    __atomic_store_n(&g_od_started, 0, __ATOMIC_RELEASE);
+    return -1;
+  }
+  return 0;
+}
+
+int cpufreq_set_governor(const char *name) {
+  int g = -1, old, rc;
+  u64 flags;
+
+  for (int i = 0; i < GOV_COUNT; i++)
+    if (!strcmp(name, g_gov_names[i]))
+      g = i;
+  if (!g_driver || g < 0 || !gov_ok(g))
+    return -1;
+  if (g == GOV_ONDEMAND && od_start() != 0)
+    return -1;
+  spin_lock_irqsave(&g_policy_lock, &flags);
+  old = g_gov;
+  __atomic_store_n(&g_gov, g, __ATOMIC_RELEASE);
+  if (g == GOV_USERSPACE)
+    /* Linux starts userspace where the clock is. */
+    g_setspeed_khz = (g_pss_sel >= 0 && g_pss_sel < g_pss_n)
+                         ? g_pss[g_pss_sel].mhz * 1000u
+                         : eff_max();
+  /* A request the register refuses is a failure: the caller asked for a
+   * frequency and did not get one. */
+  rc = apply_locked();
+  if (rc != 0)
+    __atomic_store_n(&g_gov, old, __ATOMIC_RELEASE);
+  spin_unlock_irqrestore(&g_policy_lock, flags);
+  if (rc == 0 && g == GOV_ONDEMAND)
+    scheduler_wake_all(&g_od_chan);
+  return rc;
+}
+
+int cpufreq_set_speed(u32 khz) {
+  u64 flags;
+  int rc;
+
+  if (!g_driver || !khz)
+    return -1;
+  spin_lock_irqsave(&g_policy_lock, &flags);
+  if (g_gov != GOV_USERSPACE) {
+    rc = -1;
+  } else {
+    g_setspeed_khz = khz;
+    rc = drive_locked(khz);
+  }
+  spin_unlock_irqrestore(&g_policy_lock, flags);
+  return rc;
+}
+
+u32 cpufreq_setspeed_khz(void) {
+  return g_gov == GOV_USERSPACE ? g_setspeed_khz : 0;
+}
+
+int cpufreq_set_policy_limit(int is_max, u32 khz) {
+  u64 flags;
+  int rc;
+
+  if (!g_driver)
+    return -1;
+  if (khz < g_min_khz)
+    khz = g_min_khz;
+  if (khz > g_max_khz)
+    khz = g_max_khz;
+  spin_lock_irqsave(&g_policy_lock, &flags);
+  if (is_max)
+    g_user_max_khz = khz;
+  else
+    g_user_min_khz = khz;
+  /* Linux keeps min <= max by moving the other one. */
+  if (g_user_min_khz > g_user_max_khz) {
+    if (is_max)
+      g_user_min_khz = khz;
+    else
+      g_user_max_khz = khz;
+  }
+  rc = apply_locked();
+  spin_unlock_irqrestore(&g_policy_lock, flags);
+  return rc;
+}
+
+/* _PPC again: at start, and whenever the platform says it changed. */
+void cpufreq_ppc_changed(void) {
+  char path[PSS_PATH_MAX + 8];
+  struct aml_result r;
+  int ppc = 0;
+  u64 flags;
+
+  if (g_driver != DRV_PSS)
+    return;
+  pss_path_join(path, sizeof(path), g_pss_path, "_PPC");
+  if (aml_exists(path) && aml_evaluate(path, 0, 0, &r) == AML_OK &&
+      r.type == AML_T_INTEGER)
+    ppc = r.integer < (u64)g_pss_n ? (int)r.integer : g_pss_n - 1;
+  spin_lock_irqsave(&g_policy_lock, &flags);
+  g_ppc = ppc;
+  (void)apply_locked();
+  spin_unlock_irqrestore(&g_policy_lock, flags);
+}
+
+int cpufreq_thermal_states(void) {
+  return g_driver == DRV_PSS ? g_pss_n - 1 : 0;
+}
+
+int cpufreq_thermal_limit(void) { return g_driver == DRV_PSS ? g_thermal : 0; }
+
+int cpufreq_set_thermal_limit(int state) {
+  u64 flags;
+  int rc;
+
+  if (g_driver != DRV_PSS || state < 0 || state >= g_pss_n)
+    return -1;
+  spin_lock_irqsave(&g_policy_lock, &flags);
+  g_thermal = state;
+  rc = apply_locked();
+  spin_unlock_irqrestore(&g_policy_lock, flags);
+  return rc;
+}
+
+int cpufreq_is_pss_node(const char *path) {
+  return g_driver == DRV_PSS && path && !strcmp(path, g_pss_path);
+}
+
+u64 cpufreq_state_time_ms(int idx) {
+  u64 ns, flags;
+
+  if (g_driver != DRV_PSS || idx < 0 || idx >= g_pss_n)
+    return 0;
+  spin_lock_irqsave(&g_policy_lock, &flags);
+  ns = g_state_ns[idx];
+  if (idx == g_pss_sel)
+    ns += ktime_monotonic_ns() - g_state_since;
+  spin_unlock_irqrestore(&g_policy_lock, flags);
+  return ns / 1000000ull;
+}
+
+u64 cpufreq_transitions(void) { return g_driver == DRV_PSS ? g_trans : 0; }
+
+u32 cpufreq_od_load(void) { return __atomic_load_n(&g_od_load, __ATOMIC_RELAXED); }
+u32 cpufreq_od_sampling_rate_us(void) { return g_od_rate_us; }
+u32 cpufreq_od_up_threshold(void) { return g_od_up; }
+
+int cpufreq_od_set_sampling_rate_us(u32 us) {
+  /* Linux's floor is ten ticks' worth; this kernel's timer is finer, but a
+   * sample shorter than a tick measures nothing. */
+  u32 hz = sched_tick_hz() ? sched_tick_hz() : 100;
+
+  if (us < 1000000u / hz || us > 10000000u)
+    return -1;
+  g_od_rate_us = us;
+  return 0;
+}
+
+int cpufreq_od_set_up_threshold(u32 pct) {
+  if (pct < 11 || pct > 100)
+    return -1;
+  g_od_up = pct;
   return 0;
 }
 
@@ -545,9 +946,32 @@ u32 cpufreq_state_khz(int idx) { (void)idx; return 0; }
 u32 cpufreq_state_control(int idx) { (void)idx; return 0; }
 const char *cpufreq_pss_path(void) { return ""; }
 const char *cpufreq_pct_space_name(void) { return "none"; }
-int cpufreq_request_state(int idx) { (void)idx; return -1; }
 int cpufreq_selected_state(void) { return -1; }
 int cpufreq_request_took(void) { return 0; }
 u32 cpufreq_status_value(void) { return 0; }
+const char *cpufreq_governors(void) { return "performance"; }
+int cpufreq_set_speed(u32 khz) { (void)khz; return -1; }
+u32 cpufreq_setspeed_khz(void) { return 0; }
+u32 cpufreq_policy_max_khz(void) { return 0; }
+u32 cpufreq_policy_min_khz(void) { return 0; }
+int cpufreq_set_policy_limit(int is_max, u32 khz) {
+  (void)is_max;
+  (void)khz;
+  return -1;
+}
+u32 cpufreq_bios_limit_khz(void) { return 0; }
+int cpufreq_ppc(void) { return -1; }
+void cpufreq_ppc_changed(void) {}
+int cpufreq_is_pss_node(const char *path) { (void)path; return 0; }
+int cpufreq_thermal_states(void) { return 0; }
+int cpufreq_thermal_limit(void) { return 0; }
+int cpufreq_set_thermal_limit(int state) { (void)state; return -1; }
+u64 cpufreq_state_time_ms(int idx) { (void)idx; return 0; }
+u64 cpufreq_transitions(void) { return 0; }
+u32 cpufreq_od_load(void) { return 0; }
+u32 cpufreq_od_sampling_rate_us(void) { return 0; }
+u32 cpufreq_od_up_threshold(void) { return 0; }
+int cpufreq_od_set_sampling_rate_us(u32 us) { (void)us; return -1; }
+int cpufreq_od_set_up_threshold(u32 pct) { (void)pct; return -1; }
 
 #endif

@@ -98,15 +98,14 @@ static u8 kbd_dev_read(void) { return 0; }
  * bails out early when there is no framebuffer, which would leave the keyboard
  * dead. The controller config byte is read-modify-written so kbd and mouse
  * init compose regardless of order. */
-void ps2_kbd_init(void)
+/* The controller's configuration and the keyboard itself: at boot, and after
+ * an S3 that reset both (M135) -- the controller comes back with translation
+ * off, so the set-1 map would read set-2 codes. 0 when the keyboard passed
+ * its self-test and the controller kept translation on. */
+static int kbd_program(void)
 {
-	/* A key can end a suspend once this controller is live (M129). */
-	suspend_register_input_source();
-	kbd_debug_enabled = bootinfo_has_flag("b1nix.kbd-debug");
-
-	/* M107: hand the builtin layout to the VT keymap. From here on every
-	 * translation goes through that table, so KDSKBENT (loadkmap) can replace
-	 * any entry and KDGKBENT (dumpkmap) can read the live layout back. */
+	u8 bat;
+	int translating;
 
 	/* Disable the first port while we reconfigure, then drain stale bytes. */
 	kbd_ctrl_cmd(0xAD);
@@ -129,7 +128,7 @@ void ps2_kbd_init(void)
 
 	kbd_dev_write(0xFF);        /* reset; device replies 0xFA then 0xAA */
 	(void)kbd_dev_read();
-	(void)kbd_dev_read();
+	bat = kbd_dev_read();
 	kbd_flush();
 
 	kbd_dev_write(0xF4);        /* enable scanning; device replies 0xFA */
@@ -144,16 +143,60 @@ void ps2_kbd_init(void)
 	}
 	kbd_flush();
 
-	/* Now arm IRQ1 (re-read config in case the device handshake touched it). */
+	/* Now arm IRQ1 (re-read config in case the device handshake touched it).
+	 * The read is also the check that the controller kept translation on;
+	 * nothing is read after IRQ1 is armed, the handler owns the port then. */
 	kbd_ctrl_cmd(0x20);
 	cfg = kbd_dev_read();
+	translating = (cfg & 0x40u) != 0;
 	cfg |=  0x01u;  /* first-port interrupt on */
 	cfg |=  0x40u;  /* keep translation */
 	cfg &= ~0x10u;  /* keep first-port clock enabled */
 	kbd_ctrl_cmd(0x60);
 	kbd_dev_write(cfg);
 	kbd_flush();
+	return bat == 0xAA && translating ? 0 : -1;
+}
 
+#if defined(__x86_64__)
+void ps2_mouse_resume(void);
+
+static int ps2_resume(void *ctx)
+{
+	/* The reset controller has IRQ1 armed already: keep the handler off the
+	 * port while the handshake reads its replies. */
+	int irqs_were_on = interrupts_enabled();
+	int rc;
+
+	(void)ctx;
+	interrupts_disable();
+	rc = kbd_program();
+	if (irqs_were_on)
+		interrupts_enable();
+	if (rc == 0)
+		console_write("ps2: keyboard back after the resume: self-test passed, "
+		              "translation on, irq1 armed\n");
+	else
+		console_write("ps2: keyboard did not come back after the resume\n");
+	ps2_mouse_resume();
+	return 0;
+}
+#endif
+
+void ps2_kbd_init(void)
+{
+	/* A key can end a suspend once this controller is live (M129). */
+	suspend_register_input_source();
+	kbd_debug_enabled = bootinfo_has_flag("b1nix.kbd-debug");
+
+	/* M107: hand the builtin layout to the VT keymap. From here on every
+	 * translation goes through that table, so KDSKBENT (loadkmap) can replace
+	 * any entry and KDGKBENT (dumpkmap) can read the live layout back. */
+
+	(void)kbd_program();
+#if defined(__x86_64__)
+	suspend_register_device("i8042", ps2_resume, 0);
+#endif
 	console_write("ps2_kbd: initialized on irq1\n");
 }
 

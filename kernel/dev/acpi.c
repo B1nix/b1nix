@@ -396,6 +396,10 @@ static u64 fadt_read(u32 off, int width) {
     return v;
 }
 
+u64 acpi_fadt_read(u32 off, int width) {
+    return fadt_read(off, width);
+}
+
 u16 acpi_pm1a_cnt_port(void) { return (u16)fadt_read(FADT_OFF_PM1A_CNT, 4); }
 u16 acpi_pm1b_cnt_port(void) { return (u16)fadt_read(FADT_OFF_PM1B_CNT, 4); }
 

@@ -14,7 +14,8 @@
 /* Probe the CPU's idle support. Called once, after the console exists. */
 void cpuidle_init(void);
 
-/* Park this CPU until an interrupt arrives, in the deepest state it has.
+/* Park this CPU until an interrupt arrives, in the state the governor picks
+ * for the idle it predicts.
  * Interrupts must be DISABLED on entry: the state is entered with them
  * enabled atomically, so a wake that arrives in the window before the halt is
  * not lost. Returns with interrupts enabled, as the halt leaves them. */
@@ -29,5 +30,21 @@ u32 cpuidle_state_latency_us(int state);
  * it (microseconds, as sysfs reports). */
 u64 cpuidle_state_usage(int cpu, int state);
 u64 cpuidle_state_time_us(int cpu, int state);
+
+/* M135: where the states came from ("acpi_idle" for _CST, "mwait_idle",
+ * "halt_idle") and the governor choosing among them. */
+const char *cpuidle_driver_name(void);
+const char *cpuidle_governor_name(void);
+/* The shortest idle that repays a state, and what the firmware says it
+ * draws (0 when it does not say). */
+u32 cpuidle_state_residency_us(int state);
+u32 cpuidle_state_power_mw(int state);
+/* Entries that proved too deep (the idle was shorter than the residency) and
+ * too shallow (a deeper allowed state would have fitted), as Linux counts. */
+u64 cpuidle_state_above(int cpu, int state);
+u64 cpuidle_state_below(int cpu, int state);
+/* stateN/disable: a state the governor may not pick on that CPU. */
+int cpuidle_state_disabled(int cpu, int state);
+int cpuidle_state_set_disabled(int cpu, int state, int disabled);
 
 #endif

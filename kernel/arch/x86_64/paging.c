@@ -5444,6 +5444,9 @@ u64 paging_reserve_kernel_va(usize size) {
 
 void tlb_shootdown_mm(u64 pml4_phys);
 
+/* Is `va` a kernel address? On this port the kernel is the upper half. */
+int paging_is_kernel_va(u64 va) { return va >= 0xffff800000000000ULL; }
+
 /* Write one byte of instruction text in the address space at `pml4_phys`, the
  * way a uprobe plants and lifts its breakpoint. The page must be present. A
  * frame anybody else holds -- the page cache's copy of the file, a parent's

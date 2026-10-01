@@ -309,6 +309,7 @@ struct b1nix_statfs {
 #define B1NIX_POLLERR 0x008
 #define B1NIX_POLLHUP 0x010
 #define B1NIX_POLLNVAL 0x020
+#define B1NIX_POLLRDNORM 0x040
 /* Linux's POLLRDHUP: the peer has closed its write half. Reported only to a
  * caller that asked for it, as Linux does. */
 #define B1NIX_POLLRDHUP 0x2000

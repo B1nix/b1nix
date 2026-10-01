@@ -34,10 +34,12 @@
 #include <b1nix/console.h>
 #include <b1nix/cpuidle.h>
 #include <b1nix/errno.h>
+#include <b1nix/hibernate.h>
 #include <b1nix/ktime.h>
 #include <b1nix/rtc.h>
 #include <b1nix/sched.h>
 #include <b1nix/types.h>
+#include <b1nix/vfs.h>
 
 #include <string.h>
 
@@ -67,17 +69,37 @@
  * sleeping with it live would lose whatever it held. */
 #define SUSPEND_PARK_MS 5000
 
-#define SUSPEND_MAX_SOURCES 4
+#define SUSPEND_MAX_SOURCES 6
 
 struct wake_source {
   const char *name;
   suspend_wake_armed_fn armed;
   void *ctx;
   u32 flags;
+  /* /sys/class/wakeup/wakeupN (M135): the events it reported, the ones that
+   * ended a suspend, and when it last did either. */
+  u64 events;
+  u64 wakeups;
+  u64 last_ms;
 };
 
 static struct wake_source g_sources[SUSPEND_MAX_SOURCES];
 static int g_nsources;
+
+/* /sys/power/wakeup_count (M135): every wakeup event since boot, and the
+ * count userspace wrote back, which a suspend must still match. */
+static volatile u64 g_events;
+static u64 g_saved_events;
+static volatile int g_saved_valid;
+/* /sys/power/mem_sleep: what `mem` means, deep (S3) or s2idle. */
+static volatile int g_mem_deep = -1;
+/* /sys/power/sync_on_suspend. */
+static volatile int g_sync_on_suspend = 1;
+
+int suspend_sync_on_suspend(void) { return g_sync_on_suspend; }
+void suspend_set_sync_on_suspend(int on) {
+  __atomic_store_n(&g_sync_on_suspend, on ? 1 : 0, __ATOMIC_RELEASE);
+}
 
 static volatile u64 g_wake_count;
 static const char *volatile g_wake_source_name = "none";
@@ -89,7 +111,66 @@ static volatile int g_suspended;
  * architecture both provide it; a state listed here that cannot be entered is
  * how a suspend becomes a hang. */
 const char *suspend_states(void) {
-  return arch_s3_supported() ? "freeze mem" : "freeze";
+  /* `mem` is whichever mem_sleep names, and s2idle is always one of them;
+   * `disk` where there is somewhere to write the image. */
+  return hibernate_available() ? "freeze mem disk" : "freeze mem";
+}
+
+static int mem_is_deep(void) {
+  if (g_mem_deep < 0)
+    g_mem_deep = arch_s3_supported() ? 1 : 0;
+  return g_mem_deep;
+}
+
+const char *suspend_mem_sleep(void) {
+  if (!arch_s3_supported())
+    return "[s2idle]";
+  return mem_is_deep() ? "s2idle [deep]" : "[s2idle] deep";
+}
+
+int suspend_set_mem_sleep(const char *name) {
+  if (!strcmp(name, "s2idle")) {
+    g_mem_deep = 0;
+    return 0;
+  }
+  if (!strcmp(name, "deep") && arch_s3_supported()) {
+    g_mem_deep = 1;
+    return 0;
+  }
+  return -EINVAL;
+}
+
+u64 suspend_event_count(void) {
+  return __atomic_load_n(&g_events, __ATOMIC_ACQUIRE);
+}
+
+int suspend_save_event_count(u64 count) {
+  if (count != suspend_event_count()) {
+    __atomic_store_n(&g_saved_valid, 0, __ATOMIC_RELEASE);
+    return -EINVAL; /* an event arrived since it was read */
+  }
+  g_saved_events = count;
+  __atomic_store_n(&g_saved_valid, 1, __ATOMIC_RELEASE);
+  return 0;
+}
+
+int suspend_source_count(void) { return g_nsources; }
+
+const char *suspend_source_name(int i) {
+  return (i >= 0 && i < g_nsources) ? g_sources[i].name : "";
+}
+
+u64 suspend_source_stat(int i, int which) {
+  if (i < 0 || i >= g_nsources)
+    return 0;
+  switch (which) {
+  case SUSPEND_STAT_EVENTS:
+    return g_sources[i].events;
+  case SUSPEND_STAT_WAKEUPS:
+    return g_sources[i].wakeups;
+  default:
+    return g_sources[i].last_ms;
+  }
 }
 
 int suspend_register_wake_source_flags(const char *name,
@@ -111,9 +192,42 @@ int suspend_register_wake_source(const char *name, suspend_wake_armed_fn armed,
                                             SUSPEND_WAKE_IDLE);
 }
 
+/* The registered source an event belongs to: its own name, or -- for a
+ * keyboard, a serial line, the console -- the one "input" source they share. */
+static struct wake_source *source_of(const char *name) {
+  struct wake_source *input = 0;
+
+  for (int i = 0; i < g_nsources; i++) {
+    if (name && !strcmp(g_sources[i].name, name))
+      return &g_sources[i];
+    if (!strcmp(g_sources[i].name, "input"))
+      input = &g_sources[i];
+  }
+  return input;
+}
+
 void suspend_wake_event(const char *source) {
-  if (!__atomic_load_n(&g_suspended, __ATOMIC_ACQUIRE))
+  int suspended = __atomic_load_n(&g_suspended, __ATOMIC_ACQUIRE);
+  struct wake_source *ws;
+
+  /* A keypress while the machine is up is not a wakeup event; a power button
+   * press or an alarm is, suspended or not, as Linux counts them. */
+  if (!suspended) {
+    ws = source_of(source);
+    if (ws && (ws->flags & SUSPEND_WAKE_EVENTS)) {
+      ws->events++;
+      ws->last_ms = ktime_monotonic_ns() / 1000000ull;
+      __atomic_fetch_add(&g_events, 1, __ATOMIC_RELEASE);
+    }
     return;
+  }
+  ws = source_of(source);
+  if (ws) {
+    ws->events++;
+    ws->wakeups++;
+    ws->last_ms = ktime_monotonic_ns() / 1000000ull;
+  }
+  __atomic_fetch_add(&g_events, 1, __ATOMIC_RELEASE);
   g_wake_source_name = source ? source : "unknown";
   __atomic_fetch_add(&g_wake_count, 1, __ATOMIC_RELEASE);
   /* Nothing to kick: the suspending CPU is halted inside cpuidle_enter() and
@@ -128,10 +242,11 @@ const char *suspend_last_wake_source(void) { return g_wake_source_name; }
 
 /* ── device resume ──────────────────────────────────────────────────────── */
 
-#define SUSPEND_MAX_DEVICES 16
+#define SUSPEND_MAX_DEVICES 32
 
 struct resume_dev {
   const char *name;
+  suspend_resume_fn suspend;
   suspend_resume_fn resume;
   void *ctx;
 };
@@ -139,16 +254,77 @@ struct resume_dev {
 static struct resume_dev g_devices[SUSPEND_MAX_DEVICES];
 static int g_ndevices;
 
-int suspend_register_device(const char *name, suspend_resume_fn resume,
-                            void *ctx) {
+int suspend_register_device_ops(const char *name, suspend_resume_fn suspend,
+                                suspend_resume_fn resume, void *ctx) {
   if (!name || !resume || g_ndevices >= SUSPEND_MAX_DEVICES)
     return -1;
   g_devices[g_ndevices].name = name;
+  g_devices[g_ndevices].suspend = suspend;
   g_devices[g_ndevices].resume = resume;
   g_devices[g_ndevices].ctx = ctx;
   g_ndevices++;
   return 0;
 }
+
+int suspend_register_device(const char *name, suspend_resume_fn resume,
+                            void *ctx) {
+  return suspend_register_device_ops(name, 0, resume, ctx);
+}
+
+/* A device every other device's resume depends on -- an IOMMU, which has to
+ * translate and remap before anything does DMA or raises a message
+ * interrupt: first to resume, last to suspend. */
+int suspend_register_device_early(const char *name, suspend_resume_fn resume,
+                                  void *ctx) {
+  if (!name || !resume || g_ndevices >= SUSPEND_MAX_DEVICES)
+    return -1;
+  for (int i = g_ndevices; i > 0; i--)
+    g_devices[i] = g_devices[i - 1];
+  g_devices[0].name = name;
+  g_devices[0].suspend = 0;
+  g_devices[0].resume = resume;
+  g_devices[0].ctx = ctx;
+  g_ndevices++;
+  return 0;
+}
+
+/* A module going away takes its callbacks with it; the order of the others
+ * is kept, it is the order they come back in. */
+void suspend_unregister_device(suspend_resume_fn resume) {
+  for (int i = 0; i < g_ndevices; i++) {
+    if (g_devices[i].resume != resume)
+      continue;
+    for (int j = i + 1; j < g_ndevices; j++)
+      g_devices[j - 1] = g_devices[j];
+    g_ndevices--;
+    return;
+  }
+}
+
+int suspend_devices_suspend(void);
+
+/* In the reverse of the resume order, as Linux suspends: the drivers that
+ * depend on others go first. One that fails stops the sleep, and the ones
+ * already suspended are resumed again. */
+static int suspend_suspend_devices(void) {
+  for (int i = g_ndevices - 1; i >= 0; i--) {
+    if (!g_devices[i].suspend)
+      continue;
+    if (g_devices[i].suspend(g_devices[i].ctx) != 0) {
+      console_write("power: ");
+      console_write(g_devices[i].name);
+      console_write(" refused to suspend\n");
+      for (int k = i + 1; k < g_ndevices; k++)
+        if (g_devices[k].suspend)
+          (void)g_devices[k].resume(g_devices[k].ctx);
+      return -EBUSY;
+    }
+  }
+  return 0;
+}
+
+/* The same, for hibernation, which drives its own sequence. */
+int suspend_devices_suspend(void) { return suspend_suspend_devices(); }
 
 int suspend_resume_devices(void) {
   int failed = 0;
@@ -227,6 +403,14 @@ static int suspend_enter_s3(const char *armed) {
     return rc;
   }
 
+  rc = suspend_suspend_devices();
+  if (rc < 0) {
+    __atomic_store_n(&g_suspended, 0, __ATOMIC_RELEASE);
+    sched_unpark_secondary_cpus();
+    sched_thaw_userspace();
+    return rc;
+  }
+
   console_write("power: mem (S3), ");
   console_write_dec((u64)sched_frozen_count());
   console_write(" task(s) held, wake source ");
@@ -296,6 +480,25 @@ int suspend_enter(const char *state) {
 
   if (!state)
     return -EINVAL;
+  /* The wakeup_count handshake: a count written back that events have since
+   * overtaken means something wanted the machine awake after userspace
+   * decided to suspend it. Checked once per attempt, as Linux does. */
+  if (__atomic_exchange_n(&g_saved_valid, 0, __ATOMIC_ACQ_REL) &&
+      g_saved_events != suspend_event_count()) {
+    console_write("power: suspend aborted, a wakeup event arrived after "
+                  "wakeup_count was written\n");
+    return -EBUSY;
+  }
+  if (strcmp(state, "disk") == 0)
+    return hibernate_available() ? hibernate_enter() : -EINVAL;
+  if (strcmp(state, "mem") == 0 && !mem_is_deep())
+    state = "freeze";
+  /* What Linux does first (sync_on_suspend): the dirty data goes to the
+   * disks while every task can still run, so a sleep the machine does not
+   * come back from loses nothing that was already written. */
+  if (__atomic_load_n(&g_sync_on_suspend, __ATOMIC_ACQUIRE) &&
+      (!strcmp(state, "mem") || !strcmp(state, "freeze")))
+    (void)vfs_sync();
   if (strcmp(state, "mem") == 0) {
     /* Only a source that can wake a powered-off machine will do here. There is
      * no ceiling on an S3 — once the processor is off nothing of this kernel is
@@ -404,6 +607,16 @@ void suspend_register_input_source(void) {
 
 void suspend_init(void) {
   rtc_wake_source_init();
+#if defined(__aarch64__)
+  {
+    /* What this port's deep sleep would be: PSCI's, if the firmware has it. */
+    extern long arch_psci_system_suspend_supported(void);
+    long r = arch_psci_system_suspend_supported();
+
+    console_write(r == 0 ? "power: PSCI SYSTEM_SUSPEND implemented\n"
+                         : "power: PSCI SYSTEM_SUSPEND not implemented\n");
+  }
+#endif
   console_write("power: states:");
   console_write(" ");
   console_write(suspend_states());
