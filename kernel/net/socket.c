@@ -394,7 +394,50 @@ static void udp_cork_done(struct vfs_socket_state *s) {
   s->udp_cork_len = 0;
 }
 
+static isize sock_send_once(struct vfs_handle *h, const void *buf, usize len,
+                            int flags);
+
 isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int flags) {
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  isize rc = sock_send_once(h, buf, len, flags);
+
+  /* MSG_ZEROCOPY on a socket that turned SO_ZEROCOPY on: the send gets the
+   * next id, and its completion goes on the error queue, merged with the ones
+   * before it that nobody has read yet -- as Linux coalesces them. The data
+   * was copied, so the buffer is free at once. */
+  if (rc >= 0 && (flags & B1NIX_MSG_ZEROCOPY) && s->so_zerocopy) {
+    if (s->zc_pending && s->zc_hi + 1 == s->zc_next) {
+      s->zc_hi = s->zc_next;
+    } else if (!s->zc_pending) {
+      s->zc_lo = s->zc_hi = s->zc_next;
+      s->zc_pending = 1;
+    }
+    s->zc_next++;
+    scheduler_wake_all(vfs_poll_chan);
+  }
+  return rc;
+}
+
+int vfs_socket_errqueue_zc(int fd, u32 *lo, u32 *hi, int *family) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  struct vfs_socket_state *s;
+
+  if (!h)
+    return -EBADF;
+  if (h->kind != VFS_HANDLE_SOCKET)
+    return -ENOTSOCK;
+  s = (struct vfs_socket_state *)h->private_data;
+  *family = s->domain;
+  if (!s->zc_pending)
+    return -EAGAIN;
+  *lo = s->zc_lo;
+  *hi = s->zc_hi;
+  s->zc_pending = 0;
+  return 0;
+}
+
+static isize sock_send_once(struct vfs_handle *h, const void *buf, usize len,
+                            int flags) {
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
 
   /* After shutdown(SHUT_WR) the write half is closed: POSIX requires EPIPE. */
@@ -513,7 +556,40 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
   return -ENOTCONN;
 }
 
+static isize sock_recv_once(struct vfs_handle *h, void *buf, usize len,
+                            int flags);
+
+/* Whether a recv with these flags keeps going until its buffer is full:
+ * MSG_WAITALL, on a stream, when the call may block and is not a peek. */
+static int sock_waitall(struct vfs_handle *h, struct vfs_socket_state *s,
+                        int flags) {
+  return (flags & B1NIX_MSG_WAITALL) && s->type == B1NIX_SOCK_STREAM &&
+         !(flags & (B1NIX_MSG_DONTWAIT | B1NIX_MSG_PEEK)) &&
+         !(h->flags & B1NIX_O_NONBLOCK);
+}
+
 isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  isize got = sock_recv_once(h, buf, len, flags);
+
+  /* MSG_WAITALL: what has arrived so far is not the answer while there is
+   * room left. A signal, an error, a receive timeout or the end of the stream
+   * ends the wait, and what was received by then is the answer. */
+  if (got <= 0 || !sock_waitall(h, s, flags))
+    return got;
+  while ((usize)got < len) {
+    isize n = sock_recv_once(h, (char *)buf + got, len - (usize)got,
+                             flags & ~B1NIX_MSG_WAITALL);
+
+    if (n <= 0)
+      break;
+    got += n;
+  }
+  return got;
+}
+
+static isize sock_recv_once(struct vfs_handle *h, void *buf, usize len,
+                            int flags) {
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
 
   /* After shutdown(SHUT_RD) the read half is closed: report EOF. */
@@ -973,6 +1049,11 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
         } else if (tcp_is_close_wait(conn)) {
           pfd->revents |= B1NIX_POLLOUT;
           pfd->revents |= B1NIX_POLLHUP;
+        } else if (tcp_is_fin_wait(conn)) {
+          /* Our own write half is shut and the peer's is open: still a
+           * connection to read from, not a hang-up. A write answers EPIPE,
+           * so it is "writable", as tcp_poll has it. */
+          pfd->revents |= B1NIX_POLLOUT;
         } else {
           pfd->revents |= B1NIX_POLLHUP;
         }
@@ -1009,6 +1090,9 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
       }
     }
   }
+  /* Something on the error queue is POLLERR, as on Linux. */
+  if (s->zc_pending)
+    pfd->revents |= B1NIX_POLLERR;
   return 0;
 }
 
@@ -2371,6 +2455,41 @@ static void scm_trace(const char *what, usize count) {
   klog_info(line);
 }
 
+/* sendmsg with ancillary data AND a destination: descriptors or credentials
+ * sent to the address in msg_name, on a socket that need not be connected.
+ * sd_notify_barrier sends BARRIER=1 with a pipe end exactly this way; refused
+ * with ENOTCONN, systemd-notify gave up on the barrier and exited before the
+ * manager had read its READY=1, and the manager, finding no process to
+ * attribute the message to, ignored it -- a Type=notify service that never
+ * started, depending on who ran first. */
+isize vfs_socket_sendmsg_to(int fd, const void *buf, usize len, int flags,
+                            struct vfs_handle **handles, usize nhandles,
+                            const struct b1nix_ucred *cred, const void *addr,
+                            usize addrlen) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  struct b1nix_sockaddr_un dest;
+  struct vfs_socket_state *s;
+
+  if (!h)
+    return -EBADF;
+  if (h->kind != VFS_HANDLE_SOCKET)
+    return -ENOTSOCK;
+  s = (struct vfs_socket_state *)h->private_data;
+  if (s->domain != B1NIX_AF_UNIX)
+    return -EOPNOTSUPP;
+  if (nhandles > VFS_SCM_MAX_FDS)
+    return -EINVAL;
+  if (addrlen < 2)
+    return -EINVAL;
+  memset(&dest, 0, sizeof(dest));
+  memcpy(&dest, addr, addrlen < sizeof(dest) ? addrlen : sizeof(dest));
+  scm_trace("send", nhandles);
+  return unix_send_control_to(s, buf, len, handles, nhandles, cred,
+                              (h->flags & B1NIX_O_NONBLOCK) ||
+                                  (flags & B1NIX_MSG_DONTWAIT),
+                              &dest);
+}
+
 isize vfs_socket_sendmsg(int fd, const void *buf, usize len, int flags,
                          struct vfs_handle **handles, usize nhandles,
                          const struct b1nix_ucred *cred) {
@@ -2441,6 +2560,28 @@ isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
                                has_cred);
   if (rc < 0 || (recv_flags & B1NIX_MSG_PEEK))
     return rc;
+  /* MSG_WAITALL, as recv's; a message that carried descriptors ends it, as
+   * Linux's unix_stream_read_generic stops after the one with SCM_RIGHTS. */
+  if (rc > 0 && sock_waitall(h, s, recv_flags)) {
+    while ((usize)rc < len && nhandles == 0) {
+      /* Each pass reports its own credentials; the first ones stand unless a
+       * later message carries some. */
+      struct b1nix_ucred more_cred;
+      int more_has = 0;
+      isize n = unix_recv_control(s, (char *)buf + rc, len - (usize)rc,
+                                  recv_flags & ~B1NIX_MSG_WAITALL, handles,
+                                  &nhandles, cred ? &more_cred : 0,
+                                  has_cred ? &more_has : 0);
+
+      if (n <= 0)
+        break;
+      if (more_has) {
+        *cred = more_cred;
+        *has_cred = 1;
+      }
+      rc += n;
+    }
+  }
 
   usize installed = 0;
   for (usize i = 0; i < nhandles; i++) {
@@ -2508,6 +2649,7 @@ int vfs_socket_wants_peer_pidfd(int fd) {
 #define SOCK_SO_SNDTIMEO  21
 #define SOCK_SO_REUSEPORT 15
 #define SOCK_SO_PASSCRED  16
+#define SOCK_SO_ZEROCOPY  60
 /* Linux 6.5 and 6.16 respectively. A kernel that refuses them outright fails
  * callers that treat the refusal as fatal: dbus-broker validates its
  * controller socket with SO_PASSPIDFD and exits ("Protocol not available"),
@@ -2713,6 +2855,17 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
        * peer to fill. */
       if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn)
         tcp_set_rcvbuf((struct tcp_conn *)s->tcp_conn, (u32)s->so_rcvbuf);
+      return 0;
+    /* SO_ZEROCOPY: as sock_setsockopt has it, TCP and UDP only, and a
+     * boolean. What it turns on is the error-queue report of MSG_ZEROCOPY
+     * sends (vfs_socket_send_h). */
+    case SOCK_SO_ZEROCOPY:
+      if ((s->domain != B1NIX_AF_INET && s->domain != B1NIX_AF_INET6) ||
+          (s->type != B1NIX_SOCK_STREAM && s->type != B1NIX_SOCK_DGRAM))
+        return -EOPNOTSUPP;
+      if (v < 0 || v > 1)
+        return -EINVAL;
+      s->so_zerocopy = (u8)v;
       return 0;
     case SOCK_SO_PASSCRED:
       /* Linux handles SO_PASSCRED generically in sock_setsockopt, so it
@@ -2992,6 +3145,7 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
      * family's default, which is what 0 means to the caller asking. */
     case SOCK_SO_PROTOCOL:  v = s->protocol; break;
     case SOCK_SO_PASSCRED:  v = s->so_passcred; break;
+    case SOCK_SO_ZEROCOPY:  v = s->so_zerocopy; break;
     case SOCK_SO_PASSPIDFD: v = s->so_passpidfd; break;
     case SOCK_SO_PASSRIGHTS: v = s->so_no_passrights ? 0 : 1; break;
     case SOCK_SO_TIMESTAMP: v = s->so_timestamp; break;
@@ -3124,7 +3278,12 @@ int vfs_shutdown(int fd, int how) {
   }
   /* Half-close is a statement to the PEER, not only a local flag: closing the
    * write half must make the other end's read return 0. Recording it here and
-   * nowhere else left every AF_UNIX half-close invisible to the reader. */
+   * nowhere else left every AF_UNIX half-close invisible to the reader -- and
+   * every TCP one: the FIN was only ever sent by close(), so a peer reading
+   * to the end of a half-closed stream waited for ever. */
+  if ((how == SOCK_SHUT_WR || how == SOCK_SHUT_RDWR) &&
+      s->type == B1NIX_SOCK_STREAM && s->tcp_conn && s->connected)
+    tcp_shutdown_write((struct tcp_conn *)s->tcp_conn);
   if (s->domain == B1NIX_AF_UNIX && s->unix_data)
     unix_shutdown(s, how == SOCK_SHUT_WR || how == SOCK_SHUT_RDWR,
                   how == SOCK_SHUT_RD || how == SOCK_SHUT_RDWR);

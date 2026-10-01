@@ -459,6 +459,33 @@ interface rather than a missing feature:
   walks the documented depths reads -EINVAL as "this kernel is broken", where
   -ENOMEM is the answer it stops on.
 
+### The rest of the uapi (M133)
+
+- **Placement.** The submission and completion threads (`iou-sqp-<pid>`,
+  `iou-wrk-<pid>`, as Linux names them) run on any CPU. `IORING_SETUP_SQ_AFF`
+  pins the first to `sq_thread_cpu`; `IORING_REGISTER_IOWQ_AFF` places the
+  second. Two cross-ring walks that read another ring's requests under the list
+  lock alone became reachable races once those threads left the boot CPU; each
+  ring's requests are now read under its own lock.
+- **NAPI.** `IORING_REGISTER_NAPI` is Linux's contract — the settings in force
+  handed back, a STATIC id list — and a wait with something armed on a socket
+  spins on the loopback queue and every interface's receive ring for the
+  registered time before it sleeps.
+- **Zero-copy receive.** `IORING_REGISTER_ZCRX_IFQ` takes an area and a refill
+  ring in the program's memory; `RECV_ZC` fills area pages from a TCP stream
+  and reports each in a 32-byte completion, and pages come back through the
+  refill ring. The bytes are copied in — the fallback Linux itself takes for
+  data that did not land in the area from the NIC — since no driver here
+  splits headers or steers a flow to a queue. `SEND_ZC` likewise copies and
+  says so when asked (`IORING_SEND_ZC_REPORT_USAGE`).
+- **Sockets.** A request issued because its descriptor became ready is issued
+  `MSG_DONTWAIT`: readiness is the descriptor's, another request can take the
+  data first, and a blocking call there stalled the whole ring. A stream send,
+  and a receive with `MSG_WAITALL`, carries on a piece at a time until it is
+  whole, reporting the total as Linux's `done_io` does.
+- **Waiting.** The task in `io_uring_enter` is woken by id when another thread
+  posts a completion, rather than when its sleep times out.
+
 ## Observability: perf, userfaultfd, fanotify and eBPF (M126)
 
 Four ways for a program to see what the kernel is doing, and in two of the four
@@ -524,19 +551,27 @@ for ever and the machine stops doing anything else. Linux marks those files
 
 ### eBPF
 
-A program is verified, loaded and interpreted, and can be attached to a perf
-event so that it runs on every sample. Maps are how it keeps state that
-userspace reads while it runs: a profiler that counts into a map writes no
-records at all.
+A program is verified, then JIT-compiled (x86_64) or interpreted, and runs on a
+perf event, a tracepoint, a kprobe or a uprobe; maps are how it keeps state
+that userspace reads while it runs. The distribution's `bpftrace` works on it:
+the Debian lane counts a kprobe and a libc uprobe into maps and prints from
+`BEGIN`.
 
-The verifier is the part that matters. It walks every path with a model of
-what each register holds — uninitialised, a number, the context, a stack
-pointer at a known offset, a map, a map value that may be NULL, a map value
-that has been tested — and refuses the moment an instruction could do
-something the model cannot prove is in bounds. Backward jumps are refused
-outright, which is what makes the walk terminate; Linux required the same
-until bounded loops arrived.
+The verifier walks every path with a model of what each register and stack
+slot holds, prunes a state another already covered, tracks constants and the
+references a ring-buffer reservation must give back, and refuses the moment an
+instruction could do something the model cannot prove is in bounds. Backward
+jumps are refused, which is what makes the walk terminate.
 
-What is missing is stated at load time rather than discovered later: no JIT,
-no BTF (so no CO-RE), no kprobe or tracepoint attach points, and no program
-types outside the tracing ones.
+Programs see Linux's contexts — `pt_regs`, `bpf_perf_event_data`, a
+tracepoint's record — and call the helpers `bpftrace` compiles to:
+`probe_read*`, `get_stackid`/`get_stack`, ring buffers, `perf_event_output`,
+`get_current_task`, with per-CPU maps and perf event arrays beside them.
+Attachment is through `PERF_EVENT_IOC_SET_BPF` or `bpf_link`. The kernel's BTF
+comes from its own DWARF at build time and is served at
+`/sys/kernel/btf/vmlinux`.
+
+Probes are x86_64-only: an int3 in the kernel text (stepped with interrupts
+off, so the step cannot migrate CPUs), or one planted in a private copy of a
+process's text page for a uprobe; the kprobe and uprobe PMUs and tracefs'
+`kprobe_events`/`uprobe_events` create them.

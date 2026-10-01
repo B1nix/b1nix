@@ -19,6 +19,8 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <stdlib.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -863,6 +865,165 @@ static void test_dual_stack_accept(void) {
   close(ls);
 }
 
+#ifndef SO_ZEROCOPY
+#define SO_ZEROCOPY 60
+#endif
+#ifndef MSG_ZEROCOPY
+#define MSG_ZEROCOPY 0x4000000
+#endif
+#ifndef IP_RECVERR
+#define IP_RECVERR 11
+#endif
+#define ZC_ORIGIN 5 /* SO_EE_ORIGIN_ZEROCOPY */
+#define ZC_COPIED 1 /* SO_EE_CODE_ZEROCOPY_COPIED */
+#define BIG_MSG (3u << 20)
+
+/* A stream's MSG_WAITALL, a message longer than any one staging window, and
+ * the MSG_ZEROCOPY completions SO_ZEROCOPY reports on the error queue. */
+static void test_tcp_waitall_zerocopy(void) {
+  int srv = socket(AF_INET, SOCK_STREAM, 0);
+  int one = 1;
+  struct sockaddr_in addr;
+
+  if (srv < 0) { marker("TCP-SMOKE: fail waitall-socket\n"); return; }
+  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(56003);
+  inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+      listen(srv, 2) < 0) {
+    marker("TCP-SMOKE: fail waitall-listen\n");
+    close(srv);
+    return;
+  }
+  pid_t pid = fork();
+  if (pid < 0) { marker("TCP-SMOKE: fail waitall-fork\n"); close(srv); return; }
+  if (pid == 0) {
+    int cli = socket(AF_INET, SOCK_STREAM, 0);
+    char piece[1000];
+    char *big = malloc(BIG_MSG);
+    char zc[2];
+
+    close(srv);
+    if (cli < 0 || !big ||
+        connect(cli, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+      _exit(1);
+    /* Three pieces, apart in time: only MSG_WAITALL makes them one read. */
+    for (int i = 0; i < 3; i++) {
+      memset(piece, 'a' + i, sizeof(piece));
+      if (send(cli, piece, sizeof(piece), 0) != (ssize_t)sizeof(piece))
+        _exit(2);
+      usleep(20000);
+    }
+    /* Three MiB in one sendmsg, over two iovecs. */
+    for (unsigned i = 0; i < BIG_MSG; i++)
+      big[i] = (char)(i * 7u);
+    struct iovec iv[2] = {{big, BIG_MSG / 3}, {big + BIG_MSG / 3, BIG_MSG - BIG_MSG / 3}};
+    struct msghdr mh;
+
+    memset(&mh, 0, sizeof(mh));
+    mh.msg_iov = iv;
+    mh.msg_iovlen = 2;
+    if (sendmsg(cli, &mh, 0) != (ssize_t)BIG_MSG)
+      _exit(3);
+    /* The server's two zerocopy bytes. */
+    if (recv(cli, zc, sizeof(zc), MSG_WAITALL) != 2)
+      _exit(4);
+    close(cli);
+    _exit(0);
+  }
+
+  int acc = accept(srv, NULL, NULL);
+  char buf[3000];
+  ssize_t got = acc >= 0 ? recv(acc, buf, sizeof(buf), MSG_WAITALL) : -1;
+  int pieces_ok = got == (ssize_t)sizeof(buf);
+
+  for (int i = 0; pieces_ok && i < 3000; i++)
+    if (buf[i] != 'a' + i / 1000)
+      pieces_ok = 0;
+  if (pieces_ok)
+    marker("TCP-SMOKE: ok recv-waitall\n");
+  else {
+    printf("TCP-SMOKE: fail recv-waitall — %zd bytes of 3000\n", got);
+    fflush(stdout);
+  }
+
+  char *big = malloc(BIG_MSG);
+  ssize_t bgot = -1;
+  int big_ok = 0;
+
+  if (big && acc >= 0) {
+    struct iovec iv = {big, BIG_MSG};
+    struct msghdr mh;
+
+    memset(&mh, 0, sizeof(mh));
+    mh.msg_iov = &iv;
+    mh.msg_iovlen = 1;
+    bgot = recvmsg(acc, &mh, MSG_WAITALL);
+    big_ok = bgot == (ssize_t)BIG_MSG;
+    for (unsigned i = 0; big_ok && i < BIG_MSG; i++)
+      if (big[i] != (char)(i * 7u))
+        big_ok = 0;
+  }
+  if (big_ok)
+    marker("TCP-SMOKE: ok sendmsg-large\n");
+  else {
+    printf("TCP-SMOKE: fail sendmsg-large — %zd bytes of %u\n", bgot, BIG_MSG);
+    fflush(stdout);
+  }
+  free(big);
+
+  /* SO_ZEROCOPY: two MSG_ZEROCOPY sends are one completion range, 0..1,
+   * reported as copied; the queue is empty after it. */
+  int zc_ok = 0;
+
+  if (acc >= 0 && setsockopt(acc, SOL_SOCKET, SO_ZEROCOPY, &one, sizeof(one)) == 0 &&
+      send(acc, "x", 1, MSG_ZEROCOPY) == 1 && send(acc, "y", 1, MSG_ZEROCOPY) == 1) {
+    struct pollfd pf = {acc, 0, 0};
+    char ctl[128];
+    struct msghdr mh;
+
+    memset(&mh, 0, sizeof(mh));
+    mh.msg_control = ctl;
+    mh.msg_controllen = sizeof(ctl);
+    int pr = poll(&pf, 1, 1000);
+    ssize_t r = recvmsg(acc, &mh, MSG_ERRQUEUE);
+    struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+
+    if (pr == 1 && (pf.revents & POLLERR) && r == 0 && (mh.msg_flags & MSG_ERRQUEUE) &&
+        c && c->cmsg_level == SOL_IP && c->cmsg_type == IP_RECVERR) {
+      const unsigned char *d = CMSG_DATA(c);
+      unsigned int ee_errno, ee_info, ee_data;
+
+      memcpy(&ee_errno, d, 4);
+      memcpy(&ee_info, d + 8, 4);
+      memcpy(&ee_data, d + 12, 4);
+      errno = 0;
+      zc_ok = ee_errno == 0 && d[4] == ZC_ORIGIN && d[6] == ZC_COPIED &&
+              ee_info == 0 && ee_data == 1 &&
+              recvmsg(acc, &mh, MSG_ERRQUEUE) < 0 && errno == EAGAIN;
+    }
+  }
+  int ux = socket(AF_UNIX, SOCK_STREAM, 0);
+  int ux_refused = ux >= 0 && setsockopt(ux, SOL_SOCKET, SO_ZEROCOPY, &one,
+                                         sizeof(one)) < 0 && errno == EOPNOTSUPP;
+
+  if (ux >= 0)
+    close(ux);
+  marker(zc_ok && ux_refused ? "TCP-SMOKE: ok so-zerocopy\n"
+                             : "TCP-SMOKE: fail so-zerocopy\n");
+
+  int st = 0;
+
+  waitpid(pid, &st, 0);
+  if (acc >= 0)
+    close(acc);
+  close(srv);
+  marker(WIFEXITED(st) && WEXITSTATUS(st) == 0 ? "TCP-SMOKE: ok waitall-peer\n"
+                                                : "TCP-SMOKE: fail waitall-peer\n");
+}
+
 int main(void) {
   test_unix_socket_events();
   test_unix_dgram_outlives_sender();
@@ -874,6 +1035,7 @@ int main(void) {
   test_udp_send_recv();
   test_tcp_path();
   test_tcp_accept_after_peer_close();
+  test_tcp_waitall_zerocopy();
   test_dual_stack_accept();
   test_poll_readiness();
   test_dns_parse();

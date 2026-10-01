@@ -944,6 +944,14 @@ isize unix_send_control(struct vfs_socket_state *s, const void *buf, usize len,
   return unix_send_to(s, buf, len, handles, nhandles, cred, nonblock, 0);
 }
 
+/* The same, to the address a sendmsg names rather than the connected peer. */
+isize unix_send_control_to(struct vfs_socket_state *s, const void *buf,
+                           usize len, struct vfs_handle **handles,
+                           usize nhandles, const struct b1nix_ucred *cred,
+                           int nonblock, const struct b1nix_sockaddr_un *dest) {
+  return unix_send_to(s, buf, len, handles, nhandles, cred, nonblock, dest);
+}
+
 isize unix_sendto(struct vfs_socket_state *s,
                   const struct b1nix_sockaddr_un *addr, const void *buf,
                   usize len, int nonblock) {

@@ -318,6 +318,15 @@ struct b1nix_statfs {
  * longer than the buffer (Linux's MSG_TRUNC for recv). */
 #define B1NIX_MSG_TRUNC 0x20
 #define B1NIX_MSG_DONTWAIT 0x40
+/* recv on a stream socket: wait for the whole buffer, not the first bytes,
+ * unless a signal, an error or the end of the stream comes first. */
+#define B1NIX_MSG_WAITALL 0x100
+/* recvmsg: read the socket's error queue (MSG_ZEROCOPY completions) instead
+ * of its data. */
+#define B1NIX_MSG_ERRQUEUE 0x2000
+/* send on a socket with SO_ZEROCOPY: report when the buffer is free again,
+ * through the error queue. */
+#define B1NIX_MSG_ZEROCOPY 0x4000000
 /* send on a datagram socket: more of this datagram follows (Linux MSG_MORE);
  * the pieces leave as one datagram with the first send without it. */
 #define B1NIX_MSG_MORE 0x8000

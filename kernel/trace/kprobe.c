@@ -100,6 +100,13 @@ static spinlock_t g_kp_lock = SPINLOCK_INIT;
 /* The probe each CPU is in the middle of single-stepping, +1 so that zero
  * means "none". A CPU steps one instruction at a time, so one slot each. */
 static volatile u32 g_stepping[MAX_CPUS];
+/* Whether interrupts were on where the probe hit. The step runs with them off:
+ * an interrupt between the return from the int3 and the stepped instruction
+ * could preempt the task and resume it on another CPU, whose #DB then finds
+ * nothing in its g_stepping slot -- a "debug" panic in the probed function one
+ * byte in, seen with bpftrace's kprobe on vfs_find_node. Linux single-steps a
+ * kprobe with IF clear for the same reason. */
+static volatile u8 g_step_if[MAX_CPUS];
 
 static unsigned kprobe_this_cpu(void) {
   struct percpu *pc = get_percpu();
@@ -230,8 +237,11 @@ int kprobe_handle_bp(struct interrupt_frame *frame) {
     frame->rip = hit;
     frame->rflags |= 0x100ull; /* TF */
     cpu = kprobe_this_cpu();
-    if (cpu < MAX_CPUS)
+    if (cpu < MAX_CPUS) {
+      g_step_if[cpu] = (frame->rflags & 0x200ull) ? 1 : 0;
+      frame->rflags &= ~0x200ull; /* IF off for the one instruction */
       g_stepping[cpu] = (u32)i + 1;
+    }
     return 1;
   }
   return 0;
@@ -252,6 +262,8 @@ int kprobe_handle_db(struct interrupt_frame *frame) {
   g_stepping[cpu] = 0;
   slot--;
   frame->rflags &= ~0x100ull; /* TF off; the step is done */
+  if (g_step_if[cpu])
+    frame->rflags |= 0x200ull; /* and interrupts back as they were */
   /* Put the breakpoint back, unless the probe was turned off meanwhile. */
   {
     struct b1nix_tracepoint *tp = tracepoint_by_id(g_kp[slot].id);

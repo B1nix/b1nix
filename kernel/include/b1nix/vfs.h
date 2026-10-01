@@ -881,6 +881,10 @@ struct b1nix_ucred {
  * descriptors being passed are the shared-memory regions the GPU process needs
  * before anything can be drawn. */
 #define VFS_SCM_MAX_FDS 32
+isize vfs_socket_sendmsg_to(int fd, const void *buf, usize len, int flags,
+                            struct vfs_handle **handles, usize nhandles,
+                            const struct b1nix_ucred *cred, const void *addr,
+                            usize addrlen);
 isize vfs_socket_sendmsg(int fd, const void *buf, usize len, int flags,
                          struct vfs_handle **handles, usize nhandles,
                          const struct b1nix_ucred *cred);
@@ -919,6 +923,10 @@ usize vfs_socket_origdstaddr(int fd, void *addr, usize cap);
 /* SO_TIMESTAMP: 0 = off, 1 = SO_TIMESTAMP, 2 = SO_TIMESTAMPNS. */
 int vfs_socket_timestamp_enabled(int fd);
 int vfs_socket_is_dgram(int fd);
+/* The oldest MSG_ZEROCOPY completion range of socket `fd`, taken off its error
+ * queue: 0 and the range, -EAGAIN when the queue is empty. `family` gets the
+ * socket's address family, which decides the control message it goes in. */
+int vfs_socket_errqueue_zc(int fd, u32 *lo, u32 *hi, int *family);
 u64 vfs_socket_last_timestamp_usec(int fd);
 
 /* M32b pseudo-terminals (kernel/dev/pty.c). */
@@ -1152,6 +1160,14 @@ struct vfs_socket_state {
   /* SO_BROADCAST: a datagram to the limited broadcast address is refused with
    * EACCES unless the socket asked for it, as on Linux. */
   int so_broadcast;
+  /* SO_ZEROCOPY, and the MSG_ZEROCOPY completions waiting on the error queue:
+   * send ids zc_lo..zc_hi, not yet read by a MSG_ERRQUEUE recvmsg. Every send
+   * is a copy here, so each is reported as SO_EE_CODE_ZEROCOPY_COPIED. */
+  u8 so_zerocopy;
+  u8 zc_pending;
+  u32 zc_next;
+  u32 zc_lo;
+  u32 zc_hi;
   /* SO_BINDTODEVICE: the interface index the socket sends by and receives
    * from, 0 when unbound. */
   int bind_ifindex;

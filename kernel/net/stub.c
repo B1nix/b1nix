@@ -2,6 +2,7 @@
 #include <b1nix/net.h>
 
 void net_poll(void) {}
+void net_busy_poll(void) {}
 
 int net_is_ready(void)
 {

@@ -9,7 +9,10 @@
  *
  * Every marker is printed only after the operation's result has been checked.
  */
+#include <arpa/inet.h>
 #include <dirent.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/io_uring.h>
@@ -42,8 +45,7 @@
 /* Opcodes and flags newer than the uapi header this is compiled against. The
  * values are the ABI's, taken from the same enum the kernel's copy holds. */
 #define IOU_OP_SETXATTR         42
-/* Zero-copy receive: it needs a NIC-driven refill ring (see the roadmap), so
- * it is the opcode this kernel genuinely does not have. */
+/* Zero-copy receive: the newest opcode the probe must report. */
 #define IOU_OP_RECV_ZC          58
 #define IOU_OP_SOCKET           45
 #define IOU_OP_SEND_ZC          47
@@ -207,7 +209,8 @@ static int ring_make(struct ring *r, unsigned entries, unsigned flags,
 /* Map the rings the params in `r` describe. */
 static int ring_map(struct ring *r) {
   r->sq_sz = r->p.sq_off.array + r->p.sq_entries * sizeof(unsigned);
-  size_t cq_sz = r->p.cq_off.cqes + r->p.cq_entries * sizeof(struct io_uring_cqe);
+  size_t cq_sz = r->p.cq_off.cqes + r->p.cq_entries * sizeof(struct io_uring_cqe) *
+                                        ((r->p.flags & IORING_SETUP_CQE32) ? 2 : 1);
 
   if (cq_sz > r->sq_sz)
     r->sq_sz = cq_sz;
@@ -984,7 +987,7 @@ static void check_probe(void) {
   }
   int nop_ok = 0, read_ok = 0, openat_ok = 0, statx_ok = 0, pbuf_ok = 0;
   int xattr_ok = 0;
-  int zc_reported = 1;
+  int zc_reported = 0;
 
   for (unsigned i = 0; i < p->ops_len; i++) {
     if (p->ops[i].op == IORING_OP_NOP)
@@ -1000,9 +1003,9 @@ static void check_probe(void) {
     /* The xattr opcodes are implemented, so the probe must say so... */
     if (p->ops[i].op == IOU_OP_SETXATTR)
       xattr_ok = (p->ops[i].flags & IO_URING_OP_SUPPORTED) != 0;
-    /* ... and zero-copy receive is not, so it must say that too. */
+    /* ... and so is zero-copy receive. */
     if (p->ops[i].op == IOU_OP_RECV_ZC)
-      zc_reported = (p->ops[i].flags & IO_URING_OP_SUPPORTED) == 0;
+      zc_reported = (p->ops[i].flags & IO_URING_OP_SUPPORTED) != 0;
   }
   judge("probe",
         p->ops_len > 0 && nop_ok && read_ok && openat_ok && statx_ok &&
@@ -1010,12 +1013,12 @@ static void check_probe(void) {
         "the probe does not tell the truth about which opcodes work",
         (long)p->ops_len);
 
-  /* And an opcode the probe calls unsupported must say so rather than do
-   * something. */
+  /* And an opcode past the last one the probe names must say so rather than
+   * do something. */
   struct io_uring_cqe cqe;
   struct io_uring_sqe *sqe = sq_get(&r);
 
-  sqe->opcode = IOU_OP_RECV_ZC;
+  sqe->opcode = (unsigned char)p->ops_len;
   sqe->fd = -1;
   sqe->user_data = 61;
   rc = submit_wait(&r, 1, &cqe);
@@ -3753,6 +3756,334 @@ static void check_affinity(void) {
   ring_free(&r);
 }
 
+/* IORING_REGISTER_NAPI, spelled out: the header this is built against may
+ * predate it. */
+#define IOU_REG_NAPI 27
+#define IOU_UNREG_NAPI 28
+struct iou_napi {
+  unsigned int busy_poll_to;
+  unsigned char prefer_busy_poll;
+  unsigned char opcode;
+  unsigned char pad[2];
+  unsigned int op_param;
+  unsigned int resv;
+};
+
+static int napi_reg(int fd, unsigned op, unsigned opcode, unsigned param,
+                    unsigned us, struct iou_napi *back) {
+  struct iou_napi n;
+
+  memset(&n, 0, sizeof(n));
+  n.busy_poll_to = us;
+  n.prefer_busy_poll = 1;
+  n.opcode = (unsigned char)opcode;
+  n.op_param = param;
+  int rc = io_uring_register_(fd, op, &n, 1);
+
+  if (back)
+    *back = n;
+  return rc;
+}
+
+/* NAPI busy polling: the settings go in and come back as Linux's
+ * io_register_napi hands them back, the STATIC list refuses what it should,
+ * and a wait that busy-polls still reaps a datagram that arrives during it. */
+static void check_napi(void) {
+  struct ring r;
+  struct iou_napi back;
+  int rc;
+
+  if (ring_make(&r, 8, 0, 0) < 0) {
+    bad("napi", "no ring", 0);
+    return;
+  }
+  rc = napi_reg(r.fd, IOU_REG_NAPI, 0, 0, 50, &back);
+  int first = rc == 0 && back.op_param == 255 && back.busy_poll_to == 0;
+
+  rc = napi_reg(r.fd, IOU_REG_NAPI, 0, 1, 1000, &back);
+  int second = rc == 0 && back.op_param == 0 && back.busy_poll_to == 50 &&
+               back.prefer_busy_poll == 1;
+  int low_id = napi_reg(r.fd, IOU_REG_NAPI, 1, 1, 0, 0) < 0 && errno == EINVAL;
+  int add = napi_reg(r.fd, IOU_REG_NAPI, 1, 1000, 0, 0) == 0;
+  int dup = napi_reg(r.fd, IOU_REG_NAPI, 1, 1000, 0, 0) < 0 && errno == EEXIST;
+  int del = napi_reg(r.fd, IOU_REG_NAPI, 2, 1000, 0, 0) == 0;
+  int gone = napi_reg(r.fd, IOU_REG_NAPI, 2, 1000, 0, 0) < 0 && errno == ENOENT;
+  struct iou_napi padded;
+
+  memset(&padded, 0, sizeof(padded));
+  padded.pad[0] = 1;
+  int pad = io_uring_register_(r.fd, IOU_REG_NAPI, &padded, 1) < 0 &&
+            errno == EINVAL;
+
+  rc = napi_reg(r.fd, IOU_UNREG_NAPI, 0, 0, 0, &back);
+  int undo = rc == 0 && back.op_param == 1 && back.busy_poll_to == 1000;
+
+  judge("napi-register",
+        first && second && low_id && add && dup && del && gone && pad && undo,
+        "IORING_(UN)REGISTER_NAPI did not hand back the settings in force or "
+        "refuse what Linux refuses", (long)rc);
+
+  /* DYNAMIC tracking with 2 ms of busy polling, and a receive armed on a UDP
+   * socket: the datagram a child sends while the parent waits completes it. */
+  int a = socket(AF_INET, SOCK_DGRAM, 0), b = socket(AF_INET, SOCK_DGRAM, 0);
+  struct sockaddr_in sa;
+  socklen_t sl = sizeof(sa);
+  char buf[16] = "";
+  int got_it = 0;
+
+  memset(&sa, 0, sizeof(sa));
+  sa.sin_family = AF_INET;
+  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (a >= 0 && b >= 0 && bind(a, (struct sockaddr *)&sa, sizeof(sa)) == 0 &&
+      getsockname(a, (struct sockaddr *)&sa, &sl) == 0 &&
+      napi_reg(r.fd, IOU_REG_NAPI, 0, 0, 2000, 0) == 0) {
+    struct io_uring_sqe *sqe = sq_get(&r);
+    struct io_uring_cqe cqe;
+
+    sqe->opcode = IORING_OP_RECV;
+    sqe->fd = a;
+    sqe->addr = (unsigned long long)(unsigned long)buf;
+    sqe->len = sizeof(buf);
+    sqe->user_data = 0x4e;
+    pid_t pid = fork();
+
+    if (pid == 0) {
+      usleep(5000);
+      sendto(b, "napi", 4, 0, (struct sockaddr *)&sa, sizeof(sa));
+      _exit(0);
+    }
+    rc = io_uring_enter_(r.fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0);
+    got_it = rc >= 0 && cq_get(&r, &cqe) && cqe.user_data == 0x4e &&
+             cqe.res == 4 && memcmp(buf, "napi", 4) == 0;
+    if (pid > 0)
+      waitpid(pid, 0, 0);
+  }
+  judge("napi-busy-wait", got_it,
+        "a wait that busy-polls did not reap the datagram that arrived during it",
+        (long)rc);
+  if (a >= 0)
+    close(a);
+  if (b >= 0)
+    close(b);
+  ring_free(&r);
+}
+
+/* Zero-copy receive, spelled out for the same reason as NAPI. */
+#define IOU_REG_ZCRX 32
+#define IOU_OP_RECV_ZC_ 58
+struct zc_area { unsigned long long addr, len, token; unsigned flags, dmabuf_fd; unsigned long long resv2[2]; };
+struct zc_region { unsigned long long user_addr, size; unsigned flags, id; unsigned long long mmap_offset, resv[4]; };
+struct zc_offsets { unsigned head, tail, rqes, resv2; unsigned long long resv[2]; };
+struct zc_reg {
+  unsigned if_idx, if_rxq, rq_entries, flags;
+  unsigned long long area_ptr, region_ptr;
+  struct zc_offsets offsets;
+  unsigned zcrx_id, resv2;
+  unsigned long long resv[3];
+};
+struct zc_rqe { unsigned long long off; unsigned len, pad; };
+
+/* The next 32-byte CQE of a CQE32 ring, or 0. */
+static int cq_get32(struct ring *r, struct io_uring_cqe *out, unsigned long long *off) {
+  unsigned head = __atomic_load_n(r->cq_head, __ATOMIC_RELAXED);
+  unsigned tail = __atomic_load_n(r->cq_tail, __ATOMIC_ACQUIRE);
+
+  if (head == tail)
+    return 0;
+  char *c = (char *)r->cqes + (size_t)(head & *r->cq_mask) * 32;
+
+  memcpy(out, c, 16);
+  memcpy(off, c + 16, 8);
+  __atomic_store_n(r->cq_head, head + 1, __ATOMIC_RELEASE);
+  return 1;
+}
+
+/* One transfer of `n` bytes through RECV_ZC: each completion's bytes are
+ * checked where its offset says they are, and the page goes straight back
+ * through the refill ring. Returns the bytes seen, or -1. */
+static long zc_take(struct ring *r, int cli, const unsigned char *area,
+                    char *rq, struct zc_reg *reg, size_t n, unsigned char seed,
+                    int *ended) {
+  unsigned char *pat = malloc(n);
+  size_t seen = 0;
+
+  if (!pat)
+    return -1;
+  for (size_t i = 0; i < n; i++)
+    pat[i] = (unsigned char)(seed + i * 13);
+  if (send(cli, pat, n, 0) != (ssize_t)n) {
+    free(pat);
+    return -1;
+  }
+  for (int spin = 0; spin < 2000 && seen < n; spin++) {
+    struct io_uring_cqe cqe;
+    unsigned long long off;
+
+    io_uring_enter_(r->fd, 0, 1, IORING_ENTER_GETEVENTS, 0, 0);
+    while (cq_get32(r, &cqe, &off)) {
+      if (cqe.res <= 0 || !(cqe.flags & IORING_CQE_F_MORE) ||
+          seen + (size_t)cqe.res > n ||
+          memcmp(area + off, pat + seen, (size_t)cqe.res) != 0) {
+        *ended = 1;
+        free(pat);
+        return -1;
+      }
+      seen += (size_t)cqe.res;
+      /* Give the page back. */
+      unsigned tail = *(volatile unsigned *)(rq + reg->offsets.tail);
+      struct zc_rqe *e = (struct zc_rqe *)(rq + reg->offsets.rqes) +
+                         (tail & (reg->rq_entries - 1));
+
+      e->off = off & ~4095ull;
+      e->len = 4096;
+      __atomic_store_n((unsigned *)(rq + reg->offsets.tail), tail + 1,
+                       __ATOMIC_RELEASE);
+    }
+  }
+  free(pat);
+  return (long)seen;
+}
+
+static void check_zcrx(void) {
+  struct ring r;
+  struct zc_area area;
+  struct zc_region rg;
+  struct zc_reg reg;
+  const size_t area_len = 8 * 4096;
+  unsigned char *abuf = mmap(0, area_len, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  char *rq = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                  -1, 0);
+  unsigned lo = if_nametoindex("lo");
+  int rc;
+
+  if (abuf == MAP_FAILED || rq == MAP_FAILED || !lo) {
+    bad("zcrx-register", "no memory or no lo", (long)lo);
+    return;
+  }
+#define ZC_RESET()                                                           \
+  do {                                                                       \
+    memset(&area, 0, sizeof(area));                                          \
+    memset(&rg, 0, sizeof(rg));                                              \
+    memset(&reg, 0, sizeof(reg));                                            \
+    area.addr = (unsigned long long)(unsigned long)abuf;                     \
+    area.len = area_len;                                                     \
+    rg.user_addr = (unsigned long long)(unsigned long)rq;                    \
+    rg.size = 4096;                                                          \
+    rg.flags = 1; /* IORING_MEM_REGION_TYPE_USER */                          \
+    reg.if_idx = lo;                                                         \
+    reg.rq_entries = 8;                                                      \
+    reg.area_ptr = (unsigned long long)(unsigned long)&area;                 \
+    reg.region_ptr = (unsigned long long)(unsigned long)&rg;                 \
+  } while (0)
+
+  /* A ring without DEFER_TASKRUN and CQE32 cannot have one. */
+  int plain_refused = 0;
+
+  if (ring_make(&r, 8, 0, 0) == 0) {
+    ZC_RESET();
+    plain_refused = io_uring_register_(r.fd, IOU_REG_ZCRX, &reg, 1) < 0 &&
+                    errno == EINVAL;
+    ring_free(&r);
+  }
+  if (ring_make(&r, 8,
+                IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SINGLE_ISSUER |
+                    IORING_SETUP_CQE32,
+                0) < 0) {
+    bad("zcrx-register", "no DEFER_TASKRUN CQE32 ring", 0);
+    return;
+  }
+  ZC_RESET();
+  area.addr += 1;
+  int unaligned = io_uring_register_(r.fd, IOU_REG_ZCRX, &reg, 1) < 0 &&
+                  errno == EINVAL;
+  ZC_RESET();
+  reg.rq_entries = 4096; /* 128 + 16 * 4096 is past one page */
+  int small = io_uring_register_(r.fd, IOU_REG_ZCRX, &reg, 1) < 0 &&
+              errno == EINVAL;
+  ZC_RESET();
+  reg.if_idx = 999;
+  int nodev = io_uring_register_(r.fd, IOU_REG_ZCRX, &reg, 1) < 0 &&
+              errno == ENODEV;
+  ZC_RESET();
+  reg.if_rxq = 1;
+  int noq = io_uring_register_(r.fd, IOU_REG_ZCRX, &reg, 1) < 0 &&
+            errno == EINVAL;
+  ZC_RESET();
+  rc = io_uring_register_(r.fd, IOU_REG_ZCRX, &reg, 1);
+  int good = rc == 0 && reg.offsets.rqes >= 128 && reg.offsets.tail != reg.offsets.head &&
+             area.token == 0;
+
+  judge("zcrx-register",
+        plain_refused && unaligned && small && nodev && noq && good,
+        "IORING_REGISTER_ZCRX_IFQ did not refuse what Linux refuses, or did "
+        "not describe the refill ring", (long)rc);
+  if (!good) {
+    ring_free(&r);
+    return;
+  }
+
+  /* A TCP connection over lo, and one RECV_ZC on the accepted end. */
+  int srv = socket(AF_INET, SOCK_STREAM, 0), cli = socket(AF_INET, SOCK_STREAM, 0);
+  int one = 1, acc = -1, ended = 0;
+  struct sockaddr_in sa;
+  socklen_t sl = sizeof(sa);
+
+  memset(&sa, 0, sizeof(sa));
+  sa.sin_family = AF_INET;
+  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  if (srv >= 0 && cli >= 0 && bind(srv, (struct sockaddr *)&sa, sizeof(sa)) == 0 &&
+      getsockname(srv, (struct sockaddr *)&sa, &sl) == 0 && listen(srv, 1) == 0 &&
+      connect(cli, (struct sockaddr *)&sa, sizeof(sa)) == 0)
+    acc = accept(srv, 0, 0);
+  long first = -1, second = -1;
+  int eof_ok = 0;
+
+  if (acc >= 0) {
+    struct io_uring_sqe *sqe = sq_get(&r);
+
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IOU_OP_RECV_ZC_;
+    sqe->fd = acc;
+    sqe->ioprio = IORING_RECV_MULTISHOT;
+    /* zcrx_ifq_idx shares the word after buf_index/personality/splice_fd_in */
+    ((unsigned *)sqe)[11] = reg.zcrx_id;
+    sqe->user_data = 0x7a;
+    io_uring_enter_(r.fd, 1, 0, 0, 0, 0);
+    /* Six pages in flight at most, of eight: the second transfer only fits
+     * if the first one's pages came back through the refill ring. */
+    first = zc_take(&r, cli, abuf, rq, &reg, 6 * 4096, 1, &ended);
+    second = zc_take(&r, cli, abuf, rq, &reg, 6 * 4096, 7, &ended);
+    /* The end of the stream ends the request: a last CQE, 0, no F_MORE. */
+    shutdown(cli, SHUT_WR);
+    for (int spin = 0; spin < 2000 && !eof_ok && !ended; spin++) {
+      struct io_uring_cqe cqe;
+      unsigned long long off;
+
+      io_uring_enter_(r.fd, 0, 1, IORING_ENTER_GETEVENTS, 0, 0);
+      while (cq_get32(&r, &cqe, &off))
+        if (cqe.user_data == 0x7a && cqe.res == 0 &&
+            !(cqe.flags & IORING_CQE_F_MORE))
+          eof_ok = 1;
+    }
+  }
+  printf("M125-SMOKE:   zcrx transfers %ld and %ld bytes, end %d\n", first,
+         second, eof_ok);
+  judge("recv-zc",
+        first == 6 * 4096 && second == 6 * 4096 && eof_ok,
+        "RECV_ZC did not put the stream into the area where its completions "
+        "said, take pages back through the refill ring, or end at EOF",
+        first);
+  if (acc >= 0)
+    close(acc);
+  close(cli);
+  close(srv);
+  ring_free(&r);
+  munmap(abuf, area_len);
+  munmap(rq, 4096);
+}
+
 int main(void) {
   printf("M125-SMOKE: start\n");
   fflush(stdout);
@@ -3810,6 +4141,8 @@ int main(void) {
   check_personality();
   check_resize_and_query();
   check_affinity();
+  check_napi();
+  check_zcrx();
 
   printf("M125-SMOKE: done\n");
   fflush(stdout);

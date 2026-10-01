@@ -367,6 +367,10 @@ struct syscall_msghdr;
 u64 syscall_sendmsg_user(int fd, const struct syscall_msghdr *user_msg,
                          int flags);
 u64 syscall_recvmsg_user(int fd, struct syscall_msghdr *user_msg, int flags);
+u64 syscall_sendmsg_user_at(int fd, const struct syscall_msghdr *user_msg,
+                            int flags, usize skip, usize *want);
+u64 syscall_recvmsg_user_at(int fd, struct syscall_msghdr *user_msg, int flags,
+                            usize skip, usize *want);
 u64 syscall_recvmsg_user_buf(int fd, struct syscall_msghdr *user_msg,
                              int flags, u64 buf, usize buf_len);
 u64 syscall_recvmsg_user_mshot(int fd, struct syscall_msghdr *user_msg,

@@ -179,9 +179,8 @@ distribution must not inherit.
 
 Kernel work does not stop for the phases. What each remaining gap costs the
 distribution is in [../kernel/abi-gaps.md](../kernel/abi-gaps.md). M125
-(io_uring) and M126 (perf, eBPF) are closed. What the phases below actually
-wait on is kernel milestone **M133**, which collects every gap in that table no
-other milestone owns — UEFI boot above all, and the four Debian units that
-still fail. M130 (Wi-Fi) and M135 (the rest of the power management) each land after it as
+(io_uring) and M126 (perf, eBPF) are closed, and so is **M133**, which
+collected every gap in that table no other milestone owned — UEFI boot above
+all, and the Debian units that failed. M130 (Wi-Fi) and M135 (the rest of the power management) each land as
 a `b1nix-kernel` release the overlay ships, and the self-host build lane stays as
 a kernel test on release tags.

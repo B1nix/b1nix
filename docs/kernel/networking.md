@@ -23,6 +23,15 @@ The drivers are virtio-net over PCI and MMIO, e1000/e1000e and r8169. A laptop
 without a serial port sends its kernel log as UDP with
 `b1nix.netconsole=<ip>:<port>` (see `drivers-and-graphics.md`).
 
+Socket calls follow Linux where programs look closely (M133): `MSG_WAITALL`
+waits for the whole buffer on a stream; `sendmsg`/`recvmsg` move a message of
+any size a megabyte-window at a time instead of refusing past 1 MiB;
+`shutdown(SHUT_WR)` on TCP sends its FIN and keeps receiving; descriptors and
+credentials go to the address a datagram `sendmsg` names (systemd's notify
+barrier depends on it); and `SO_ZEROCOPY` reports `MSG_ZEROCOPY` sends on the
+error queue (`MSG_ERRQUEUE`, `POLLERR`) as copied ranges. Loopback TCP still
+segments at 1460 bytes, which bounds its throughput.
+
 ## Network namespaces
 
 A network interface belongs to exactly one namespace, and a veth pair is the

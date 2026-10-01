@@ -1559,6 +1559,8 @@ void net_loopback_release(void)
 	net_loopback_drain();
 }
 
+static void net_poll_devices(void);
+
 void net_poll(void)
 {
 	/* Drain loopback first, and unconditionally — loopback must work even
@@ -1569,7 +1571,21 @@ void net_poll(void)
 		return;
 
 	tcp_timer_tick();
+	net_poll_devices();
+}
 
+/* What a busy poller spins on (io_uring's IORING_REGISTER_NAPI): the loopback
+ * queue and every interface's receive ring, without net_poll's walk of every
+ * connection's timers, which is the net task's to run. */
+void net_busy_poll(void)
+{
+	net_loopback_drain();
+	if (g_netdev)
+		net_poll_devices();
+}
+
+static void net_poll_devices(void)
+{
 	/* Restores what was there rather than clearing it: a sender waiting for
 	 * ARP inside a delivery polls from here, and the delivery it returns to
 	 * still needs its own receiving interface. */

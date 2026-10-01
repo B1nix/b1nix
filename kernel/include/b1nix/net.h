@@ -23,6 +23,9 @@ struct in6_addr_k {
 
 void net_init(void);
 void net_poll(void);
+/* One pass over the loopback queue and every interface's receive ring, for a
+ * caller that busy-polls instead of sleeping. */
+void net_busy_poll(void);
 /* Loopback (127.0.0.0/8, ::1) datagrams are NOT delivered synchronously inside
  * the sender's call stack — that recursion (ipv4_send -> ipv4_receive ->
  * tcp_input -> tcp_send -> ipv4_send -> ...) re-enters the TCP state machine
@@ -261,6 +264,7 @@ int tcp_connect_error(struct tcp_conn *conn);
 int tcp_is_readable(struct tcp_conn *conn);
 usize tcp_bytes_available(struct tcp_conn *conn);
 int tcp_is_close_wait(struct tcp_conn *conn);
+int tcp_is_fin_wait(struct tcp_conn *conn);
 int tcp_is_closed(struct tcp_conn *conn);
 int tcp_send(struct tcp_conn *conn, const void *data, usize len);
 /* SO_RCVBUF for an established connection: caps the receive buffer and the
@@ -278,6 +282,8 @@ int tcp_set_user_timeout(struct tcp_conn *conn, u32 ms);
 u32 tcp_get_keepalive_param(struct tcp_conn *conn, int which);
 int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags);
 int tcp_close(struct tcp_conn *conn);
+/* shutdown(SHUT_WR): send the FIN, keep receiving. */
+int tcp_shutdown_write(struct tcp_conn *conn);
 /* Claim a connection slot for a listener (or 0 when the pool is exhausted). The
  * returned conn is stored on the socket state so a later close() reclaims it. */
 struct tcp_conn *tcp_listen(u16 local_port, int backlog);
@@ -533,6 +539,10 @@ isize unix_recv(struct vfs_socket_state *s, void *buf, usize len);
 isize unix_send_control(struct vfs_socket_state *s, const void *buf, usize len,
                         struct vfs_handle **handles, usize nhandles,
                         const struct b1nix_ucred *cred, int nonblock);
+isize unix_send_control_to(struct vfs_socket_state *s, const void *buf,
+                           usize len, struct vfs_handle **handles,
+                           usize nhandles, const struct b1nix_ucred *cred,
+                           int nonblock, const struct b1nix_sockaddr_un *dest);
 isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
                         int flags, struct vfs_handle **handles,
                         usize *nhandles, struct b1nix_ucred *cred,

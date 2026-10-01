@@ -356,6 +356,10 @@ struct tcp_conn {
   u32 ooo_bytes;
   u32 ooo_segs;
   int handed_to_user;
+  /* shutdown(SHUT_WR): our FIN went out while the socket stays open. The
+   * connection outlives TIME_WAIT until the socket is closed -- its reader may
+   * still be draining what the peer sent -- and a close sends no second FIN. */
+  u8 shut_wr;
   /* Passively opened: this connection was created by a SYN arriving at a
    * listener, not by a connect(2) of ours. A locally initiated connection can
    * share a listener's port number (tcp_alloc_port hands out ephemerals from
@@ -1431,6 +1435,19 @@ int tcp_is_close_wait(struct tcp_conn *conn) {
   return res;
 }
 
+/* Our write half closed by shutdown(SHUT_WR), the peer's still open. */
+int tcp_is_fin_wait(struct tcp_conn *conn) {
+  if (!conn)
+    return 0;
+  u64 irq = irq_save();
+  tcp_lock();
+  int res = conn->used && conn->shut_wr &&
+            (conn->state == TCP_FIN_WAIT1 || conn->state == TCP_FIN_WAIT2);
+  tcp_unlock();
+  irq_restore(irq);
+  return res;
+}
+
 int tcp_is_closed(struct tcp_conn *conn) {
   if (!conn)
     return 1;
@@ -1802,6 +1819,97 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags) {
 }
 
 /* ── TCP close ── */
+/* Queue and emit our FIN, moving the connection to `next_state`. Called
+ * without the TCP lock; returns -1 when the connection went away meanwhile. */
+static int tcp_send_fin(struct tcp_conn *conn, int next_state) {
+  struct tcp_retransmit_pkt *rp = kmalloc(sizeof(struct tcp_retransmit_pkt));
+  u64 irq;
+
+  if (!rp)
+    return -1;
+  rp->data = kmalloc(sizeof(struct tcp_header));
+  if (!rp->data) {
+    kfree(rp);
+    return -1;
+  }
+
+  irq = irq_save();
+  tcp_lock();
+
+  if (!conn->used) {
+    /* Freed by the retransmit/connect-abort paths between the two lock
+     * acquisitions (the allocations above run outside the lock). */
+    tcp_unlock();
+    irq_restore(irq);
+    kfree(rp->data);
+    kfree(rp);
+    return -1;
+  }
+
+  u8 packet[sizeof(struct tcp_header)];
+  memset(packet, 0, sizeof(packet));
+  struct tcp_header *tcp = (struct tcp_header *)packet;
+  tcp->src_port = bswap16(conn->local_port);
+  tcp->dst_port = bswap16(conn->remote_port);
+  tcp->seq_num = bswap32(conn->snd_nxt);
+  tcp->ack_num = bswap32(conn->rcv_nxt);
+  tcp->data_offset = (5 << 4);
+  tcp->flags = TCP_FIN | TCP_ACK;
+  tcp->window = bswap16(tcp_adv_window(conn));
+
+  u32 seq_start = conn->snd_nxt;
+  conn->state = next_state;
+  conn->snd_nxt++;
+
+  // Set up rp under lock
+  memcpy(rp->data, packet, sizeof(packet));
+  rp->len = sizeof(packet);
+  rp->seq = seq_start;
+  rp->timestamp = scheduler_get_uptime_ticks();
+  rp->dlen = 1;
+  rp->sacked = 0;
+  rp->retries = 0;
+  rp->next = 0;
+
+  // Insert rp into queue
+  struct tcp_retransmit_pkt **prev = &conn->retransmit_queue;
+  while (*prev)
+    prev = &(*prev)->next;
+  *prev = rp;
+
+  tcp_unlock();
+  irq_restore(irq);
+
+  // Emit FIN segment outside the lock (calls kzalloc, loopback enqueue)
+  tcp_conn_emit(conn, packet, sizeof(packet));
+  return 0;
+}
+
+/* shutdown(SHUT_WR) on a connected socket: the FIN goes out now, so the peer
+ * reads the end of the stream, and our side can still receive (FIN_WAIT1/2
+ * take data like ESTABLISHED). From CLOSE_WAIT the peer is done too, and ours
+ * is the last FIN. Anything else has no write half left to close. */
+int tcp_shutdown_write(struct tcp_conn *conn) {
+  u64 irq;
+  int next;
+
+  if (!conn || !conn->used)
+    return -1;
+  irq = irq_save();
+  tcp_lock();
+  if (conn->shut_wr || (conn->state != TCP_ESTABLISHED &&
+                        conn->state != TCP_CLOSE_WAIT)) {
+    tcp_unlock();
+    irq_restore(irq);
+    return 0;
+  }
+  next = conn->state == TCP_CLOSE_WAIT ? TCP_LAST_ACK : TCP_FIN_WAIT1;
+  conn->shut_wr = 1;
+  tcp_unlock();
+  irq_restore(irq);
+  return tcp_send_fin(conn, next);
+}
+
 int tcp_close(struct tcp_conn *conn) {
   if (!conn || !conn->used)
     return -1;
@@ -1826,6 +1934,29 @@ int tcp_close(struct tcp_conn *conn) {
     return 0;
   }
 
+  /* Half-closed already: the FIN is out, and the socket closing now only
+   * lets the connection go -- at once if it is over, through TIME_WAIT's
+   * timer otherwise. */
+  if (conn->shut_wr) {
+    conn->shut_wr = 0;
+    if (conn->state == TCP_TIME_WAIT)
+      tcp_enter_time_wait(conn);
+    int done = conn->state == TCP_CLOSED;
+    tcp_unlock();
+    irq_restore(irq);
+    if (!done)
+      goto wait_fin_ack;
+    tcp_clear_retransmit_queue(conn);
+    tcp_clear_ooo_queue(conn);
+    tcp_free_recv_buf(conn);
+    irq = irq_save();
+    tcp_lock();
+    conn->used = 0;
+    tcp_unlock();
+    irq_restore(irq);
+    return 0;
+  }
+
   if (conn->state == TCP_CLOSE_WAIT) {
     conn->state = TCP_LAST_ACK;
   }
@@ -1833,65 +1964,10 @@ int tcp_close(struct tcp_conn *conn) {
   tcp_unlock();
   irq_restore(irq);
 
-  struct tcp_retransmit_pkt *rp = kmalloc(sizeof(struct tcp_retransmit_pkt));
-  if (!rp)
+  if (tcp_send_fin(conn, TCP_FIN_WAIT1) < 0)
     return -1;
-  rp->data = kmalloc(sizeof(struct tcp_header));
-  if (!rp->data) {
-    kfree(rp);
-    return -1;
-  }
 
-  irq = irq_save();
-  tcp_lock();
-
-  if (!conn->used) {
-    /* Freed by the retransmit/connect-abort paths between the two lock
-     * acquisitions (the allocations above run outside the lock). */
-    tcp_unlock();
-    irq_restore(irq);
-    kfree(rp->data);
-    kfree(rp);
-    return -1;
-  }
-
-  /* Send FIN */
-  u8 packet[sizeof(struct tcp_header)];
-  memset(packet, 0, sizeof(packet));
-  struct tcp_header *tcp = (struct tcp_header *)packet;
-  tcp->src_port = bswap16(conn->local_port);
-  tcp->dst_port = bswap16(conn->remote_port);
-  tcp->seq_num = bswap32(conn->snd_nxt);
-  tcp->ack_num = bswap32(conn->rcv_nxt);
-  tcp->data_offset = (5 << 4);
-  tcp->flags = TCP_FIN | TCP_ACK;
-  tcp->window = bswap16(tcp_adv_window(conn));
-
-  u32 seq_start = conn->snd_nxt;
-  conn->state = TCP_FIN_WAIT1;
-  conn->snd_nxt++;
-
-  // Set up rp under lock
-  memcpy(rp->data, packet, sizeof(packet));
-  rp->len = sizeof(packet);
-  rp->seq = seq_start;
-  rp->timestamp = scheduler_get_uptime_ticks();
-  rp->dlen = 1;
-  rp->sacked = 0;
-  rp->retries = 0;
-  rp->next = 0;
-
-  // Insert rp into queue
-  struct tcp_retransmit_pkt **prev = &conn->retransmit_queue;
-  while (*prev)
-    prev = &(*prev)->next;
-  *prev = rp;
-
-  tcp_unlock();
-  irq_restore(irq);
-
-  // Emit FIN segment outside the lock (calls kzalloc, loopback enqueue)
-  tcp_conn_emit(conn, packet, sizeof(packet));
+wait_fin_ack:
 
   /* Wait for FIN-ACK (poll a bit) */
   for (int tries = 0; tries < 50; tries++) {
@@ -2673,7 +2749,7 @@ void tcp_timer_tick(void) {
       continue;
     }
 
-    if (conn->state == TCP_TIME_WAIT) {
+    if (conn->state == TCP_TIME_WAIT && !conn->shut_wr) {
       if (now - conn->time_wait_since >= TCP_TIME_WAIT_TICKS) {
         tcp_unlock();
         irq_restore(irq);

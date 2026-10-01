@@ -3573,10 +3573,15 @@ struct syscall_cmsghdr {
  * process that sends a large message. */
 #define SYSCALL_IOV_MAX 64
 
+/* How much of a message's payload is staged in the kernel at a time. A stream
+ * moves a longer message a window after another; a datagram longer than this
+ * is EMSGSIZE, which no datagram socket here could carry anyway. */
+#define MSG_WINDOW (1u << 20)
+
 static int copyin_message(const struct syscall_msghdr *user_msg,
                           struct syscall_msghdr *msg,
                           struct syscall_iovec *iov, char **payload,
-                          usize *payload_len) {
+                          usize *payload_len, usize *total_len) {
   if (!user_msg || syscall_copyin(msg, user_msg, sizeof(*msg)) < 0)
     return -EFAULT;
   /* IOV_MAX is 1024 on Linux; sixteen was our own invention and chromium's
@@ -3592,15 +3597,18 @@ static int copyin_message(const struct syscall_msghdr *user_msg,
                      (usize)msg->msg_iovlen * sizeof(*iov)) < 0)
     return -EFAULT;
 
+  /* The total is Linux's to bound: at most MAX_RW_COUNT, and an iovec whose
+   * lengths add up past ssize_t is EINVAL. It used to be capped at 1 MiB with
+   * EMSGSIZE, which refused a 4 MiB sendmsg over TCP that Linux sends whole;
+   * the payload is now staged a window at a time instead (MSG_WINDOW). */
   usize total = 0;
   for (int i = 0; i < msg->msg_iovlen; i++) {
-    /* A message the size of a frame's metadata or a font list passes here
-     * routinely; 64 KiB turned those into EMSGSIZE, which Mojo reads as a dead
-     * channel rather than something to split. */
-    if (iov[i].iov_len > (1u << 20) || total > (1u << 20) - iov[i].iov_len)
-      return -EMSGSIZE;
+    if (iov[i].iov_len > 0x7ffff000u || total > 0x7ffff000u - iov[i].iov_len)
+      return -EINVAL;
     total += iov[i].iov_len;
   }
+  if (total_len)
+    *total_len = total;
   /* A message with no bytes in it is a message. Linux sends and receives
    * zero-length datagrams, and the ancillary data they carry is the whole
    * point of some of them -- a receiver takes the sender's identity from the
@@ -3611,32 +3619,101 @@ static int copyin_message(const struct syscall_msghdr *user_msg,
     *payload_len = 0;
     return 0;
   }
-  char *buf = kmalloc(total);
+  usize stage = total < MSG_WINDOW ? total : MSG_WINDOW;
+  char *buf = kmalloc(stage);
   if (!buf)
     return -ENOMEM;
   *payload = buf;
-  *payload_len = total;
+  *payload_len = stage;
+  return 0;
+}
+
+/* Copy `len` bytes from `src` into the message's iovec, `skip` bytes in. */
+static int scatter_iov(const struct syscall_iovec *iov, int n, usize skip,
+                       const char *src, usize len) {
+  usize pos = 0, done = 0;
+
+  for (int i = 0; i < n && done < len; i++) {
+    usize ilen = iov[i].iov_len;
+
+    if (pos + ilen <= skip) {
+      pos += ilen;
+      continue;
+    }
+    usize from = pos < skip ? skip - pos : 0;
+    usize chunk = ilen - from;
+
+    if (chunk > len - done)
+      chunk = len - done;
+    if (chunk &&
+        syscall_copyout((char *)iov[i].iov_base + from, src + done, chunk) < 0)
+      return -EFAULT;
+    done += chunk;
+    pos += ilen;
+  }
+  return 0;
+}
+
+/* Copy `len` bytes of the message's iovec, starting `skip` bytes in, to `dst`. */
+static int gather_iov(const struct syscall_iovec *iov, int n, usize skip,
+                      char *dst, usize len) {
+  usize pos = 0, done = 0;
+
+  for (int i = 0; i < n && done < len; i++) {
+    usize ilen = iov[i].iov_len;
+
+    if (pos + ilen <= skip) {
+      pos += ilen;
+      continue;
+    }
+    usize from = pos < skip ? skip - pos : 0;
+    usize chunk = ilen - from;
+
+    if (chunk > len - done)
+      chunk = len - done;
+    if (chunk &&
+        syscall_copyin(dst + done, (const char *)iov[i].iov_base + from,
+                       chunk) < 0)
+      return -EFAULT;
+    done += chunk;
+    pos += ilen;
+  }
   return 0;
 }
 
 u64 syscall_sendmsg_user(int fd, const struct syscall_msghdr *user_msg,
                        int flags) {
+  return syscall_sendmsg_user_at(fd, user_msg, flags, 0, 0);
+}
+
+/* sendmsg of the message's payload from byte `skip` on (io_uring's
+ * MSG_WAITALL carrying on after a partial send); `want` gets the payload's
+ * whole length. A stream longer than MSG_WINDOW goes a window at a time, the
+ * ancillary data with the first; it stops early where a window went out short
+ * -- a non-blocking socket full, or a signal -- and reports what did go. */
+u64 syscall_sendmsg_user_at(int fd, const struct syscall_msghdr *user_msg,
+                            int flags, usize skip, usize *want) {
   struct syscall_msghdr msg;
   struct syscall_iovec iov[SYSCALL_IOV_MAX];
   char *payload = 0;
   usize payload_len = 0;
-  int err = copyin_message(user_msg, &msg, iov, &payload, &payload_len);
+  usize total = 0;
+  int err = copyin_message(user_msg, &msg, iov, &payload, &payload_len, &total);
   if (err < 0)
     return (u64)err;
-
-  usize off = 0;
-  for (int i = 0; i < msg.msg_iovlen; i++) {
-    if (iov[i].iov_len &&
-        syscall_copyin(payload + off, iov[i].iov_base, iov[i].iov_len) < 0) {
-      kfree(payload);
-      return (u64)-EFAULT;
-    }
-    off += iov[i].iov_len;
+  if (want)
+    *want = total;
+  if (skip > total)
+    skip = total;
+  if (total - skip > MSG_WINDOW &&
+      (vfs_socket_is_dgram(fd) || vfs_socket_sends_empty_messages(fd))) {
+    kfree(payload);
+    return (u64)-EMSGSIZE;
+  }
+  payload_len = total - skip < payload_len ? total - skip : payload_len;
+  if (gather_iov(iov, msg.msg_iovlen, skip, payload, payload_len) < 0) {
+    kfree(payload);
+    return (u64)-EFAULT;
   }
 
   struct vfs_handle *handles[VFS_SCM_MAX_FDS] = {0};
@@ -3715,25 +3792,56 @@ u64 syscall_sendmsg_user(int fd, const struct syscall_msghdr *user_msg,
     cred_ptr = &cred;
   }
   isize rc;
-  if (!nhandles && !cred_ptr && msg.msg_name && msg.msg_namelen) {
-    /* sendmsg() with msg_name is sendto() with the address in the header —
-     * the destination applies per message, no connect() required. */
-    u8 kaddr[sizeof(struct b1nix_sockaddr_un)];
-    usize alen = msg.msg_namelen > sizeof(kaddr) ? sizeof(kaddr)
-                                                 : msg.msg_namelen;
+  usize sent = 0;
+  u8 kaddr[sizeof(struct b1nix_sockaddr_un)];
+  usize alen = 0;
+
+  if (msg.msg_name && msg.msg_namelen) {
+    alen = msg.msg_namelen > sizeof(kaddr) ? sizeof(kaddr) : msg.msg_namelen;
     memset(kaddr, 0, sizeof(kaddr));
     if (syscall_copyin(kaddr, msg.msg_name, alen) < 0) {
       err = -EFAULT;
       goto sendmsg_fail;
     }
-    rc = vfs_socket_sendto(fd, payload, payload_len, flags, kaddr, alen);
-  } else {
-    rc = vfs_socket_sendmsg(fd, payload, payload_len, flags, handles, nhandles,
-                            cred_ptr);
   }
-  if (rc >= 0) {
+  /* The path is chosen once, for every window of the message: ancillary data
+   * to a named destination (see vfs_socket_sendmsg_to -- a datagram socket
+   * takes msg_name whether or not it is connected, a stream or seqpacket one
+   * ignores it), a plain sendto, or the connected socket. */
+  int to_named = alen && (nhandles || cred_ptr) && vfs_socket_is_dgram(fd);
+  int plain_to = alen && !nhandles && !cred_ptr;
+
+  for (;;) {
+    if (to_named) {
+      rc = vfs_socket_sendmsg_to(fd, payload, payload_len, flags, handles,
+                                 nhandles, cred_ptr, kaddr, alen);
+    } else if (plain_to) {
+      /* sendmsg() with msg_name is sendto() with the address in the header —
+       * the destination applies per message, no connect() required. */
+      rc = vfs_socket_sendto(fd, payload, payload_len, flags, kaddr, alen);
+    } else {
+      rc = vfs_socket_sendmsg(fd, payload, payload_len, flags, handles,
+                              nhandles, cred_ptr);
+    }
+    if (rc < 0)
+      break;
+    /* The descriptors and credentials went with the first window. */
+    nhandles = 0;
+    cred_ptr = 0;
+    sent += (usize)rc;
+    if ((usize)rc < payload_len || skip + sent >= total)
+      break;
+    payload_len = total - skip - sent < MSG_WINDOW ? total - skip - sent
+                                                   : MSG_WINDOW;
+    if (gather_iov(iov, msg.msg_iovlen, skip + sent, payload, payload_len) <
+        0) {
+      rc = -EFAULT;
+      break;
+    }
+  }
+  if (rc >= 0 || sent) {
     kfree(payload);
-    return (u64)rc;
+    return (u64)(sent ? sent : (usize)rc);
   }
   err = (int)rc;
 
@@ -3746,10 +3854,31 @@ sendmsg_fail:
 }
 
 static u64 recvmsg_common(int fd, struct syscall_msghdr *user_msg, int flags,
-                          u64 sel_buf, usize sel_len, int mshot);
+                          u64 sel_buf, usize sel_len, int mshot, usize skip);
 
 u64 syscall_recvmsg_user(int fd, struct syscall_msghdr *user_msg, int flags) {
-  return recvmsg_common(fd, user_msg, flags, 0, 0, 0);
+  return recvmsg_common(fd, user_msg, flags, 0, 0, 0, 0);
+}
+
+/* recvmsg into the message's iovec from byte `skip` on: io_uring's
+ * MSG_WAITALL, carrying on where the part that has arrived left off. `want`
+ * gets the iovec's whole length. */
+u64 syscall_recvmsg_user_at(int fd, struct syscall_msghdr *user_msg, int flags,
+                            usize skip, usize *want) {
+  if (want) {
+    struct syscall_msghdr m;
+    struct syscall_iovec iov[SYSCALL_IOV_MAX];
+    char *payload = 0;
+    usize len = 0;
+    usize total = 0;
+    int err = copyin_message(user_msg, &m, iov, &payload, &len, &total);
+
+    if (err < 0)
+      return (u64)(i64)err;
+    kfree(payload);
+    *want = total;
+  }
+  return recvmsg_common(fd, user_msg, flags, 0, 0, 0, skip);
 }
 
 /* io_uring's multishot recvmsg: each message goes into one selected buffer as
@@ -3759,7 +3888,7 @@ u64 syscall_recvmsg_user(int fd, struct syscall_msghdr *user_msg, int flags) {
  * is what the completion reports -- Linux's io_recvmsg_multishot. */
 u64 syscall_recvmsg_user_mshot(int fd, struct syscall_msghdr *user_msg,
                                int flags, u64 buf, usize buf_len) {
-  return recvmsg_common(fd, user_msg, flags, buf, buf_len, 1);
+  return recvmsg_common(fd, user_msg, flags, buf, buf_len, 1, 0);
 }
 
 /* recvmsg into one buffer the caller chose instead of the message's iovec:
@@ -3769,7 +3898,7 @@ u64 syscall_recvmsg_user_mshot(int fd, struct syscall_msghdr *user_msg,
  * written back as recvmsg(2) does. */
 u64 syscall_recvmsg_user_buf(int fd, struct syscall_msghdr *user_msg,
                              int flags, u64 buf, usize buf_len) {
-  return recvmsg_common(fd, user_msg, flags, buf, buf_len ? buf_len : 1, 0);
+  return recvmsg_common(fd, user_msg, flags, buf, buf_len ? buf_len : 1, 0, 0);
 }
 
 struct recvmsg_out_abi { /* struct io_uring_recvmsg_out */
@@ -3779,17 +3908,81 @@ struct recvmsg_out_abi { /* struct io_uring_recvmsg_out */
   u32 flags;
 };
 
+/* recvmsg(MSG_ERRQUEUE). The one entry this kernel queues is a MSG_ZEROCOPY
+ * completion, and it comes back as ip_recv_error / ipv6_recv_error give it: no
+ * bytes, one IP_RECVERR (IPV6_RECVERR) control message holding a
+ * sock_extended_err and an empty offender address, MSG_ERRQUEUE in msg_flags.
+ * An empty queue is EAGAIN. */
+static u64 recvmsg_errqueue(int fd, struct syscall_msghdr *user_msg,
+                            struct syscall_msghdr *msg) {
+  struct {
+    u32 ee_errno;
+    u8 ee_origin;
+    u8 ee_type;
+    u8 ee_code;
+    u8 ee_pad;
+    u32 ee_info;
+    u32 ee_data;
+    u8 offender[28]; /* sockaddr_in6; a sockaddr_in is the first 16 */
+  } ee;
+  u32 lo = 0, hi = 0;
+  int family = 0;
+  int rc = vfs_socket_errqueue_zc(fd, &lo, &hi, &family);
+
+  if (rc < 0)
+    return (u64)(i64)rc;
+  memset(&ee, 0, sizeof(ee));
+  ee.ee_origin = 5; /* SO_EE_ORIGIN_ZEROCOPY */
+  ee.ee_code = 1;   /* SO_EE_CODE_ZEROCOPY_COPIED: every send here copies */
+  ee.ee_info = lo;
+  ee.ee_data = hi;
+
+  int v6 = family == B1NIX_AF_INET6;
+  usize data_len = 16 + (v6 ? 28u : 16u);
+  usize hdr = K_CMSG_ALIGN(sizeof(struct syscall_cmsghdr));
+  usize need = hdr + data_len;
+  usize used = 0;
+  int out_flags = B1NIX_MSG_ERRQUEUE;
+
+  if (msg->msg_control && msg->msg_controllen >= need) {
+    struct syscall_cmsghdr c;
+
+    c.cmsg_len = need;
+    c.cmsg_level = v6 ? 41 : 0; /* SOL_IPV6 : SOL_IP */
+    c.cmsg_type = v6 ? 25 : 11; /* IPV6_RECVERR : IP_RECVERR */
+    if (syscall_copyout(msg->msg_control, &c, sizeof(c)) < 0 ||
+        syscall_copyout((char *)msg->msg_control + hdr, &ee, data_len) < 0)
+      return (u64)-EFAULT;
+    used = K_CMSG_ALIGN(need);
+    if (used > msg->msg_controllen)
+      used = msg->msg_controllen;
+  } else {
+    out_flags |= K_MSG_CTRUNC;
+  }
+  msg->msg_namelen = 0;
+  msg->msg_controllen = used;
+  msg->msg_flags = out_flags;
+  if (syscall_copyout(user_msg, msg, sizeof(*msg)) < 0)
+    return (u64)-EFAULT;
+  return 0;
+}
+
 static u64 recvmsg_common(int fd, struct syscall_msghdr *user_msg, int flags,
-                          u64 sel_buf, usize sel_len, int mshot) {
+                          u64 sel_buf, usize sel_len, int mshot, usize skip) {
   usize mshot_hdr = 0;
 
   struct syscall_msghdr msg;
   struct syscall_iovec iov[SYSCALL_IOV_MAX];
   char *payload = 0;
   usize payload_len = 0;
-  int err = copyin_message(user_msg, &msg, iov, &payload, &payload_len);
+  usize total = 0;
+  int err = copyin_message(user_msg, &msg, iov, &payload, &payload_len, &total);
   if (err < 0)
     return (u64)err;
+  if ((flags & B1NIX_MSG_ERRQUEUE) && !mshot && !sel_len) {
+    kfree(payload);
+    return recvmsg_errqueue(fd, user_msg, &msg);
+  }
   if (mshot) {
     mshot_hdr = sizeof(struct recvmsg_out_abi) + (usize)msg.msg_namelen +
                 (usize)msg.msg_controllen;
@@ -3824,6 +4017,14 @@ static u64 recvmsg_common(int fd, struct syscall_msghdr *user_msg, int flags,
     iov[0].iov_base = (void *)(usize)sel_buf;
     iov[0].iov_len = cap;
     msg.msg_iovlen = 1;
+  }
+  /* The first `skip` bytes of the iovec are already filled: read only what
+   * is left, and put it after them. */
+  if (skip) {
+    if (skip > total)
+      skip = total;
+    if (total - skip < payload_len)
+      payload_len = total - skip;
   }
 
   usize header_space = K_CMSG_ALIGN(sizeof(struct syscall_cmsghdr));
@@ -3865,17 +4066,59 @@ static u64 recvmsg_common(int fd, struct syscall_msghdr *user_msg, int flags,
       scheduler_fd_flags_set(received_fds[i], B1NIX_FD_CLOEXEC);
 
   usize copied = 0;
+  usize pos = 0; /* where in the iovec iov[i] starts */
   for (int i = 0; i < msg.msg_iovlen && copied < (usize)rc; i++) {
-    usize chunk = iov[i].iov_len;
+    usize from = 0;
+
+    if (pos + iov[i].iov_len <= skip) {
+      pos += iov[i].iov_len;
+      continue;
+    }
+    if (pos < skip)
+      from = skip - pos;
+    pos += iov[i].iov_len;
+    usize chunk = iov[i].iov_len - from;
     if (chunk > (usize)rc - copied)
       chunk = (usize)rc - copied;
-    if (chunk && syscall_copyout(iov[i].iov_base, payload + copied, chunk) < 0) {
+    if (chunk && syscall_copyout((char *)iov[i].iov_base + from, payload + copied,
+                                 chunk) < 0) {
       for (usize j = 0; j < received_count; j++)
         vfs_close(received_fds[j]);
       kfree(payload);
       return (u64)-EFAULT;
     }
     copied += chunk;
+  }
+  /* MSG_WAITALL on a stream longer than one staging window: the next window,
+   * and the next, until the iovec is full -- the wait recv(2) gives, for a
+   * message the size of what sendmsg now sends. A window that comes back
+   * short (the end of the stream, a signal) ends it, and so does a message
+   * that brought descriptors. */
+  if ((flags & B1NIX_MSG_WAITALL) && !mshot && !sel_len && !received_count &&
+      !vfs_socket_is_dgram(fd) && !vfs_socket_sends_empty_messages(fd)) {
+    usize got = (usize)rc, win = payload_len;
+    int full = (usize)rc == win;
+
+    while (full && skip + got < total) {
+      usize cnt = 0;
+      int more_cred = 0, more_trunc = 0;
+      struct b1nix_ucred c2;
+      isize r2;
+
+      win = total - skip - got < MSG_WINDOW ? total - skip - got : MSG_WINDOW;
+      r2 = vfs_socket_recvmsg(fd, payload, win, flags, received_fds, 0, &cnt,
+                              &c2, &more_cred, &more_trunc);
+      if (r2 <= 0)
+        break;
+      if (scatter_iov(iov, msg.msg_iovlen, skip + got, payload, (usize)r2) <
+          0) {
+        kfree(payload);
+        return (u64)-EFAULT;
+      }
+      got += (usize)r2;
+      full = (usize)r2 == win;
+    }
+    rc = (isize)got;
   }
   kfree(payload);
 
