@@ -15,4 +15,11 @@
 struct mmu_notifier;
 struct mmu_notifier_ops;
 struct mmu_interval_notifier;
+struct mm_struct;
+
+/* A host TLB flush of [start, end) in @mm, passed on to a secondary TLB that
+ * shares its page tables (the KVM glue, kernel/lkpi/kvm_mm.c). */
+void mmu_notifier_arch_invalidate_secondary_tlbs(struct mm_struct *mm,
+						 unsigned long start,
+						 unsigned long end);
 #endif

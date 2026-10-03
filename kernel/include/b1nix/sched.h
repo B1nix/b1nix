@@ -427,6 +427,11 @@ void task_set_xsave_area(struct task *t, void *area);
 int scheduler_resched_pending(void);
 void scheduler_note_resched(void);
 int task_fpu_alloc(struct task *t);
+/* The CPU's FP/SIMD registers stop holding the current task's state, and
+ * come back (see sched_fpu_flush_current in kernel/sched/scheduler.c). */
+void sched_fpu_flush_current(void);
+int sched_fpu_foreign(void);
+void sched_fpu_reload_current(void);
 /* The task table has SCHED_MAX_TASKS rows and every side table the scheduler
  * keeps (FPU area, nice, affinity, ...) is indexed by a task's row in it.
  * task_slot_index() hands that row out so another subsystem can keep a

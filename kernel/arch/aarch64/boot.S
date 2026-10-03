@@ -352,6 +352,35 @@ _start_kernel:
 	str w2, [x1]
 #endif
 
+	// A CPU with the Virtualization Host Extensions keeps the kernel here, as
+	// Linux does: with HCR_EL2.E2H the kernel's *_EL1 register accesses reach
+	// the EL2 registers, and with TGE its EL0 runs in the EL2&0 regime. That
+	// is what lets KVM run guests (M131). Without VHE, down to EL1 as before.
+	mrs x0, id_aa64mmfr1_el1
+	ubfx x0, x0, #8, #4		// ID_AA64MMFR1_EL1.VH
+	cbz x0, .el2_to_el1
+	movz x0, #0x8800, lsl #16	// TGE (27) | RW (31)
+	movk x0, #0x0004, lsl #32	// E2H (34)
+	msr hcr_el2, x0
+	isb
+	mrs x0, S3_4_C12_C9_5		// ICC_SRE_EL2
+	orr x0, x0, #0x1		// SRE: GIC system registers at EL2
+	orr x0, x0, #0x8		// Enable: and at EL1
+	msr S3_4_C12_C9_5, x0
+	isb
+	msr cntvoff_el2, xzr		// virtual counter == physical counter
+	// SCTLR_EL1 is SCTLR_EL2 now: MMU and caches off until the kernel's
+	// page tables are up, as on the way down.
+	mrs x0, sctlr_el1
+	bic x0, x0, #(1 << 0)
+	bic x0, x0, #(1 << 1)
+	bic x0, x0, #(1 << 2)
+	bic x0, x0, #(1 << 12)
+	msr sctlr_el1, x0
+	isb
+	ret
+
+.el2_to_el1:
 	// EL1's execution state has to be set explicitly: HCR_EL2.RW = 1 (AArch64)
 	movz x0, #0x8000, lsl #16
 	msr hcr_el2, x0

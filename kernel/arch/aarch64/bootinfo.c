@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/panic.h>
@@ -68,6 +69,19 @@ static int g_gic_from_fdt;
  * and every timeout in the kernel simply never ends. */
 static u32 g_timer_virt_irq = 27;
 u32 fdt_timer_virt_irq(void) { return g_timer_virt_irq; }
+/* Every timer output the tree lists, by its position there (0 secure
+ * physical, 1 physical, 2 virtual, 3 hypervisor physical, 4 hypervisor
+ * virtual); 0 for one it does not list. KVM gives a guest the EL1 two. */
+static u32 g_timer_irqs[5];
+static u32 g_timer_irq_flags[5];
+u32 fdt_timer_irq(u32 index) { return index < 5 ? g_timer_irqs[index] : 0; }
+/* Its trigger, as the tree's third cell gives it (IRQ_TYPE_*: 4 level
+ * high, 8 level low). */
+u32 fdt_timer_irq_flags(u32 index) { return index < 5 ? g_timer_irq_flags[index] : 0; }
+/* The GIC's maintenance interrupt, 0 without one, and its trigger. */
+static u32 g_gic_maint_irq, g_gic_maint_irq_flags;
+u32 fdt_gic_maint_irq(void) { return g_gic_maint_irq; }
+u32 fdt_gic_maint_irq_flags(void) { return g_gic_maint_irq_flags; }
 
 static int g_psci_use_smc;
 static int g_psci_from_fdt;
@@ -641,6 +655,13 @@ static void fdt_finish_node(struct fdt_node *node, int depth)
 			g_gic_is_v3 = 1;
 			g_gic_from_fdt = 1;
 		}
+		/* The virtualisation maintenance interrupt, when the GIC has the
+		 * EL2 interface (a PPI; M131's vGIC takes it). */
+		if (node->interrupts && node->interrupts_len >= 3 * 4 &&
+		    fdt32_to_cpu(node->interrupts[0]) == 1) {
+			g_gic_maint_irq = fdt32_to_cpu(node->interrupts[1]) + 16;
+			g_gic_maint_irq_flags = fdt32_to_cpu(node->interrupts[2]) & 0xf;
+		}
 	}
 
 	/* The SD/MMC controller a Pi 4 boots from. */
@@ -766,20 +787,30 @@ static void fdt_finish_node(struct fdt_node *node, int depth)
 		}
 	}
 
-	/* The architected timer's interrupts: four <type, number, flags> triples,
-	 * in the order secure-physical, non-secure-physical, VIRTUAL, hypervisor.
-	 * This kernel drives CNTV, so the third is the one it needs. A PPI (type
-	 * 1) numbers from INTID 16. */
+	/* The architected timer's interrupts: <type, number, flags> triples, in
+	 * the order secure-physical, non-secure-physical, VIRTUAL, hypervisor
+	 * physical and (with VHE) hypervisor virtual. This kernel drives CNTV, so
+	 * at EL1 the third is the one it needs; running at EL2 with E2H (VHE,
+	 * M131) CNTV is the EL2 virtual timer, the fifth. A PPI (type 1) numbers
+	 * from INTID 16. */
 	if (fdt_compatible_is(node->compatible, node->compatible_len,
 	                      "arm,armv8-timer") &&
 	    node->interrupts && node->interrupts_len >= 9 * 4) {
-		u32 type = fdt32_to_cpu(node->interrupts[6]);
-		u32 num = fdt32_to_cpu(node->interrupts[7]);
+		int at_el2 = arch_kernel_at_el2() && node->interrupts_len >= 15 * 4;
+		u32 type = fdt32_to_cpu(node->interrupts[at_el2 ? 12 : 6]);
+		u32 num = fdt32_to_cpu(node->interrupts[at_el2 ? 13 : 7]);
 
 		if (type == 1)
 			g_timer_virt_irq = num + 16;
 		else
 			g_timer_virt_irq = num + 32;
+		for (u32 i = 0; i < 5 && (i + 1) * 3 * 4 <= node->interrupts_len; i++) {
+			u32 t = fdt32_to_cpu(node->interrupts[i * 3]);
+			u32 n = fdt32_to_cpu(node->interrupts[i * 3 + 1]);
+
+			g_timer_irqs[i] = n + (t == 1 ? 16 : 32);
+			g_timer_irq_flags[i] = fdt32_to_cpu(node->interrupts[i * 3 + 2]) & 0xf;
+		}
 	}
 
 	/* How to call the firmware's PSCI implementation. QEMU virt answers on
@@ -1344,6 +1375,8 @@ void bootinfo_init_from_fdt(u64 dtb_address)
 	console_write("aarch64: platform: ");
 	console_write(platform_name());
 	console_write("\n");
+	if (arch_kernel_at_el2())
+		console_write("aarch64: kernel at EL2 (VHE host)\n");
 	for (usize i = 0; i < global_bootinfo.memory_region_count; i++) {
 		console_write("aarch64: RAM bank 0x");
 		console_write_hex64(global_bootinfo.memory_regions[i].base);

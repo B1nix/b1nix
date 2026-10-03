@@ -412,25 +412,23 @@ int add_wait_queue_priority_exclusive(wait_queue_head_t *wq_head,
 void kvm_mm_hooks_fill(struct b1nix_kvm_hooks *h);
 void kvm_cpuhp_all_down(void);
 void kvm_cpuhp_all_up(void);
-int lkpi_initcall_kvm_x86_init(void);
-int lkpi_initcall_vt_init(void);
-int lkpi_initcall_svm_init(void);
-void kvm_percpu_mirror_all(void);
-extern bool enable_apicv;
+/* The architecture's half (kvm_x86_cpu.c, kvm_arm64_init.c): what KVM reads
+ * of the CPU before anything else, and the arch module init itself. */
+int kvm_arch_lkpi_early(void);
+int kvm_arch_lkpi_start(void);
 
 static struct b1nix_kvm_hooks kvm_hooks;
 
-/* Bring KVM up: the CPU description it reads, per-CPU storage, the kernel
- * hooks, then the generic x86 layer and VMX, in upstream's module order. */
+/* Bring KVM up: per-CPU storage, the CPU description it reads, the kernel
+ * hooks, then the architecture's KVM in upstream's module order. */
 int kvm_lkpi_init(void)
 {
 	int r;
 
-	lkpi_x86_cpu_init();
-	/* The rate b1nix's clock was calibrated to: KVM's TSC and kvmclock
-	 * arithmetic all divide by it. */
-	tsc_khz = b1nix_kvm_tsc_khz();
 	r = kvm_percpu_init();
+	if (r)
+		return r;
+	r = kvm_arch_lkpi_early();
 	if (r)
 		return r;
 	kvm_hooks.sched_out = kvm_sched_out_hook;
@@ -440,27 +438,5 @@ int kvm_lkpi_init(void)
 	kvm_hooks.cpus_down = kvm_cpuhp_all_down;
 	kvm_hooks.cpus_up = kvm_cpuhp_all_up;
 	b1nix_kvm_set_hooks(&kvm_hooks);
-	/* Posted interrupts need host vectors b1nix does not route to KVM yet;
-	 * the in-kernel APIC is emulated without them. */
-	enable_apicv = false;
-	r = lkpi_initcall_kvm_x86_init();
-	if (r)
-		return r;
-	/* Intel's module first; on a CPU without VMX it declines and AMD's
-	 * takes the machine instead, as loading kvm_intel then kvm_amd does. */
-	r = lkpi_initcall_vt_init();
-	if (r) {
-		int vmx = r;
-
-		r = lkpi_initcall_svm_init();
-		if (r)
-			pr_info("kvm: neither vendor module loaded (VMX %d, SVM %d)\n", vmx, r);
-		else
-			pr_info("kvm: AMD SVM\n");
-	} else {
-		pr_info("kvm: Intel VMX\n");
-	}
-	if (!r)
-		kvm_percpu_mirror_all();
-	return r;
+	return kvm_arch_lkpi_start();
 }

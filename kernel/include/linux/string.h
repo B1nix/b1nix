@@ -230,4 +230,11 @@ static inline char *strchrnul(const char *s, int c)
 
 void *kmemdup_array(const void *src, size_t count, size_t element_size, gfp_t gfp);
 
+/* A clear the compiler may not drop as a dead store, for secrets. */
+static inline void memzero_explicit(void *s, usize count)
+{
+	memset(s, 0, count);
+	__asm__ volatile("" : : "r"(s) : "memory");
+}
+
 #endif

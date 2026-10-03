@@ -22,6 +22,7 @@
 #include <b1nix/rseq.h>
 #include <b1nix/serial_tty.h>
 #include <b1nix/gicv3.h>
+#include <b1nix/ipi.h>
 #include <b1nix/net.h>
 #include "platform.h"
 #include <stdio.h>
@@ -659,6 +660,13 @@ static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 	 * at the runqueues again on its own. */
 	if (irq == GICV3_SGI_RESCHED && gicv3_present()) {
 		gic_eoi(iar);
+		return;
+	}
+	/* A function another CPU queued for this one: acknowledged first, as
+	 * on x86_64, so the function may itself wait for another CPU. */
+	if (irq == GICV3_SGI_CALL && gicv3_present()) {
+		gic_eoi(iar);
+		smp_call_handler();
 		return;
 	}
 	/* The reboot path parks every other CPU here, for good. */

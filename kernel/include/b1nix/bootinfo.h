@@ -88,6 +88,12 @@ u64 fdt_cpu_release_addr(u32 index);
 /* Board addresses taken from the tree, falling back to QEMU virt's when it
  * does not say: the GICv2 distributor and CPU interface, and the console UART. */
 u64 fdt_gicd_base(void);
+/* The timer output at a position in the tree's list, and the GIC's
+ * maintenance interrupt; INTIDs, 0 when absent. */
+u32 fdt_timer_irq(u32 index);
+u32 fdt_timer_irq_flags(u32 index);
+u32 fdt_gic_maint_irq(void);
+u32 fdt_gic_maint_irq_flags(void);
 u64 fdt_gicc_base(void);
 /* GICv3: the redistributor region (one frame per CPU) and, when the tree has
  * one, the ITS — the only path to message-signalled interrupts on this board.

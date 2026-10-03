@@ -31,14 +31,14 @@ void pat_init_cpu(void) {}
 
 int pat_available(void) { return 1; }
 
-u32 cache_line_size(void)
+int cache_line_size(void)
 {
 	u64 ctr;
 	__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
 	/* CTR_EL0.DminLine (bits 19:16): log2 of the smallest data cache line,
 	 * counted in 4-byte words. */
 	u32 words = 1u << ((u32)(ctr >> 16) & 0xf);
-	return words * 4u;
+	return (int)(words * 4u);
 }
 
 /* DC CVAC/CIVAC are architectural on every AArch64 implementation — there is no

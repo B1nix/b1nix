@@ -5,6 +5,9 @@
 #include <linux/rwsem.h>
 #include <linux/atomic.h>
 #include <linux/list.h>
+#ifdef CONFIG_ARM64
+#include <asm/pgtable-types.h>
+#endif
 
 /*
  * A b1nix process address space, as KVM holds on to it (M131).
@@ -24,5 +27,10 @@ struct mm_struct {
 	struct hlist_head notifiers;
 	spinlock_t notifier_lock;
 	struct list_head node;   /* lkpi's registry */
+#ifdef CONFIG_ARM64
+	/* The same address space's level-0 table, as arm64 KVM walks it to size
+	 * a host mapping (the tables are identity-mapped on aarch64). */
+	pgd_t *pgd;
+#endif
 };
 #endif

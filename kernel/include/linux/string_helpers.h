@@ -10,5 +10,7 @@ static inline const char *str_enable_disable(bool v)
 { return v ? "enable" : "disable"; }
 
 #define str_no_yes(v) str_yes_no(!(v))
+static inline const char *str_read_write(bool v) { return v ? "read" : "write"; }
+#define str_write_read(v) str_read_write(!(v))
 
 #endif

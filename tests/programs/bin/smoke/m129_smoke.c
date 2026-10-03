@@ -86,7 +86,7 @@ static long monotonic_ms(void) {
 }
 
 int main(void) {
-  long a, b, idle_rate = 0, busy_rate = 0;
+  long a, b, idle_rate = 0, busy_rate = 0, idle_count = 0, idle_ms = 1;
   char buf[256];
 
   printf("M129-SMOKE: start\n");
@@ -115,7 +115,9 @@ int main(void) {
     t1 = monotonic_ms();
     if (t1 <= t0)
       t1 = t0 + 1;
-    idle_rate = (b - a) * 1000 / (t1 - t0);
+    idle_count = b - a;
+    idle_ms = t1 - t0;
+    idle_rate = idle_count * 1000 / idle_ms;
   }
   /* What the bound is depends on what this kernel was asked to do. With
    * b1nix.dynticks the timer is programmed for the next deadline and an idle
@@ -155,8 +157,13 @@ int main(void) {
        * that wake on this machine ask for about that: capping the idle
        * interval can only save what nobody asked for. The claim here is
        * therefore the weaker true one — the cap costs nothing — and the
-       * number is printed for whoever wants the trend. */
-      judge("idle-not-worse", idle_rate <= hz * ncpu,
+       * number is printed for whoever wants the trend. It is held against
+       * what the fixed beat would have taken over the same window: the nap
+       * runs a little past a second (and the clock reads in whole
+       * milliseconds), so a beat fits its ticks for that time plus one more
+       * per CPU at the edges. */
+      judge("idle-not-worse",
+            idle_count <= hz * ncpu * (idle_ms + 1) / 1000 + ncpu,
             "an idle second costs more than the fixed beat would, so the "
             "capped timer is firing more often than the tick it replaced",
             idle_rate);

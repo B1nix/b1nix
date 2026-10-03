@@ -9,4 +9,8 @@ static inline void kmemleak_ignore(const void *p) { (void)p; }
 
 static inline void kmemleak_update_trace(const void *p) { (void)p; }
 
+/* b1nix has no leak detector to tell that part of an object went away. */
+static inline void kmemleak_free_part(const void *p, size_t size) { (void)p; (void)size; }
+static inline void kmemleak_free_part_phys(phys_addr_t p, size_t size) { (void)p; (void)size; }
+
 #endif

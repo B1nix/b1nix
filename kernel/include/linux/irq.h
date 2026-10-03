@@ -21,16 +21,35 @@ static inline void irq_free_descs(unsigned int irq, unsigned int cnt)
 { (void)irq; (void)cnt; }
 
 
-/* An interrupt controller, as the core drives it. b1nix owns its IOAPIC and
- * MSI paths and nothing imported installs a chip, so this is the shape only —
- * a driver that registered one would find nothing calling it. */
+/* An interrupt controller, as the core drives it. On x86 b1nix owns its
+ * IOAPIC and MSI paths and nothing imported installs a chip, so this is the
+ * shape only. arm64 KVM drives the GIC through one
+ * (kvm-shim-arm64/linux/irq.h). */
 struct irq_data;
+
+/* An interrupt's state inside the interrupt controller, as a chip reads and
+ * sets it apart from delivery (a hypervisor hands a guest the active state of
+ * a host interrupt this way). */
+enum irqchip_irq_state {
+	IRQCHIP_STATE_PENDING,
+	IRQCHIP_STATE_ACTIVE,
+	IRQCHIP_STATE_MASKED,
+	IRQCHIP_STATE_LINE_LEVEL,
+};
+
 struct irq_chip {
 	const char *name;
 	void (*irq_mask)(struct irq_data *data);
 	void (*irq_unmask)(struct irq_data *data);
 	void (*irq_ack)(struct irq_data *data);
 	void (*irq_eoi)(struct irq_data *data);
+	int (*irq_set_type)(struct irq_data *data, unsigned int flow_type);
+	int (*irq_set_vcpu_affinity)(struct irq_data *data, void *vcpu_info);
+	int (*irq_get_irqchip_state)(struct irq_data *data,
+				     enum irqchip_irq_state which, bool *state);
+	int (*irq_set_irqchip_state)(struct irq_data *data,
+				     enum irqchip_irq_state which, bool state);
+	unsigned long flags;
 };
 
 

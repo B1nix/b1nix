@@ -185,8 +185,13 @@ struct percpu {
      * CPU has to reprogram that timer, and this is what says whether it needs
      * to: see sched_note_deadline and arch_kick_idle_before. */
     u64 timer_deadline_tick;
+    /* This CPU's FP/SIMD registers do not hold the current task's state:
+     * KVM saved it and flushed them, or loaded a guest's there (Linux's
+     * TIF_FOREIGN_FPSTATE). The task's image is in memory; the switch does not
+     * save over it, and the return to user mode loads it back. */
+    u64 fpu_foreign;
     /* Up to the two words KVM reads at the end of the page (checked below). */
-    u8 __pad[3928];
+    u8 __pad[3920];
     /* KVM's entry code reads these %gs-relative (<b1nix/percpu_kvm.h>). Last
      * in the page, so the offsets stay put when fields are added above. */
     u64 kvm_spec_ctrl;

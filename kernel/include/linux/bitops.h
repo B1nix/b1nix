@@ -237,12 +237,21 @@ static inline unsigned long find_first_zero_bit(const unsigned long *addr,
  * counts whatever the promotion left in the upper bits. */
 #define hweight8(x)  ((unsigned int)__builtin_popcount((unsigned char)(x)))
 #define hweight16(x) ((unsigned int)__builtin_popcount((unsigned short)(x)))
+/* The constant-expression forms, usable in array sizes and static asserts. */
+#define HWEIGHT8(w)  __builtin_popcount((u8)(w))
+#define HWEIGHT16(w) __builtin_popcount((u16)(w))
+#define HWEIGHT32(w) __builtin_popcount((u32)(w))
+#define HWEIGHT64(w) __builtin_popcountll((u64)(w))
+#define HWEIGHT(w)   HWEIGHT64((u64)(w))
+#define hweight_long(x) ((unsigned int)__builtin_popcountl((unsigned long)(x)))
 
 
 /* The index of the lowest set bit. Undefined for zero, as upstream's is — the
  * callers here always pass a mask they have already tested. */
 static inline unsigned long __ffs(unsigned long word)
 { return (unsigned long)__builtin_ctzl(word); }
+static inline unsigned long __ffs64(u64 word)
+{ return (unsigned long)__builtin_ctzll(word); }
 static inline unsigned long __fls(unsigned long word)
 { return (unsigned long)(63 - __builtin_clzl(word)); }
 /* ffs/fls/fls64 are already defined above; only the double-underscore forms,

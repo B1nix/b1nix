@@ -31,8 +31,13 @@ struct interrupt_frame {
 	 * math. Use elr/sp_el0/x0 directly instead of rip/rsp/rax. */
 } __attribute__((packed));
 
-/* The per-CPU block the exception vectors read through TPIDR_EL1. */
+/* The per-CPU block the exception vectors read through TPIDR_EL1 (TPIDR_EL2
+ * at EL2). */
 void aarch64_pcpu_asm_init(u32 cpu);
+/* A CPU's MPIDR_EL1, as that CPU recorded it (0 before it came up). */
+u64 aarch64_cpu_mpidr(u32 cpu);
+/* M131: the per-CPU offset of KVM's variables on that CPU. */
+void aarch64_set_kvm_percpu_off(u32 cpu, u64 off);
 void aarch64_set_kstack_top(u64 top);
 u64 aarch64_kstack_top(void);
 u64 aarch64_el1_fault_sp(void);
@@ -42,5 +47,15 @@ int aarch64_on_el1_fault_stack(u64 sp);
 void arch_check_and_deliver_signals(struct interrupt_frame *frame);
 u64 sys_sigreturn(struct interrupt_frame *frame);
 void arch_backtrace(u64 fp, u64 lr);
+
+
+/* Is the kernel running at EL2 -- a VHE host (HCR_EL2.E2H), where KVM can run
+ * guests -- rather than at EL1? boot.S decides, from ID_AA64MMFR1_EL1.VH. */
+static inline int arch_kernel_at_el2(void) {
+	u64 el;
+
+	__asm__ volatile("mrs %0, CurrentEL" : "=r"(el));
+	return ((el >> 2) & 3) == 2;
+}
 
 #endif

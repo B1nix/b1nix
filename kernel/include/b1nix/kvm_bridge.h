@@ -14,7 +14,10 @@
 
 /* ── CPUs ─────────────────────────────────────────────────────────────── */
 int b1nix_kvm_cpu_count(void);
+const char *b1nix_kvm_cmdline(void);
 int b1nix_kvm_this_cpu(void);
+int b1nix_kvm_cpu_present(int cpu);
+void b1nix_kvm_kick_cpu(int cpu);
 u32 b1nix_kvm_cpu_apic_id(int cpu);          /* 0xffffffff when absent */
 u64 b1nix_kvm_cpu_gs_base(int cpu);          /* the kernel GS base of that CPU */
 u64 b1nix_kvm_cpu_tss_base(int cpu);
@@ -96,6 +99,45 @@ struct b1nix_kvm_hooks {
 	void (*cpus_up)(void);
 };
 void b1nix_kvm_set_hooks(const struct b1nix_kvm_hooks *hooks);
+
+/* ── the task's FP/SIMD registers (arm64) ─────────────────────────────── */
+void b1nix_kvm_fp_flush_task(void);
+int b1nix_kvm_fp_foreign(void);
+/* Save / load the registers in Linux's struct user_fpsimd_state layout. */
+void b1nix_kvm_fp_save(void *area);
+void b1nix_kvm_fp_load(void *area);
+
+/* ── arm64: CPUs, GIC, RAM, fixmap (kernel/virt/kvm_bridge_arm64.c) ──── */
+u64 b1nix_kvm_cpu_mpidr(int cpu);
+int b1nix_kvm_at_el2(void);
+/* Where KVM's per-CPU variables lie on a CPU, as an offset from their
+ * template (what KVM's hyp assembly adds to a per-CPU symbol). */
+void b1nix_kvm_set_percpu_off(int cpu, u64 off);
+u64 b1nix_kvm_host_vectors(void);
+/* The timer output at a device-tree position, the vGIC maintenance
+ * interrupt: INTIDs, 0 when absent. */
+u32 b1nix_kvm_timer_irq(int index);
+u32 b1nix_kvm_timer_irq_flags(int index);	/* IRQ_TYPE_* */
+u32 b1nix_kvm_gic_maint_irq(void);
+u32 b1nix_kvm_gic_maint_irq_flags(void);
+int b1nix_kvm_gic_v3(void);
+int b1nix_kvm_gic_eoimode_split(void);
+/* A handler for a GIC interrupt, run in interrupt context on the CPU that
+ * took it; enable/disable are this CPU's for a PPI. */
+int b1nix_kvm_irq_register(u32 irq, int (*fn)(void *), void *ctx);
+int b1nix_kvm_irq_unregister(u32 irq, int (*fn)(void *), void *ctx);
+void b1nix_kvm_irq_enable(u32 irq);
+void b1nix_kvm_irq_disable(u32 irq);
+/* active: 1 the active bit, 0 the pending bit. */
+int b1nix_kvm_irq_state(u32 irq, int active, int *state);
+int b1nix_kvm_irq_set_state(u32 irq, int active, int on);
+void b1nix_kvm_irq_set_forwarded(u32 irq, int on);
+int b1nix_kvm_ram_region(int index, u64 *base, u64 *size);
+u64 b1nix_kvm_direct_map_end(void);
+u64 b1nix_kvm_alloc_block(int order);
+u64 b1nix_kvm_fixmap_top(void);
+/* Map the page at pa at va, or unmap va when pa is 0. */
+void b1nix_kvm_fixmap_set(u64 va, u64 pa, int writable);
 /* This CPU must run return_to_user before it next enters user mode. */
 void b1nix_kvm_arm_user_return(void);
 #endif

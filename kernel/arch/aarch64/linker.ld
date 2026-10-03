@@ -17,10 +17,31 @@ SECTIONS
 		KEEP(*(.text.boot))
 		*(.text .text.*)
 		__kernel_text_end = .;
+		/* arm64 KVM (M131) runs as a VHE host, in the kernel's own text:
+		 * the sections Linux keeps for the separate (nVHE) hypervisor
+		 * image are empty here. */
+		__hyp_idmap_text_start = .;
+		__hyp_idmap_text_end = .;
+		__hyp_text_start = .;
+		__hyp_text_end = .;
 	}
 
 	.rodata ALIGN(4K) : {
+		__start_rodata = .;
 		*(.rodata .rodata.*)
+		__hyp_rodata_start = .;
+		__hyp_rodata_end = .;
+		__hyp_reloc_begin = .;
+		__hyp_reloc_end = .;
+		__end_rodata = .;
+	}
+
+	/* arm64 KVM's alternatives: instructions patched once the CPU's
+	 * features are known (kernel/lkpi/kvm_arm64_alt.c). */
+	.altinstructions ALIGN(8) : {
+		__alt_instructions = .;
+		KEEP(*(.altinstructions))
+		__alt_instructions_end = .;
 	}
 
 	/* M95 module loader: resolve_ksym walks __ksymtab_start..__ksymtab_end
@@ -34,6 +55,8 @@ SECTIONS
 
 	.data ALIGN(4K) : {
 		*(.data .data.*)
+		__hyp_data_start = .;
+		__hyp_data_end = .;
 	}
 
 	/* M35: kallsyms symbol blob, generated post-link and appended on a second
@@ -57,7 +80,10 @@ SECTIONS
 		__bss_start = .;
 		*(COMMON)
 		*(.bss .bss.*)
+		__hyp_bss_start = .;
+		__hyp_bss_end = .;
 		__bss_end = .;
+		__bss_stop = .;
 	}
 
 	__kernel_end = .;

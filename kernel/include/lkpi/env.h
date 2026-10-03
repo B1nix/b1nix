@@ -142,9 +142,13 @@ struct mm_struct;
 typedef struct {
 	unsigned long sig[1];
 } lkpi_sigset_t;
+/* A process identity handle (<linux/pid.h>): each task carries its own, so
+ * task_pid() of the same task is the same pointer. */
+struct pid { int nr; };
 struct lkpi_task {
 	int pid;
 	int tgid;
+	struct pid pid_obj;
 	char comm[16];
 	/* A wake that arrived before the task managed to sleep.
 	 *
@@ -193,6 +197,9 @@ struct lkpi_task {
 		unsigned short gsindex;
 		unsigned long fsbase;
 		unsigned long gsbase;
+		/* arm64: the task's SCTLR_EL1 user bits. b1nix enables no MTE
+		 * tag checking for userspace, so this stays 0. */
+		unsigned long sctlr_user;
 	} thread;
 	/* Scheduler delay accounting (sched_info), which b1nix does not keep:
 	 * KVM's steal-time reporting reads it and reports none. */

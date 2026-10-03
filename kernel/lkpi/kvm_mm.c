@@ -28,9 +28,6 @@
 #include <linux/uaccess.h>
 #include <linux/interval_tree_generic.h>
 #include <linux/interval_tree.h>
-#include <asm/pgtable.h>
-#include <asm/memtype.h>
-#include <asm/e820/api.h>
 #include <b1nix/kvm_bridge.h>
 
 /* ── address spaces ───────────────────────────────────────────────────── */
@@ -100,6 +97,9 @@ again:
 	if (!fresh)
 		return NULL;
 	fresh->pml4_phys = pml4;
+#ifdef CONFIG_ARM64
+	fresh->pgd = (pgd_t *)(uintptr_t)(pml4 + lkpi_direct_map_base());
+#endif
 	init_rwsem(&fresh->mmap_lock);
 	atomic_set(&fresh->mm_users, 1);
 	atomic_set(&fresh->mm_count, 1);
@@ -185,6 +185,21 @@ static void mm_invalidate(struct mm_struct *mm, u64 start, u64 end, int blockabl
 			subs[i]->ops->invalidate_range_end(subs[i], &range);
 }
 
+/* A host TLB flush of [start, end) in @mm: a secondary TLB that shares its
+ * page tables drops the same range. */
+void mmu_notifier_arch_invalidate_secondary_tlbs(struct mm_struct *mm,
+						 unsigned long start,
+						 unsigned long end)
+{
+	struct mmu_notifier *subs[KVM_MM_MAX_SUBS];
+	int n = mm_subs(mm, subs);
+
+	for (int i = 0; i < n; i++)
+		if (subs[i]->ops->arch_invalidate_secondary_tlbs)
+			subs[i]->ops->arch_invalidate_secondary_tlbs(subs[i], mm,
+								     start, end);
+}
+
 /* From b1nix's TLB code: [start, end) of address space pml4 (0: all of
  * them) changed, and its old frames are about to be released. */
 static void kvm_mm_invalidate_hook(u64 pml4, u64 start, u64 end, int blockable)
@@ -251,26 +266,8 @@ void kvm_mm_hooks_fill(struct b1nix_kvm_hooks *h)
 	h->mm_release = kvm_mm_release_hook;
 }
 
-/* ── page tables ──────────────────────────────────────────────────────── */
+/* ── the direct map ───────────────────────────────────────────────────── */
 
-/* KVM sizes its own mappings after the host's (host_pfn_mapping_level): a
- * guest range the process has mapped with a 2 MiB page (THP) goes into EPT or
- * NPT as one. With four-level paging an mm's top table is its PML4, which is
- * what the walk expects. Under LA57 b1nix keeps the process's PML4 below a
- * PML5 of its own, which the walk would have to start from; there it gets an
- * empty table and maps everything at 4 KiB -- slower, never wrong. The walk
- * runs with interrupts off, so a table freed after a shootdown cannot go away
- * under it. */
-static pgd_t kvm_empty_pgd[512] __attribute__((aligned(4096)));
-
-pgd_t *lkpi_mm_pgd(struct mm_struct *mm)
-{
-	if (!mm || !mm->pml4_phys || b1nix_kvm_la57())
-		return kvm_empty_pgd;
-	return (pgd_t *)(uintptr_t)(mm->pml4_phys + lkpi_direct_map_base());
-}
-
-int lkpi_paging_la57(void) { return b1nix_kvm_la57(); }
 unsigned long lkpi_direct_map_base(void) { return (unsigned long)b1nix_kvm_direct_map_base(); }
 unsigned long lkpi_virt_to_phys(const volatile void *va)
 {
@@ -284,20 +281,6 @@ bool pfn_valid(unsigned long pfn)
 {
 	(void)pfn;
 	return false;
-}
-
-bool pat_pfn_immune_to_uc_mtrr(unsigned long pfn)
-{
-	u64 pa = (u64)pfn << PAGE_SHIFT;
-
-	return b1nix_kvm_range_is_ram(pa, pa + PAGE_SIZE);
-}
-
-bool e820__mapped_raw_any(u64 start, u64 end, enum e820_type type)
-{
-	if (type != E820_TYPE_RAM)
-		return false;
-	return b1nix_kvm_range_is_ram(start, end);
 }
 
 /* ── the mapping around an address ────────────────────────────────────── */

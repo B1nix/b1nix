@@ -54,7 +54,7 @@ int pat_available(void)
 	return g_pat_ready;
 }
 
-u32 cache_line_size(void)
+int cache_line_size(void)
 {
 	return g_clflush_size ? g_clflush_size : 64;
 }

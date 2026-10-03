@@ -3,6 +3,7 @@
 #define LKPI_PAGE_H
 
 #include <lkpi/types.h>
+#include <lkpi/rcu.h>
 /* struct page carries a list head, so the list type has to be complete. */
 #include <linux/list.h>
 
@@ -58,8 +59,12 @@ struct page {
 	unsigned long private;
 	/* Linkage for whatever list currently owns the page. Upstream's reclaim
 	 * uses it for the LRU; b1nix has no page LRU, so it belongs entirely to
-	 * the allocator or driver holding the page. */
-	struct list_head lru;
+	 * the allocator or driver holding the page -- which may instead free it
+	 * after a grace period through rcu_head, as upstream overlays them. */
+	union {
+		struct list_head lru;
+		struct rcu_head rcu_head;
+	};
 
 	/*
 	 * The page-cache half.

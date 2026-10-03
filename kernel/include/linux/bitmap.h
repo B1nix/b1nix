@@ -159,4 +159,46 @@ void bitmap_write(unsigned long *map, unsigned long value,
 	map[index + 1] |= (value >> space);
 }
 
+static inline bool bitmap_equal(const unsigned long *a, const unsigned long *b,
+				unsigned int nbits)
+{
+	unsigned int k, full = nbits / BITS_PER_LONG;
+
+	for (k = 0; k < full; k++)
+		if (a[k] != b[k])
+			return false;
+	if (nbits % BITS_PER_LONG)
+		return !((a[k] ^ b[k]) & BITMAP_LAST_WORD_MASK(nbits));
+	return true;
+}
+
+/* Scatter and gather: move the bits of @src to the positions set in @mask and
+ * back again. gather(scatter(x)) == x for the bits @mask covers. @dst starts
+ * zeroed, so only set bits are written. */
+static inline void bitmap_scatter(unsigned long *dst, const unsigned long *src,
+				  const unsigned long *mask, unsigned int nbits)
+{
+	unsigned int n = 0;
+	unsigned int bit;
+
+	bitmap_zero(dst, nbits);
+	for_each_set_bit(bit, mask, nbits)
+		if (test_bit(n++, src))
+			__set_bit(bit, dst);
+}
+
+static inline void bitmap_gather(unsigned long *dst, const unsigned long *src,
+				 const unsigned long *mask, unsigned int nbits)
+{
+	unsigned int n = 0;
+	unsigned int bit;
+
+	bitmap_zero(dst, nbits);
+	for_each_set_bit(bit, mask, nbits) {
+		if (test_bit(bit, src))
+			__set_bit(n, dst);
+		n++;
+	}
+}
+
 #endif

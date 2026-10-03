@@ -285,6 +285,11 @@ static inline i64 atomic64_xchg(atomic64_t *v, i64 new)
 	return __atomic_exchange_n(&v->counter, new, __ATOMIC_SEQ_CST);
 }
 
+/* The unordered forms: the fully ordered ones satisfy every caller of these. */
+#define atomic64_xchg_relaxed(v, n)		atomic64_xchg(v, n)
+#define atomic64_cmpxchg_relaxed(v, o, n)	atomic64_cmpxchg(v, o, n)
+#define atomic64_add_return_relaxed(i, v)	atomic64_add_return(i, v)
+
 /* Decrement unless the value is already zero or negative, returning the value
  * BEFORE the decrement. The "unless" is why it cannot be a plain dec: a caller
  * uses it to consume from a budget and must be able to see that the budget was

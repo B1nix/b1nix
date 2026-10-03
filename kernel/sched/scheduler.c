@@ -270,6 +270,42 @@ int task_fpu_alloc(struct task *t) {
   return 1;
 }
 
+/* The CPU's FP/SIMD registers stop being the current task's (M131: arm64 KVM
+ * saves them before a vCPU runs and may leave a guest's there). The task's
+ * image goes to memory first unless it is already there, and it comes back
+ * on the way to user mode (sched_fpu_reload_current), or when a switch brings
+ * this task in again. Interrupts off, or at least no preemption, around it. */
+void sched_fpu_flush_current(void) {
+  struct percpu *pc = get_percpu();
+  struct task *t = current_task;
+
+  if (!pc || pc->fpu_foreign)
+    return;
+  if (t) {
+    task_fpu_save(t);
+    t->fpu_initialized = 1;
+  }
+  pc->fpu_foreign = 1;
+}
+
+int sched_fpu_foreign(void) {
+  struct percpu *pc = get_percpu();
+
+  return pc && pc->fpu_foreign;
+}
+
+/* Load the current task's image back into registers something else used. */
+void sched_fpu_reload_current(void) {
+  struct percpu *pc = get_percpu();
+  struct task *t = current_task;
+
+  if (!pc || !pc->fpu_foreign)
+    return;
+  if (t)
+    task_fpu_restore(t);
+  pc->fpu_foreign = 0;
+}
+
 /* Canonical clean FXSAVE image, loaded into tasks that have never run. */
 static __attribute__((aligned(16))) u8 g_clean_fpu[512];
 static int g_clean_fpu_ready = 0;
@@ -6194,7 +6230,10 @@ static int scheduler_yield_inner(void) {
    * task's live state, then load the incoming task's (or a clean image if it
    * has never run). Without this, userspace XMM registers are clobbered by
    * other tasks and FP-heavy programs (e.g. cc1) corrupt silently. */
-  task_fpu_save(old_task);
+  /* Registers that are not old_task's (sched_fpu_flush_current) must not be
+   * saved over its image, which is already in memory. */
+  if (!sched_fpu_foreign())
+    task_fpu_save(old_task);
   old_task->fpu_initialized = 1;
   /* Each thread's protection-key rights (x86 PKRU) travel with it, as the
    * FPU register file does. */
@@ -6210,6 +6249,12 @@ static int scheduler_yield_inner(void) {
   } else {
     arch_fpu_restore(g_clean_fpu);
     new_task->fpu_initialized = 1;
+  }
+  {
+    struct percpu *pc = get_percpu();
+
+    if (pc)
+      pc->fpu_foreign = 0;
   }
 
   /* The switch is about to save THIS CPU's stack pointer into old_task's

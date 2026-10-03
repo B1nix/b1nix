@@ -35,6 +35,10 @@
 #define GICD_IGROUPR_OFF     0x0080
 #define GICD_ISENABLER_OFF   0x0100
 #define GICD_ICENABLER_OFF   0x0180
+#define GICD_ISPENDR_OFF     0x0200
+#define GICD_ICPENDR_OFF     0x0280
+#define GICD_ISACTIVER_OFF   0x0300
+#define GICD_ICACTIVER_OFF   0x0380
 #define GICD_IPRIORITYR_OFF  0x0400
 #define GICD_IROUTER_OFF     0x6000
 
@@ -57,6 +61,10 @@
 #define GICR_IGROUPR0_OFF    (GICR_SGI_OFF + 0x0080)
 #define GICR_ISENABLER0_OFF  (GICR_SGI_OFF + 0x0100)
 #define GICR_ICENABLER0_OFF  (GICR_SGI_OFF + 0x0180)
+#define GICR_ISPENDR0_OFF    (GICR_SGI_OFF + 0x0200)
+#define GICR_ICPENDR0_OFF    (GICR_SGI_OFF + 0x0280)
+#define GICR_ISACTIVER0_OFF  (GICR_SGI_OFF + 0x0300)
+#define GICR_ICACTIVER0_OFF  (GICR_SGI_OFF + 0x0380)
 #define GICR_IPRIORITYR_OFF  (GICR_SGI_OFF + 0x0400)
 
 static u64 g_gicd;
@@ -64,6 +72,13 @@ static u64 g_gicr;      /* base of the redistributor region */
 static u64 g_gicr_size;
 static int g_present;
 static u32 g_lines = 32;
+/* EOImode 1: ICC_EOIR1 only drops the running priority and ICC_DIR
+ * deactivates, so an interrupt handed to a guest can stay active until the
+ * guest ends it. Chosen when the kernel runs at EL2, where KVM needs it
+ * (Linux's gic-v3 driver does the same). */
+static int g_eoimode_split;
+/* Interrupts whose deactivation belongs to a guest (gicv3_set_forwarded). */
+static u64 g_forwarded[1024 / 64];
 
 static inline volatile u32 *d32(u64 off) {
 	return (volatile u32 *)(usize)(g_gicd + off);
@@ -145,12 +160,15 @@ void gicv3_cpu_init(void) {
 
 	__asm__ volatile("msr S3_0_C4_C6_0, %0" : : "r"((u64)0xf0)); /* ICC_PMR_EL1 */
 	__asm__ volatile("msr S3_0_C12_C12_7, %0" : : "r"((u64)0));  /* ICC_IGRPEN1_EL1 = 0 */
-	__asm__ volatile("msr S3_0_C12_C12_4, %0" : : "r"((u64)0));  /* ICC_CTLR_EL1: EOImode 0 */
+	/* ICC_CTLR_EL1.EOImode: split priority drop and deactivation at EL2. */
+	g_eoimode_split = arch_kernel_at_el2();
+	__asm__ volatile("msr S3_0_C12_C12_4, %0"
+	                 : : "r"((u64)(g_eoimode_split ? 1u << 1 : 0)));
 	__asm__ volatile("isb");
 	__asm__ volatile("msr S3_0_C12_C12_7, %0\n\tisb" : : "r"((u64)1)); /* enable group 1 */
 
 	*(volatile u32 *)(usize)(rd + GICR_ISENABLER0_OFF) =
-	    (1u << GICV3_SGI_RESCHED) | (1u << GICV3_SGI_HALT);
+	    (1u << GICV3_SGI_RESCHED) | (1u << GICV3_SGI_HALT) | (1u << GICV3_SGI_CALL);
 }
 
 /* The reschedule SGI to every CPU but this one (ICC_SGI1R_EL1.IRM). The stores
@@ -316,5 +334,92 @@ u32 gicv3_ack(void) {
 }
 
 void gicv3_eoi(u32 iar) {
+	u32 irq = iar & 0xffffffu;
+
 	__asm__ volatile("msr S3_0_C12_C12_1, %0" : : "r"((u64)iar)); /* ICC_EOIR1_EL1 */
+	if (!g_eoimode_split)
+		return;
+	if (irq < 1024 && (__atomic_load_n(&g_forwarded[irq / 64], __ATOMIC_RELAXED) >>
+	                   (irq % 64)) & 1)
+		return;
+	__asm__ volatile("msr S3_0_C12_C11_1, %0" : : "r"((u64)iar)); /* ICC_DIR_EL1 */
+}
+
+int gicv3_eoimode_split(void) { return g_eoimode_split; }
+
+void gicv3_set_forwarded(u32 irq, int on) {
+	if (irq >= 1024)
+		return;
+	if (on)
+		__atomic_fetch_or(&g_forwarded[irq / 64], 1ULL << (irq % 64), __ATOMIC_RELAXED);
+	else
+		__atomic_fetch_and(&g_forwarded[irq / 64], ~(1ULL << (irq % 64)), __ATOMIC_RELAXED);
+}
+
+/* SGI to the CPU with this MPIDR: ICC_SGI1R_EL1 names it by Aff3.Aff2.Aff1
+ * and a bit for Aff0 in the target list (Aff0 below 16). */
+void gicv3_send_sgi(u64 mpidr, u32 sgi) {
+	u64 aff0 = mpidr & 0xff;
+	u64 v;
+
+	if (!g_present || aff0 >= 16)
+		return;
+	v = (((mpidr >> 32) & 0xffULL) << 48) | (((mpidr >> 16) & 0xffULL) << 32) |
+	    (((mpidr >> 8) & 0xffULL) << 16) | ((u64)(sgi & 0xf) << 24) | (1ULL << aff0);
+	__asm__ volatile("dsb ishst" ::: "memory");
+	__asm__ volatile("msr S3_0_C12_C11_5, %0\n\tisb" : : "r"(v));
+}
+
+void gicv3_disable_irq(u32 irq) {
+	if (irq < 32) {
+		u64 rd = gicr_for_this_cpu();
+
+		if (rd)
+			*(volatile u32 *)(usize)(rd + GICR_ICENABLER0_OFF) = 1u << irq;
+		return;
+	}
+	if (irq >= g_lines)
+		return;
+	*d32(GICD_ICENABLER_OFF + (irq / 32) * 4) = 1u << (irq % 32);
+	gicd_wait_rwp();
+}
+
+/* The set/clear-active and set/clear-pending banks: this CPU's redistributor
+ * for SGIs and PPIs, the distributor for SPIs. */
+static volatile u32 *state_reg(u32 irq, int active, int set) {
+	u32 off;
+
+	if (irq < 32) {
+		u64 rd = gicr_for_this_cpu();
+
+		if (!rd)
+			return 0;
+		off = active ? (set ? GICR_ISACTIVER0_OFF : GICR_ICACTIVER0_OFF)
+		             : (set ? GICR_ISPENDR0_OFF : GICR_ICPENDR0_OFF);
+		return (volatile u32 *)(usize)(rd + off);
+	}
+	if (irq >= g_lines)
+		return 0;
+	off = active ? (set ? GICD_ISACTIVER_OFF : GICD_ICACTIVER_OFF)
+	             : (set ? GICD_ISPENDR_OFF : GICD_ICPENDR_OFF);
+	return d32(off + (irq / 32) * 4);
+}
+
+int gicv3_irq_state(u32 irq, int active, int *state) {
+	volatile u32 *r = state_reg(irq, active, 1);
+
+	if (!r)
+		return -1;
+	*state = (*r >> (irq % 32)) & 1;
+	return 0;
+}
+
+int gicv3_set_irq_state(u32 irq, int active, int on) {
+	volatile u32 *r = state_reg(irq, active, on);
+
+	if (!r)
+		return -1;
+	*r = 1u << (irq % 32);
+	__asm__ volatile("dsb sy" ::: "memory");
+	return 0;
 }

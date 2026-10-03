@@ -44,4 +44,10 @@ static inline int register_vmap_purge_notifier(struct notifier_block *nb)
 static inline int unregister_vmap_purge_notifier(struct notifier_block *nb)
 { (void)nb; return 0; }
 
+/* The GFP-taking form. */
+static inline void *__vmalloc(usize size, gfp_t gfp) { return lkpi_kmalloc(size, gfp); }
+/* b1nix's vmalloc memory is kmalloc memory, inside the direct map, and it has
+ * no module area: no address is in either range. */
+static inline bool is_vmalloc_or_module_addr(const void *x) { (void)x; return false; }
+
 #endif

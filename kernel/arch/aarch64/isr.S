@@ -24,7 +24,7 @@
 // field-for-field: x0..x30, esr, elr, spsr, far, sp_el0, tpidr_el0, pad — so
 // `sp` right after SAVE_REGS can be handed to C as a real
 // `struct interrupt_frame *`, not NULL.
-// Per-CPU block offsets, reached through TPIDR_EL1 (kernel/arch/aarch64/smp.c
+// Per-CPU block offsets, reached through TPIDR_EL1 or, at EL2, TPIDR_EL2 (get_pcpu_asm; smp.c
 // fills it in, one per CPU). Must match struct aarch64_pcpu_asm, which asserts
 // them. Slot 0 is dead weight now -- see the note below -- and stays only so the
 // two fault-stack offsets keep the values the struct gives them.
@@ -32,6 +32,20 @@
 .equ PCPU_FAULT_TOP,  8
 .equ PCPU_FAULT_SP,   16
 .equ PCPU_FAULT_X1,   24
+
+// The per-CPU block's register: TPIDR_EL2 at EL2 (a VHE host's TPIDR_EL1
+// holds a loaded vCPU's value), TPIDR_EL1 otherwise. Clobbers the flags,
+// which the interrupted context keeps in SPSR.
+.macro get_pcpu_asm reg
+	mrs \reg, CurrentEL
+	cmp \reg, #(2 << 2)
+	b.eq .Lpcpu_el2\@
+	mrs \reg, tpidr_el1
+	b .Lpcpu_done\@
+.Lpcpu_el2\@:
+	mrs \reg, tpidr_el2
+.Lpcpu_done\@:
+.endm
 
 // SP_EL1 belongs to the task, not to the CPU.
 //
@@ -207,7 +221,7 @@ sync_el1:
 	// pointer is gone is already fatal, and not restoring SP is what keeps
 	// the switch off the ordinary, recoverable path.
 8:
-	mrs x0, tpidr_el1
+	get_pcpu_asm x0
 	cbz x0, 9f                   // no per-CPU block yet: nothing better to do
 	// Park the bad SP itself. Once we move off it the frame no longer says
 	// what it was, and that value is the whole content of the report. x1 is
@@ -331,7 +345,7 @@ irq_el0:
 // dedicated fault stack first, the same way sync_el1 does for an unusable SP,
 // then call C. Nothing returns from here.
 fiq_entry:
-	mrs x0, tpidr_el1
+	get_pcpu_asm x0
 	cbz x0, 1f
 	ldr x0, [x0, #PCPU_FAULT_TOP]
 	cbz x0, 1f
@@ -342,7 +356,7 @@ fiq_entry:
 	b .
 
 serror_entry:
-	mrs x0, tpidr_el1
+	get_pcpu_asm x0
 	cbz x0, 2f
 	ldr x0, [x0, #PCPU_FAULT_TOP]
 	cbz x0, 2f

@@ -29,6 +29,7 @@ typedef struct lkpi_spinlock raw_spinlock_t;
 typedef struct lkpi_spinlock rwlock_t;
 
 #define DEFINE_SPINLOCK(name) spinlock_t name
+#define DEFINE_RAW_SPINLOCK(name) raw_spinlock_t name
 /* A statically unlocked spinlock: all-zero, the state spin_lock_init leaves. */
 #define __SPIN_LOCK_UNLOCKED(name) { 0 }
 

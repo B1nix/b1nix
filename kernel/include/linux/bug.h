@@ -67,6 +67,7 @@ extern int oops_in_progress;
 #define TAINT_WARN            9
 #define TAINT_MACHINE_CHECK   4
 #define TAINT_DIE             1
+#define TAINT_CPU_OUT_OF_SPEC 2
 #define LOCKDEP_STILL_OK      1
 #define LOCKDEP_NOW_UNRELIABLE 0
 
@@ -91,5 +92,13 @@ void panic(const char *fmt, ...) __attribute__((format(printf, 1, 2), noreturn))
 /* WARN, but not more often than the rate limiter allows. Same return value as
  * WARN_ON — the condition — so it can be used in an if. */
 #define WARN_RATELIMIT(cond, fmt, ...) WARN_ON(cond)
+
+/* An entry of the kernel's BUG()/WARN() table. b1nix's BUG() is a direct
+ * panic call and keeps no table, so no address is a recorded BUG site. */
+struct bug_entry { unsigned long bug_addr; };
+static inline struct bug_entry *find_bug(unsigned long bugaddr) { (void)bugaddr; return 0; }
+static inline void bug_get_file_line(struct bug_entry *bug, const char **file,
+				     unsigned int *line)
+{ (void)bug; *file = 0; *line = 0; }
 
 #endif

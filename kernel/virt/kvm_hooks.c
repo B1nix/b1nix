@@ -8,16 +8,13 @@
 #include <b1nix/kvm_hooks.h>
 #include <b1nix/arch.h>
 #include <b1nix/lapic.h>
+#include <b1nix/sched.h>
 
 static int this_cpu(void)
 {
-#if defined(__x86_64__)
 	struct percpu *p = get_percpu();
 
 	return p ? (int)p->cpu_id : 0;
-#else
-	return 0;
-#endif
 }
 
 /* ── hooks ────────────────────────────────────────────────────────────── */
@@ -46,6 +43,8 @@ void kvm_hook_return_to_user(void)
 	if (!g_urn_armed[cpu])
 		return;
 	g_urn_armed[cpu] = 0;
+	/* The task's FP/SIMD image, if KVM had the registers. */
+	sched_fpu_reload_current();
 	if (h->return_to_user)
 		h->return_to_user();
 }

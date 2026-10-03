@@ -559,7 +559,7 @@ KERNEL_BASE ?= 0x40080000
 ARCH_LDFLAGS += --defsym=KERNEL_LOAD_BASE=$(KERNEL_BASE)
 LINKER_SCRIPT := kernel/arch/aarch64/linker.ld
 ASM_SOURCES := kernel/arch/aarch64/boot.S kernel/arch/aarch64/context_switch.S kernel/arch/aarch64/isr.S kernel/arch/aarch64/fpu.S
-ARCH_SOURCES := kernel/arch/aarch64/arch.c kernel/arch/aarch64/platform.c kernel/arch/aarch64/bootinfo.c kernel/arch/aarch64/smp.c kernel/arch/aarch64/gicv3.c kernel/arch/aarch64/gicv3_its.c kernel/arch/aarch64/console.c kernel/arch/aarch64/fb_panel.c kernel/arch/aarch64/io.c kernel/arch/aarch64/interrupts.c kernel/arch/aarch64/paging.c kernel/arch/aarch64/serial.c kernel/arch/aarch64/signal.c kernel/arch/aarch64/coredump.c kernel/arch/aarch64/gdbstub.c kernel/arch/aarch64/memtype.c kernel/arch/aarch64/qcom_restart.c kernel/virt/kvm_hooks.c
+ARCH_SOURCES := kernel/arch/aarch64/arch.c kernel/arch/aarch64/platform.c kernel/arch/aarch64/bootinfo.c kernel/arch/aarch64/smp.c kernel/arch/aarch64/smp_call.c kernel/arch/aarch64/gicv3.c kernel/arch/aarch64/gicv3_its.c kernel/arch/aarch64/console.c kernel/arch/aarch64/fb_panel.c kernel/arch/aarch64/io.c kernel/arch/aarch64/interrupts.c kernel/arch/aarch64/paging.c kernel/arch/aarch64/serial.c kernel/arch/aarch64/signal.c kernel/arch/aarch64/coredump.c kernel/arch/aarch64/gdbstub.c kernel/arch/aarch64/memtype.c kernel/arch/aarch64/qcom_restart.c kernel/virt/kvm_hooks.c
 else
 $(error Unsupported ARCH=$(ARCH). Active builds support ARCH=x86_64 and ARCH=aarch64)
 endif
@@ -1330,8 +1330,8 @@ fs-probe:
 # the filesystem and DRM imports, compiled unmodified against linuxkpi. The
 # headers KVM needs beyond the shared shim sit in kernel/include/kvm-shim, first
 # on its include path; the glue that implements them against b1nix is
-# kernel/lkpi/kvm_*.c. x86_64 only (aarch64 KVM is a later item), and gated on
-# the staged tree the same way i915 is: `make kvm-fetch` stages it.
+# kernel/lkpi/kvm_*.c. This block is x86_64's; arm64's follows it. Both are
+# gated on the staged tree the same way i915 is: `make kvm-fetch` stages it.
 KVM_IMPORT_DIR := build/src/kvm-$(LKPI_LINUX_VERSION)
 B1NIX_KVM ?= 1
 ifeq ($(ARCH),x86_64)
@@ -1355,14 +1355,17 @@ KVM_IMPORT_NAMES := \
 KVM_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/$(KVM_IMPORT_DIR)/%.o,$(KVM_IMPORT_NAMES)) \
 	$(BUILD_DIR)/$(KVM_IMPORT_DIR)/arch/x86/kvm/vmx/vmenter.o \
 	$(BUILD_DIR)/$(KVM_IMPORT_DIR)/arch/x86/kvm/svm/vmenter.o
+# kvm_*.c is shared by the architectures, kvm_x86_*.c and kvm_arm64_*.c are
+# each one's own.
 KVM_GLUE_SOURCES := $(wildcard kernel/lkpi/kvm_*.c)
-KVM_GLUE_SOURCES := $(filter-out kernel/lkpi/kvm_asm_offsets.c,$(KVM_GLUE_SOURCES))
+KVM_GLUE_SOURCES := $(filter-out kernel/lkpi/kvm_x86_asm_offsets.c kernel/lkpi/kvm_arm64_%,$(KVM_GLUE_SOURCES))
 KVM_GLUE_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(KVM_GLUE_SOURCES))
-KVM_IMPORT_OBJECTS += $(KVM_GLUE_OBJECTS) $(BUILD_DIR)/kernel/virt/kvm_bridge.o
+KVM_IMPORT_OBJECTS += $(KVM_GLUE_OBJECTS) $(BUILD_DIR)/kernel/virt/kvm_bridge.o \
+	$(BUILD_DIR)/kernel/virt/kvm_bridge_x86.o
 $(BUILD_DIR)/kernel/main.o: COMMON_CFLAGS += -DB1NIX_KVM=1
 
 KVM_GEN_DIR := $(BUILD_DIR)/kvm-gen
-KVM_INCLUDES := -I kernel/include/kvm-shim -I kernel/include -I kernel/include/uapi \
+KVM_INCLUDES := -I kernel/include/kvm-shim-x86 -I kernel/include/kvm-shim -I kernel/include -I kernel/include/uapi \
 	-I $(DRM_IMPORT_DIR)/include -I $(DRM_IMPORT_DIR)/include/uapi \
 	-I $(KVM_IMPORT_DIR)/include -I $(KVM_IMPORT_DIR)/include/uapi \
 	-I $(KVM_IMPORT_DIR)/arch/x86/include -I $(KVM_IMPORT_DIR)/arch/x86/include/uapi \
@@ -1382,7 +1385,7 @@ $(BUILD_DIR)/$(KVM_IMPORT_DIR)/%.o: $(KVM_IMPORT_DIR)/%.c $(DRM_FLAGS_STAMP)
 
 # The VMX and SVM entry code, and the offsets they read (upstream's
 # asm-offsets step).
-$(KVM_GEN_DIR)/kvm-asm-offsets.h: kernel/lkpi/kvm_asm_offsets.c
+$(KVM_GEN_DIR)/kvm-asm-offsets.h: kernel/lkpi/kvm_x86_asm_offsets.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KVM_IMPORT_CFLAGS) $(ARCH_CFLAGS) -S $< -o $(KVM_GEN_DIR)/kvm-asm-offsets.s
 	@sed -n 's/.*"->\([A-Za-z_0-9]*\) \$$\{0,1\}\([0-9-]*\) .*/#define \1 \2/p' \
@@ -1401,6 +1404,144 @@ $(KVM_GLUE_OBJECTS): $(BUILD_DIR)/%.o: %.c
 endif
 endif
 endif
+
+# arm64 KVM (M131), VHE host only: arch/arm64/kvm and its hyp/vhe code,
+# unmodified, over the same linuxkpi (B1NIX_KVM_ARM64=0 leaves it out). Its
+# sysreg and cpucap headers are generated from the staged tables with
+# upstream's awk scripts, as Kbuild does. It starts only when the kernel runs
+# at EL2 (boot.S stays there on a CPU with VHE).
+B1NIX_KVM_ARM64 ?= 1
+ifeq ($(ARCH),aarch64)
+ifeq ($(B1NIX_KVM_ARM64),1)
+ifneq ($(wildcard $(KVM_IMPORT_DIR)/arch/arm64/kvm/arm.c),)
+KVMA_GEN_DIR := $(BUILD_DIR)/kvm-gen
+KVMA_NAMES := \
+	virt/kvm/kvm_main.c virt/kvm/eventfd.c virt/kvm/binary_stats.c \
+	virt/kvm/coalesced_mmio.c virt/kvm/irqchip.c \
+	virt/kvm/dirty_ring.c \
+	arch/arm64/kvm/arm.c arch/arm64/kvm/mmu.c arch/arm64/kvm/mmio.c \
+	arch/arm64/kvm/psci.c arch/arm64/kvm/hypercalls.c arch/arm64/kvm/pvtime.c \
+	arch/arm64/kvm/inject_fault.c arch/arm64/kvm/va_layout.c \
+	arch/arm64/kvm/handle_exit.c arch/arm64/kvm/config.c arch/arm64/kvm/guest.c \
+	arch/arm64/kvm/debug.c arch/arm64/kvm/reset.c arch/arm64/kvm/sys_regs.c \
+	arch/arm64/kvm/stacktrace.c arch/arm64/kvm/vgic-sys-reg-v3.c \
+	arch/arm64/kvm/fpsimd.c arch/arm64/kvm/pkvm.c arch/arm64/kvm/arch_timer.c \
+	arch/arm64/kvm/trng.c arch/arm64/kvm/vmid.c arch/arm64/kvm/emulate-nested.c \
+	arch/arm64/kvm/nested.c arch/arm64/kvm/at.c \
+	arch/arm64/kvm/vgic/vgic.c arch/arm64/kvm/vgic/vgic-init.c \
+	arch/arm64/kvm/vgic/vgic-irqfd.c arch/arm64/kvm/vgic/vgic-v2.c \
+	arch/arm64/kvm/vgic/vgic-v3.c arch/arm64/kvm/vgic/vgic-v4.c \
+	arch/arm64/kvm/vgic/vgic-mmio.c arch/arm64/kvm/vgic/vgic-mmio-v2.c \
+	arch/arm64/kvm/vgic/vgic-mmio-v3.c arch/arm64/kvm/vgic/vgic-kvm-device.c \
+	arch/arm64/kvm/vgic/vgic-its.c arch/arm64/kvm/vgic/vgic-debug.c \
+	arch/arm64/kvm/vgic/vgic-v3-nested.c arch/arm64/kvm/vgic/vgic-v5.c \
+	arch/arm64/kvm/hyp/pgtable.c arch/arm64/lib/insn.c
+KVMA_HYP_NAMES := \
+	arch/arm64/kvm/hyp/vhe/timer-sr.c arch/arm64/kvm/hyp/vhe/sysreg-sr.c \
+	arch/arm64/kvm/hyp/vhe/debug-sr.c arch/arm64/kvm/hyp/vhe/switch.c \
+	arch/arm64/kvm/hyp/vhe/tlb.c arch/arm64/kvm/hyp/vgic-v3-sr.c \
+	arch/arm64/kvm/hyp/aarch32.c arch/arm64/kvm/hyp/vgic-v2-cpuif-proxy.c \
+	arch/arm64/kvm/hyp/exception.c
+KVMA_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/$(KVM_IMPORT_DIR)/%.o,$(KVMA_NAMES) $(KVMA_HYP_NAMES))
+KVMA_INCLUDES := -I kernel/include/kvm-shim-arm64 -I $(KVMA_GEN_DIR) \
+	-I $(KVM_IMPORT_DIR)/arch/arm64/include -I $(KVM_IMPORT_DIR)/arch/arm64/include/uapi \
+	-I kernel/include/kvm-shim -I kernel/include -I kernel/include/uapi \
+	-I $(DRM_IMPORT_DIR)/include -I $(DRM_IMPORT_DIR)/include/uapi \
+	-I $(KVM_IMPORT_DIR)/include -I $(KVM_IMPORT_DIR)/include/uapi \
+	-I $(KVM_IMPORT_DIR)/arch/arm64/kvm -I $(KVM_IMPORT_DIR)/arch/arm64/kvm/hyp/include \
+	-I $(KVM_IMPORT_DIR)/virt/kvm
+KVMA_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
+	-fno-stack-protector -fno-pic -w -g -MMD -MP $(KERNEL_OPT) \
+	$(FILE_PREFIX_MAP) \
+	-D__KERNEL__ -D__linux__ -DKBUILD_MODNAME='"kvm"' \
+	-Wa,-march=armv8.5-a -DARM64_ASM_ARCH='"armv8.5-a"' \
+	$(DRM_IMPORT_ARCH_FLAGS) \
+	-isystem $(CLANG_RESOURCE_INC) $(KVMA_INCLUDES) \
+	-include kvm_kconfig.h -include linux/compiler_types.h -include linux/types.h \
+	-include kvm_prelude.h -include kvm_linux_extra.h
+
+$(KVMA_GEN_DIR)/asm/sysreg-defs.h: $(KVM_IMPORT_DIR)/arch/arm64/tools/sysreg
+	@mkdir -p $(dir $@)
+	awk -f $(KVM_IMPORT_DIR)/arch/arm64/tools/gen-sysreg.awk $< > $@.tmp && mv $@.tmp $@
+$(KVMA_GEN_DIR)/asm/cpucap-defs.h: $(KVM_IMPORT_DIR)/arch/arm64/tools/cpucaps
+	@mkdir -p $(dir $@)
+	awk -f $(KVM_IMPORT_DIR)/arch/arm64/tools/gen-cpucaps.awk $< > $@.tmp && mv $@.tmp $@
+# The sizes of protected KVM's hyp structures (hyp-constants.c), extracted the
+# way upstream's asm-offsets step does.
+$(KVMA_GEN_DIR)/hyp_constants.h: $(KVM_IMPORT_DIR)/arch/arm64/kvm/hyp/hyp-constants.c \
+		$(KVMA_GEN_DIR)/asm/sysreg-defs.h $(KVMA_GEN_DIR)/asm/cpucap-defs.h
+	@mkdir -p $(dir $@)
+	$(CC) $(KVMA_CFLAGS) $(ARCH_CFLAGS) -S $< -o $(KVMA_GEN_DIR)/hyp-constants.s
+	@sed -n 's/.*"->\([A-Za-z_0-9]*\) \$$\{0,1\}#\{0,1\}\([0-9-]*\) .*/#define \1 \2/p' \
+		$(KVMA_GEN_DIR)/hyp-constants.s > $@.tmp && mv $@.tmp $@
+KVMA_GEN := $(KVMA_GEN_DIR)/asm/sysreg-defs.h $(KVMA_GEN_DIR)/asm/cpucap-defs.h \
+	$(KVMA_GEN_DIR)/hyp_constants.h
+
+# The offsets the world-switch assembly reads (upstream's asm-offsets step).
+$(KVMA_GEN_DIR)/asm/asm-offsets.h: kernel/lkpi/kvm_arm64_asm_offsets.c \
+		$(KVMA_GEN_DIR)/asm/sysreg-defs.h $(KVMA_GEN_DIR)/asm/cpucap-defs.h
+	@mkdir -p $(dir $@)
+	$(CC) $(KVMA_CFLAGS) $(ARCH_CFLAGS) -S $< -o $(KVMA_GEN_DIR)/asm-offsets.s
+	@sed -n 's/.*"->\([A-Za-z_0-9]*\) \$$\{0,1\}#\{0,1\}\([0-9-]*\) .*/#define \1 \2/p' \
+		$(KVMA_GEN_DIR)/asm-offsets.s > $@.tmp && mv $@.tmp $@
+KVMA_GEN += $(KVMA_GEN_DIR)/asm/asm-offsets.h
+# The feature-register tables KVM checks a guest's ID registers against, cut
+# from upstream's cpufeature.c (tools/import/kvm/gen-arm64-ftr.py).
+$(KVMA_GEN_DIR)/arm64-ftr.c: $(KVM_IMPORT_DIR)/arch/arm64/kernel/cpufeature.c \
+		tools/import/kvm/gen-arm64-ftr.py
+	@mkdir -p $(dir $@)
+	python3 tools/import/kvm/gen-arm64-ftr.py $< $@.tmp && mv $@.tmp $@
+KVMA_FTR_OBJECT := $(KVMA_GEN_DIR)/arm64-ftr.o
+$(KVMA_FTR_OBJECT): $(KVMA_GEN_DIR)/arm64-ftr.c $(KVMA_GEN)
+	$(CC) $(KVMA_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
+
+$(filter %/hyp/vhe/%.o %/hyp/vgic-v3-sr.o %/hyp/aarch32.o %/hyp/vgic-v2-cpuif-proxy.o %/hyp/exception.o,$(KVMA_OBJECTS)): KVMA_CFLAGS += -D__KVM_VHE_HYPERVISOR__
+$(KVMA_OBJECTS): $(BUILD_DIR)/$(KVM_IMPORT_DIR)/%.o: $(KVM_IMPORT_DIR)/%.c $(KVMA_GEN)
+	@mkdir -p $(dir $@)
+	$(CC) $(KVMA_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
+# The world-switch entry, the hyp vectors and the FP/SIMD save/restore,
+# assembled as part of the VHE hypervisor.
+KVMA_ASM_NAMES := arch/arm64/kvm/hyp/entry.S arch/arm64/kvm/hyp/hyp-entry.S \
+	arch/arm64/kvm/hyp/fpsimd.S
+KVMA_ASM_OBJECTS := $(patsubst %.S,$(BUILD_DIR)/$(KVM_IMPORT_DIR)/%.o,$(KVMA_ASM_NAMES))
+# Upstream's generic headers come before linuxkpi's here: they are guarded for
+# assembly, and linuxkpi's are C only.
+KVMA_ASM_INCLUDES := -I kernel/include/kvm-shim-arm64 -I $(KVMA_GEN_DIR) \
+	-I $(KVM_IMPORT_DIR)/arch/arm64/include -I $(KVM_IMPORT_DIR)/arch/arm64/include/uapi \
+	-I $(KVM_IMPORT_DIR)/include -I $(KVM_IMPORT_DIR)/include/uapi \
+	-I kernel/include/kvm-shim -I kernel/include -I kernel/include/uapi \
+	-I $(KVM_IMPORT_DIR)/arch/arm64/kvm -I $(KVM_IMPORT_DIR)/arch/arm64/kvm/hyp/include
+$(KVMA_ASM_OBJECTS): $(BUILD_DIR)/$(KVM_IMPORT_DIR)/%.o: $(KVM_IMPORT_DIR)/%.S $(KVMA_GEN)
+	@mkdir -p $(dir $@)
+	$(CC) -D__ASSEMBLY__ -D__KVM_VHE_HYPERVISOR__ -D__KERNEL__ -nostdinc -MMD -MP -w \
+		--target=$(TARGET) -march=armv8.5-a -DARM64_ASM_ARCH='"armv8.5-a"' \
+		$(KVMA_ASM_INCLUDES) -include kvm_kconfig.h -c $< -o $@
+# The glue: the shared kvm_*.c and arm64's own kvm_arm64_*.c, with KVM's
+# include path (every directory a system one, in the same order, so the
+# warnings are the glue's own -- and -MD, since -MMD leaves system headers out
+# of the dependencies) and b1nix's warnings; b1nix's side of the seam
+# is kernel/virt/kvm_bridge*.c.
+KVMA_GLUE_SOURCES := $(filter-out kernel/lkpi/kvm_x86_% kernel/lkpi/kvm_arm64_asm_offsets.c,\
+	$(wildcard kernel/lkpi/kvm_*.c))
+KVMA_GLUE_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(KVMA_GLUE_SOURCES))
+$(KVMA_GLUE_OBJECTS): $(BUILD_DIR)/%.o: %.c $(KVMA_GEN)
+	@mkdir -p $(dir $@)
+	$(CC) $(subst -MMD,-MD,$(subst -I ,-isystem ,$(filter-out -w,$(KVMA_CFLAGS)))) -Wall -Wextra \
+		$(ARCH_CFLAGS) -c $< -o $@
+$(BUILD_DIR)/kernel/lkpi/kvm_arm64_nvhe_S.o: kernel/lkpi/kvm_arm64_nvhe.S
+	@mkdir -p $(dir $@)
+	$(CC) -D__ASSEMBLY__ --target=$(TARGET) -c $< -o $@
+KVMA_GLUE_OBJECTS += $(BUILD_DIR)/kernel/lkpi/kvm_arm64_nvhe_S.o
+kvma-objs: $(KVMA_OBJECTS) $(KVMA_ASM_OBJECTS) $(KVMA_GLUE_OBJECTS) $(KVMA_FTR_OBJECT)
+# Into the kernel, with b1nix's side of the seam and the start-up call.
+KVM_IMPORT_OBJECTS := $(KVMA_OBJECTS) $(KVMA_ASM_OBJECTS) $(KVMA_GLUE_OBJECTS) \
+	$(KVMA_FTR_OBJECT) $(BUILD_DIR)/kernel/virt/kvm_bridge.o \
+	$(BUILD_DIR)/kernel/virt/kvm_bridge_arm64.o
+$(BUILD_DIR)/kernel/main.o: COMMON_CFLAGS += -DB1NIX_KVM=1
+endif
+endif
+endif
+.PHONY: kvma-objs
 
 .PHONY: kvm-fetch kvm-objs
 kvm-fetch:

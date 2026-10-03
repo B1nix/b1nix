@@ -31,6 +31,10 @@
 #define VM_DONTDUMP  0x0080
 #define VM_NORESERVE 0x0200
 #define VM_MIXEDMAP  0x1000
+/* Set by a driver that lets a mapping be made uncached in a guest (vfio-pci);
+ * nothing sets it here. No MTE, so no mapping may carry allocation tags. */
+#define VM_ALLOW_ANY_UNCACHED (1UL << 39)
+#define VM_MTE_ALLOWED 0UL
 /* A hint that this mapping would benefit from huge pages. There are none for
  * file mappings here, so it is recorded and not acted on. */
 #define VM_HUGEPAGE  0x20000
@@ -295,8 +299,8 @@ static inline unsigned long page_index(struct page *page)
 { return page->index; }
 static inline loff_t page_offset(struct page *page)
 { return (loff_t)page->index << PAGE_SHIFT; }
-static inline void *page_private(struct page *page)
-{ return (void *)page->private; }
+static inline unsigned long page_private(struct page *page)
+{ return page->private; }
 static inline void set_page_private(struct page *page, unsigned long v)
 { page->private = v; }
 static inline void *folio_get_private(struct folio *folio)
@@ -777,7 +781,23 @@ static inline unsigned int folio_order(const struct folio *folio)
 { (void)folio; return 0; }
 static inline unsigned int folio_shift(const struct folio *folio)
 { return PAGE_SHIFT + folio_order(folio); }
+static inline void *alloc_pages_exact(usize size, gfp_t gfp)
+{
+	return (void *)__get_free_pages(gfp, get_order(size));
+}
+static inline void free_pages_exact(void *virt, usize size)
+{
+	free_pages((unsigned long)virt, get_order(size));
+}
+bool pfn_valid(unsigned long pfn);
+static inline struct page *pfn_to_online_page(unsigned long pfn)
+{
+	return pfn_valid(pfn) ? pfn_to_page(pfn) : NULL;
+}
+#define VM_WARN_ON_ONCE(cond) WARN_ON_ONCE(cond)
 static inline int page_ref_count(const struct page *page)
+{ return page->count; }
+static inline int page_count(const struct page *page)
 { return page->count; }
 static inline int folio_ref_count(const struct folio *folio)
 { return folio->count; }

@@ -9,7 +9,7 @@
  * KVM_RUN has it loaded, the task's XSAVE area pointer is swapped to the
  * guest's image, so a context switch in the middle saves and restores the
  * guest's registers -- the same thing Linux does by swapping
- * fpu->fpstate. Implemented in kernel/lkpi/kvm_fpu.c.
+ * fpu->fpstate. Implemented in kernel/lkpi/kvm_x86_fpu.c.
  */
 #include_next <asm/fpu/api.h>
 #include <linux/types.h>

@@ -9,7 +9,7 @@
  * back to the CPUID leaf and register it came from (reverse_cpuid.h) to build
  * the CPUID it shows a guest, so the words have to be Linux's words. lkpi
  * fills boot_cpu_data.x86_capability from CPUID in that layout at the first
- * use (kernel/lkpi/kvm_cpu.c); the Linux-defined synthetic bits it sets are
+ * use (kernel/lkpi/kvm_x86_cpu.c); the Linux-defined synthetic bits it sets are
  * the ones whose meaning it can establish, and the rest stay clear.
  *
  * The rest of lkpi (i915) uses <asm/cpufeature.h> from kernel/include, which

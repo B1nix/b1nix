@@ -1,21 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * b1nix's side of the KVM seam (M131): see <b1nix/kvm_bridge.h>.
+ * b1nix's side of the KVM seam (M131): see <b1nix/kvm_bridge.h>. The part
+ * every architecture shares; kvm_bridge_x86.c and kvm_bridge_arm64.c hold
+ * the rest.
  */
 #include <b1nix/kvm_bridge.h>
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/ipi.h>
-#include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/ktime.h>
 #include <b1nix/sched.h>
 #include <b1nix/errno.h>
 #include <b1nix/kvm_hooks.h>
-
-extern int paging_la57(void);
-int arch_rdmsr_safe(u32 msr, u64 *out);
-int arch_wrmsr_safe(u32 msr, u64 value);
 
 int b1nix_kvm_cpu_count(void) { return g_max_cpus; }
 
@@ -26,51 +23,10 @@ int b1nix_kvm_this_cpu(void)
 	return p ? (int)p->cpu_id : 0;
 }
 
-u32 b1nix_kvm_cpu_apic_id(int cpu)
-{
-	struct percpu *p = get_percpu_n(cpu);
-
-	return p ? p->apic_id : 0xffffffffu;
-}
-
-/* b1nix never swaps GS: the kernel GS base of a CPU is always its struct
- * percpu, and that is what a VMCS must restore on VM exit. */
-u64 b1nix_kvm_cpu_gs_base(int cpu)
-{
-	return (u64)(usize)get_percpu_n(cpu);
-}
-
-u64 b1nix_kvm_cpu_tss_base(int cpu) { return arch_tss_base(cpu); }
-
-/* The two per-CPU values KVM's entry code reads through GS (see
- * <b1nix/percpu_kvm.h>). */
-void b1nix_kvm_percpu_mirror(int cpu, u64 spec_ctrl, u64 svm_hsave_pa)
-{
-	struct percpu *p = get_percpu_n(cpu);
-
-	if (!p)
-		return;
-	p->kvm_spec_ctrl = spec_ctrl;
-	p->kvm_svm_hsave_pa = svm_hsave_pa;
-}
-
-void b1nix_kvm_send_ipi(int cpu, u32 vector)
-{
-	struct percpu *p = get_percpu_n(cpu);
-
-	if (p)
-		lapic_send_ipi(p->apic_id, (vector & 0xff) | LAPIC_ICR_FIXED);
-}
-
 int b1nix_kvm_call_on_cpu(int cpu, void (*fn)(void *), void *info, int wait)
 {
 	return smp_call_on_cpu(cpu, fn, info, wait);
 }
-
-int b1nix_kvm_rdmsr_safe(u32 msr, u64 *val) { return arch_rdmsr_safe(msr, val); }
-int b1nix_kvm_wrmsr_safe(u32 msr, u64 val) { return arch_wrmsr_safe(msr, val); }
-
-u32 b1nix_kvm_tsc_khz(void) { return arch_tsc_khz(); }
 
 void b1nix_kvm_udelay(u64 us)
 {
@@ -79,10 +35,6 @@ void b1nix_kvm_udelay(u64 us)
 	while (ktime_monotonic_ns() < end)
 		cpu_relax();
 }
-
-u64 b1nix_kvm_direct_map_base(void) { return DIRECT_MAP_BASE; }
-u64 b1nix_kvm_virt_to_phys(const void *va) { return vmm_virt_to_phys((void *)va); }
-int b1nix_kvm_la57(void) { return paging_la57(); }
 
 int b1nix_kvm_range_is_ram(u64 start, u64 end)
 {
@@ -99,6 +51,9 @@ int b1nix_kvm_range_is_ram(u64 start, u64 end)
 	}
 	return 0;
 }
+
+u64 b1nix_kvm_virt_to_phys(const void *va) { return vmm_virt_to_phys((void *)va); }
+u64 b1nix_kvm_direct_map_base(void) { return DIRECT_MAP_BASE; }
 
 u64 b1nix_kvm_zero_page_phys(void) { return pmm_zero_page(); }
 
@@ -221,22 +176,22 @@ void b1nix_kvm_wake(void *task)
 		scheduler_wake_task(t->id);
 }
 
-/* ── the task's FPU image ─────────────────────────────────────────────── */
+/* ── the task's FP/SIMD registers (arm64 KVM) ─────────────────────────── */
 
-void *b1nix_kvm_task_xsave_area(void)
+/* Save the current task's registers and mark them foreign; they are loaded
+ * back on the way to user mode, which this arms. */
+void b1nix_kvm_fp_flush_task(void)
 {
-	if (!current_task || !task_fpu_alloc(current_task))
-		return 0;
-	return task_xsave_area(current_task);
+	sched_fpu_flush_current();
+	b1nix_kvm_arm_user_return();
 }
 
-void b1nix_kvm_task_set_xsave_area(void *area)
-{
-	if (current_task)
-		task_set_xsave_area(current_task, area);
-}
+int b1nix_kvm_fp_foreign(void) { return sched_fpu_foreign(); }
 
-u64 b1nix_kvm_xsave_size(void) { return arch_xsave_area_size(); }
-u64 b1nix_kvm_xsave_mask(void) { return arch_xsave_mask(); }
-void b1nix_kvm_xsave(void *area, u64 mask) { arch_xsave(area, mask); }
-void b1nix_kvm_xrstor(void *area, u64 mask) { arch_xrstor(area, mask); }
+/* The kernel command line, for KVM's early parameters. */
+const char *b1nix_kvm_cmdline(void)
+{
+	const char *c = bootinfo_cmdline();
+
+	return c ? c : "";
+}

@@ -18,6 +18,8 @@ struct static_key_true  { struct static_key key; };
 
 #define STATIC_KEY_INIT_FALSE { .key = { .enabled = false } }
 #define STATIC_KEY_INIT_TRUE  { .key = { .enabled = true } }
+#define STATIC_KEY_FALSE_INIT STATIC_KEY_INIT_FALSE
+#define STATIC_KEY_TRUE_INIT  STATIC_KEY_INIT_TRUE
 #define DEFINE_STATIC_KEY_FALSE(name) struct static_key_false name = STATIC_KEY_INIT_FALSE
 #define DEFINE_STATIC_KEY_TRUE(name)  struct static_key_true  name = STATIC_KEY_INIT_TRUE
 

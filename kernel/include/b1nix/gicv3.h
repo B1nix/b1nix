@@ -18,7 +18,19 @@ void gicv3_enable_irq(u32 irq);
 /* Park this CPU for good: sent by the reboot path so that nothing else
  * touches the flash or the PMIC while the reset is prepared. */
 #define GICV3_SGI_HALT    2u
+/* Run the function another CPU queued for this one (smp_call_on_cpu). */
+#define GICV3_SGI_CALL    3u
 void gicv3_send_resched_others(void);
+/* One SGI to one CPU, by its MPIDR. */
+void gicv3_send_sgi(u64 mpidr, u32 sgi);
+/* Per-interrupt state for a hypervisor (M131). A PPI or SGI is this CPU's. */
+void gicv3_disable_irq(u32 irq);
+int  gicv3_irq_state(u32 irq, int active, int *state);   /* active: 1 active, 0 pending */
+int  gicv3_set_irq_state(u32 irq, int active, int on);
+/* A forwarded interrupt is left active at EOI: its deactivation is the
+ * guest's, through the virtual CPU interface. Only with EOImode 1 (EL2). */
+void gicv3_set_forwarded(u32 irq, int on);
+int  gicv3_eoimode_split(void);
 u32  gicv3_ack(void);
 void gicv3_eoi(u32 iar);
 u32  gicv3_ack_peek(void);

@@ -75,6 +75,10 @@ static inline const char *printk_skip_headers(const char *buffer)
 #define pr_emerg(fmt, ...)   lkpi_printk("drm: " fmt, ##__VA_ARGS__)
 #define pr_alert(fmt, ...)   lkpi_printk("drm: " fmt, ##__VA_ARGS__)
 #define pr_crit(fmt, ...)    lkpi_printk("drm: " fmt, ##__VA_ARGS__)
+/* Message prefixes for firmware that reports something impossible. */
+#define FW_BUG		"[Firmware Bug]: "
+#define FW_WARN		"[Firmware Warn]: "
+#define FW_INFO		"[Firmware Info]: "
 #define pr_err(fmt, ...)     lkpi_printk("drm: " fmt, ##__VA_ARGS__)
 #define pr_warn(fmt, ...)    lkpi_printk("drm: " fmt, ##__VA_ARGS__)
 #define pr_notice(fmt, ...)  lkpi_printk("drm: " fmt, ##__VA_ARGS__)

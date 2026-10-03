@@ -136,4 +136,21 @@ static inline void cpu_relax(void) { lkpi_cpu_relax(); }
 #define noinline_for_stack noinline
 #endif
 
+/* A symbol the linker must keep for callers it cannot see (assembly); clang
+ * keeps every non-static symbol anyway. */
+#ifndef __visible
+#define __visible
+#endif
+
+/* Kept out of function tracing; b1nix has no ftrace, so nothing to keep out
+ * of. */
+#ifndef notrace
+#define notrace
+#endif
+
+/* Control cannot reach here: after a trap, an infinite loop or an eret. */
+#ifndef unreachable
+#define unreachable() __builtin_unreachable()
+#endif
+
 #endif

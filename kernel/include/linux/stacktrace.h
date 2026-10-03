@@ -8,4 +8,7 @@ static inline unsigned int stack_trace_save(unsigned long *store,
                                             unsigned int size,
                                             unsigned int skipnr)
 { (void)store; (void)size; (void)skipnr; return 0; }
+/* A stack walker's per-frame callback: false stops the walk. */
+typedef bool (*stack_trace_consume_fn)(void *cookie, unsigned long addr);
+
 #endif

@@ -15,6 +15,12 @@ static inline usize struct_size_helper(usize base, usize n, usize elem)
   return __builtin_add_overflow(base, r, &r) ? (usize)-1 : r; }
 #define struct_size(p, member, n) \
 	struct_size_helper(sizeof(*(p)), (n), sizeof(*(p)->member))
+/* Sizes that saturate at SIZE_MAX instead of wrapping, so an allocation of
+ * the result fails rather than coming back too small. */
+static inline usize size_mul(usize a, usize b)
+{ usize r; return __builtin_mul_overflow(a, b, &r) ? (usize)-1 : r; }
+static inline usize size_add(usize a, usize b)
+{ usize r; return __builtin_add_overflow(a, b, &r) ? (usize)-1 : r; }
 #define flex_array_size(p, member, n) array_size((n), sizeof(*(p)->member))
 
 /*

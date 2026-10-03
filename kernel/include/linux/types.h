@@ -198,5 +198,11 @@ struct vm_fault;
 
 /* The integer type device-id tables store driver data in (uapi mod_devicetable). */
 typedef unsigned long kernel_ulong_t;
+#ifdef __SIZEOF_INT128__
+typedef __int128 s128;
+typedef unsigned __int128 u128;
+#endif
+/* A hardware interrupt number, as an irq domain names it. */
+typedef unsigned long irq_hw_number_t;
 
 #endif

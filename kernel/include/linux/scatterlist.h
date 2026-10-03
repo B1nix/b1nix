@@ -5,6 +5,9 @@
 #include <linux/mm.h>
 #include <linux/types.h>
 
+/* The longest scatterlist a single allocation chains, as Linux sizes it. */
+#define SG_MAX_SEGMENTS 2048
+
 /* The page iterator lives in <lkpi/scatterlist.h>, so its implementation
  * file needs no linux header — see <lkpi/env.h> for the boundary rule. */
 

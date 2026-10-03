@@ -429,7 +429,26 @@ static inline void cpumask_set_cpu(unsigned int cpu, struct cpumask *m)
 {
 	__atomic_fetch_or(&m->bits[cpu / 64], 1UL << (cpu % 64), __ATOMIC_SEQ_CST);
 }
+static inline void cpumask_clear_cpu(unsigned int cpu, struct cpumask *m)
+{
+	__atomic_fetch_and(&m->bits[cpu / 64], ~(1UL << (cpu % 64)), __ATOMIC_SEQ_CST);
+}
+static inline bool cpumask_test_cpu(int cpu, const struct cpumask *m)
+{
+	return (m->bits[cpu / 64] >> (cpu % 64)) & 1;
+}
+static inline void cpumask_copy(struct cpumask *dst, const struct cpumask *src)
+{
+	*dst = *src;
+}
+#define cpumask_of(cpu) get_cpu_mask(cpu)
+/* No CPU hotplug: every possible CPU is online (<linux/cpumask.h>). */
+const struct cpumask *lkpi_cpu_possible_mask(void);
+#define cpu_possible_mask lkpi_cpu_possible_mask()
+#define cpu_online_mask lkpi_cpu_possible_mask()
+#ifdef CONFIG_X86
 static inline bool cpu_smt_possible(void) { return sched_smt_active(); }
+#endif
 #define preemptible() (!irqs_disabled() && !in_atomic())
 
 /* ── arithmetic and bits ──────────────────────────────────────────────── */
@@ -507,12 +526,35 @@ static inline void hrtimer_restart(struct hrtimer *t)
 }
 
 
+unsigned long clear_user(void __user *to, unsigned long n);
+
 /* ── guards ───────────────────────────────────────────────────────────── */
 DEFINE_LOCK_GUARD_1(srcu, struct srcu_struct,
 		    _T->idx = srcu_read_lock(_T->lock),
 		    srcu_read_unlock(_T->lock, _T->idx),
 		    int idx)
 DEFINE_LOCK_GUARD_0(rcu, rcu_read_lock(), rcu_read_unlock())
+DEFINE_LOCK_GUARD_0(preempt, preempt_disable(), preempt_enable())
+DEFINE_LOCK_GUARD_1(raw_spinlock_irqsave, raw_spinlock_t,
+		    raw_spin_lock_irqsave(_T->lock, _T->flags),
+		    raw_spin_unlock_irqrestore(_T->lock, _T->flags),
+		    unsigned long flags)
+DEFINE_LOCK_GUARD_1(raw_spinlock, raw_spinlock_t,
+		    raw_spin_lock(_T->lock), raw_spin_unlock(_T->lock))
+DEFINE_LOCK_GUARD_1(spinlock, spinlock_t,
+		    spin_lock(_T->lock), spin_unlock(_T->lock))
+DEFINE_LOCK_GUARD_1(spinlock_irqsave, spinlock_t,
+		    spin_lock_irqsave(_T->lock, _T->flags),
+		    spin_unlock_irqrestore(_T->lock, _T->flags),
+		    unsigned long flags)
+DEFINE_LOCK_GUARD_1(read_lock, rwlock_t,
+		    read_lock(_T->lock), read_unlock(_T->lock))
+DEFINE_LOCK_GUARD_1(write_lock, rwlock_t,
+		    write_lock(_T->lock), write_unlock(_T->lock))
+DEFINE_LOCK_GUARD_1(write_lock_irqsave, rwlock_t,
+		    write_lock_irqsave(_T->lock, _T->flags),
+		    write_unlock_irqrestore(_T->lock, _T->flags),
+		    unsigned long flags)
 
 /* ── CPUs, again ──────────────────────────────────────────────────────── */
 #define for_each_cpu(cpu, mask) \
@@ -624,6 +666,7 @@ int add_wait_queue_priority_exclusive(wait_queue_head_t *wq_head,
 				      struct wait_queue_entry *wq_entry);
 
 
+#ifdef CONFIG_X86
 /* ── AMD SVM (M131) ───────────────────────────────────────────────────── */
 /* No memory encryption on the host: the C-bit is never set in an address. */
 #ifndef __sme_set
@@ -635,9 +678,6 @@ static inline int numa_node_id(void) { return 0; }
 /* The host's memory-encryption mask: no SME here. */
 #define sme_me_mask 0ULL
 #define __no_kcsan
-#ifndef FW_BUG
-#define FW_BUG "[Firmware Bug]: "
-#endif
 /* Zen 1's divide-by-zero erratum: a DIV left in flight can leak its quotient
  * to the next context. Upstream clears it only on affected parts; a harmless
  * 0/1 everywhere does the same job. */
@@ -658,17 +698,11 @@ static inline void __flush_tlb_all(void)
 	__asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
 	__asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
 }
-#define HWEIGHT32(w) __builtin_popcount((u32)(w))
-unsigned long clear_user(void __user *to, unsigned long n);
 /* AVIC's parameter ops: named by a definition, never called (see
  * <linux/moduleparam.h>). */
 #define KERNEL_PARAM_OPS_FL_NOARG (1 << 0)
 int param_set_bint(const char *val, const struct kernel_param *kp);
 int param_get_bool(char *buffer, const struct kernel_param *kp);
-DEFINE_LOCK_GUARD_1(raw_spinlock_irqsave, raw_spinlock_t,
-		    raw_spin_lock_irqsave(_T->lock, _T->flags),
-		    raw_spin_unlock_irqrestore(_T->lock, _T->flags),
-		    unsigned long flags)
 /* What AVIC hands the AMD IOMMU for a posted interrupt (asm/irq_remapping.h);
  * with no IOMMU interrupt remapping it only ever reaches the no-op stubs. */
 struct amd_iommu_pi_data {
@@ -680,6 +714,8 @@ struct amd_iommu_pi_data {
 	bool is_guest_mode;
 	void *ir_data;
 };
+
+#endif /* CONFIG_X86 */
 
 /* ── eventfd: the process's own eventfds (<linux/eventfd.h>) ─────────── */
 #include <linux/eventfd.h>
@@ -704,6 +740,14 @@ int kvm_anon_inode_getfd(const char *name, const struct file_operations *fops,
 __poll_t kvm_vfs_poll(struct file *file, poll_table *pt);
 struct vm_area_struct *kvm_vma_lookup(struct mm_struct *mm, unsigned long addr);
 struct vm_area_struct *kvm_find_vma(struct mm_struct *mm, unsigned long addr);
+/* The first VMA overlapping [start, end). */
+static inline struct vm_area_struct *
+find_vma_intersection(struct mm_struct *mm, unsigned long start, unsigned long end)
+{
+	struct vm_area_struct *vma = kvm_find_vma(mm, start);
+
+	return (vma && end > vma->vm_start) ? vma : NULL;
+}
 unsigned long kvm_vm_mmap(struct file *file, unsigned long addr, unsigned long len,
 			  unsigned long prot, unsigned long flag, unsigned long offset);
 

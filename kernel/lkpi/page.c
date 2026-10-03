@@ -52,6 +52,36 @@ void lkpi_page_init(void)
 
 /* ── struct page ────────────────────────────────────────────────── */
 
+/*
+ * 2^order contiguous frames at an address aligned to their size, as Linux's
+ * page allocator always returns them: a table the hardware reads from a base
+ * register (arm64 KVM's concatenated stage-2 root) depends on it. A buddy
+ * block when the tree has one; otherwise twice the run from the frame
+ * allocator, trimmed to the aligned window inside it -- every frame is freed
+ * on its own, so the trim is two frees.
+ */
+static u64 lkpi_alloc_aligned_frames(u32 order)
+{
+	usize n = (usize)1 << order;
+	u64 size = (u64)n * PAGE_SIZE;
+	u64 raw, aligned;
+
+	if (order == 0)
+		return pmm_alloc_frames(1);
+	raw = pmm_alloc_block((int)order);
+	if (raw)
+		return raw;
+	raw = pmm_alloc_frames(2 * n);
+	if (!raw)
+		return 0;
+	aligned = (raw + size - 1) & ~(size - 1);
+	for (u64 f = raw; f < aligned; f += PAGE_SIZE)
+		pmm_free_frame(f);
+	for (u64 f = aligned + size; f < raw + 2 * size; f += PAGE_SIZE)
+		pmm_free_frame(f);
+	return aligned;
+}
+
 struct page *alloc_pages(u32 gfp, u32 order)
 {
 	(void)gfp; /* see the note in <lkpi/page.h> */
@@ -64,7 +94,7 @@ struct page *alloc_pages(u32 gfp, u32 order)
 	if (!pages)
 		return 0;
 
-	u64 phys = pmm_alloc_frames(n);
+	u64 phys = lkpi_alloc_aligned_frames(order);
 	if (!phys) {
 		lkpi_kfree(pages);
 		return 0;

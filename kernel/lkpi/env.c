@@ -601,6 +601,7 @@ struct lkpi_task *lkpi_current(void)
 		 */
 		t->pid = (int)cur->id + 1;
 		t->tgid = (int)cur->id + 1;
+		t->pid_obj.nr = t->pid;
 		const char *name = cur->name;
 		usize i = 0;
 		for (; name && name[i] && i < sizeof(t->comm) - 1; i++)
@@ -609,6 +610,7 @@ struct lkpi_task *lkpi_current(void)
 	} else {
 		t->pid = 0;
 		t->tgid = 0;
+		t->pid_obj.nr = 0;
 		t->comm[0] = 0;
 	}
 	return t;

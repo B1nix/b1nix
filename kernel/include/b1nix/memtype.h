@@ -96,7 +96,7 @@ int pat_available(void);
 
 /* Cache-line size reported by CPUID leaf 1 (CLFLUSH line size * 8), 64 when
  * the CPU does not report one. */
-u32 cache_line_size(void);
+int cache_line_size(void);
 
 /* clflush every line of [addr, addr+size), bracketed by fences. Safe to call on
  * any mapping; a no-op when the CPU lacks CLFLUSH. */

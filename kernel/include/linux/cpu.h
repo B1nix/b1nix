@@ -15,12 +15,13 @@ enum cpuhp_state {
 	CPUHP_RADIX_DEAD,
 	CPUHP_AP_KVM_ONLINE,
 	CPUHP_AP_X86_KVM_CLK_ONLINE,
+	CPUHP_NR_STATES,
 };
 
 /* A state whose callbacks run for the CPUs that are up (M131: KVM enables
  * VMX on each through it). CPUs do not come and go here after boot, so the
  * startup callback runs once per online CPU at registration and the teardown
- * once each at removal. Implemented in kernel/lkpi/kvm_smp.c. */
+ * once each at removal. Implemented in kernel/lkpi/kvm_cpu.c. */
 int cpuhp_setup_state(enum cpuhp_state state, const char *name,
 		      int (*startup)(unsigned int cpu),
 		      int (*teardown)(unsigned int cpu));

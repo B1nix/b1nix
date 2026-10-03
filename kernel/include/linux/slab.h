@@ -298,4 +298,7 @@ void *memdup_user_nul(const void *user_src, usize len);
 /* A copy of n * size user bytes, refusing a product that overflows. */
 void *memdup_array_user(const void *src, usize n, usize size);
 
+/* No KASAN, so pointers carry no tag to strip. */
+static inline void *kasan_reset_tag(const void *addr) { return (void *)addr; }
+
 #endif

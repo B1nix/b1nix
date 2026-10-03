@@ -517,7 +517,11 @@ static void debugfs_file_release(void *ctx)
 
 struct dentry *debugfs_create_dir(const char *name, struct dentry *parent)
 {
-	void *p = parent ? (void *)parent : lkpi_sysfs_debug_root();
+	void *p;
+
+	if (IS_ERR(parent))
+		return parent;
+	p = parent ? (void *)parent : lkpi_sysfs_debug_root();
 
 	if (!name || !p)
 		return 0;
@@ -528,8 +532,14 @@ struct dentry *debugfs_create_file(const char *name, umode_t mode,
                                    struct dentry *parent, void *data,
                                    const struct file_operations *fops)
 {
-	void *p = parent ? (void *)parent : lkpi_sysfs_debug_root();
+	void *p;
 
+	/* A parent that failed to be created (an error pointer, as KVM keeps in
+	 * kvm->debugfs_dentry when it makes no directory) gets no file, as
+	 * upstream's debugfs answers. */
+	if (IS_ERR(parent))
+		return parent;
+	p = parent ? (void *)parent : lkpi_sysfs_debug_root();
 	if (!name || !p || !fops)
 		return 0;
 

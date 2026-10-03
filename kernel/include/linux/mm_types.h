@@ -10,6 +10,10 @@
  * up when the mapping goes away. */
 struct vm_operations_struct;
 
+typedef unsigned long vm_flags_t;
+/* A swap slot, as MTE tag storage and the swap cache name one. */
+typedef struct { unsigned long val; } swp_entry_t;
+
 struct vm_area_struct {
 	unsigned long vm_start;
 	unsigned long vm_end;

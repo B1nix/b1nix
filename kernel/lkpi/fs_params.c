@@ -436,18 +436,14 @@ __kernel_fsid_t uuid_to_fsid(const __u8 *uuid)
 /*
  * The address-not-page spelling of the page allocator.
  *
- * jbd2 allocates its descriptor blocks this way. Only single pages are served:
- * an order above zero would need physically contiguous pages, and a caller
- * given one page where it asked for four writes past the end of it — so the
- * request fails instead.
+ * jbd2 allocates its descriptor blocks this way; arm64 KVM its stage-2 root,
+ * two or more contiguous pages aligned to their size, which alloc_pages
+ * guarantees.
  */
 unsigned long __get_free_pages(gfp_t gfp, unsigned int order)
 {
-	struct page *page;
+	struct page *page = order ? alloc_pages(gfp, order) : alloc_page(gfp);
 
-	if (order != 0)
-		return 0;
-	page = alloc_page(gfp);
 	if (!page)
 		return 0;
 	return (unsigned long)page_address(page);
@@ -464,9 +460,12 @@ unsigned long get_zeroed_page(gfp_t gfp)
 
 void free_pages(unsigned long addr, unsigned int order)
 {
-	if (!addr || order != 0)
+	if (!addr)
 		return;
-	__free_page(virt_to_page((void *)addr));
+	if (order)
+		__free_pages(virt_to_page((void *)addr), order);
+	else
+		__free_page(virt_to_page((void *)addr));
 }
 
 /* Sleep until the deadline. The mode (absolute or relative) is upstream's;

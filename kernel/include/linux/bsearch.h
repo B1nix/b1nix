@@ -6,8 +6,9 @@
 /* Binary search over a sorted array. Written out rather than forwarded to the
  * kernel's own: b1nix's lib has no bsearch, and the callers here pass a
  * comparison function with Linux's signature. */
-static inline void *bsearch(const void *key, const void *base, size_t num,
-                            size_t size, int (*cmp)(const void *, const void *))
+static inline void *__inline_bsearch(const void *key, const void *base,
+                                     size_t num, size_t size,
+                                     int (*cmp)(const void *, const void *))
 {
 	const char *pivot;
 	int result;
@@ -24,5 +25,11 @@ static inline void *bsearch(const void *key, const void *base, size_t num,
 		num >>= 1;
 	}
 	return 0;
+}
+
+static inline void *bsearch(const void *key, const void *base, size_t num,
+                            size_t size, int (*cmp)(const void *, const void *))
+{
+	return __inline_bsearch(key, base, num, size, cmp);
 }
 #endif

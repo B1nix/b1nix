@@ -3,7 +3,7 @@
 #define KVM_SHIM_ASM_MSR_H
 #ifndef __ASSEMBLY__
 /* MSR access as KVM calls it (M131). The *_safe forms catch the #GP a missing
- * MSR raises (lkpi's extable, kernel/lkpi/kvm_cpu.c) and return -EIO. */
+ * MSR raises (lkpi's extable, kernel/lkpi/kvm_x86_cpu.c) and return -EIO. */
 #include <linux/types.h>
 #include <asm/msr-index.h>
 

@@ -16,4 +16,9 @@
 #define __swab64(x) swab64(x)
 #endif
 
+/* Byte swaps the compiler folds when the argument is a constant. */
+#define ___constant_swab16(x) ((u16)__builtin_bswap16((u16)(x)))
+#define ___constant_swab32(x) ((u32)__builtin_bswap32((u32)(x)))
+#define ___constant_swab64(x) ((u64)__builtin_bswap64((u64)(x)))
+
 #endif

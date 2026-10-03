@@ -467,6 +467,21 @@ static void prof_dump_thread(void *arg)
 	b1nix_prof_dump_all();
 }
 
+#if defined(B1NIX_KVM) && B1NIX_KVM
+/* M131: Linux's KVM, imported. /dev/kvm appears only when the CPU has the
+ * virtualisation it needs (VMX or SVM; arm64 EL2 with VHE). */
+static void kvm_start(void)
+{
+	extern int kvm_lkpi_init(void);
+	int kr = kvm_lkpi_init();
+
+	if (kr)
+		kprintf(LOGLEVEL_INFO, "kvm", "not available (%d)", kr);
+	else
+		kprintf(LOGLEVEL_INFO, "kvm", "/dev/kvm ready");
+}
+#endif
+
 void kernel_main(usize arg0, usize arg1)
 {
 #ifdef __x86_64__
@@ -1559,6 +1574,11 @@ void kernel_main(usize arg0, usize arg1)
 	smp_boot_aps();
 	sysfs_cpus_online();
 	BOOTMARK(70);
+#if defined(B1NIX_KVM) && B1NIX_KVM
+	/* M131: arm64 KVM, as a VHE host. After the APs: it reads every CPU's
+	 * ID registers and needs them all at EL2. */
+	kvm_start();
+#endif
 #endif
 
 #if defined(__x86_64__)
@@ -1569,15 +1589,7 @@ void kernel_main(usize arg0, usize arg1)
 #if defined(B1NIX_KVM) && B1NIX_KVM
 	/* M131: Linux's KVM. After the APs, because its set-up checks every CPU
 	 * for VMX; /dev/kvm appears only when the CPU has it. */
-	{
-		extern int kvm_lkpi_init(void);
-		int kr = kvm_lkpi_init();
-
-		if (kr)
-			kprintf(LOGLEVEL_INFO, "kvm", "not available (%d)", kr);
-		else
-			kprintf(LOGLEVEL_INFO, "kvm", "/dev/kvm ready");
-	}
+	kvm_start();
 #endif
 
 	/* Each AP turns CR4.SMEP on for itself and stays quiet about it (its line

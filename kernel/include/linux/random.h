@@ -22,4 +22,6 @@ static inline void get_random_bytes(void *buf, int nbytes)
  * picking jitter and back-off, not keys. */
 static inline u32 get_random_u32_below(u32 ceil)
 { return ceil ? lkpi_random_u32() % ceil : 0; }
+static inline unsigned long get_random_long(void) { return (unsigned long)get_random_u64(); }
+
 #endif

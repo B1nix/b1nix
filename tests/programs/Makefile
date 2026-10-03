@@ -392,10 +392,9 @@ BINARIES += $(BUILD)/bin/m134_aml_smoke
 BINARIES += $(BUILD)/bin/m135_acpi_smoke
 BINARIES += $(BUILD)/bin/m135_hib_smoke
 BINARIES += $(BUILD)/bin/m135_iommu_s3_smoke
-# M131: a VM through /dev/kvm (x86 register layout; aarch64 KVM is later).
-ifneq ($(B1NIX_ARCH),aarch64)
+# M131: VMs through /dev/kvm. The guests are each architecture's own code,
+# so aarch64 builds the same program from its own source.
 BINARIES += $(BUILD)/bin/m131_kvm_smoke
-endif
 # reboot(RESTART2, "bootloader"): the iommu lane ends through it.
 BINARIES += $(BUILD)/bin/reboot2_smoke
 BINARIES += $(BUILD)/bin/m42_w5pre_smoke
@@ -605,6 +604,16 @@ ifeq ($(GEN_MUSL_POSTLINK),1)
 endif
 
 
+
+ifeq ($(B1NIX_ARCH),aarch64)
+$(BUILD)/bin/m131_kvm_smoke: bin/smoke/m131_kvm_smoke_arm64.c $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(GEN_PIC) -c $< -o $(BUILD)/bin/m131_kvm_smoke.o
+	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) $(if $(GEN_LINKER),-T $(GEN_LINKER)) -o $@ $(GEN_CRT0) $(BUILD)/bin/m131_kvm_smoke.o $(GEN_LINK_LIBS)
+ifeq ($(GEN_MUSL_POSTLINK),1)
+	$(call stamp_linux_osabi,$@)
+endif
+endif
 
 $(BUILD)/bin/%: $$(call bin_src,$$*) $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER)
 	@mkdir -p $(dir $@)

@@ -27,6 +27,7 @@
 #define fs_initcall(fn)          LKPI_INITCALL(fn)
 #define subsys_initcall(fn)      LKPI_INITCALL(fn)
 #define device_initcall(fn)      LKPI_INITCALL(fn)
+#define device_initcall_sync(fn) LKPI_INITCALL(fn)
 #define late_initcall(fn)        LKPI_INITCALL(fn)
 #define core_initcall(fn)        LKPI_INITCALL(fn)
 #define postcore_initcall(fn)    LKPI_INITCALL(fn)
@@ -34,5 +35,21 @@
 #define module_init(fn)          LKPI_INITCALL(fn)
 #define module_exit(fn)
 #endif
+
+/*
+ * Boot parameters parsed before the subsystem initialises: early_param("name",
+ * fn) records the pair in its own section, and lkpi_run_early_params() calls
+ * fn with the value of every name=value on the kernel command line (and with
+ * "" for a bare name).
+ */
+struct lkpi_early_param {
+	const char *name;
+	int (*fn)(char *arg);
+};
+#define early_param(str, func)						\
+	static const struct lkpi_early_param __lkpi_early_##func	\
+	__attribute__((used, section("lkpi_early_param"), aligned(8))) =	\
+		{ str, func }
+void lkpi_run_early_params(void);
 
 #endif

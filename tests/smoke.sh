@@ -1097,7 +1097,7 @@ _mkimg() {  # mkimg <instance-suffix>
 }
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
-    _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg pku; _mkimg hib; _mkimg smp; _mkimg switchroot
+    _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg pku; _mkimg hib; _mkimg smp; _mkimg switchroot; _mkimg kvm
     [ "${SMOKE_BIGMEM:-0}" = "1" ] && _mkimg bigmem
     [ "${SMOKE_LA57:-0}" = "1" ] && _mkimg la57
 }
@@ -1117,6 +1117,7 @@ IOMMU_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-iommu-$ARCH.log"
 AMDVI_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-amdvi-$ARCH.log"
 PKU_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-pku-$ARCH.log"
 HIB_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-hib-$ARCH.log"
+KVM_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-kvm-$ARCH.log"
 BIGMEM_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-bigmem-$ARCH.log"
 LA57_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-la57-$ARCH.log"
 RASPI_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-raspi-$ARCH.log"
@@ -1184,7 +1185,11 @@ if [ "$SMOKE_PARALLEL" = "1" ] && { [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMO
 		# all; asking for v3 here exercises the redistributors (one per CPU,
 		# and this lane has four) and the ITS without changing what every other
 		# lane runs on.
-		[ "$ARCH" = "aarch64" ] && SMOKE_MACHINE="virt,gic-version=3,iommu=smmuv3"
+		[ "$ARCH" = "aarch64" ] && SMOKE_MACHINE="virt,gic-version=3,iommu=smmuv3,virtualization=on"
+		# ... and the EL2 lane: a CPU with VHE and the machine's EL2 enabled,
+		# so the kernel stays at EL2 as a VHE host (what arm64 KVM needs,
+		# M131), boot CPU and secondaries both.
+		[ "$ARCH" = "aarch64" ] && SMOKE_ACCEL="-cpu max"
 		# Stop on the USERSPACE AP proof, not the kernel work-stealing selftest:
 		# /bin/m24b_smoke (which emits "M24B-BKL: instance ran-on-ap") runs from
 		# init, long after the selftest marker, so cutting the instance at the
@@ -1692,6 +1697,33 @@ launch_pku() {
 	pid_pku=$!
 }
 
+# M131 on arm64: KVM runs only with the kernel at EL2 as a VHE host, which
+# needs a CPU with VHE and the machine's EL2 (virtualization=on), and the vGIC
+# needs a GICv3. No ordinary aarch64 lane has those (the smp lane does, but it
+# ends before userspace), so this one boots with them, runs the KVM test and
+# restarts, the way the pku lane does on x86_64.
+launch_kvm() {
+	[ "$ARCH" = "aarch64" ] || return 0
+	(
+		SATA_IMG=$(disk_img sata kvm)
+		AHCI_IMG=$(disk_img ahci kvm)
+		NVME_IMG=$(disk_img nvme kvm)
+		SWAP_IMG=$(disk_img swap kvm)
+		B1NIX_ISO_NAME=b1nix-kvm.iso
+		SMOKE_MACHINE="virt,gic-version=3,virtualization=on"
+		SMOKE_ACCEL="-cpu max"
+		EXTRA_QEMU_ARGS="-smp 2"
+		SMOKE_DONE_PATTERN="reboot: restarting|KERNEL PANIC|\[PANIC\]"
+		SMOKE_DONE_SETTLE=5
+		STALL_TIMEOUT=${SMOKE_KVM_STALL:-300}
+		TIMEOUT=${SMOKE_KVM_TIMEOUT:-600}
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[kvm]  "
+		run_qemu "$KVM_LOG"
+	) &
+	pid_kvm=$!
+}
+
 # M135 hibernation: the test writes its image and asks for a reboot, and the
 # same QEMU process then boots again and resumes it -- so this instance, and
 # only this one, runs without -no-reboot. A crash that resets the machine is
@@ -1886,6 +1918,7 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	# work and takes 37 s. Ordered by guest time they started last and the whole
 	# suite ended when they did.
 	_inst_list="pku hib switchroot blk sysnet posix sys gfx iommu init amdvi"
+	[ "$ARCH" = "aarch64" ] && _inst_list="kvm $_inst_list"
 	# The Raspberry Pi lane is off by default, and not because it is broken.
 	#
 	# It is the one instance no accelerator can take: HVF needs -cpu host and
@@ -1905,7 +1938,8 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	fi
 	[ "${SMOKE_BIGMEM:-0}" = "1" ] && _inst_list="bigmem $_inst_list"
 	[ "${SMOKE_LA57:-0}" = "1" ] && _inst_list="la57 $_inst_list"
-	[ -n "${SMOKE_INSTANCES:-}" ] && _inst_list="$SMOKE_INSTANCES"
+	# smp is launched by its own block above, never from the pool.
+	[ -n "${SMOKE_INSTANCES:-}" ] && _inst_list=$(command echo " $SMOKE_INSTANCES " | sed 's/ smp / /g')
 	# Drop the logs of every instance this run will not start. Their checks
 	# would otherwise grep the previous run's output and report a pass nobody
 	# earned -- a restricted SMOKE_INSTANCES run printed the full suite's
@@ -1916,14 +1950,14 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	if [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMOKE_INSTANCES " | grep -q " smp "; then
 		_ran_list="$_ran_list smp"
 	fi
-	for _known in sys sysnet blk posix gfx init switchroot iommu amdvi pku hib bigmem la57 raspi smp; do
+	for _known in sys sysnet blk posix gfx init switchroot iommu amdvi pku hib bigmem la57 raspi smp kvm; do
 		case " $_ran_list " in
 		*" $_known "*) continue ;;
 		esac
 		rm -f "$PROJECT_DIR/smoke_run/b1nix-smoke-$_known-$ARCH.log"
 	done
 	run_slot_pool $SMOKE_MAX_CONCURRENT $_inst_list
-	cat "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$PKU_LOG" "$HIB_LOG" "$RASPI_LOG" 2>/dev/null >"$LOG" || true
+	cat "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$PKU_LOG" "$HIB_LOG" "$RASPI_LOG" "$KVM_LOG" 2>/dev/null >"$LOG" || true
 else
 	launch_sys
 	launch_smp_solo
@@ -1948,7 +1982,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "=== Results ==="
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
-	for _i in sys sysnet blk posix gfx init switchroot iommu amdvi pku smp; do
+	for _i in sys sysnet blk posix gfx init switchroot iommu amdvi pku smp kvm; do
 	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" "$(disk_img vblk "$_i")"
 	done
 	[ "$FAILED" -eq 0 ]
@@ -3828,6 +3862,22 @@ if [ "$ARCH" = "x86_64" ]; then
 else
 	skipped "protection keys with the hardware" "arm64 keys need the Permission Overlay Extension, which QEMU does not model"
 fi
+# M131 on arm64: Linux's KVM as a VHE host, in the kvm lane (EL2, GICv3).
+if [ "$ARCH" = "aarch64" ]; then
+	check_output "$KVM_LOG" "aarch64: kernel at EL2 (VHE host)" "the kvm lane's kernel stayed at EL2 as a VHE host"
+	check_output "$KVM_LOG" "VHE mode initialized successfully" "arm64 KVM initialises in VHE mode: CPU capabilities decided, alternatives patched, vGIC and timer set up"
+	check_output "$KVM_LOG" "vgic interrupt IRQ25" "the vGIC takes the GIC's maintenance interrupt (PPI 9) from the device tree"
+	check_output "$KVM_LOG" "kvm: /dev/kvm ready" "/dev/kvm is registered on arm64"
+	check_output "$KVM_LOG" "M131-KVM: ok api-version" "/dev/kvm answers KVM_GET_API_VERSION with 12 on arm64"
+	check_output "$KVM_LOG" "M131-KVM: ok create-vm" "KVM_CREATE_VM returns a VM descriptor on arm64"
+	check_output "$KVM_LOG" "M131-KVM: ok vcpu" "KVM_CREATE_VCPU, and the vCPU's run area maps (arm64)"
+	check_output "$KVM_LOG" "M131-KVM: ok setup" "the vCPU is initialised for the preferred target with PSCI 0.2, and its registers are set through KVM_SET_ONE_REG"
+	check_output "$KVM_LOG" "M131-KVM: ok guest-mmio" "the guest ran at EL1 under the VHE host: its stores to unbacked memory come back as MMIO exits carrying 2+2 as it computed it"
+	check_output "$KVM_LOG" "M131-KVM: ok guest-psci-off" "the guest's PSCI SYSTEM_OFF comes back to userspace as a shutdown system event"
+	check_output "$KVM_LOG" "M131-KVM: ok vgic" "an in-kernel GICv3 is created, placed and initialised for the VM"
+	check_output "$KVM_LOG" "M131-KVM: ok guest-timer-irq" "the guest's virtual timer fired and its interrupt reached it through the vGIC: the handler acknowledged INTID 27 and ended it"
+	check_output "$KVM_LOG" "M131-KVM: done" "the arm64 KVM smoke completes with no failure"
+fi
 # ── M127: cgroup v2 resource control, the OOM killer and PSI (m127_smoke) ──
 check_output "$LOG" "M127-SMOKE: ok cg-controllers" "cgroup.controllers lists cpu, io, memory and pids; the filesystem is CGROUP2_SUPER_MAGIC; enabling a controller in the parent creates its files in the children at their documented defaults, and withdrawing it removes them"
 check_output "$LOG" "M127-SMOKE: ok pids-max" "a fork past pids.max fails with EAGAIN, pids.current never exceeds the limit and pids.events counts the refusal"
@@ -4830,6 +4880,7 @@ if [ "$ARCH" = "aarch64" ]; then
 	check_output "$SMP_LOG" "M28-HEAPBENCH: ok" "the heap scales across those CPUs instead of serialising on one lock"
 	# The GICv3 half of this lane: a message-signalled interrupt, raised by the
 	# ITS itself so the check does not depend on a particular device.
+	check_output "$SMP_LOG" "aarch64: kernel at EL2 (VHE host)" "on a CPU with VHE the kernel stays at EL2 (HCR_EL2.E2H and TGE) and runs there"
 	check_output "$SMP_LOG" "gicv3: dist" "the GICv3 distributor and redistributors come up from the device tree"
 	check_output "$SMP_LOG" "its: 0x" "the ITS is brought up (command queue, device and collection tables, LPI tables)"
 	check_output "$SMP_LOG" "M98-ITS: ok int-delivery" "an LPI raised through the ITS reaches the vector that owns it"
@@ -4897,7 +4948,7 @@ if [ "$BLOCKED" -gt 0 ]; then
 	report_wedged_instances
 fi
 
-for _i in sys sysnet blk posix gfx init switchroot iommu amdvi pku smp; do
+for _i in sys sysnet blk posix gfx init switchroot iommu amdvi pku smp kvm; do
     rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" \
           "$(disk_img vblk "$_i")" "$(disk_img ahci "$_i")" "$(disk_img btrfs "$_i")" "$(disk_img btrfsz "$_i")" \
           "$(disk_img bcache "$_i")"

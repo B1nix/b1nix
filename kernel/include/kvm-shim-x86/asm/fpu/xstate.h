@@ -5,7 +5,7 @@
  * XSAVE feature groups as KVM reasons about them (M131). The masks are
  * Linux's definitions (arch/x86/include/asm/fpu/xstate.h, the part that is
  * pure constants); what the host actually supports is b1nix's XCR0, which
- * lkpi publishes as fpu_kernel_cfg / fpu_user_cfg (kernel/lkpi/kvm_fpu.c).
+ * lkpi publishes as fpu_kernel_cfg / fpu_user_cfg (kernel/lkpi/kvm_x86_fpu.c).
  */
 #include <linux/types.h>
 #include <asm/fpu/types.h>

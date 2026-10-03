@@ -195,7 +195,7 @@ answers which question, are in [../versioning.md](../versioning.md).
 - [x] Import Linux's KVM (x86 core + VMX and SVM) through linuxkpi; `/dev/kvm` with the vCPU ioctl ABI. Unmodified 6.18 KVM picks VMX on the KVM lanes and SVM on the pku lane's AMD model (m131_kvm_smoke on both).
 - [x] EPT/NPT second-level paging, in-kernel LAPIC/IOAPIC/PIT, eventfd-based irqfd/ioeventfd, nested virtualization off. Guest timers fire from the tick; irqfd/ioeventfd use the process's own eventfds.
 - [ ] `partial` Distribution QEMU with `-accel kvm` boots a distribution kernel, then b1nix itself, inside b1nix; on bare metal and nested under the host's KVM. Nested under the host (Debian lane): SeaBIOS guest, Debian's cloud kernel on 2 vCPUs with a virtio disk, b1nix itself on 2 vCPUs through GRUB. Open: bare metal untested.
-- [ ] `planned` aarch64 KVM (VHE) after x86 works.
+- [ ] `partial` aarch64 KVM as a VHE host: the kernel stays at EL2 on a CPU with VHE, and unmodified arm64 KVM runs a guest at EL1 with stage-2 paging, PSCI, an in-kernel GICv3 and the virtual timer (kvm lane). Open: QEMU with `-accel kvm` booting a kernel on arm64; nVHE hosts.
 
 ## M132: Xperia 5 without the 64 MiB boot image limit
 

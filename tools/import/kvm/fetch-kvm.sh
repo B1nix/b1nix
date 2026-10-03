@@ -26,12 +26,133 @@ STAGE_DIR="$ROOT_DIR/build/src/kvm-${LINUX_VERSION}"
 
 mkdir -p "$SRC_PARENT"
 
+TAR_PATH="$SRC_PARENT/$TARBALL"
+P="linux-${LINUX_VERSION}"
+
+# arm64 (M131): arch/arm64/kvm and what it is written against -- its own asm
+# headers, the GIC, timer, SMCCC and PSCI definitions, and the tables the
+# sysreg and cpucap headers are generated from (upstream's awk generators,
+# run by the Makefile). Staged on its own so a tree staged for x86 alone
+# gains it without being extracted again.
+stage_arm64() {
+	set -- \
+		"$P/arch/arm64/kvm" \
+		"$P/arch/arm64/tools/sysreg" \
+		"$P/arch/arm64/tools/cpucaps" \
+		"$P/arch/arm64/tools/gen-sysreg.awk" \
+		"$P/arch/arm64/tools/gen-cpucaps.awk" \
+		"$P/arch/arm64/include/uapi/asm/kvm.h" \
+		"$P/arch/arm64/include/uapi/asm/sve_context.h" \
+		"$P/arch/arm64/include/uapi/asm/ptrace.h" \
+		"$P/arch/arm64/include/asm/esr.h" \
+		"$P/arch/arm64/include/asm/sysreg.h" \
+		"$P/arch/arm64/include/asm/kvm_arm.h" \
+		"$P/arch/arm64/include/asm/kvm_asm.h" \
+		"$P/arch/arm64/include/asm/kvm_emulate.h" \
+		"$P/arch/arm64/include/asm/kvm_host.h" \
+		"$P/arch/arm64/include/asm/kvm_hyp.h" \
+		"$P/arch/arm64/include/asm/kvm_mmu.h" \
+		"$P/arch/arm64/include/asm/kvm_nested.h" \
+		"$P/arch/arm64/include/asm/kvm_pgtable.h" \
+		"$P/arch/arm64/include/asm/kvm_pkvm.h" \
+		"$P/arch/arm64/include/asm/kvm_ptrauth.h" \
+		"$P/arch/arm64/include/asm/kvm_types.h" \
+		"$P/arch/arm64/include/asm/kvm_mte.h" \
+		"$P/arch/arm64/include/asm/virt.h" \
+		"$P/arch/arm64/include/asm/arch_gicv3.h" \
+		"$P/arch/arm64/include/asm/arch_timer.h" \
+		"$P/include/linux/irqchip/arm-gic-v3.h" \
+		"$P/include/linux/irqchip/arm-gic-common.h" \
+		"$P/include/linux/irqchip/arm-gic.h" \
+		"$P/include/linux/irqchip/arm-gic-v4.h" \
+		"$P/include/linux/irqchip/arm-gic-v5.h" \
+		"$P/include/linux/irqchip/arm-vgic-info.h" \
+		"$P/include/clocksource/arm_arch_timer.h" \
+		"$P/include/linux/arm-smccc.h" \
+		"$P/include/linux/psci.h" \
+		"$P/include/uapi/linux/psci.h" \
+		"$P/include/linux/perf/arm_pmu.h" \
+		"$P/include/linux/perf/arm_pmuv3.h" \
+		"$P/include/uapi/linux/const.h" \
+		"$P/include/linux/kasan-tags.h" \
+		"$P/arch/arm64/include/asm/hyp_image.h" \
+		"$P/arch/arm64/include/asm/gpr-num.h" \
+		"$P/arch/arm64/include/asm/hwcap.h" \
+		"$P/arch/arm64/include/uapi/asm/hwcap.h" \
+		"$P/arch/arm64/include/asm/insn.h" \
+		"$P/arch/arm64/include/asm/insn-def.h" \
+		"$P/arch/arm64/include/asm/alternative.h" \
+		"$P/arch/arm64/include/asm/alternative-macros.h" \
+		"$P/include/asm-generic/kvm_para.h" \
+		"$P/include/uapi/asm-generic/kvm_para.h" \
+		"$P/arch/arm64/include/asm/brk-imm.h" \
+		"$P/include/vdso/bits.h" \
+		"$P/include/vdso/const.h" \
+		"$P/arch/arm64/include/asm/sections.h" \
+		"$P/include/asm-generic/sections.h" \
+		"$P/arch/arm64/include/asm/cpucaps.h" \
+		"$P/arch/arm64/include/asm/cache.h" \
+		"$P/arch/arm64/include/asm/cputype.h" \
+		"$P/arch/arm64/include/asm/cpufeature.h" \
+		"$P/arch/arm64/include/asm/ptrace.h" \
+		"$P/arch/arm64/include/asm/daifflags.h" \
+		"$P/include/linux/irqchip/arm-gic-v3-prio.h" \
+		"$P/arch/arm64/include/asm/stacktrace/frame.h" \
+		"$P/include/linux/kasan-enabled.h" \
+		"$P/arch/arm64/include/asm/fpsimd.h" \
+		"$P/arch/arm64/include/asm/mte-def.h" \
+		"$P/arch/arm64/include/uapi/asm/sigcontext.h" \
+		"$P/arch/arm64/include/asm/stacktrace/nvhe.h" \
+		"$P/arch/arm64/include/asm/stage2_pgtable.h" \
+		"$P/arch/arm64/include/asm/vncr_mapping.h" \
+		"$P/arch/arm64/include/asm/pvclock-abi.h" \
+		"$P/arch/arm64/include/asm/debug-monitors.h" \
+		"$P/arch/arm64/include/asm/arm_pmuv3.h" \
+		"$P/arch/arm64/include/asm/vectors.h" \
+		"$P/arch/arm64/include/asm/lse.h" \
+		"$P/arch/arm64/include/asm/pointer_auth.h" \
+		"$P/arch/arm64/include/asm/tlbflush.h" \
+		"$P/include/uapi/linux/falloc.h" \
+		"$P/include/linux/arm_ffa.h" \
+		"$P/arch/arm64/include/asm/traps.h" \
+		"$P/arch/arm64/include/asm/pgtable-hwdef.h" \
+		"$P/arch/arm64/include/asm/spectre.h" \
+		"$P/arch/arm64/include/asm/atomic_ll_sc.h" \
+		"$P/arch/arm64/include/asm/compiler.h" \
+		"$P/arch/arm64/include/asm/tlbbatch.h" \
+		"$P/arch/arm64/include/asm/pgtable-prot.h" \
+		"$P/arch/arm64/include/asm/mte.h" \
+		"$P/arch/arm64/include/asm/stacktrace/common.h" \
+		"$P/arch/arm64/include/asm/assembler.h" \
+		"$P/arch/arm64/include/asm/fpsimdmacros.h" \
+		"$P/arch/arm64/include/asm/asm-bug.h" \
+		"$P/arch/arm64/include/asm/asm-extable.h" \
+		"$P/include/linux/build_bug.h" \
+		"$P/arch/arm64/include/asm/page-def.h" \
+		"$P/include/vdso/page.h" \
+		"$P/include/linux/compiler.h" \
+		"$P/include/linux/init.h" \
+		"$P/include/linux/linkage.h" \
+		"$P/arch/arm64/include/asm/linkage.h" \
+		"$P/arch/arm64/kernel/cpufeature.c" \
+		"$P/arch/arm64/lib/insn.c"
+	# Every path there already: nothing to do. A path missing (a list that
+	# grew since the tree was staged) stages them all again.
+	_missing=0
+	for _f in "$@"; do
+		[ -e "$STAGE_DIR/${_f#"$P"/}" ] || _missing=1
+	done
+	[ "$_missing" = 0 ] && return 0
+	echo "fetch-kvm: staging arm64 KVM from $P" >&2
+	tar -xf "$TAR_PATH" -C "$STAGE_DIR" --strip-components=1 "$@"
+}
+
 if [ -d "$STAGE_DIR/virt" ]; then
+	stage_arm64
 	echo "$STAGE_DIR"
 	exit 0
 fi
 
-TAR_PATH="$SRC_PARENT/$TARBALL"
 if [ ! -f "$TAR_PATH" ]; then
 	echo "fetch-kvm: downloading $TARBALL" >&2
 	curl -L "$URL" -o "$TAR_PATH.part" 1>&2
@@ -46,7 +167,6 @@ if [ "$have" != "$LINUX_SHA256" ]; then
 	exit 1
 fi
 
-P="linux-${LINUX_VERSION}"
 echo "fetch-kvm: staging KVM from $P" >&2
 rm -rf "$STAGE_DIR.tmp"
 mkdir -p "$STAGE_DIR.tmp"
@@ -139,4 +259,5 @@ tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
 	"$P/include/uapi/linux/perf_event.h"
 
 mv "$STAGE_DIR.tmp" "$STAGE_DIR"
+stage_arm64
 echo "$STAGE_DIR"

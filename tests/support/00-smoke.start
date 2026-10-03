@@ -60,6 +60,13 @@ elif grep -q 'b1nix.smoke=pku' /proc/cmdline 2>/dev/null; then
     [ -x /bin/m131_kvm_smoke ] && /bin/m131_kvm_smoke
     ( /bin/usleep 200000; /bin/reboot -f ) &
     exit 0
+elif grep -q 'b1nix.smoke=kvm' /proc/cmdline 2>/dev/null; then
+    # M131 on arm64: this instance's kernel runs at EL2 as a VHE host with a
+    # GICv3, which no other aarch64 lane has; it runs the KVM test, then
+    # restarts.
+    [ -x /bin/m131_kvm_smoke ] && /bin/m131_kvm_smoke
+    ( /bin/usleep 200000; /bin/reboot -f ) &
+    exit 0
 elif grep -q 'b1nix.smoke=hib' /proc/cmdline 2>/dev/null; then
     # M135 hibernation: the one test, which writes an image, reboots, and
     # carries on in the resumed machine; then a power-off.

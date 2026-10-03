@@ -2011,18 +2011,11 @@ struct file *get_file_rcu(struct file *f)
 
 /* ── tasks ────────────────────────────────────────────────────────── */
 
-/*
- * A refcounted handle on a task's identity.
- *
- * b1nix has no pid object that outlives its task — which is the whole point of
- * upstream's. Handing back the raw pid would let a caller hold something that
- * can be recycled. NULL means "no identity recorded"; i915 uses it only to show
- * an owner in debugfs, and shows none.
- */
+/* A handle on a task's identity: the one in its lkpi task (<linux/pid.h>). */
 struct pid *get_task_pid(struct lkpi_task *task, enum pid_type type)
 {
-	(void)task; (void)type;
-	return 0;
+	(void)type;
+	return task_pid(task);
 }
 
 long io_schedule_timeout(long timeout)

@@ -86,4 +86,10 @@ static inline void writeq(u64 v, volatile void *addr)
  */
 #include <asm/barrier.h>
 
+/* The unordered accessors: the plain accesses above carry no barrier. */
+#define readl_relaxed(addr)	readl(addr)
+#define writel_relaxed(v, addr)	writel(v, addr)
+#define readq_relaxed(addr)	readq(addr)
+#define writeq_relaxed(v, addr)	writeq(v, addr)
+
 #endif

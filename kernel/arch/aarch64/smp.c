@@ -44,7 +44,10 @@ extern void arch_context_switch(struct cpu_context *old, struct cpu_context *new
                                 volatile int *old_stack_released);
 extern void timer_init_cpu(void);
 
-/* The block the exception vectors reach through TPIDR_EL1. Offsets are
+/* The block the exception vectors reach through TPIDR_EL1 -- TPIDR_EL2 when
+ * the kernel runs at EL2 as a VHE host, because KVM loads a guest's
+ * TPIDR_EL1 there for as long as a vCPU is loaded, with the host still
+ * running (Linux moves its per-CPU offset to TPIDR_EL2 the same way). Offsets are
  * hardcoded in kernel/arch/aarch64/isr.S; the asserts below keep the two in
  * step. One per CPU, because the vectors' two jobs — resetting SP_EL1 on an
  * EL0 entry and finding a stack for an EL1 fault — are per CPU the moment a
@@ -54,16 +57,26 @@ struct aarch64_pcpu_asm {
 	u64 fault_top;   /* +8  top of this CPU's EL1 fault stack */
 	u64 fault_sp;    /* +16 SP_EL1 the current EL1 fault interrupted */
 	u64 fault_x1;    /* +24 scratch: isr.S borrows x1 to read SP, puts it back */
+	/* +32 M131: where this CPU's copy of KVM's per-CPU variables lies, as
+	 * an offset from their template -- Linux's per-CPU offset, which KVM's
+	 * world-switch assembly adds to a symbol (kvm-shim-arm64/asm/assembler.h
+	 * reads it here). */
+	u64 kvm_percpu_off;
 };
 _Static_assert(__builtin_offsetof(struct aarch64_pcpu_asm, kstack_top) == 0, "PCPU_KSTACK_TOP");
 _Static_assert(__builtin_offsetof(struct aarch64_pcpu_asm, fault_top) == 8, "PCPU_FAULT_TOP");
 _Static_assert(__builtin_offsetof(struct aarch64_pcpu_asm, fault_sp) == 16, "PCPU_FAULT_SP");
 _Static_assert(__builtin_offsetof(struct aarch64_pcpu_asm, fault_x1) == 24, "PCPU_FAULT_X1");
+_Static_assert(__builtin_offsetof(struct aarch64_pcpu_asm, kvm_percpu_off) == 32,
+               "PCPU_KVM_PERCPU_OFF, kvm-shim-arm64/asm/assembler.h");
 
 #define AARCH64_ASM_CPUS 8
 #define EL1_FAULT_STACK_SIZE 16384
 
 static struct aarch64_pcpu_asm g_pcpu_asm[AARCH64_ASM_CPUS];
+/* Each CPU's MPIDR, recorded by the CPU itself: what an SGI to one CPU and
+ * KVM's CPU map name it by. */
+static u64 g_cpu_mpidr[AARCH64_ASM_CPUS];
 static u8 g_el1_fault_stacks[AARCH64_ASM_CPUS][EL1_FAULT_STACK_SIZE]
     __attribute__((aligned(16)));
 
@@ -82,15 +95,33 @@ void aarch64_pcpu_asm_init(u32 cpu)
 	    (u64)(usize)g_el1_fault_stacks[cpu] + EL1_FAULT_STACK_SIZE;
 	g_pcpu_asm[cpu].fault_sp = 0;
 	g_pcpu_asm[cpu].fault_x1 = 0;
+	__asm__ volatile("mrs %0, mpidr_el1" : "=r"(g_cpu_mpidr[cpu]));
 
-	__asm__ volatile("msr tpidr_el1, %0" : : "r"(&g_pcpu_asm[cpu]) : "memory");
+	if (arch_kernel_at_el2())
+		__asm__ volatile("msr tpidr_el2, %0" : : "r"(&g_pcpu_asm[cpu]) : "memory");
+	else
+		__asm__ volatile("msr tpidr_el1, %0" : : "r"(&g_pcpu_asm[cpu]) : "memory");
+}
+
+void aarch64_set_kvm_percpu_off(u32 cpu, u64 off)
+{
+	if (cpu < AARCH64_ASM_CPUS)
+		__atomic_store_n(&g_pcpu_asm[cpu].kvm_percpu_off, off, __ATOMIC_RELEASE);
+}
+
+u64 aarch64_cpu_mpidr(u32 cpu)
+{
+	return cpu < AARCH64_ASM_CPUS ? g_cpu_mpidr[cpu] : 0;
 }
 
 static struct aarch64_pcpu_asm *pcpu_asm_self(void)
 {
 	struct aarch64_pcpu_asm *p;
 
-	__asm__ volatile("mrs %0, tpidr_el1" : "=r"(p));
+	if (arch_kernel_at_el2())
+		__asm__ volatile("mrs %0, tpidr_el2" : "=r"(p));
+	else
+		__asm__ volatile("mrs %0, tpidr_el1" : "=r"(p));
 	return p;
 }
 
