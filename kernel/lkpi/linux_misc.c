@@ -11,6 +11,7 @@
 #include <b1nix/arch.h>
 #include <linux/delay.h>
 #include <linux/dma-fence.h>
+#include <linux/eventfd.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/i2c.h>
@@ -587,26 +588,127 @@ struct dma_fence *sync_file_get_fence(int fd)
 
 /* ── eventfd ────────────────────────────────────────────────────── */
 
+/* Linux's EPOLLIN, the key irqfd's wake callback tests for. */
+#define LKPI_EPOLLIN 0x001
+
+static void lkpi_eventfd_notify(void *kobj, unsigned events)
+{
+	struct eventfd_ctx *ctx = kobj;
+
+	(void)events;
+	__wake_up(&ctx->wqh, TASK_NORMAL, 0, (void *)(uintptr_t)LKPI_EPOLLIN);
+}
+
+static void lkpi_eventfd_destroy(void *kobj)
+{
+	kfree(kobj);
+}
+
+/* The eventfd_ctx of a held eventfd handle, made if it has none. */
+static struct eventfd_ctx *lkpi_eventfd_ctx_of(void *handle)
+{
+	static int ops_set;
+	struct eventfd_ctx *ctx = lkpi_eventfd_kobj(handle, NULL), *fresh;
+
+	if (ctx)
+		return ctx;
+	if (!__atomic_exchange_n(&ops_set, 1, __ATOMIC_ACQ_REL))
+		lkpi_eventfd_set_kernel_ops(lkpi_eventfd_notify, lkpi_eventfd_destroy);
+	fresh = kzalloc(sizeof(*fresh), GFP_KERNEL);
+	if (!fresh)
+		return NULL;
+	fresh->handle = handle;
+	init_waitqueue_head(&fresh->wqh);
+	ctx = lkpi_eventfd_kobj(handle, fresh);
+	if (ctx != fresh)
+		kfree(fresh);
+	return ctx;
+}
+
 struct eventfd_ctx *eventfd_ctx_fdget(int fd)
 {
-	(void)fd;
-	/*
-	 * b1nix has eventfd (VFS_HANDLE_EVENTFD), but reaching it means calling
-	 * into the VFS from a translation unit that cannot include its headers —
-	 * the same boundary the descriptor calls in <lkpi/env.h> cross. Wiring it
-	 * belongs with the first caller that needs a driver to signal userspace,
-	 * and until then this reports absence rather than accepting a descriptor
-	 * it would never signal.
-	 */
-	return ERR_PTR(-ENOSYS);
+	void *h = lkpi_fd_get_eventfd(fd);
+	struct eventfd_ctx *ctx;
+
+	if (!h)
+		return ERR_PTR(-EBADF);
+	ctx = lkpi_eventfd_ctx_of(h);
+	if (!ctx) {
+		lkpi_handle_release(h);
+		return ERR_PTR(-ENOMEM);
+	}
+	return ctx;
+}
+
+static int lkpi_eventfd_file_release(struct inode *inode, struct file *f)
+{
+	struct eventfd_ctx *ctx = f->private_data;
+
+	(void)inode;
+	f->private_data = NULL;
+	if (ctx)
+		eventfd_ctx_put(ctx);
+	return 0;
+}
+
+static const struct file_operations lkpi_eventfd_fops = {
+	.release = lkpi_eventfd_file_release,
+};
+
+bool lkpi_file_is_eventfd(const struct file *f)
+{
+	return f && f->f_op == &lkpi_eventfd_fops;
+}
+
+struct file *lkpi_eventfd_file(int fd)
+{
+	struct eventfd_ctx *ctx = eventfd_ctx_fdget(fd);
+	struct file *f;
+
+	if (IS_ERR(ctx))
+		return NULL;
+	f = anon_inode_getfile("[eventfd]", &lkpi_eventfd_fops, ctx, O_RDWR);
+	if (!f)
+		eventfd_ctx_put(ctx);
+	return f;
+}
+
+struct eventfd_ctx *eventfd_ctx_fileget(struct file *file)
+{
+	struct eventfd_ctx *ctx;
+
+	if (!lkpi_file_is_eventfd(file))
+		return ERR_PTR(-EINVAL);
+	ctx = file->private_data;
+	lkpi_handle_retain(ctx->handle);
+	return ctx;
 }
 
 void eventfd_ctx_put(struct eventfd_ctx *ctx)
 {
-	(void)ctx;
+	/* The last reference frees the eventfd, and the ctx with it: nothing of
+	 * the ctx is touched after this. */
+	if (ctx)
+		lkpi_handle_release(ctx->handle);
 }
 
 void eventfd_signal(struct eventfd_ctx *ctx)
 {
-	(void)ctx;
+	if (ctx)
+		lkpi_eventfd_signal(ctx->handle, 1);
+}
+
+void eventfd_ctx_do_read(struct eventfd_ctx *ctx, __u64 *cnt)
+{
+	*cnt = lkpi_eventfd_take(ctx->handle);
+}
+
+int eventfd_ctx_remove_wait_queue(struct eventfd_ctx *ctx, wait_queue_entry_t *wait,
+				  __u64 *cnt)
+{
+	lkpi_spin_lock(&ctx->wqh.lock);
+	__remove_wait_queue(&ctx->wqh, wait);
+	*cnt = lkpi_eventfd_take(ctx->handle);
+	lkpi_spin_unlock(&ctx->wqh.lock);
+	return *cnt ? 0 : -EAGAIN;
 }

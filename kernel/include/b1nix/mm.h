@@ -471,6 +471,9 @@ void vma_trace_dump(u64 start, u64 end);
 void vma_trace_dump_addr(u64 va);
 int vma_trace_faults_enabled(void);
 int vmm_handle_page_fault(u64 fault_addr, u64 error_code);
+/* mmap/munmap for the current task, from kernel code (syscall.c). */
+u64 syscall_mmap_current(void *addr, usize length, int prot, int flags);
+isize syscall_munmap_current(void *addr, usize length);
 
 /* What the last page fault on THIS CPU decided, recorded as it was decided.
  * The exception report re-walks the tables, but by then other CPUs have run;

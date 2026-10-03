@@ -4,4 +4,5 @@
 #include <linux/mem_encrypt.h>
 #define CC_ATTR_MEM_ENCRYPT 1
 #define CC_ATTR_GUEST_MEM_ENCRYPT 2
+#define CC_ATTR_HOST_SEV_SNP 3
 #endif

@@ -25,6 +25,8 @@
 #include <b1nix/pkeys.h>
 #include <b1nix/secretmem.h>
 #include <b1nix/cpuidle.h>
+#include <b1nix/kvm_hooks.h>
+#include <b1nix/ktimer.h>
 #include <b1nix/sched.h>
 #include "../syscall/linux_modern.h"
 #include <b1nix/klog.h>
@@ -228,6 +230,14 @@ static void task_fpu_restore(struct task *t) {
     arch_fpu_restore(t->fpu_state);
 }
 
+/* Replace the area the task's registers are saved into on a switch (M131:
+ * a vCPU's guest image while KVM_RUN has it loaded). NULL is ignored. */
+void task_set_xsave_area(struct task *t, void *area) {
+  if (!t || !area || !arch_xsave_enabled())
+    return;
+  g_task_xsave[task_index(t)] = area;
+}
+
 void *task_xsave_area(const struct task *t) {
   if (!t || !arch_xsave_enabled())
     return 0;
@@ -367,12 +377,39 @@ void scheduler_preempt_disable(void) {
   interrupts_restore(flags);
 }
 
-void scheduler_preempt_enable(void) {
-  u64 flags = interrupts_save();
+/* A tick that wanted this task off the CPU but found it in a region that
+ * may not be preempted (M131): the switch happens when the region ends, as
+ * Linux's preempt_enable does with need_resched, and code that polls for it
+ * (KVM before each guest entry) can see it. */
+static volatile u8 g_task_resched[TASK_SLOTS];
 
-  if (current_task && g_task_preempt_depth[task_index(current_task)] > 0)
-    g_task_preempt_depth[task_index(current_task)]--;
+void scheduler_preempt_enable(void) {
+  int irqs_on = interrupts_enabled();
+  u64 flags = interrupts_save();
+  int yield_now = 0;
+
+  if (current_task && g_task_preempt_depth[task_index(current_task)] > 0) {
+    usize idx = task_index(current_task);
+
+    g_task_preempt_depth[idx]--;
+    if (g_task_preempt_depth[idx] == 0 && g_task_resched[idx] && irqs_on &&
+        current_task->state == TASK_RUNNING)
+      yield_now = 1;
+  }
   interrupts_restore(flags);
+  if (yield_now)
+    scheduler_yield();
+}
+
+int scheduler_resched_pending(void) {
+  return current_task && g_task_resched[task_index(current_task)];
+}
+
+/* The tick could not preempt: leave the request on the task. */
+void scheduler_note_resched(void) {
+  if (current_task && current_task->state == TASK_RUNNING &&
+      sched_other_work_pending())
+    g_task_resched[task_index(current_task)] = 1;
 }
 static u64  g_task_child_tid_clear[TASK_SLOTS];
 /* set_robust_list(2): the user address of the thread's robust mutex list head
@@ -1957,6 +1994,9 @@ void sched_park_here_if_asked(void) {
 }
 
 int sched_park_secondary_cpus(u64 timeout_ms) {
+  /* KVM (M131): VMXOFF on every CPU while each can still be asked to, the
+   * way Linux takes a CPU's virtualization down before it goes offline. */
+  kvm_hook_cpus_down();
   int want = (g_max_cpus > 1) ? g_max_cpus - 1 : 0;
   u64 deadline = ktime_monotonic_ns() + timeout_ms * 1000000ull;
 
@@ -1977,7 +2017,16 @@ int sched_park_secondary_cpus(u64 timeout_ms) {
   return 0;
 }
 
+static void sched_unpark_secondary_cpus_inner(void);
+
+/* KVM (M131): the CPUs a sleep powered down come back with virtualization
+ * off; KVM turns it on again on each once they are all up. */
 void sched_unpark_secondary_cpus(void) {
+  sched_unpark_secondary_cpus_inner();
+  kvm_hook_cpus_up();
+}
+
+static void sched_unpark_secondary_cpus_inner(void) {
   int want = (g_max_cpus > 1) ? g_max_cpus - 1 : 0;
 
   __atomic_store_n(&g_park_request, 0, __ATOMIC_RELEASE);
@@ -2391,19 +2440,21 @@ static struct task *pick_next_task(void) {
 
         g_task_lease_stuck[bi] = 1;
         if (!reported) {
+          char line[192];
+
           reported = 1;
-          console_write("sched: pid ");
-          console_write_dec((u64)best_task->id);
-          console_write(" (");
-          console_write(best_task->name ? best_task->name : "(none)");
-          console_write(") cannot be resumed -- lease never published,"
-                        " switching_out=");
-          console_write_dec((u64)__atomic_load_n(&g_task_switching_out[bi],
-                                                __ATOMIC_ACQUIRE));
-          console_write(" last_clear=");
-          console_write(g_task_lease_site[bi] ? g_task_lease_site[bi]
-                                              : "(never)");
-          console_write("; taking it out of the scan\n");
+          /* One write: pieces of it interleaved with a program's output on
+           * another CPU and left a line with no timestamp. */
+          snprintf(line, sizeof(line),
+                   "sched: pid %lu (%s) cannot be resumed -- lease never "
+                   "published, switching_out=%u last_clear=%s; taking it out "
+                   "of the scan\n",
+                   (unsigned long)best_task->id,
+                   best_task->name ? best_task->name : "(none)",
+                   (unsigned)__atomic_load_n(&g_task_switching_out[bi],
+                                             __ATOMIC_ACQUIRE),
+                   g_task_lease_site[bi] ? g_task_lease_site[bi] : "(never)");
+          console_write(line);
         }
       }
     }
@@ -2838,6 +2889,14 @@ static void wake_sleepers(void) {
     /* A timerfd's deadline is a deadline too (see timerfd_note_deadline). */
     if (tfd != ~0ull && tfd > scheduler_ticks && (next == 0 || tfd < next))
       next = tfd;
+  }
+  /* Interrupt-context timers are deadlines too: an idle CPU has to wake for
+   * them (ktimer_arm noted theirs; a rescan must not raise past it). */
+  {
+    u64 kt = ktimer_next_tick();
+
+    if (kt && (next == 0 || kt < next))
+      next = kt;
   }
   if (__atomic_load_n(&g_wake_deadline_gen, __ATOMIC_ACQUIRE) == gen)
     __atomic_store_n(&g_wake_deadline, next, __ATOMIC_RELEASE);
@@ -4066,6 +4125,7 @@ void task_set_user_rip(struct task *t, u64 rip) {
   g_task_user_rip[task_index(t)] = rip;
 }
 
+
 /* Where a task was in userspace when it entered the kernel, and the frame
  * pointer it left behind.
  *
@@ -4606,6 +4666,8 @@ static void clone_thread_kentry(void *arg) {
     extern void x86_clone_thread_jump_regs(u64 entry, u64 stack,
                                            const struct clone_user_regs *r);
     sched_acct_leave_kernel();
+    interrupts_disable();
+    kvm_hook_return_to_user();
     x86_clone_thread_jump_regs(entry, stack, &uregs);
   }
 #else
@@ -4622,6 +4684,8 @@ static void clone_thread_kentry(void *arg) {
      * start_func, then iretqs to ring 3 at the parent's RIP. musl's child
      * code then pops the arg from the stack and calls *r9. */
     extern void x86_clone_thread_jump(u64 entry, u64 stack, u64 start_func);
+    interrupts_disable();
+    kvm_hook_return_to_user();
     x86_clone_thread_jump(entry, stack, start_func);
   }
 #ifdef __x86_64__
@@ -4641,6 +4705,8 @@ static void clone_thread_kentry(void *arg) {
    * task's own C frames and erets from there, so SP_EL1 has to be put back
    * explicitly -- by the caller that knows whose task this is, rather than out
    * of a per-CPU slot that is only right until something publishes another. */
+  interrupts_disable();
+  kvm_hook_return_to_user();
   x86_user_jump((usize)entry, (usize)sp, (usize)user_arg, 0,
                 (usize)current_task->kernel_stack_ptr);
 #elif defined(__aarch64__)
@@ -5639,6 +5705,14 @@ static int scheduler_yield_inner(void) {
    * return after arch_context_switch resumes this task. */
   int restore_irqs = interrupts_enabled();
   interrupts_disable();
+  /* A pending reschedule request is answered by this yield, whether or not
+   * it finds another task to switch to: the CPU was offered. Cleared only on
+   * a switch, a request raised for work this CPU does not take (another
+   * CPU's queue) stayed up for good, and KVM -- which cancels every guest
+   * entry while one is up and yields to clear it -- spun in the kernel
+   * without running its guest until something else moved the task. */
+  if (current_task)
+    g_task_resched[task_index(current_task)] = 0;
   wake_sleepers();
 
   /* M29: reap DEAD thread tasks (CLONE_VM) whose stack_released has been
@@ -6094,6 +6168,13 @@ static int scheduler_yield_inner(void) {
    * genuine overlap, so it can be a panic again. */
   sched_set_prev_task(new_task == old_task ? 0 : old_task);
 
+  /* KVM's preempt notifiers (M131): a vCPU thread leaving its CPU puts its
+   * VMCS down -- here, while it is still `current` and its address space is
+   * still loaded, as Linux does before switch_mm -- and picks it up again
+   * after the switch, wherever it resumes. */
+  if (new_task != old_task)
+    kvm_hook_sched_out(old_task, new_task);
+
   new_task->state = TASK_RUNNING;
   current_task = new_task;
 
@@ -6277,6 +6358,11 @@ static int scheduler_yield_inner(void) {
   }
   arch_context_switch(&old_task->context, &new_task->context,
                       &old_task->stack_released);
+  {
+    struct percpu *pc = get_percpu();
+
+    kvm_hook_sched_in(current_task, pc ? (int)pc->cpu_id : 0);
+  }
 
   /* Switched in: SP now belongs to whoever is running here, so the window in
    * which SP legitimately still names the OUTGOING task is over. */
@@ -7058,8 +7144,11 @@ static void serial_silence_watchdog(void) {
   static u64 last_change_steal;
   static int dumps;
   static int test_mode = -1;
+  /* b1nix.silence-dump arms it outside the test lanes too: a distribution
+   * boot that wedges says as little as a test one. */
   if (test_mode < 0)
-    test_mode = bootinfo_has_flag("b1nix.test=1") ? 1 : 0;
+    test_mode = (bootinfo_has_flag("b1nix.test=1") ||
+                 bootinfo_has_flag("b1nix.silence-dump")) ? 1 : 0;
   if (!test_mode || dumps >= SILENCE_WATCHDOG_MAX_DUMPS)
     return;
   u64 seq = g_console_write_seq;
@@ -7615,6 +7704,8 @@ void scheduler_on_timer_tick(void) {
   if (current_task->state == TASK_RUNNING &&
       g_task_preempt_depth[task_index(current_task)] == 0) {
     scheduler_yield();
+  } else {
+    scheduler_note_resched();
   }
 }
 

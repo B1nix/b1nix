@@ -1668,7 +1668,9 @@ launch_amdvi() {
 # M124: protection keys on a CPU that has them. The KVM lanes get the host's
 # CPU, and a host without PKU cannot lend it; QEMU's TCG models it, so this lane
 # boots its own small image there and runs m124_smoke alone. aarch64 keys need
-# the Permission Overlay Extension, which QEMU does not model.
+# the Permission Overlay Extension, which QEMU does not model. The model is an
+# AMD one with SVM and nested paging, so m131_kvm_smoke then runs its VM
+# through KVM's SVM side -- the KVM lanes' host CPU has VMX (M131).
 launch_pku() {
 	[ "$ARCH" = "aarch64" ] && return 0
 	(
@@ -1677,7 +1679,7 @@ launch_pku() {
 		NVME_IMG=$(disk_img nvme pku)
 		SWAP_IMG=$(disk_img swap pku)
 		B1NIX_ISO_NAME=b1nix-pku.iso
-		SMOKE_ACCEL=${SMOKE_PKU_ACCEL:-"-accel tcg -cpu max"}
+		SMOKE_ACCEL=${SMOKE_PKU_ACCEL:-"-accel tcg -cpu max,vendor=AuthenticAMD,+svm,+npt"}
 		SMOKE_SMP=1
 		SMOKE_DONE_PATTERN="reboot: restarting|KERNEL PANIC|\[PANIC\]"
 		SMOKE_DONE_SETTLE=5
@@ -3513,6 +3515,15 @@ if [ -n "$ACPI_FIXTURE" ] && [ "$ARCH" = "x86_64" ]; then
 	check_output "$POSIX_LOG" "M135-BAT: $ACPI_FIXTURE_BAT_INFO" "the battery publishes what _BIX declares: cycle count, design capacity and voltage, chemistry, model, serial and maker"
 	check_output "$POSIX_LOG" "M135-ACPI: ok battery-alarm" "writing alarm hands the trip to the firmware's _BTP, and capacity_level reads Low below it"
 	check_output "$POSIX_LOG" "M135-ACPI: ok charge-behaviour" "charge_behaviour offers what _BMD says the battery can do, hands a choice to _BMC, and reads back what _BMD then reports; a mode that does not exist is refused"
+	# M131: a VM through /dev/kvm, Linux's KVM imported through linuxkpi. The
+	# lanes run under the host's KVM with -cpu host, so the guest CPU has VMX.
+	check_output "$POSIX_LOG" "kvm: Intel VMX" "on the host's Intel CPU, KVM's VMX module takes the machine"
+	check_output "$POSIX_LOG" "M131-KVM: ok api-version" "/dev/kvm answers KVM_GET_API_VERSION with 12: Linux's KVM is up and its misc device reaches the driver"
+	check_output "$POSIX_LOG" "M131-KVM: ok create-vm" "KVM_CREATE_VM returns a VM descriptor"
+	check_output "$POSIX_LOG" "M131-KVM: ok memslot" "a page of the process's memory becomes guest memory (KVM_SET_USER_MEMORY_REGION)"
+	check_output "$POSIX_LOG" "M131-KVM: ok vcpu" "KVM_CREATE_VCPU, and the vCPU's run area maps from its descriptor"
+	check_output "$POSIX_LOG" "M131-KVM: ok guest-io" "the guest executed real-mode code in VMX non-root mode: KVM_RUN reported its port writes, and they carry 2+2 as it computed it"
+	check_output "$POSIX_LOG" "M131-KVM: ok guest-hlt" "the guest's HLT comes back to userspace as KVM_EXIT_HLT"
 	check_output "$POSIX_LOG" "M135-THERMAL: trips $ACPI_FIXTURE_TZ_TRIPS" "the zone's trip points are the firmware's _CRT, _HOT, _PSV and _ACx, in Linux's order"
 	check_output "$POSIX_LOG" "M135-THERMAL: cdevs $ACPI_FIXTURE_TZ_CDEVS" "the cooling devices are the processor and the fans the zone's _ALx lists name"
 	check_output "$POSIX_LOG" "M135-ACPI: ok thermal-passive" "past _PSV the processor is slowed step by step through its P-states (ACPI's _TC1/_TC2 formula every _TSP)"
@@ -3809,6 +3820,10 @@ if [ "$ARCH" = "x86_64" ]; then
 	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-signal" "a signal handler runs with the initial key rights, and the interrupted rights are restored by sigreturn (pku lane)"
 	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-fork-exec" "a fork child keeps the keys and rights; an exec'd program starts with no keys and the initial PKRU (pku lane)"
 	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-exec-only" "mprotect(PROT_EXEC) alone makes code callable but unreadable through the execute-only key (pku lane)"
+	check_output "$PKU_LOG" "kvm: AMD SVM" "on an AMD CPU with SVM, KVM's SVM module takes the machine (pku lane)"
+	check_output "$PKU_LOG" "M131-KVM: ok vcpu" "KVM_CREATE_VCPU through SVM, and the vCPU's run area maps (pku lane)"
+	check_output "$PKU_LOG" "M131-KVM: ok guest-io" "the guest executed real-mode code under SVM with nested paging: its port writes carry 2+2 (pku lane)"
+	check_output "$PKU_LOG" "M131-KVM: ok guest-hlt" "the guest's HLT comes back to userspace under SVM (pku lane)"
 	check_output "$PKU_LOG" "M124-SMOKE: done" "the M124 suite completes under TCG with protection keys"
 else
 	skipped "protection keys with the hardware" "arm64 keys need the Permission Overlay Extension, which QEMU does not model"

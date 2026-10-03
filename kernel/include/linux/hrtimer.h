@@ -4,6 +4,7 @@
 #include <linux/ktime.h>
 #include <linux/timer.h>
 #include <linux/types.h>
+#include <lkpi/env.h>
 
 /*
  * High-resolution timers.
@@ -29,6 +30,12 @@ struct hrtimer {
 	struct {
 		ktime_t expires;
 	} node;
+	/* A hard timer (hrtimer_setup_hard) fires from the timer interrupt at
+	 * the scheduler tick's resolution rather than from the workqueue in
+	 * ten-millisecond steps; its callback must not sleep, as upstream's
+	 * hard hrtimers may not. */
+	int hard;
+	struct lkpi_ktimer kt;
 };
 
 void hrtimer_init(struct hrtimer *t, int clock_id, enum hrtimer_mode mode);
@@ -52,5 +59,13 @@ static inline void hrtimer_setup(struct hrtimer *t,
 {
 	hrtimer_init(t, clock_id, mode);
 	t->function = function;
+}
+/* The same, as a hard timer (see struct hrtimer). */
+static inline void hrtimer_setup_hard(struct hrtimer *t,
+                                      enum hrtimer_restart (*function)(struct hrtimer *),
+                                      int clock_id, enum hrtimer_mode mode)
+{
+	hrtimer_setup(t, function, clock_id, mode);
+	t->hard = 1;
 }
 #endif

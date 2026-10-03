@@ -69,6 +69,7 @@ typedef struct wait_queue_entry wait_queue_entry_t;
 
 #define WQ_FLAG_EXCLUSIVE 0x01
 #define WQ_FLAG_WOKEN     0x02
+#define WQ_FLAG_PRIORITY  0x10 /* ahead of the rest; one per queue */
 
 struct wait_queue_head {
 	volatile u64 wakeups; /* wake_up calls; diagnostics and self-test */

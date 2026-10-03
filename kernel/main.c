@@ -1566,6 +1566,19 @@ void kernel_main(usize arg0, usize arg1)
 	smp_boot_aps();
 	/* /sys is already mounted, with only the boot CPU in it. */
 	sysfs_cpus_online();
+#if defined(B1NIX_KVM) && B1NIX_KVM
+	/* M131: Linux's KVM. After the APs, because its set-up checks every CPU
+	 * for VMX; /dev/kvm appears only when the CPU has it. */
+	{
+		extern int kvm_lkpi_init(void);
+		int kr = kvm_lkpi_init();
+
+		if (kr)
+			kprintf(LOGLEVEL_INFO, "kvm", "not available (%d)", kr);
+		else
+			kprintf(LOGLEVEL_INFO, "kvm", "/dev/kvm ready");
+	}
+#endif
 
 	/* Each AP turns CR4.SMEP on for itself and stays quiet about it (its line
 	 * would land inside the one smp_boot_aps is writing). Report the tally here

@@ -13,6 +13,7 @@
 #include <b1nix/spinlock.h>
 #include <b1nix/mm.h>
 #include <b1nix/arch.h>
+#include <b1nix/ktimer.h>
 #include <b1nix/kprobe.h>
 #include <b1nix/ptrace.h>
 #include <b1nix/watchdog.h>
@@ -704,6 +705,9 @@ static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 			perf_event_tick_sample(frame->elr, frame->x29, in_user,
 			                       pc ? (int)pc->cpu_id : 0, frame);
 		}
+
+		/* Timers that fire from the interrupt itself (<b1nix/ktimer.h>). */
+		ktimer_tick();
 
 		/* Only the boot CPU runs the housekeeping half of the tick: the
 		 * watchdog counts wall time once, the serial drain owns a device, and

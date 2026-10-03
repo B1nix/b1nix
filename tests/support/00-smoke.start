@@ -54,6 +54,10 @@ elif grep -q 'b1nix.smoke=pku' /proc/cmdline 2>/dev/null; then
     mount -t 9p hostshare /mnt/host 2>/dev/null || true
     [ -x /mnt/host/bin/m124_smoke ] && cp -f /mnt/host/bin/m124_smoke /bin/m124_smoke
     /bin/m124_smoke
+    # M131 on the other vendor: the lane's CPU is an AMD model with SVM, so
+    # this VM goes through KVM's SVM side (the KVM lanes' host CPU has VMX).
+    [ -x /mnt/host/bin/m131_kvm_smoke ] && cp -f /mnt/host/bin/m131_kvm_smoke /bin/m131_kvm_smoke
+    [ -x /bin/m131_kvm_smoke ] && /bin/m131_kvm_smoke
     ( /bin/usleep 200000; /bin/reboot -f ) &
     exit 0
 elif grep -q 'b1nix.smoke=hib' /proc/cmdline 2>/dev/null; then
@@ -285,6 +289,7 @@ run_test /bin/m134_aml_smoke posix
 # M135: ACPI events. The host presses the power button and changes the VM
 # generation when it asks, so it runs where nothing else is waiting on input.
 run_test /bin/m135_acpi_smoke posix
+run_test /bin/m131_kvm_smoke posix
 # M123: the same namespaces through Alpine's unshare, nsenter and bubblewrap.
 if [ "$SMOKE_POSIX" = "1" ] && [ -x /etc/m123-tools-smoke.sh ]; then
     /bin/sh /etc/m123-tools-smoke.sh

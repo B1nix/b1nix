@@ -5,6 +5,7 @@
  * they are all in that header, because that is the one drivers reach them from.
  * This is the split-out name pointing back. */
 #include <linux/bitops.h>
+#include <linux/errno.h>
 
 /* Is every bit of `src1` also set in `src2`? The trailing-word mask matters
  * here too: bits above nbits are not part of either set. */

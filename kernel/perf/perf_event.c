@@ -1497,6 +1497,10 @@ static isize perf_open(u64 uattr, i32 pid, i32 cpu, i32 group_fd, u64 flags) {
     if (attr.config == PERF_COUNT_SW_BPF_OUTPUT &&
         attr.type == PERF_TYPE_SOFTWARE) {
       /* Its samples are the program's output; nothing ticks it. */
+    } else if (attr.config == PERF_COUNT_SW_DUMMY &&
+               attr.type == PERF_TYPE_SOFTWARE) {
+      /* Counts nothing, so it never samples: `perf record -a` opens one per
+       * CPU for the side-band records (mmap, comm, task) alone. */
     } else if (attr.config != PERF_COUNT_SW_CPU_CLOCK &&
         attr.config != PERF_COUNT_SW_TASK_CLOCK && ev->pmu_slot < 0) {
       perf_open_undo(ev);

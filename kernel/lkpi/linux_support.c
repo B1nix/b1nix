@@ -171,18 +171,28 @@ void io_mapping_free(struct io_mapping *iomap)
  */
 #define LKPI_TICK_NS (10ull * 1000ull * 1000ull)
 
+/* A callback that returns HRTIMER_RESTART has already moved its expiry --
+ * with hrtimer_forward_now(), or by adding to node.expires as KVM's PIT and
+ * LAPIC timers do -- and the timer goes back in at that absolute time, as
+ * Linux re-queues it. interval_ns is nonzero while the timer is armed; a
+ * cancel clears it, so a callback that races a cancel is not re-queued. */
 static void hrtimer_trampoline(struct timer_list *t)
 {
 	struct hrtimer *h = container_of(t, struct hrtimer, timer);
 
 	if (!h->function)
 		return;
-	if (h->function(h) == HRTIMER_RESTART && h->interval_ns) {
-		h->node.expires = ktime_add(h->node.expires, (ktime_t)h->interval_ns);
-		u64 ticks = (h->interval_ns + LKPI_TICK_NS - 1) / LKPI_TICK_NS;
+	if (h->function(h) == HRTIMER_RESTART && h->interval_ns)
+		hrtimer_start(h, h->node.expires, HRTIMER_MODE_ABS);
+}
 
-		mod_timer(&h->timer, jiffies + (ticks ? ticks : 1));
-	}
+/* A hard timer's expiry, in the timer interrupt: the same re-queue rule. */
+static void hrtimer_hard_fire(void *arg)
+{
+	struct hrtimer *h = arg;
+
+	if (h->function && h->function(h) == HRTIMER_RESTART && h->interval_ns)
+		hrtimer_start(h, h->node.expires, HRTIMER_MODE_ABS);
 }
 
 void hrtimer_init(struct hrtimer *t, int clock_id, enum hrtimer_mode mode)
@@ -193,6 +203,10 @@ void hrtimer_init(struct hrtimer *t, int clock_id, enum hrtimer_mode mode)
 		return;
 	timer_setup(&t->timer, hrtimer_trampoline, 0);
 	t->interval_ns = 0;
+	t->hard = 0;
+	memset(&t->kt, 0, sizeof(t->kt));
+	t->kt.fn = hrtimer_hard_fire;
+	t->kt.arg = t;
 }
 
 void hrtimer_start(struct hrtimer *t, ktime_t when, enum hrtimer_mode mode)
@@ -203,12 +217,19 @@ void hrtimer_start(struct hrtimer *t, ktime_t when, enum hrtimer_mode mode)
 	s64 ns = ktime_to_ns(when);
 
 	t->node.expires = (mode == HRTIMER_MODE_ABS) ? when : ktime_add(ktime_get(), when);
+	/* Armed: a restart from the callback may re-queue it (see above). */
+	if (!t->interval_ns)
+		t->interval_ns = 1;
+	if (t->hard) {
+		lkpi_ktimer_arm(&t->kt, (u64)ktime_to_ns(t->node.expires));
+		return;
+	}
 
 	/* An absolute deadline is turned into a delay against now; a relative one
 	 * already is. Getting this backwards arms a timer decades out, which looks
 	 * exactly like a timer that never fires. */
 	if (mode == HRTIMER_MODE_ABS)
-		ns -= (s64)(lkpi_ticks() * LKPI_TICK_NS);
+		ns -= (s64)ktime_to_ns(ktime_get());
 	if (ns < 0)
 		ns = 0;
 
@@ -222,6 +243,8 @@ int hrtimer_cancel(struct hrtimer *t)
 	if (!t)
 		return 0;
 	t->interval_ns = 0;
+	if (t->hard)
+		return lkpi_ktimer_cancel(&t->kt);
 	return del_timer_sync(&t->timer);
 }
 
@@ -230,12 +253,16 @@ int hrtimer_try_to_cancel(struct hrtimer *t)
 	/* No untimed cancel here: b1nix's timer teardown is the synchronous one,
 	 * and returning without waiting would let the callback run against a
 	 * structure the caller is about to free. Waiting is the safe difference. */
-	return t ? del_timer_sync(&t->timer) : 0;
+	return t ? hrtimer_cancel(t) : 0;
 }
 
 bool hrtimer_active(const struct hrtimer *t)
 {
-	return t ? timer_pending(&t->timer) : false;
+	if (!t)
+		return false;
+	if (t->hard)
+		return t->kt.queued || t->kt.running;
+	return timer_pending(&t->timer);
 }
 
 /* ── dma-fence-array ────────────────────────────────────────────── */

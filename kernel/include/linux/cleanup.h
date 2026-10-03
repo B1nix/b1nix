@@ -359,7 +359,7 @@ static __maybe_unused const bool class_##_name##_is_conditional = _is_cond
 #define __GUARD_IS_ERR(_ptr)                                       \
 	({                                                         \
 		unsigned long _rc = (__force unsigned long)(_ptr); \
-		unlikely((_rc - 1) >= -MAX_ERRNO - 1);             \
+		unlikely((_rc - 1) >= (unsigned long)(-MAX_ERRNO - 1)); \
 	})
 
 #define __DEFINE_GUARD_LOCK_PTR(_name, _exp)                                \

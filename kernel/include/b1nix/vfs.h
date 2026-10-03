@@ -668,6 +668,8 @@ isize vfs_write(int handle, const char *buffer, usize size);
 /* Positioned I/O: read/write at `offset` without touching the fd's own offset
  * (thread-safe pread/pwrite; non-seekable handles return ESPIPE). */
 isize vfs_pread(int handle, char *buffer, usize size, u64 offset);
+/* pread through the handle's pread_user op; -ESPIPE when it has none. */
+isize vfs_pread_user(int fd, void *user_buf, usize size, u64 offset);
 isize vfs_pwrite(int handle, const char *buffer, usize size, u64 offset);
 isize vfs_pread_h(struct vfs_handle *h, char *buf, usize size, u64 offset);
 isize vfs_pwrite_h(struct vfs_handle *h, const char *buf, usize size,
@@ -811,6 +813,20 @@ int vfs_ioctl(int fd, u64 request, void *arg);
 
 /* M56 event-loop / IPC primitives (kernel/fs/eventpoll.c). */
 int vfs_eventfd(unsigned int initval, int flags);
+/* Kernel users of a process's eventfd (M131: KVM's irqfd and ioeventfd). */
+struct vfs_eventfd_kernel_ops {
+  /* The eventfd was signalled (events: B1NIX_POLLIN). Called with no lock of
+   * the eventfd's held; must not sleep. */
+  void (*notify)(void *kobj, unsigned events);
+  /* The eventfd is going away: free the subscriber object. */
+  void (*destroy)(void *kobj);
+};
+void vfs_eventfd_set_kernel_ops(const struct vfs_eventfd_kernel_ops *ops);
+int vfs_handle_is_eventfd(struct vfs_handle *h);
+void vfs_eventfd_signal(struct vfs_handle *h, u64 n);
+u64 vfs_eventfd_take(struct vfs_handle *h);
+unsigned vfs_eventfd_ready(struct vfs_handle *h);
+void *vfs_eventfd_kobj(struct vfs_handle *h, void *fresh);
 /* pidfd_open(2): a descriptor for a running process.
  *
  * The point of it is that a pid is a name that can be reused and a descriptor
@@ -1012,6 +1028,10 @@ struct vfs_file_ops {
    * instead of .read in that case: it takes precedence and the syscall layer
    * does not bounce. The op owns the validation of the pointer it is given. */
   isize (*read_user)(struct vfs_handle *h, void *user_buf, usize len);
+  /* The positional form of read_user, for a file whose driver takes the
+   * position as an argument (Linux's f_op->read) rather than one it seeks:
+   * pread(2) then leaves the descriptor's offset alone without seeking. */
+  isize (*pread_user)(struct vfs_handle *h, void *user_buf, usize len, u64 off);
   isize (*write)(struct vfs_handle *h, const char *buf, usize len);
   int (*poll)(struct vfs_handle *h, struct b1nix_pollfd *pfd);
   isize (*lseek)(struct vfs_handle *h, isize offset, int whence);
@@ -1019,6 +1039,10 @@ struct vfs_file_ops {
   void (*release)(struct vfs_handle *h);
   int (*getdents)(struct vfs_handle *h, struct dirent *buf, usize max_entries);
   int (*ioctl)(struct vfs_handle *h, u64 request, void *arg);
+  /* mmap of a descriptor with no node behind it (an anonymous-inode file of
+   * an imported driver, M131): the physical page at `offset`. The syscall
+   * maps the range a page at a time through it. */
+  int (*mmap_page_phys)(struct vfs_handle *h, u64 offset, u64 *out_phys);
 };
 
 /* (There is no MAX_VFS_NODES. Nodes come from vfs_alloc_node/kzalloc and are

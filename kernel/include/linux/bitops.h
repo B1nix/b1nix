@@ -132,13 +132,31 @@ static inline void bitmap_or(unsigned long *dst, const unsigned long *a,
                              const unsigned long *b, unsigned int nbits)
 { for (unsigned int i = 0; i < BITS_TO_LONGS(nbits); i++) dst[i] = a[i] | b[i]; }
 
-static inline void bitmap_and(unsigned long *dst, const unsigned long *a,
+/* Both report whether any bit of the result (within nbits) is set, as
+ * upstream's do. */
+static inline bool bitmap_and(unsigned long *dst, const unsigned long *a,
                               const unsigned long *b, unsigned int nbits)
-{ for (unsigned int i = 0; i < BITS_TO_LONGS(nbits); i++) dst[i] = a[i] & b[i]; }
+{
+	unsigned long any = 0;
 
-static inline void bitmap_andnot(unsigned long *dst, const unsigned long *a,
+	for (unsigned int i = 0; i < BITS_TO_LONGS(nbits); i++) {
+		dst[i] = a[i] & b[i];
+		any |= (i == nbits / 64 && nbits % 64) ? dst[i] & ((1UL << (nbits % 64)) - 1) : dst[i];
+	}
+	return any != 0;
+}
+
+static inline bool bitmap_andnot(unsigned long *dst, const unsigned long *a,
                                  const unsigned long *b, unsigned int nbits)
-{ for (unsigned int i = 0; i < BITS_TO_LONGS(nbits); i++) dst[i] = a[i] & ~b[i]; }
+{
+	unsigned long any = 0;
+
+	for (unsigned int i = 0; i < BITS_TO_LONGS(nbits); i++) {
+		dst[i] = a[i] & ~b[i];
+		any |= (i == nbits / 64 && nbits % 64) ? dst[i] & ((1UL << (nbits % 64)) - 1) : dst[i];
+	}
+	return any != 0;
+}
 
 static inline void bitmap_xor(unsigned long *dst, const unsigned long *a,
                               const unsigned long *b, unsigned int nbits)

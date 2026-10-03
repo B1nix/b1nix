@@ -171,6 +171,7 @@ answers which question, are in [../versioning.md](../versioning.md).
 | M129 Power management | done | cpuidle with MWAIT C-states and a tickless idle CPU (620 timer interrupts an idle second, not 1998), cpufreq over HWP, the ratio request or ACPI `_PSS`/`_PCT`, s2idle on both arches and ACPI S3 on x86_64 — CPU, clocks, secondaries and every device's PCI header and driver state brought back, proved by a modeset, an 880 Hz tone captured after the resume and a re-addressed USB keyboard — and a battery and thermal zone read from AML against a firmware that declares them. What manages power rather than merely performing it is M135. |
 | M133 Close the ABI gaps | done | UEFI boot from a relocatable kernel, the last failing Debian units, apt on a `file:` repository, q35 without `-machine pc`; io_uring complete down to zero-copy receive, NAPI and affinity; `bpftrace` with kprobes, uprobes and BTF. |
 | M134 ACPI methods | done | An AML interpreter and evaluator: DSDT and every SSDT loaded (354 objects on QEMU, no undecoded term), the opcodes, control flow, conversions, method calls and SystemMemory/SystemIO fields, a step budget instead of a hang, and a refused region (PCI config, EC, SMBus, CMOS) propagating an error rather than a zero. It is what `/sys/class/power_supply` and `/sys/class/thermal` read and what cpufreq and the S3 sleep run on. `_PRT` interrupt routing is the one consumer still unwritten. |
+| M135 Power management, the rest | done | The machine now manages its own power. ACPI events arrive: SCI, GPE and `Notify`, so the buttons, the lid, AC, the battery and the thermal zones report changes, and power-off goes through `\_S5`. `ondemand` follows the load under the firmware's `_PPC` ceiling, `_CST` states are chosen by a menu governor, and the thermal zones act on their trips (fans, passive throttling, a critical shutdown). The rest: hibernation to a swap area on x86_64, runtime PM (NVMe to D3hot), `/sys/power` as Linux lays it out, and a resume callback on every device, with in-flight disk I/O brought through S3. aarch64 has neither S4 nor a deep sleep. |
 
 ## M102b: amdgpu on RX 6600 (render-only) + radeonsi
 
@@ -191,9 +192,9 @@ answers which question, are in [../versioning.md](../versioning.md).
 
 ## M131: KVM
 
-- [ ] `planned` Import Linux's KVM (x86 core + VMX, then SVM) through linuxkpi; `/dev/kvm` with the vCPU ioctl ABI.
-- [ ] `planned` EPT/NPT second-level paging, in-kernel LAPIC/IOAPIC, eventfd-based irqfd/ioeventfd, VMX nested off.
-- [ ] `planned` Distribution QEMU with `-accel kvm` boots Alpine, then b1nix itself, inside b1nix; on bare metal and nested under the host's KVM.
+- [x] Import Linux's KVM (x86 core + VMX and SVM) through linuxkpi; `/dev/kvm` with the vCPU ioctl ABI. Unmodified 6.18 KVM picks VMX on the KVM lanes and SVM on the pku lane's AMD model (m131_kvm_smoke on both).
+- [x] EPT/NPT second-level paging, in-kernel LAPIC/IOAPIC/PIT, eventfd-based irqfd/ioeventfd, nested virtualization off. Guest timers fire from the tick; irqfd/ioeventfd use the process's own eventfds.
+- [ ] `partial` Distribution QEMU with `-accel kvm` boots a distribution kernel, then b1nix itself, inside b1nix; on bare metal and nested under the host's KVM. Nested under the host (Debian lane): SeaBIOS guest, Debian's cloud kernel on 2 vCPUs with a virtio disk, b1nix itself on 2 vCPUs through GRUB. Open: bare metal untested.
 - [ ] `planned` aarch64 KVM (VHE) after x86 works.
 
 ## M132: Xperia 5 without the 64 MiB boot image limit
@@ -237,31 +238,32 @@ and nothing drives them.
 Per-subject detail, item by item:
 [memory-and-scheduling.md](memory-and-scheduling.md).
 
-- [ ] `planned` ACPI events: the SCI handler, GPE dispatch and `Notify`, so the
-  power button, the lid, the adapter going in and out, a battery changing state
-  and a thermal trip reach the kernel at all — today none of them do, and the
-  battery is only ever read because somebody opened a sysfs file. `\_S5` with
-  it, so a power-off is the firmware's rather than three hard-coded QEMU ports
-  that print "poweroff unsupported, halting" on a real machine.
-- [ ] `planned` The resume remainder: a resume callback for the devices that
-  still have none (Intel HDA, virtio-input, virtio-console, the PS/2
-  controller, the IOMMUs), the MSI and MSI-X capability in the PCI snapshot —
-  restoring the BARs and the command register leaves an MSI-X device back with
-  no vectors — and a quiesce callback, so the queues are drained before the
-  power goes rather than trusted to be empty.
-- [ ] `planned` Frequency and idle that respond to the machine: a load-driven
-  governor (today `performance` and `powersave` are two ends of a range and
-  nothing moves between them), `_PPC` for the ceiling the firmware asks for,
-  per-policy control with Linux's `policy*` layout, ACPI `_CST` for the idle
-  states a platform declares, and an idle governor that picks a state from the
-  predicted idle length instead of always taking the deepest one.
-- [ ] `planned` Acting on heat and charge: trip points (`_PSV`, `_AC0`,
-  `_CRT`), cooling devices, passive throttling and a critical-temperature
-  shutdown; `_BIX`, charge thresholds and an event to userspace, so a desktop's
-  battery indicator does not have to poll.
-- [ ] `planned` The two states that are missing entirely: hibernate (S4, with
-  `/sys/power/disk`), and a deep sleep on aarch64 through PSCI
-  `SYSTEM_SUSPEND`; with them the `/sys/power` surface userspace expects —
-  `wakeup_count`, `mem_sleep`, `wakeup_sources` — and runtime PM, so an idle
-  PCI device can reach D3 instead of staying at full power until the machine
-  sleeps.
+- [x] `done` ACPI events. The SCI handler, GPE dispatch and `Notify` bring the
+  power and sleep buttons, the lid, AC, battery changes, thermal notifications
+  and PCI hotplug into the kernel. Userspace sees them as evdev keys and
+  `change` uevents. Power-off uses the firmware's `\_S5`.
+- [x] `done` The resume remainder. Intel HDA, virtio-input, virtio-console, the
+  i8042 keyboard and mouse, and VT-d and AMD-Vi all have resume callbacks; the
+  IOMMUs resume first. MSI and MSI-X state is saved and restored. Disk I/O in
+  flight survives the sleep: the freezer waits for a driver's critical section
+  to end, and NVMe's resume no longer mistakes its emptied queue for completed
+  commands. Both IOMMU lanes sleep once and prove it with remapped NVMe
+  interrupts and a writer running through the S3.
+- [x] `done` Frequency and idle respond to the machine. `ondemand` follows the
+  load, `_PPC` caps it, and cpufreq uses Linux's `policy*` layout with
+  statistics. `_CST` idle states are chosen by a menu governor from the
+  predicted idle length, and each state can be disabled per CPU.
+- [x] `done` Heat and charge are acted on. Thermal zones have `_CRT`, `_HOT`,
+  `_PSV` and `_ACx`/`_ALx` trips, processor and fan cooling devices, passive
+  throttling and a critical-temperature shutdown. The battery reads `_BIX`,
+  takes a `_BTP` alarm, and offers `charge_behaviour` through `_BMD`/`_BMC`.
+  ACPI defines no charge thresholds; on Linux those come from vendor drivers,
+  so there is none here.
+- [x] `done` Hibernation on x86_64, and the `/sys/power` surface. A snapshot of
+  every used page is written to a swap area (`resume=`, `/sys/power/disk`) and
+  restored by the next boot. `/sys/power` gains `mem_sleep`, the
+  `wakeup_count` handshake, `sync_on_suspend` and `/sys/class/wakeup`. Runtime
+  PM puts an idle NVMe in D3hot. Still missing on aarch64: hibernation (it
+  needs secondary CPUs brought back with PSCI `CPU_ON` and the GIC ITS tables
+  handed from the boot kernel to the image) and PSCI `SYSTEM_SUSPEND`, which
+  QEMU does not implement.

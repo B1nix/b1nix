@@ -30,6 +30,7 @@ void tlb_shootdown_all(void);
 #include <b1nix/ptrace.h>
 #include <b1nix/rseq.h>
 #include <b1nix/tlb.h>
+#include <b1nix/kvm_hooks.h>
 #include <b1nix/sched.h>
 #include <b1nix/pkeys.h>
 #include <b1nix/secretmem.h>
@@ -4756,16 +4757,25 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
     return (u64)-ESRCH;
 
   struct vfs_node *node = 0;
+  struct vfs_handle *page_handle = 0;
   if (!(flags & MAP_ANONYMOUS)) {
     if (fd < 0)
       return (u64)-EBADF;
-    node = vfs_find_node_by_fd(fd);
-    if (IS_ERR(node))
-      return (u64)PTR_ERR(node);
+    {
+      struct vfs_handle *h = scheduler_fd_get(fd);
+
+      if (h && !h->node && h->ops && h->ops->mmap_page_phys)
+        page_handle = h;
+    }
+    if (!page_handle) {
+      node = vfs_find_node_by_fd(fd);
+      if (IS_ERR(node))
+        return (u64)PTR_ERR(node);
+    }
     // Offset must be page-aligned
     if ((offset & (PAGE_SIZE - 1)) != 0)
       return (u64)-EINVAL;
-    if (node->inode && (node->inode->flags & VFS_NODE_SECRETMEM)) {
+    if (node && node->inode && (node->inode->flags & VFS_NODE_SECRETMEM)) {
       int sc = secretmem_mmap_check(t, (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1),
                                     flags);
       if (sc)
@@ -5084,6 +5094,22 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
 
       vmm_map_page(v, frame, vmm_flags | VMM_PRESENT);
     }
+  } else if (page_handle) {
+    /* A node-less file of an imported driver (KVM's vCPU run area): the pages
+     * come from the file itself, one at a time, shared and referenced for
+     * the mapping's life like device pages. */
+    for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
+      u64 phys = 0;
+      int rc = page_handle->ops->mmap_page_phys(page_handle,
+                                                (u64)offset + (v - vaddr), &phys);
+      if (rc < 0 || !phys) {
+        for (u64 u = vaddr; u < v; u += PAGE_SIZE)
+          vmm_unmap_page(u);
+        return (u64)(rc < 0 ? rc : -EINVAL);
+      }
+      vmm_map_page(v, phys, vmm_flags | VMM_SHARED | VMM_PRESENT);
+      pmm_ref_frame(phys);
+    }
   } else if (node && node->inode && node->inode->type == VFS_DEVICE &&
              node->inode->mmap_handle_page_phys_cb) {
     /* M100: scatter-gather device memory. The pages backing the range need not
@@ -5264,6 +5290,18 @@ void vma_harvest_shared_dirty(struct task *t, u64 start, u64 end) {
       }
     }
   }
+}
+
+static isize sys_munmap(void *addr, usize length);
+
+/* mmap and munmap on behalf of the current task, for kernel callers that
+ * map into the process that asked them (M131: KVM's private memslots). */
+u64 syscall_mmap_current(void *addr, usize length, int prot, int flags) {
+  return sys_mmap(addr, length, prot, flags, -1, 0);
+}
+
+isize syscall_munmap_current(void *addr, usize length) {
+  return sys_munmap(addr, length);
 }
 
 static isize sys_munmap(void *addr, usize length) {
@@ -6578,6 +6616,12 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
 
   entry->ret = r;
   entry->in_flight = 0;
+#if defined(__x86_64__)
+  /* Interrupts stay off from here to SYSRET/IRETQ, so nothing can run a
+   * guest on this CPU between the MSR restore and ring 3 (M131). */
+  interrupts_disable();
+  kvm_hook_return_to_user();
+#endif
   return r;
 }
 
@@ -9276,6 +9320,12 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                       : (i64)(arg3 | (arg4 << 32));
         if (off < 0)
           return (u64)-EINVAL;
+        /* A driver that reads at a given position: no seeking round it. */
+        if (number == LX_pread64) {
+          isize pr = vfs_pread_user(fd, (void *)(usize)arg1, (usize)arg2, (u64)off);
+          if (pr != -ESPIPE)
+            return (u64)pr;
+        }
         isize saved = vfs_lseek(fd, 0, B1NIX_SEEK_CUR);
         if (saved < 0)
           return (u64)saved;

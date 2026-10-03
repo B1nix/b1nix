@@ -46,6 +46,9 @@ struct lkpi_spinlock {
 	/* Task that took it, so a report can tell a driver nesting the lock from
 	 * a holder that lost the CPU while holding it. */
 	u64 owner_task;
+	/* Lockdep's map, which imported code names directly (spin_acquire on a
+	 * lock's dep_map). There is no lockdep; the member takes no space. */
+	struct { } dep_map;
 };
 
 void lkpi_spin_lock_init(struct lkpi_spinlock *l);

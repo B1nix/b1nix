@@ -171,6 +171,25 @@ trap cleanup EXIT
 # polling on, booting the next part.
 trap 'exit 130' INT TERM
 
+# M131: b1nix as a guest of itself. When the image was built for nested
+# guests (QEMU=1), the base boot also gets an ISO of the kernel under test as a
+# second disk, which the harness hands to QEMU inside. Its initramfs runs the
+# same /init as the image's Linux guest, on the tree's musl busybox: the
+# distribution's busybox-static is a fixed-address ET_EXEC at 0x400000, below
+# where b1nix loads user programs.
+L2_ISO=""
+if [ -d "$BUILD_DIR/debian/rootfs/usr/lib/b1nix-l2" ] && [ -x "$BUILD_DIR/rootfs/bin/busybox" ]; then
+	L2_ISO="$RUN_DIR/l2-b1nix.iso"
+	python3 "$PROJECT_DIR/tools/image/mk-initramfs.py" "$RUN_DIR/l2-initrd.gz" \
+		--init "$PROJECT_DIR/tools/image/l2-init.sh" \
+		--file "bin/busybox=$BUILD_DIR/rootfs/bin/busybox" \
+		--file "lib/ld-musl-x86_64.so.1=$BUILD_DIR/rootfs/lib/ld-musl-x86_64.so.1" \
+		--link "lib/libc.musl-x86_64.so.1=ld-musl-x86_64.so.1" >>"$BUILD_LOG" 2>&1 &&
+		sh "$PROJECT_DIR/tools/image/mkiso.sh" --stage "$BUILD_DIR/iso-debian-l2" \
+			--out "$L2_ISO" --arch "$ARCH" --kernel "$KERNEL_ELF" --timeout 0 \
+			--module "$RUN_DIR/l2-initrd.gz:initrd" >>"$BUILD_LOG" 2>&1 || L2_ISO=""
+fi
+
 # ── Run ────────────────────────────────────────────────────────────────────
 ACCEL_ARGS=""
 # DEBIAN_ACCEL=tcg forces the emulator: slower, but QEMU's -d int can then log
@@ -242,6 +261,12 @@ fi
 DEBIAN_SILENCE="${DEBIAN_SILENCE:-120}"
 DONE_PATTERN="${DEBIAN_DONE_PATTERN:-DEBIAN-SMOKE: done|KERNEL PANIC|\[PANIC\]}"
 
+# Disks beyond the root: the nested-b1nix ISO, on the base boot only.
+boot_drives() { # name
+	[ "$1" = base ] && [ -n "$L2_ISO" ] || return 0
+	echo "-drive file=$L2_ISO,if=none,id=l2iso,format=raw,readonly=on -device virtio-blk-pci,drive=l2iso"
+}
+
 boot_start() { # name
 	_b="$1"
 	_extra=$(boot_extra "$_b")
@@ -265,7 +290,7 @@ boot_start() { # name
 		-drive file="$RUN_DIR/$_b.qcow2",if=none,id=debroot,format=qcow2,cache=unsafe \
 		-device virtio-blk-pci,drive=debroot \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-		${EXTRA_QEMU_ARGS:-} >"$RUN_DIR/$_b.log" 2>&1 &
+		$(boot_drives "$_b") ${EXTRA_QEMU_ARGS:-} >"$RUN_DIR/$_b.log" 2>&1 &
 	echo $! >"$RUN_DIR/$_b.pid"
 	now >"$RUN_DIR/$_b.t0"
 	echo 0 >"$RUN_DIR/$_b.seen"
@@ -487,6 +512,26 @@ if grep -qa "DEBIAN-SMOKE: bpftrace is present" "$LOG" 2>/dev/null; then
 	check_output "DEBIAN-SMOKE: ok bpftrace-kprobe-count" "bpftrace counts a kprobe's hits into a map and exits from a timer probe"
 	check_output "DEBIAN-SMOKE: ok bpftrace-begin" "bpftrace runs a BEGIN probe and prints through its output ring"
 	check_output "DEBIAN-SMOKE: ok bpftrace-uprobe-count" "bpftrace counts a uprobe on a libc function in every ls"
+fi
+
+# M131. The distribution's QEMU with -accel kvm, when the image was built
+# with QEMU=1: a guest boot sector run by KVM inside b1nix.
+if grep -qa "DEBIAN-SMOKE: qemu is present" "$LOG" 2>/dev/null; then
+	check_output "DEBIAN-SMOKE: ok qemu-kvm-guest" "QEMU with -accel kvm boots a guest through SeaBIOS and the guest's line reaches COM1: the code ran under b1nix's KVM"
+	check_output "DEBIAN-SMOKE: ok qemu-kvm-exit" "the guest's deliberate triple fault ends QEMU cleanly (-no-reboot)"
+	sed -n 's/.*DEBIAN-SMOKE: \(qemu exited .*\)/  \1/p' "$LOG" | tail -1
+	if grep -qa "DEBIAN-SMOKE: qemu linux exited" "$LOG" 2>/dev/null; then
+		check_output "DEBIAN-SMOKE: ok qemu-kvm-linux" "Linux boots on two vCPUs to its initramfs under QEMU -accel kvm inside b1nix and prints from userspace"
+		check_output "DEBIAN-SMOKE: ok qemu-kvm-linux-poweroff" "the nested Linux powers the virtual machine off and QEMU exits 0"
+		check_output "DEBIAN-SMOKE: ok qemu-kvm-virtio" "the nested Linux reads a virtio disk: queue kicks through KVM's ioeventfd, MSI-X back through irqfd"
+		sed -n 's/.*DEBIAN-SMOKE: \(qemu linux exited .*\|B1NIX-L2-INIT .*\)/  \1/p' "$LOG" | tail -2
+	fi
+	if grep -qa "DEBIAN-SMOKE: qemu b1nix exited" "$LOG" 2>/dev/null; then
+		check_output "DEBIAN-SMOKE: ok qemu-kvm-b1nix" "b1nix boots on two vCPUs as a guest of its own KVM (QEMU -accel kvm) and runs its initramfs /init"
+		check_output "DEBIAN-SMOKE: ok qemu-kvm-b1nix-poweroff" "the nested b1nix powers its virtual machine off and QEMU exits 0"
+		check_output "DEBIAN-SMOKE: ok qemu-kvm-2m" "guest RAM the host backs with transparent huge pages goes into the nested page tables as 2 MiB mappings"
+		sed -n 's/.*DEBIAN-SMOKE: \(qemu b1nix exited .*\|b1nix-in-b1nix: .*\)/  \1/p' "$LOG" | tail -2
+	fi
 fi
 
 # M126. The distribution's own perf, when the image was built with PERF=1.

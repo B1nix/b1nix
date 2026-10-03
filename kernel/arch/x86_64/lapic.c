@@ -349,30 +349,58 @@ static int lapic_icr_wait_idle_bounded(u64 timeout_ns) {
 }
 
 static int lapic_send_ipi_bounded(u32 apic_id, u32 icr_low, u64 timeout_ns) {
-    if (!lapic_icr_wait_idle_bounded(timeout_ns))
-        return 0;
-    lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
-    lapic_write(LAPIC_ICR_LOW, icr_low);
-    return lapic_icr_wait_idle_bounded(timeout_ns);
+    for (;;) {
+        u64 flags;
+
+        if (!lapic_icr_wait_idle_bounded(timeout_ns))
+            return 0;
+        flags = interrupts_save(); /* see lapic_icr_write */
+        if (!(lapic_read(LAPIC_ICR_LOW) & (1 << 12))) {
+            lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
+            lapic_write(LAPIC_ICR_LOW, icr_low);
+            interrupts_restore(flags);
+            return lapic_icr_wait_idle_bounded(timeout_ns);
+        }
+        interrupts_restore(flags);
+    }
+}
+
+/* Every sender writes ICR_HIGH (the destination) and then ICR_LOW (which
+ * sends) with interrupts off. An interrupt between the two whose handler sends
+ * an IPI of its own rewrites the destination, and the interrupted IPI goes to
+ * whichever CPU that one named: a cross-call that never arrived left a vCPU
+ * spinning in its VMCLEAR request (M131) until the lost target happened to
+ * poll. Only the writes are masked: waiting for delivery with interrupts off
+ * is the two-CPU deadlock described at lapic_send_ipi_allbutself_nowait. */
+static void lapic_icr_write(u32 high, u32 low) {
+    for (;;) {
+        u64 flags;
+
+        lapic_icr_wait_idle();
+        flags = interrupts_save();
+        /* An interrupt since the wait may have sent one of its own. */
+        if (!(lapic_read(LAPIC_ICR_LOW) & (1 << 12))) {
+            lapic_write(LAPIC_ICR_HIGH, high);
+            lapic_write(LAPIC_ICR_LOW, low);
+            interrupts_restore(flags);
+            return;
+        }
+        interrupts_restore(flags);
+    }
 }
 
 void lapic_send_ipi(u32 apic_id, u32 icr_low) {
-    lapic_icr_wait_idle();
     /* xAPIC (MMIO) mode: the destination APIC ID lives in ICR_HIGH bits
      * [31:24]. The old `(u64)apic_id << 32` is the x2APIC (MSR) layout; written
      * through the u32 lapic_write it truncated to 0, so every IPI targeted APIC
      * 0 (the BSP) — an INIT to self triple-faults the boot CPU. */
-    lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
-    /* Write command to ICR low */
-    lapic_write(LAPIC_ICR_LOW, icr_low);
+    lapic_icr_write(apic_id << 24, icr_low);
     /* Wait for delivery to complete */
     lapic_icr_wait_idle();
 }
 
 void lapic_send_ipi_allbutself(u32 icr_low) {
-    lapic_icr_wait_idle();
-    lapic_write(LAPIC_ICR_HIGH, 0);
-    lapic_write(LAPIC_ICR_LOW, icr_low | LAPIC_ICR_DEST_OTHERS);
+    lapic_icr_write(0, icr_low | LAPIC_ICR_DEST_OTHERS);
     lapic_icr_wait_idle();
 }
 
@@ -387,10 +415,14 @@ void lapic_send_ipi_allbutself(u32 icr_low) {
  * IPI with no payload, a delivery already pending on the target does the job
  * just as well as a fresh one, so skip the send instead of waiting. */
 void lapic_send_ipi_allbutself_nowait(u32 icr_low) {
-    if (lapic_read(LAPIC_ICR_LOW) & (1 << 12))
-        return; /* previous IPI not accepted yet — this one is redundant */
-    lapic_write(LAPIC_ICR_HIGH, 0);
-    lapic_write(LAPIC_ICR_LOW, icr_low | LAPIC_ICR_DEST_OTHERS);
+    u64 flags = interrupts_save();
+
+    if (!(lapic_read(LAPIC_ICR_LOW) & (1 << 12))) {
+        /* else: previous IPI not accepted yet — this one is redundant */
+        lapic_write(LAPIC_ICR_HIGH, 0);
+        lapic_write(LAPIC_ICR_LOW, icr_low | LAPIC_ICR_DEST_OTHERS);
+    }
+    interrupts_restore(flags);
 }
 
 void lapic_init_local(void) {

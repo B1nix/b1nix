@@ -20,6 +20,7 @@
  *   4. lapic_eoi
  */
 
+#include <b1nix/kvm_hooks.h>
 #include <b1nix/console.h>
 #include <b1nix/ipi.h>
 #include <b1nix/lapic.h>
@@ -145,6 +146,9 @@ void tlb_shootdown_handler(void) {
  * Fast-paths to a single load when nothing is pending (the common case, and
  * always true on a single-CPU boot). */
 void tlb_shootdown_poll(void) {
+    /* A function another CPU is waiting to run here (smp_call_on_cpu): the
+     * same deadlock as a shootdown if this CPU spins with interrupts off. */
+    smp_call_poll_pending();
     if (__atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE) <= 0)
         return;
     tlb_service_current();
@@ -287,6 +291,11 @@ void tlb_describe_lock(const void *lock) {
 }
 
 void tlb_shootdown_page(u64 vaddr) {
+    /* A secondary MMU (KVM's EPT) drops its copy of what changed, before the
+     * frames can be freed. On every machine, not just SMP ones (M131). */
+    if (!(vaddr >> 63))
+        kvm_hook_mm_invalidate(paging_cr3_to_pml4(read_cr3()), vaddr & ~0xfffULL,
+                               (vaddr & ~0xfffULL) + 0x1000);
     if (g_max_cpus <= 1) return;
     if (!__atomic_load_n(&g_tlb_enabled, __ATOMIC_ACQUIRE)) return;
     u64 flags;
@@ -301,6 +310,11 @@ void tlb_shootdown_page(u64 vaddr) {
     spin_unlock_irqrestore(&g_tlb_lock, flags);
 }
 
+/* No secondary-MMU notice here: every caller changes kernel mappings, or
+ * flushes after an address space was torn down, and a KVM owner's teardown has
+ * already been reported (kvm_hook_mm_release, before any frame is freed).
+ * Reporting this as "all user memory of every space changed" made each execve
+ * anywhere drop every guest's EPT and take its mmu_lock. */
 void tlb_shootdown_all(void) {
     cr3_reload();
     if (g_max_cpus <= 1) return;
@@ -316,6 +330,7 @@ void tlb_shootdown_all(void) {
  * and the fork-time COW downgrade; execve and exit keep the everyone-flush,
  * because the low identity huge pages an image replaces are global. */
 void tlb_shootdown_current_mm(void) {
+    kvm_hook_mm_invalidate(paging_cr3_to_pml4(read_cr3()), 0, KVM_HOOK_USER_END);
     cr3_reload();
     if (g_max_cpus <= 1) return;
     if (!__atomic_load_n(&g_tlb_enabled, __ATOMIC_ACQUIRE)) return;
@@ -335,6 +350,7 @@ void tlb_shootdown_current_mm(void) {
 void tlb_shootdown_mm(u64 pml4_phys) {
     if (!pml4_phys)
         return;
+    kvm_hook_mm_invalidate(pml4_phys, 0, KVM_HOOK_USER_END);
     if (paging_cr3_to_pml4(read_cr3()) == pml4_phys)
         cr3_reload();
     if (g_max_cpus <= 1) return;

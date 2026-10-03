@@ -23,6 +23,19 @@
 
 /* ── time ───────────────────────────────────────────────────────── */
 u64 lkpi_ticks(void);            /* jiffies: 10 ms each, whatever the tick rate */
+
+/* A timer whose callback runs in the timer interrupt: b1nix's struct ktimer,
+ * field for field (env.c checks). Backs linuxkpi's hard hrtimers. */
+struct lkpi_ktimer {
+	void *next;
+	u64 expires_ns;
+	void (*fn)(void *arg);
+	void *arg;
+	volatile int queued;
+	volatile int running;
+};
+void lkpi_ktimer_arm(struct lkpi_ktimer *t, u64 expires_ns);
+int lkpi_ktimer_cancel(struct lkpi_ktimer *t);
 /* Park for a number of jiffies; returns the jiffies left when woken early,
  * zero when the whole sleep elapsed. Not from atomic context. */
 u64 lkpi_sleep_jiffies(u64 jiffies_count);
@@ -124,6 +137,11 @@ int lkpi_diag_watch_report(u64 min_ms);
  * anything more would be inventing a task model the DRM core does not need.
  */
 struct mm_struct;
+/* The kernel's signal set, defined here because struct lkpi_task carries one;
+ * <linux/signal.h> names it sigset_t. */
+typedef struct {
+	unsigned long sig[1];
+} lkpi_sigset_t;
 struct lkpi_task {
 	int pid;
 	int tgid;
@@ -165,6 +183,25 @@ struct lkpi_task {
 	 * The bit values are in <linux/sched.h> with the rest of the PF_* set.
 	 */
 	unsigned int flags;
+	/* Where KVM keeps the task's own blocked mask while KVM_RUN runs with the
+	 * one KVM_SET_SIGNAL_MASK asked for (sigprocmask saves it here). */
+	lkpi_sigset_t real_blocked;
+	/* The user FS/GS selectors and bases, captured by current_save_fsgs():
+	 * KVM saves them before entering a guest and puts them back after. */
+	struct {
+		unsigned short fsindex;
+		unsigned short gsindex;
+		unsigned long fsbase;
+		unsigned long gsbase;
+	} thread;
+	/* Scheduler delay accounting (sched_info), which b1nix does not keep:
+	 * KVM's steal-time reporting reads it and reports none. */
+	struct {
+		unsigned long long run_delay;
+		unsigned long pcount;
+	} sched_info;
+	/* KVM's scratch vm_area_struct for this slot (kernel/lkpi/kvm_mm.c). */
+	struct vm_area_struct *kvm_vma;
 	/*
 	 * Dirty-page throttling state.
 	 *
@@ -223,6 +260,19 @@ int lkpi_copy_to_user(void *user_dst, const void *src, usize n);
  */
 void *lkpi_handle_alloc(void);
 void lkpi_handle_release(void *handle);
+void lkpi_handle_retain(void *handle);
+/* The process's eventfds, under linuxkpi's eventfd_ctx (M131). The handle
+ * from lkpi_fd_get_eventfd carries a reference; the subscriber object is one
+ * per eventfd, and notify runs on every signal, destroy with the eventfd. */
+int lkpi_handle_is_eventfd(void *handle);
+void *lkpi_fd_get_eventfd(int fd);
+void lkpi_eventfd_signal(void *handle, u64 n);
+u64 lkpi_eventfd_take(void *handle);
+int lkpi_eventfd_readable(void *handle);
+int lkpi_eventfd_writable(void *handle);
+void *lkpi_eventfd_kobj(void *handle, void *fresh);
+void lkpi_eventfd_set_kernel_ops(void (*notify)(void *kobj, unsigned events),
+                                 void (*destroy)(void *kobj));
 void *lkpi_handle_private(void *handle);
 /* Give `handle` the same device node `source` has, with its own reference.
  *
@@ -249,7 +299,24 @@ struct lkpi_file_bridge {
 	unsigned (*poll)(void *file);
 	long (*ioctl)(void *file, unsigned int cmd, unsigned long arg);
 	void (*put)(void *file);
+	/* The physical page behind offset of an mmap of the file (its
+	 * f_op->mmap and vm_ops->fault); 0 or a negative errno. */
+	int (*mmap_page)(void *file, u64 offset, u64 *phys);
+	/* f_op->read into a user buffer: at *pos, or at the file's own position
+	 * when pos is NULL. Bytes read or a negative errno. */
+	long (*read)(void *file, void *user_buf, usize len, u64 *pos);
 };
+
+/* A misc device (misc_register): its /dev node, created now and again on
+ * every devfs repopulation; each open gets a file of its own (the Linux side
+ * provides lkpi_misc_open). */
+void lkpi_file_bridge_ensure(void);
+/* Around code that must not turn interrupts on (see env.c). */
+void lkpi_irq_enable_suppress(int on);
+void lkpi_misc_node_add(const char *name, void *dev, unsigned int mode);
+void lkpi_misc_node_remove(void *dev);
+void lkpi_misc_dev_init(void);
+void *lkpi_misc_open(void *dev);
 void lkpi_file_bridge_register(const struct lkpi_file_bridge *bridge);
 /* The descriptor owns a reference to the file: poll, ioctl and seek reach the
  * file's operations, and the last close drops the reference. */

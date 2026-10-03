@@ -44,6 +44,16 @@
 #define __entry ((void *)0)
 #define __print_symbolic(value, symbol_array...) ""
 #define __print_flags(flag, delim, flag_array...) ""
+/* The table type __print_symbolic/__print_flags take; imported code also
+ * builds its own tables of it (KVM's exit reasons). */
+struct trace_print_flags {
+	unsigned long mask;
+	const char *name;
+};
+struct trace_print_flags_u64 {
+	unsigned long long mask;
+	const char *name;
+};
 #define __print_array(array, count, el_size) ""
 
 /*

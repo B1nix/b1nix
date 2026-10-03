@@ -206,6 +206,10 @@ x86_syscall_return:
 
 .global x86_fork_child_trampoline
 x86_fork_child_trampoline:
+    /* A new task's first return to user mode: interrupts are still off from
+     * the switch, so the KVM MSR restore (if this CPU ran a guest) happens
+     * here, before anything else can. */
+    call kvm_hook_return_to_user
     /* In the child, fork() returns 0 */
     xorq %rax, %rax
     jmp x86_syscall_return

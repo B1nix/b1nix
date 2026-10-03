@@ -421,6 +421,11 @@ void task_clear_cmdline(struct task *t);
  * code; it returns 0 when XSAVE is unavailable or memory is short, and the task
  * then keeps working with x87+SSE only. */
 void *task_xsave_area(const struct task *t);
+void task_set_xsave_area(struct task *t, void *area);
+/* A tick found the current task not preemptible and wants it off the CPU
+ * (cleared when it next switches out). */
+int scheduler_resched_pending(void);
+void scheduler_note_resched(void);
 int task_fpu_alloc(struct task *t);
 /* The task table has SCHED_MAX_TASKS rows and every side table the scheduler
  * keeps (FPU area, nice, affinity, ...) is indexed by a task's row in it.

@@ -36,6 +36,7 @@
 #include <b1nix/tlb.h>
 #include <b1nix/drm.h>
 #include <b1nix/vfs.h>
+#include <b1nix/ktimer.h>
 #include <lkpi/env.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -399,8 +400,31 @@ void lkpi_irq_restore(u64 flags)
 		lkpi_note_irq_on();
 }
 
+/* Imported code that runs inside the context switch (KVM's preempt
+ * notifiers, M131) was written for Linux, which calls it with interrupts on;
+ * here the switch runs with them off, and an enable inside it must not open
+ * that window. While this CPU's count is raised, local_irq_enable leaves
+ * interrupts off -- the disable/enable pairs such code uses to guard per-CPU
+ * lists are just as safe with them already off. */
+static volatile u8 g_irq_enable_suppressed[MAX_CPUS];
+
+void lkpi_irq_enable_suppress(int on)
+{
+	struct percpu *p = get_percpu();
+	int cpu = p ? (int)p->cpu_id : 0;
+
+	if (on)
+		g_irq_enable_suppressed[cpu]++;
+	else if (g_irq_enable_suppressed[cpu])
+		g_irq_enable_suppressed[cpu]--;
+}
+
 void lkpi_irq_enable(void)
 {
+	struct percpu *p = get_percpu();
+
+	if (p && g_irq_enable_suppressed[p->cpu_id])
+		return;
 	interrupts_enable();
 	lkpi_note_irq_on();
 }
@@ -686,10 +710,19 @@ static int lkpi_owned_ioctl(struct vfs_handle *h, u64 request, void *arg)
 {
 	long rc;
 
+
 	if (!g_lkpi_file_bridge || !h->private_data)
 		return -ENOTTY;
+	/* The driver's ioctl runs to its own return. b1nix ends a task a SIGKILL
+	 * reached at its next yield, and a vCPU thread ended inside KVM_RUN left
+	 * its VMCS loaded and its preempt notifier registered -- the next task to
+	 * get its slot ran the dead vCPU's sched_out. Linux delivers the kill on
+	 * the way back to userspace; KVM_RUN returns promptly when one is
+	 * pending, so this does not delay it. */
+	scheduler_kcrit_enter();
 	rc = g_lkpi_file_bridge->ioctl(h->private_data, (unsigned int)request,
 	                               (unsigned long)(usize)arg);
+	scheduler_kcrit_leave();
 	return rc < -0x7fffffff ? -EIO : (int)rc;
 }
 
@@ -700,12 +733,113 @@ static void lkpi_owned_release(struct vfs_handle *h)
 	h->private_data = 0;
 }
 
+static int lkpi_owned_mmap_page(struct vfs_handle *h, u64 offset, u64 *phys)
+{
+	if (!g_lkpi_file_bridge || !g_lkpi_file_bridge->mmap_page || !h->private_data)
+		return -ENODEV;
+	return g_lkpi_file_bridge->mmap_page(h->private_data, offset, phys);
+}
+
+static isize lkpi_owned_read(struct vfs_handle *h, void *user_buf, usize len)
+{
+	if (!g_lkpi_file_bridge || !h->private_data)
+		return -EBADF;
+	return (isize)g_lkpi_file_bridge->read(h->private_data, user_buf, len, NULL);
+}
+
+static isize lkpi_owned_pread(struct vfs_handle *h, void *user_buf, usize len, u64 off)
+{
+	if (!g_lkpi_file_bridge || !h->private_data)
+		return -EBADF;
+	return (isize)g_lkpi_file_bridge->read(h->private_data, user_buf, len, &off);
+}
+
 static const struct vfs_file_ops lkpi_owned_file_ops = {
+	.read_user = lkpi_owned_read,
+	.pread_user = lkpi_owned_pread,
 	.lseek = lkpi_owned_lseek,
 	.poll = lkpi_owned_poll,
 	.ioctl = lkpi_owned_ioctl,
 	.release = lkpi_owned_release,
+	.mmap_page_phys = lkpi_owned_mmap_page,
 };
+
+/* ── misc devices ───────────────────────────────────────────────────────
+ *
+ * Each registered miscdevice gets /dev/<name>. Opening it asks the Linux
+ * side for a struct file of its own (lkpi_misc_open, which runs the driver's
+ * open), and from then on the descriptor is an owned file: ioctl, poll, mmap
+ * and the last close go to the driver's file_operations. */
+#define LKPI_MISC_MAX 8
+static struct {
+	const char *name;
+	void *dev;
+	unsigned int mode;
+	struct vfs_node *node;
+} g_lkpi_misc[LKPI_MISC_MAX];
+
+static int lkpi_misc_open_cb(struct vfs_node *node, struct vfs_handle *h)
+{
+	for (int i = 0; i < LKPI_MISC_MAX; i++) {
+		void *file;
+
+		if (!g_lkpi_misc[i].dev || g_lkpi_misc[i].node != node)
+			continue;
+		file = lkpi_misc_open(g_lkpi_misc[i].dev);
+		if (!file || IS_ERR(file))
+			return file ? (int)PTR_ERR(file) : -ENODEV;
+		h->private_data = file;
+		h->ops = &lkpi_owned_file_ops;
+		return 0;
+	}
+	return -ENODEV;
+}
+
+static void lkpi_misc_make_node(int i)
+{
+	char path[64];
+	struct vfs_node *node;
+
+	snprintf(path, sizeof(path), "/dev/%s", g_lkpi_misc[i].name);
+	node = vfs_add_node(path, VFS_DEVICE, 0, 0, 0);
+	if (!node || IS_ERR(node))
+		return;
+	node->inode->mode = g_lkpi_misc[i].mode ? g_lkpi_misc[i].mode : 0600;
+	node->inode->open_cb = lkpi_misc_open_cb;
+	g_lkpi_misc[i].node = node;
+	vfs_node_put(node);
+}
+
+void lkpi_misc_node_add(const char *name, void *dev, unsigned int mode)
+{
+	for (int i = 0; i < LKPI_MISC_MAX; i++) {
+		if (g_lkpi_misc[i].dev)
+			continue;
+		g_lkpi_misc[i].name = name;
+		g_lkpi_misc[i].dev = dev;
+		g_lkpi_misc[i].mode = mode;
+		lkpi_misc_make_node(i);
+		return;
+	}
+}
+
+void lkpi_misc_node_remove(void *dev)
+{
+	for (int i = 0; i < LKPI_MISC_MAX; i++)
+		if (g_lkpi_misc[i].dev == dev) {
+			g_lkpi_misc[i].dev = NULL;
+			g_lkpi_misc[i].node = NULL;
+		}
+}
+
+/* After the real root is mounted: the nodes made on the initramfs are gone
+ * from view, so they are made again (vfs_populate_dev). */
+void lkpi_misc_dev_init(void)
+{
+	for (int i = 0; i < LKPI_MISC_MAX; i++)
+		if (g_lkpi_misc[i].dev)
+			lkpi_misc_make_node(i);
+}
 
 void lkpi_handle_set_owned_file(void *handle)
 {
@@ -737,6 +871,83 @@ void lkpi_handle_release(void *handle)
 {
 	if (handle)
 		vfs_handle_release((struct vfs_handle *)handle);
+}
+
+/* ── interrupt-context timers (M131) ──────────────────────────────── */
+
+_Static_assert(sizeof(struct lkpi_ktimer) == sizeof(struct ktimer),
+               "struct lkpi_ktimer must mirror struct ktimer");
+_Static_assert(__builtin_offsetof(struct lkpi_ktimer, running) ==
+               __builtin_offsetof(struct ktimer, running),
+               "struct lkpi_ktimer must mirror struct ktimer");
+
+void lkpi_ktimer_arm(struct lkpi_ktimer *t, u64 expires_ns)
+{
+	ktimer_arm((struct ktimer *)t, expires_ns);
+}
+
+int lkpi_ktimer_cancel(struct lkpi_ktimer *t)
+{
+	return ktimer_cancel((struct ktimer *)t);
+}
+
+/* ── the process's eventfds, for linuxkpi's eventfd_ctx (M131) ──── */
+
+int lkpi_handle_is_eventfd(void *handle)
+{
+	return vfs_handle_is_eventfd((struct vfs_handle *)handle);
+}
+
+void *lkpi_fd_get_eventfd(int fd)
+{
+	struct vfs_handle *h = scheduler_fd_get_retain(fd);
+
+	if (h && !vfs_handle_is_eventfd(h)) {
+		vfs_handle_release(h);
+		h = 0;
+	}
+	return h;
+}
+
+void lkpi_handle_retain(void *handle)
+{
+	if (handle)
+		vfs_handle_retain((struct vfs_handle *)handle);
+}
+
+void lkpi_eventfd_signal(void *handle, u64 n)
+{
+	vfs_eventfd_signal((struct vfs_handle *)handle, n);
+}
+
+u64 lkpi_eventfd_take(void *handle)
+{
+	return vfs_eventfd_take((struct vfs_handle *)handle);
+}
+
+int lkpi_eventfd_readable(void *handle)
+{
+	return (vfs_eventfd_ready((struct vfs_handle *)handle) & B1NIX_POLLIN) != 0;
+}
+
+int lkpi_eventfd_writable(void *handle)
+{
+	return (vfs_eventfd_ready((struct vfs_handle *)handle) & B1NIX_POLLOUT) != 0;
+}
+
+void *lkpi_eventfd_kobj(void *handle, void *fresh)
+{
+	return vfs_eventfd_kobj((struct vfs_handle *)handle, fresh);
+}
+
+static struct vfs_eventfd_kernel_ops g_lkpi_efd_ops;
+
+void lkpi_eventfd_set_kernel_ops(void (*notify)(void *kobj, unsigned events),
+                                 void (*destroy)(void *kobj))
+{
+	g_lkpi_efd_ops.notify = notify;
+	g_lkpi_efd_ops.destroy = destroy;
+	vfs_eventfd_set_kernel_ops(&g_lkpi_efd_ops);
 }
 
 void *lkpi_handle_private(void *handle)

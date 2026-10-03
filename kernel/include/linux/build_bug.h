@@ -5,6 +5,12 @@
  * were written there first, so this is the split-out name pointing back. */
 #include <linux/kernel.h>
 
+#ifndef ASSERT_STRUCT_OFFSET
+#define ASSERT_STRUCT_OFFSET(type, field, expected_offset) \
+	_Static_assert(__builtin_offsetof(type, field) == (expected_offset), \
+		       "Offset of " #field " in " #type " has changed.")
+#endif
+
 #ifndef static_assert
 #define static_assert(expr, ...) _Static_assert(expr, #expr)
 #endif

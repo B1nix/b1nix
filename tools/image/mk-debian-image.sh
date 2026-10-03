@@ -109,6 +109,15 @@ sysvinit)
 		_fio_pkgs="$_fio_pkgs bpftrace"
 		RESOLVE_DEPS="${RESOLVE_DEPS:-1}"
 	fi
+	# QEMU=1 adds the distribution's QEMU and the firmware it boots a PC
+	# with: a virtual machine inside b1nix, through /dev/kvm (M131).
+	if [ "${QEMU:-0}" = "1" ]; then
+		_fio_pkgs="$_fio_pkgs qemu-system-x86 seabios"
+		RESOLVE_DEPS="${RESOLVE_DEPS:-1}"
+		# QEMU and the libraries it draws in are larger than the rest of
+		# the profile together.
+		IMG_SIZE_MB=$((IMG_SIZE_MB + 512))
+	fi
 	# bpftool (and libelf1, the one library of its the base lacks): the
 	# distribution's reader of the kernel's BTF (M133).
 	PACKAGES="${PACKAGES:-procps libproc2-0 libncursesw6 sysvinit-core sysvinit-utils bpftool libelf1$_fio_pkgs}"
@@ -483,6 +492,80 @@ for p in $PACKAGES; do
 		tar -x -f - -C "$ROOTFS" --keep-directory-symlink $TAR_OWNER_FLAGS ||
 		die "$p: unpack failed"
 done
+
+# ── 3b. A guest to run inside (QEMU=1, M131) ───────────────────────────────
+# The distribution's cloud kernel and an initramfs of busybox-static whose
+# /init (tools/image/l2-init.sh) reports what it booted on and powers the
+# machine off. Only the kernel
+# image is taken from its package -- the guest needs no modules -- and neither
+# package is installed into the tree: they are data for the VM, not software
+# b1nix runs.
+L2_DIR="$ROOTFS/usr/lib/b1nix-l2"
+
+# fetch_deb <package>: the package's .deb in $DEBS, verified against the index.
+fetch_deb() {
+	[ -f "$DEBS/$1.deb" ] && return 0
+	fetch_index
+	set -- "$1" $(resolve_pkg "$1")
+	[ $# -ge 2 ] || die "package '$1' not found in $SUITE/$COMPONENT/$DEB_ARCH Packages"
+	log "downloading $1 ${4:-?} -> $2"
+	curl -sfL "$MIRROR/$2" -o "$DEBS/$1.deb.part" || die "download failed (404?): $MIRROR/$2"
+	if [ -n "${3:-}" ]; then
+		[ "$(sha256sum "$DEBS/$1.deb.part" | cut -d' ' -f1)" = "$3" ] ||
+			die "$1: sha256 mismatch"
+	fi
+	mv "$DEBS/$1.deb.part" "$DEBS/$1.deb"
+}
+
+# deb_extract <package> <dir> <member...>: members of its data.tar into dir.
+deb_extract() {
+	_deb="$DEBS/$1.deb" _dir="$2"
+	shift 2
+	_member=$(ar t "$_deb" | grep '^data\.tar' | head -1)
+	case "$_member" in
+	data.tar.xz) _dec="xz -dc" ;;
+	data.tar.zst) _dec="zstd -dc" ;;
+	data.tar.gz) _dec="gzip -dc" ;;
+	*) die "$_deb: unknown data member '$_member'" ;;
+	esac
+	mkdir -p "$_dir"
+	ar p "$_deb" "$_member" | $_dec | tar -x -f - -C "$_dir" --wildcards "$@" ||
+		die "$_deb: cannot extract $*"
+}
+
+if [ "${QEMU:-0}" = "1" ]; then
+	fetch_index
+	# The metapackage names the kernel it currently means.
+	_kpkg=$(awk '/^Package: linux-image-cloud-amd64$/ { p = 1 }
+		p && /^Depends: / { sub(/^Depends: /, ""); sub(/[ ,(].*/, ""); print; exit }' "$PKG_INDEX")
+	[ -n "$_kpkg" ] || die "no linux-image-cloud-amd64 in the Packages index"
+	fetch_deb "$_kpkg"
+	fetch_deb busybox-static
+	_l2tmp="$CACHE/l2-extract"
+	rm -rf "$_l2tmp"
+	# The kernel, and the virtio modules a disk needs: the guest's disk is
+	# what makes QEMU use KVM's ioeventfd (queue kicks) and irqfd (MSI-X).
+	_l2mods="virtio virtio_ring virtio_pci_modern_dev virtio_pci_legacy_dev virtio_pci virtio_blk"
+	deb_extract "$_kpkg" "$_l2tmp/k" './boot/vmlinuz-*' \
+		'./lib/modules/*/kernel/drivers/virtio/virtio*.ko' \
+		'./lib/modules/*/kernel/drivers/block/virtio_blk.ko'
+	deb_extract busybox-static "$_l2tmp/b" './bin/busybox'
+	mkdir -p "$L2_DIR"
+	cp "$_l2tmp"/k/boot/vmlinuz-* "$L2_DIR/vmlinuz"
+	log "L2 guest: kernel from $_kpkg, initramfs of busybox-static"
+	_l2args=""
+	for _m in $_l2mods; do
+		_ko=$(ls "$_l2tmp"/k/lib/modules/*/kernel/drivers/*/"$_m.ko" 2>/dev/null | head -1)
+		[ -n "$_ko" ] || die "no $_m.ko in $_kpkg"
+		_l2args="$_l2args --file lib/$_m.ko=$_ko"
+	done
+	echo "$_l2mods" >"$_l2tmp/l2-modules"
+	python3 "$(dirname "$0")/mk-initramfs.py" "$L2_DIR/initrd.gz" \
+		--init "$(dirname "$0")/l2-init.sh" --file "bin/busybox=$_l2tmp/b/bin/busybox" \
+		--file "lib/l2-modules=$_l2tmp/l2-modules" $_l2args ||
+		die "cannot build the L2 initramfs"
+	rm -rf "$_l2tmp"
+fi
 
 # ── 4. Our test harness (everything we add is prefixed b1nix-) ──────────────
 log "staging /b1nix-stage.sh"

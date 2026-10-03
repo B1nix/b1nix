@@ -18,6 +18,9 @@
 /* M35: ELF core dump on fatal fault (kernel/arch/x86_64/coredump.c). */
 void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/lapic.h>
+#include <b1nix/ipi.h>
+#include <b1nix/kvm_hooks.h>
+#include <b1nix/ktimer.h>
 #include <b1nix/mm.h>
 u64 paging_cr3_to_pml4(u64 cr3);
 #include <b1nix/serial.h>
@@ -228,6 +231,7 @@ extern void isr63(void);
 extern void isr64(void);   /* LAPIC timer — per-CPU scheduler tick */
 extern void isr65(void);   /* TLB shootdown IPI */
 extern void isr66(void);   /* Reschedule IPI — wake from sti;hlt */
+extern void isr67(void);   /* Cross-CPU function call */
 extern void isr255(void);  /* LAPIC spurious — no-EOI no-op */
 
 static volatile u64 timer_ticks;
@@ -429,6 +433,8 @@ void x86_idt_init(void) {
    * the global runqueue doesn't wait for the next 10 ms LAPIC tick on
    * each idle AP. Handler is a no-op (just EOI). */
   idt_set_gate(66, isr66);
+  /* Cross-CPU function call (smp_call_on_cpu). */
+  idt_set_gate(67, isr67);
   idt_set_gate(255, isr255);
 
   struct idt_pointer pointer = {
@@ -720,6 +726,12 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
     lapic_eoi();
     return;
   }
+  /* Cross-CPU function call: run the requested function here. No BKL,
+   * like the other IPIs; the callback runs with interrupts off. */
+  if (frame->vector == 67) {
+    smp_call_handler();
+    return;
+  }
 
   /* LAPIC timer (vector 0x40 = 64) — per-CPU scheduler tick. Drives the global
    * scheduler bookkeeping (scheduler_ticks++, wake_sleepers) on the BSP only so
@@ -751,6 +763,14 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
      * switch away, and a one-shot timer left unarmed across the switch is a
      * timer that never fires again. No-op unless b1nix.dynticks is on. */
     lapic_timer_rearm();
+    /* Timers that fire from the interrupt itself (KVM's guest timers), on
+     * whichever CPU ticks first once they are due. */
+    ktimer_tick();
+    /* A cross-call aimed here whose IPI did not get through: a vCPU moving
+     * CPUs waits on the old one to VMCLEAR its VMCS, and an idle CPU that
+     * missed the IPI left it spinning until something else woke this CPU.
+     * The tick picks it up. */
+    smp_call_poll_pending();
     /* Record the user RIP the tick preempted, so the silence watchdog's task
      * dump can name the exact user function a wedged thread group spins in
      * (a thread group burning CPU in the same address forever is a lockup;
@@ -808,6 +828,11 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
        * both nice and a sched_setaffinity that moved it elsewhere. */
       extern void scheduler_preempt_user_ap(void);
       scheduler_preempt_user_ap();
+    } else {
+      /* A kernel-mode tick on an AP is not preempted (see above), but it
+       * still asks: code that checks (KVM between guest entries, M131)
+       * yields on its own. */
+      scheduler_note_resched();
     }
     if (frame->cs == 0x1B || frame->cs == 0x23) {
       /* rseq(2): the tick may have preempted (and the task may have come back
@@ -916,8 +941,11 @@ void x86_irq_handler(struct interrupt_frame *frame) {
   if (from_user)
     sched_acct_enter_kernel();
   x86_irq_handler_dispatch(frame);
-  if (from_user)
+  if (from_user) {
     sched_acct_leave_kernel();
+    interrupts_disable();
+    kvm_hook_return_to_user();
+  }
 }
 
 static void x86_irq_handler_dispatch(struct interrupt_frame *frame) {
@@ -930,6 +958,12 @@ static void x86_irq_handler_dispatch(struct interrupt_frame *frame) {
    * contention without adding correctness. */
   if (frame->vector == 66) {
     lapic_eoi();
+    return;
+  }
+  /* Cross-CPU function call: run the requested function here. No BKL,
+   * like the other IPIs; the callback runs with interrupts off. */
+  if (frame->vector == 67) {
+    smp_call_handler();
     return;
   }
   /* T3 (M28 #7): LAPIC timer (vector 64) bypasses the BKL.
@@ -1007,9 +1041,13 @@ int arch_rdmsr_safe(u32 msr, u64 *out) {
 
   p = msr_probe_slot();
   p->faulted = 0;
-  __asm__ volatile("lea 1f(%%rip), %0\n\t"
+  /* The fault handler matches the faulting RIP against p->rip, so the store
+   * has to be in memory BEFORE the instruction runs: as an asm output it was
+   * only written after, and a probe that faulted was an unhandled #GP. */
+  __asm__ volatile("lea 1f(%%rip), %%rax\n\t"
+                   "movq %%rax, %[slot]\n\t"
                    "1: rdmsr"
-                   : "=r"(p->rip), "=a"(lo), "=d"(hi)
+                   : [slot] "=m"(p->rip), "=a"(lo), "=d"(hi)
                    : "c"(msr)
                    : "memory");
   ok = !p->faulted;
@@ -1027,11 +1065,15 @@ int arch_wrmsr_safe(u32 msr, u64 value) {
 
   p = msr_probe_slot();
   p->faulted = 0;
-  __asm__ volatile("lea 1f(%%rip), %0\n\t"
+  /* As in arch_rdmsr_safe: the address is stored before the WRMSR runs. The
+   * value goes in through r8 because RAX carries the address first. */
+  __asm__ volatile("lea 1f(%%rip), %%rax\n\t"
+                   "movq %%rax, %[slot]\n\t"
+                   "movl %k[lo], %%eax\n\t"
                    "1: wrmsr"
-                   : "=r"(p->rip)
-                   : "a"((u32)value), "d"((u32)(value >> 32)), "c"(msr)
-                   : "memory");
+                   : [slot] "=m"(p->rip)
+                   : [lo] "r"((u32)value), "d"((u32)(value >> 32)), "c"(msr)
+                   : "rax", "memory");
   ok = !p->faulted;
   p->rip = 0;
   interrupts_restore(flags);
@@ -2093,8 +2135,11 @@ void x86_exception_handler(struct interrupt_frame *frame) {
   if (from_user)
     sched_acct_enter_kernel();
   x86_exception_handler_inner(frame);
-  if (from_user)
+  if (from_user) {
     sched_acct_leave_kernel();
+    interrupts_disable();
+    kvm_hook_return_to_user();
+  }
 }
 
 /* ── Stack Backtrace ──────────────────────────────────────────── */

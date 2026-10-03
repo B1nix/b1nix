@@ -49,18 +49,57 @@ struct eventfd_state {
   volatile int lock;
   u64 count;
   int semaphore; /* EFD_SEMAPHORE: read decrements by 1 */
+  /* A kernel subscriber's object (M131: KVM's irqfd and ioeventfd, through
+   * linuxkpi's eventfd_ctx), told of every signal. One per eventfd, made on
+   * first use and destroyed with the eventfd -- a subscriber keeps the
+   * eventfd alive by holding its handle. */
+  void *kobj;
 };
+
+/* The lock is held for a few loads and stores, with interrupts off: a kernel
+ * subscriber's wake callback takes it from under a lock of its own with
+ * interrupts off, and must neither yield nor wait on a holder that was
+ * preempted. */
+static u64 efd_lock(struct eventfd_state *e) {
+  u64 flags = interrupts_save();
+
+  while (__atomic_test_and_set(&e->lock, __ATOMIC_ACQUIRE))
+    cpu_relax();
+  return flags;
+}
+
+static void efd_unlock(struct eventfd_state *e, u64 flags) {
+  __atomic_clear(&e->lock, __ATOMIC_RELEASE);
+  interrupts_restore(flags);
+}
+
+static const struct vfs_eventfd_kernel_ops *g_efd_kops;
+
+void vfs_eventfd_set_kernel_ops(const struct vfs_eventfd_kernel_ops *ops) {
+  g_efd_kops = ops;
+}
+
+/* The count went up: readers, pollers and the kernel subscriber. */
+static void efd_signalled(struct eventfd_state *e) {
+  void *kobj = __atomic_load_n(&e->kobj, __ATOMIC_ACQUIRE);
+
+  scheduler_wake_all(e);
+  scheduler_wake_all(vfs_poll_chan);
+  if (kobj && g_efd_kops && g_efd_kops->notify)
+    g_efd_kops->notify(kobj, B1NIX_POLLIN);
+}
 
 static isize eventfd_read(struct vfs_handle *h, char *buf, usize len) {
   struct eventfd_state *e = (struct eventfd_state *)h->private_data;
+  u64 flags;
+
   if (!e || len < sizeof(u64))
     return -EINVAL;
   while (1) {
-    while (__atomic_test_and_set(&e->lock, __ATOMIC_ACQUIRE))
-      scheduler_yield();
+    flags = efd_lock(e);
     if (e->count != 0)
       break;
-    __atomic_clear(&e->lock, __ATOMIC_RELEASE);
+    efd_unlock(e, flags);
     if (h->flags & B1NIX_O_NONBLOCK)
       return -EAGAIN;
     if (scheduler_signal_pending())
@@ -75,7 +114,7 @@ static isize eventfd_read(struct vfs_handle *h, char *buf, usize len) {
     out = e->count;
     e->count = 0;
   }
-  __atomic_clear(&e->lock, __ATOMIC_RELEASE);
+  efd_unlock(e, flags);
   scheduler_wake_all(e);
   scheduler_wake_all(vfs_poll_chan);
   memcpy(buf, &out, sizeof(u64));
@@ -84,6 +123,8 @@ static isize eventfd_read(struct vfs_handle *h, char *buf, usize len) {
 
 static isize eventfd_write(struct vfs_handle *h, const char *buf, usize len) {
   struct eventfd_state *e = (struct eventfd_state *)h->private_data;
+  u64 flags;
+
   if (!e || len < sizeof(u64))
     return -EINVAL;
   u64 add;
@@ -91,23 +132,91 @@ static isize eventfd_write(struct vfs_handle *h, const char *buf, usize len) {
   if (add == 0xffffffffffffffffULL)
     return -EINVAL; /* the all-ones value is reserved by the ABI */
   while (1) {
-    while (__atomic_test_and_set(&e->lock, __ATOMIC_ACQUIRE))
-      scheduler_yield();
+    flags = efd_lock(e);
     if (e->count + add <= EVENTFD_MAX) {
       e->count += add;
-      __atomic_clear(&e->lock, __ATOMIC_RELEASE);
+      efd_unlock(e, flags);
       break;
     }
-    __atomic_clear(&e->lock, __ATOMIC_RELEASE);
+    efd_unlock(e, flags);
     if (h->flags & B1NIX_O_NONBLOCK)
       return -EAGAIN;
     if (scheduler_signal_pending())
       return -ERESTARTSYS;
     scheduler_block_on(e);
   }
-  scheduler_wake_all(e);
-  scheduler_wake_all(vfs_poll_chan);
+  efd_signalled(e);
   return (isize)sizeof(u64);
+}
+
+static struct eventfd_state *efd_of(struct vfs_handle *h) {
+  return h && h->kind == VFS_HANDLE_EVENTFD
+             ? (struct eventfd_state *)h->private_data
+             : 0;
+}
+
+int vfs_handle_is_eventfd(struct vfs_handle *h) { return efd_of(h) != 0; }
+
+/* eventfd_signal: add n, never blocking -- a count that would pass the
+ * maximum stops at it, as Linux's does. */
+void vfs_eventfd_signal(struct vfs_handle *h, u64 n) {
+  struct eventfd_state *e = efd_of(h);
+  u64 flags;
+
+  if (!e)
+    return;
+  flags = efd_lock(e);
+  if (EVENTFD_MAX - e->count < n)
+    n = EVENTFD_MAX - e->count;
+  e->count += n;
+  efd_unlock(e, flags);
+  efd_signalled(e);
+}
+
+/* eventfd_ctx_do_read: what a read would return, taken without blocking
+ * (0 when nothing is there). */
+u64 vfs_eventfd_take(struct vfs_handle *h) {
+  struct eventfd_state *e = efd_of(h);
+  u64 flags, out;
+
+  if (!e)
+    return 0;
+  flags = efd_lock(e);
+  out = (e->semaphore && e->count) ? 1 : e->count;
+  e->count -= out;
+  efd_unlock(e, flags);
+  if (out) {
+    scheduler_wake_all(e);
+    scheduler_wake_all(vfs_poll_chan);
+  }
+  return out;
+}
+
+/* B1NIX_POLLIN / B1NIX_POLLOUT, as poll(2) would answer. */
+unsigned vfs_eventfd_ready(struct vfs_handle *h) {
+  struct eventfd_state *e = efd_of(h);
+  u64 count;
+
+  if (!e)
+    return 0;
+  count = __atomic_load_n(&e->count, __ATOMIC_ACQUIRE);
+  return (count > 0 ? B1NIX_POLLIN : 0) | (count < EVENTFD_MAX ? B1NIX_POLLOUT : 0);
+}
+
+/* The subscriber object: the one already there, or `fresh` installed now.
+ * The caller frees `fresh` when another won the race. */
+void *vfs_eventfd_kobj(struct vfs_handle *h, void *fresh) {
+  struct eventfd_state *e = efd_of(h);
+  void *expect = 0;
+
+  if (!e)
+    return 0;
+  if (!fresh)
+    return __atomic_load_n(&e->kobj, __ATOMIC_ACQUIRE);
+  if (__atomic_compare_exchange_n(&e->kobj, &expect, fresh, 0, __ATOMIC_ACQ_REL,
+                                  __ATOMIC_ACQUIRE))
+    return fresh;
+  return expect;
 }
 
 static int eventfd_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
@@ -124,6 +233,10 @@ static int eventfd_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
 
 static void eventfd_release(struct vfs_handle *h) {
   if (h->private_data) {
+    struct eventfd_state *e = (struct eventfd_state *)h->private_data;
+
+    if (e->kobj && g_efd_kops && g_efd_kops->destroy)
+      g_efd_kops->destroy(e->kobj);
     kfree(h->private_data);
     h->private_data = 0;
   }

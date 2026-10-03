@@ -392,6 +392,10 @@ BINARIES += $(BUILD)/bin/m134_aml_smoke
 BINARIES += $(BUILD)/bin/m135_acpi_smoke
 BINARIES += $(BUILD)/bin/m135_hib_smoke
 BINARIES += $(BUILD)/bin/m135_iommu_s3_smoke
+# M131: a VM through /dev/kvm (x86 register layout; aarch64 KVM is later).
+ifneq ($(B1NIX_ARCH),aarch64)
+BINARIES += $(BUILD)/bin/m131_kvm_smoke
+endif
 # reboot(RESTART2, "bootloader"): the iommu lane ends through it.
 BINARIES += $(BUILD)/bin/reboot2_smoke
 BINARIES += $(BUILD)/bin/m42_w5pre_smoke

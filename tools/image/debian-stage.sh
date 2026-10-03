@@ -1121,6 +1121,108 @@ if command -v bpftool >/dev/null 2>&1; then
 	fi
 fi
 
+# M131. A virtual machine inside this one: the distribution's QEMU with
+# -accel kvm, when the image was built with QEMU=1. The guest is a boot
+# sector SeaBIOS loads -- it writes a line to COM1 and then triple-faults on
+# purpose (an empty IDT and an int3), which -no-reboot turns into QEMU
+# exiting. So the line in the output was written by guest code KVM ran, and
+# QEMU's own exit proves the triple fault went through KVM too.
+if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+	echo "DEBIAN-SMOKE: qemu is present: $(qemu-system-x86_64 --version 2>&1 | head -1)"
+	# Transparent huge pages for the guests' RAM, which QEMU madvises: KVM
+	# then maps what the host backs with 2 MiB pages as 2 MiB in EPT/NPT.
+	# madvise is also the distribution's default; the setting is put back.
+	l2_thp=$(sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)
+	echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+	printf '%b' '\0061\0300\0216\0330\0276\0040\0174\0272\0370\0003\0254\0204\0300\0164\0003\0356\0353\0370\0017\0001\0036\0032\0174\0314\0353\0376\0000\0000\0000\0000\0000\0000\0102\0061\0116\0111\0130\0055\0114\0062\0055\0107\0125\0105\0123\0124\0012\0000' >/tmp/l2.img
+	dd if=/dev/zero bs=1 count=$((510 - 48)) >>/tmp/l2.img 2>/dev/null
+	printf '\125\252' >>/tmp/l2.img
+	rm -f /tmp/l2.out
+	timeout -k 5 120 qemu-system-x86_64 -accel kvm -machine pc -m 32 -nodefaults \
+		-display none -no-reboot -serial file:/tmp/l2.out \
+		-drive file=/tmp/l2.img,format=raw,if=ide,index=0 >/tmp/l2.log 2>&1
+	l2_rc=$?
+	head -5 /tmp/l2.log | while IFS= read -r l; do echo "DEBIAN-SMOKE: qemu: $l"; done
+	echo "DEBIAN-SMOKE: qemu exited $l2_rc, the guest wrote: $(tr -d '\r\n' </tmp/l2.out 2>/dev/null)"
+	grep -q '^B1NIX-L2-GUEST$' /tmp/l2.out 2>/dev/null && ok qemu-kvm-guest || bad qemu-kvm-guest "$l2_rc"
+	[ "$l2_rc" = 0 ] && ok qemu-kvm-exit || bad qemu-kvm-exit "$l2_rc"
+
+	# Then Linux: the distribution's cloud kernel and a busybox initramfs
+	# whose /init prints what it booted on and powers off. The line comes from
+	# a kernel that got as far as userspace on this KVM -- timer, interrupt
+	# controllers, paging, a second vCPU it brought up with INIT/SIPI -- and
+	# QEMU exiting 0 is its ACPI poweroff.
+	if [ -f /usr/lib/b1nix-l2/vmlinuz ]; then
+		rm -f /tmp/l2l.out
+		l2_t0=$(cut -d' ' -f1 /proc/uptime)
+		timeout -k 5 110 qemu-system-x86_64 -accel kvm -machine pc -m 160 -smp 2 -nodefaults \
+			-display none -no-reboot -serial file:/tmp/l2l.out \
+			-kernel /usr/lib/b1nix-l2/vmlinuz -initrd /usr/lib/b1nix-l2/initrd.gz \
+			-append "console=ttyS0 panic=-1 loglevel=4" >/tmp/l2l.log 2>&1
+		l2_rc=$?
+		echo "DEBIAN-SMOKE: qemu linux exited $l2_rc after $(awk -v t="$l2_t0" '{ printf "%.1f", $1 - t }' /proc/uptime) s"
+		if grep -q '^B1NIX-L2-INIT .* cpus=2 ' /tmp/l2l.out 2>/dev/null; then
+			echo "DEBIAN-SMOKE: $(grep '^B1NIX-L2-INIT ' /tmp/l2l.out | tr -d '\r')"
+			ok qemu-kvm-linux
+		else
+			tr -d '\r' </tmp/l2l.out 2>/dev/null | tail -15 |
+				while IFS= read -r l; do echo "DEBIAN-SMOKE: l2: $l"; done
+			bad qemu-kvm-linux "$l2_rc"
+		fi
+		[ "$l2_rc" = 0 ] && ok qemu-kvm-linux-poweroff || bad qemu-kvm-linux-poweroff "$l2_rc"
+
+		# And a virtio disk: its queue kicks reach QEMU through KVM's
+		# ioeventfd and its MSI-X interrupts come back through irqfd, so the
+		# line read off it crossed both.
+		rm -f /tmp/l2v.out
+		{ echo B1NIX-L2-DISK-OK; head -c 1048576 /dev/zero; } >/tmp/l2disk.img
+		timeout -k 5 110 qemu-system-x86_64 -accel kvm -machine pc -m 160 -nodefaults \
+			-display none -no-reboot -serial file:/tmp/l2v.out \
+			-kernel /usr/lib/b1nix-l2/vmlinuz -initrd /usr/lib/b1nix-l2/initrd.gz \
+			-drive file=/tmp/l2disk.img,format=raw,if=virtio \
+			-append "console=ttyS0 panic=-1 loglevel=4 b1nix.l2disk=vda" >/tmp/l2v.log 2>&1
+		l2_rc=$?
+		echo "DEBIAN-SMOKE: qemu virtio exited $l2_rc"
+		if grep -q '^B1NIX-L2-VIRTIO B1NIX-L2-DISK-OK' /tmp/l2v.out 2>/dev/null; then
+			ok qemu-kvm-virtio
+		else
+			{ head -3 /tmp/l2v.log; tr -d '\r' </tmp/l2v.out 2>/dev/null | tail -15; } |
+				while IFS= read -r l; do echo "DEBIAN-SMOKE: l2v: $l"; done
+			bad qemu-kvm-virtio "$l2_rc"
+		fi
+	fi
+
+	# b1nix inside b1nix: the lane hands the base boot an ISO of the kernel
+	# under test, with the same busybox initramfs, as a second disk. The
+	# kernel's banner and /init's line come from b1nix running as a guest of
+	# its own KVM on two vCPUs -- SeaBIOS, GRUB reading the CD, the AP brought
+	# up -- and /init's poweroff is its ACPI shutdown.
+	if [ -b /dev/vdb ] && [ "$(dd if=/dev/vdb bs=1 skip=32769 count=5 2>/dev/null)" = CD001 ]; then
+		rm -f /tmp/l2b.out
+		l2_t0=$(cut -d' ' -f1 /proc/uptime)
+		(sleep 2.5; echo "info stats vm") |
+		timeout -k 5 110 qemu-system-x86_64 -accel kvm -machine pc -m 384 -smp 2 -nodefaults \
+			-display none -no-reboot -serial file:/tmp/l2b.out -cdrom /dev/vdb \
+			-monitor stdio >/tmp/l2b.log 2>&1
+		l2_rc=$?
+		l2_2m=$(tr -d '\r' </tmp/l2b.log | sed -n 's/.*pages_2m (instant): \([0-9]*\).*/\1/p' | head -1)
+		echo "DEBIAN-SMOKE: b1nix guest memory in 2 MiB mappings: ${l2_2m:-?}"
+		[ "${l2_2m:-0}" -gt 0 ] && ok qemu-kvm-2m || bad qemu-kvm-2m "${l2_2m:-none}"
+		echo "DEBIAN-SMOKE: qemu b1nix exited $l2_rc after $(awk -v t="$l2_t0" '{ printf "%.1f", $1 - t }' /proc/uptime) s"
+		if grep -aq 'b1nix kernel booting' /tmp/l2b.out 2>/dev/null &&
+			grep -aq 'B1NIX-L2-INIT .* cpus=2 ' /tmp/l2b.out 2>/dev/null; then
+			echo "DEBIAN-SMOKE: b1nix-in-b1nix: $(grep -a -o 'B1NIX-L2-INIT .*' /tmp/l2b.out | head -1 | tr -d '\r')"
+			ok qemu-kvm-b1nix
+		else
+			{ head -3 /tmp/l2b.log; tr -d '\r' </tmp/l2b.out 2>/dev/null | tail -20; } |
+				while IFS= read -r l; do echo "DEBIAN-SMOKE: l2b: $l"; done
+			bad qemu-kvm-b1nix "$l2_rc"
+		fi
+		[ "$l2_rc" = 0 ] && ok qemu-kvm-b1nix-poweroff || bad qemu-kvm-b1nix-poweroff "$l2_rc"
+	fi
+	[ -n "$l2_thp" ] && echo "$l2_thp" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+fi
+
 # bpftrace, when the image has it (BPFTRACE=1): the tracer eBPF is there for.
 # A kprobe counted into a map, and a timer probe that ends the run -- the
 # program on the kprobe, the one on the perf event, the maps and the output

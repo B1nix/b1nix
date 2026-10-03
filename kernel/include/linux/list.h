@@ -330,6 +330,9 @@ static inline usize list_count_nodes(struct list_head *head)
 }
 
 
+#ifndef HLIST_HEAD
+#define HLIST_HEAD(name) struct hlist_head name = { .first = NULL }
+#endif
 #ifndef INIT_HLIST_HEAD
 #define INIT_HLIST_HEAD(ptr) ((ptr)->first = NULL)
 #endif

@@ -32,6 +32,7 @@
 #include <linux/raid/xor.h>
 #include <linux/uio.h>
 #include <lkpi/env.h>
+#include <linux/anon_inodes.h>
 
 /* ── read-ahead ─────────────────────────────────────────────────── */
 
@@ -437,18 +438,44 @@ static struct miscdevice *misc_registered;
 
 int misc_register(struct miscdevice *misc)
 {
-	if (!misc)
+	if (!misc || !misc->name)
 		return -EINVAL;
 	misc->list.next = NULL;
 	misc->list.prev = NULL;
 	misc_registered = misc;
+	lkpi_misc_node_add(misc->nodename ? misc->nodename : misc->name, misc,
+			   misc->mode);
 	return 0;
 }
 
 void misc_deregister(struct miscdevice *misc)
 {
+	lkpi_misc_node_remove(misc);
 	if (misc_registered == misc)
 		misc_registered = NULL;
+}
+
+/* An open of a misc device's node: a file of its own, carrying the device as
+ * private_data, and the driver's open if it has one -- what Linux's
+ * misc_open does. */
+void *lkpi_misc_open(void *dev)
+{
+	struct miscdevice *misc = dev;
+	struct file *f;
+	int r;
+
+	lkpi_file_bridge_ensure();
+	f = anon_inode_getfile(misc->name, misc->fops, misc, O_RDWR);
+	if (IS_ERR(f))
+		return f;
+	if (misc->fops->open) {
+		r = misc->fops->open(f->f_inode, f);
+		if (r) {
+			fput(f);
+			return ERR_PTR(r);
+		}
+	}
+	return f;
 }
 
 /*

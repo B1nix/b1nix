@@ -538,84 +538,114 @@ guest writes a file and reads `/proc` afterwards — graded as
 `suspend-rtcwake` and `suspend-alive`. Nothing on that path is a b1nix
 interface, which is the point of running it.
 
-## Power management: what is not done (M135)
+## Power management that manages (M135)
 
-The machine sleeps, wakes and scales. It does not manage its own power: nothing
-here reacts to a closed lid, lowers the clock because the machine is idle, or
-acts on a temperature. This is the list, kept here rather than in the roadmap
-because it is long and each line names the thing that is missing rather than a
-theme.
+M129 made the machine sleep, wake and scale. M135 adds the parts that decide
+when to do it, and closes the gaps left in the sleep itself.
 
-**Events from the platform.** There is no SCI handler and no GPE dispatch, and
-`Notify` is not implemented, so nothing the firmware raises reaches the kernel:
-the power button, the lid switch, the adapter going in or out, a battery
-changing state, a thermal trip. Two consequences follow. A desktop cannot ask
-this kernel to suspend on a lid close, because the kernel never hears the lid.
-And the battery and thermal files are only ever evaluated when somebody reads
-them — a change is not an event, it is something a poller notices later.
+**Events from the platform.** The SCI handler dispatches GPEs and runs the
+`_Lxx`/`_Exx` methods. `Notify` reaches the kernel from there:
 
-**Powering off.** `reboot(RB_POWER_OFF)` writes three hard-coded ports
-(`0x604`, `0xB004`, `0x4004` — QEMU and Bochs) and, on a machine that is
-neither, prints "poweroff unsupported, halting". The honest path is the one S3
-already uses: `\_S5` for the sleep type and the FADT's PM1 control register,
-which the kernel now reads anyway.
+- The power and sleep buttons become evdev keys.
+- The lid becomes `SW_LID`.
+- The adapter, a battery and a thermal zone each post a `change` uevent on
+  their power_supply or thermal device.
+- A bus check on a hotplug slot rescans it.
 
-**The resume remainder.** Ten drivers have a resume callback (see the S3
-section); these do not: Intel HDA, virtio-input, virtio-console, the PS/2
-controller, and the IOMMUs (VT-d/AMD-Vi domains and the interrupt-remapping
-table; SMMUv3 on aarch64). The PCI snapshot restores the BARs, the command
-register, the cache line, the latency timer and the interrupt line — and NOT
-the MSI or MSI-X capability, so a device driven over message-signalled
-interrupts comes back with no vectors. There is no quiesce (suspend) callback
-at all: the queues are not drained before the power goes, and what saves the
-machine today is that userspace is frozen rather than that the devices are
-idle. The resume list is flat — no ordering, no dependencies, and a driver that
-fails gets a line in the log and nothing else.
+Power-off takes its sleep type from `\_S5` and writes the FADT's PM1 control
+register.
 
-**States that are absent.** Hibernate (S4) does not exist: no image, no
-`/sys/power/disk`. aarch64 has no deep sleep — PSCI `SYSTEM_SUSPEND` is not
-implemented, so `/sys/power/state` there is `freeze` alone. The `/sys/power`
-surface is one file: no `wakeup_count`, `mem_sleep`, `wakeup_sources` or
-`pm_wakeup_irq`. Only the RTC alarm counts as a wake source deep enough for
-S3; a power button, a lid, wake-on-LAN and USB wake do not exist as sources.
-A `freeze` with nothing armed still sleeps to its ten-second ceiling.
+**Frequency and idle.** `ondemand` runs as a kernel thread (`kondemand`). Each
+period it measures busy time against wall time and picks the lowest P-state
+that keeps the load under its threshold. `_PPC` is the firmware's ceiling;
+Notify 0x80 on the processor re-reads it, and it appears as `bios_limit`.
+cpufreq has Linux's layout: `policy0`, with `cpuN/cpufreq` links, the
+`userspace` governor, and `stats/time_in_state` and `total_trans`.
 
-**Frequency.** Two governors, and they are the two ends of the range:
-`performance` pins the top state and `powersave` the bottom. Nothing moves
-between them by itself, which is what `ondemand` and `schedutil` are for, so an
-idle machine runs at the frequency it was left at. `_PPC` — the ceiling the
-firmware asks for, which is how a laptop says "you are on battery" — is not
-read. `_PSS` is taken from one processor container and applied to the machine:
-there is no per-policy or per-core control, and no `policy*` directory layout,
-which is the shape `cpupower` and every tuning daemon expect. No boost or turbo
-knob, no energy-performance preference beyond the two presets, and no feedback
-from temperature or a power cap (no RAPL).
+cpuidle takes the platform's states from `_CST`: FFH MWAIT hints, SystemIO
+`P_LVLx` reads and HLT. A menu governor picks among them. It uses the next
+timer, multiplies by a correction factor learnt from how long past idles
+really lasted, and switches to the typical interval when recent idles were
+regular. Each state has `usage`, `time`, `above` and `below` counters and can
+be disabled per CPU.
 
-**Idle.** The C-states come from CPUID leaf 5 — the MWAIT hints the processor
-advertises — and ACPI's `_CST`, which is where a platform declares the states
-it really has, is not read. There is no idle governor: `cpuidle_enter` takes
-the deepest state this CPU has, every time, rather than choosing from the
-predicted length of the idle period and the state's exit latency. On aarch64
-there is one state, WFI; PSCI `CPU_SUSPEND` is not used. And there is no
-runtime power management anywhere: an idle PCI device stays at full power
-until the whole machine sleeps, because nothing puts it in D3 and nothing gates
-a clock or a power domain.
+**Heat and charge.** A thermal zone reads its trips from `_CRT`, `_HOT`,
+`_PSV` and `_ACx`. Its cooling devices are the processors (P-state steps) and
+the fans named in `_ALx`, which are switched through their `_PR0` power
+resources. `kthermald` polls every `_TSP` and applies the passive formula
+`_TC1 * (Tn - Tn-1) + _TC2 * (Tn - Tpsv)`. Crossing `_CRT` runs
+`/sbin/poweroff`, and forces the power-off if it has not happened within
+thirty seconds. `emul_temp` drives all of this in tests.
 
-**Heat and charge, read but not acted on.** `/sys/class/thermal/thermal_zoneN`
-publishes a type and a temperature and nothing else: no trip points (`_PSV`,
-`_AC0`, `_CRT`), no cooling devices, no passive throttling, and no
-critical-temperature shutdown — a machine that overheats keeps going. The
-battery publishes `_BIF`/`_BST` and not `_BIX`, has no charge thresholds, and
-raises no event, so a desktop's indicator polls. Hotkeys and the idle-power
-comparison the M129 notes mention are untouched.
+The battery reads `_BIX` (falling back to `_BIF`): cycle count, chemistry,
+model, serial and maker. It sets a `_BTP` alarm, and `capacity_level` follows
+that alarm. `charge_behaviour` offers what `_BMD` says the battery can do
+(`auto`, `inhibit-charge`, `force-discharge`), hands the choice to `_BMC`, and
+reads back `_BMD`'s status. There are no `charge_control_*_threshold` files.
+ACPI does not define them, and on Linux they come from vendor drivers.
 
-**What the tests do not cover.** S3 is exercised in one lane and on x86_64
-only: one sleep per run, with the machine quiet. There is no repeated-cycle
-test and none with I/O in flight across the sleep, which is exactly where the
-missing quiesce callback would show. The five-level-paging lane
-(`SMOKE_LA57=1`) is flaky under TCG — it can trip the guest's own
-twenty-second console-silence watchdog on a slow test — so a wedge there is
-worth a second run before it is read as a regression.
+**The sleep itself.**
+
+- *Callbacks.* Every device the lanes run has a resume callback: Intel HDA,
+  the i8042 keyboard and mouse, virtio-input and virtio-console, and VT-d and
+  AMD-Vi. An IOMMU registers through `suspend_register_device_early`, which
+  resumes it before any device that could DMA or raise a remapped interrupt.
+- *PCI.* The PCI snapshot also carries MSI and MSI-X. It is taken again just
+  before the sleep, because drivers enable their vectors after the boot-time
+  scan.
+- *Quiesce.* A driver that holds a device marks the section with
+  `scheduler_kcrit_enter`: the virtio-blk, NVMe and AHCI I/O locks do.
+  - The freezer does not stop a task inside such a section; it lets the task
+    finish its command first.
+  - Before this, a task could be frozen while waiting for a completion. The
+    controller then lost the command in the S3, and the task waited for ever.
+  - The same run found that NVMe's resume zeroed its completion queues while
+    the driver marks an empty slot with `0xFFFF`. Every command after an S3,
+    or after a runtime D3hot round trip, therefore "completed" at once and
+    reused its buffer under the controller.
+- *`/sys/power`.* It has Linux's files: `mem_sleep` (`s2idle`, or `deep` when
+  S3 exists), `wakeup_count` with its abort-on-change handshake,
+  `sync_on_suspend`, `disk` and `resume`. `/sys/class/wakeup` lists the
+  sources with their event counts.
+- *Runtime PM.* It keeps usage counts and an autosuspend delay under each PCI
+  device's `power/`, and a `krpmd` thread suspends idle devices. NVMe goes to
+  D3hot and returns through its resume path.
+
+**Hibernation (x86_64).** `echo disk > /sys/power/state` works as follows:
+
+1. It freezes userspace, parks the other CPUs and suspends the devices.
+2. With interrupts off, it copies every used frame into free memory, marking
+   the copies in a bitmap so they do not copy themselves.
+3. It writes the frame list and the pages to the resume device. That device is
+   a swap area named by `resume=` or `/sys/power/resume`, and its signature is
+   replaced by `B1NXHIBE`.
+4. It powers off, or reboots when `/sys/power/disk` says so.
+
+The next boot finds the signature before it mounts anything:
+
+1. It checks that the image came from the same kernel (a hash of its text).
+2. It stages every page in a frame the image does not use.
+3. It stops all DMA: legacy virtio devices are reset, and bus mastering is
+   switched off.
+4. On temporary tables it copies the pages home and jumps back into the saved
+   context, which returns from its write to `/sys/power/state`.
+
+Two parts of the page allocator's state live inside free frames, so the image
+has to save them as well. The first frame of each free buddy block holds that
+block's list links. The allocator's free markers in parked frames are wiped on
+the copy frames before they are freed again.
+
+**Still missing.**
+
+- aarch64 has no hibernation. The image would need its secondary CPUs brought
+  back with PSCI `CPU_ON` (the park there cannot be undone), and the GIC ITS
+  tables handed over from the boot kernel.
+- aarch64 has no deep sleep. PSCI `SYSTEM_SUSPEND` is probed at boot, and
+  QEMU answers "not implemented".
+- There is no RAPL power capping, no boost or energy-performance knob beyond
+  the governors, and no ACPI hotkeys.
+- The lanes exercise one S3 per run (posix, iommu, amdvi) and one hibernation.
+  No test repeats a cycle.
 
 ## Transparent huge pages for anonymous memory (M128)
 

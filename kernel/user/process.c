@@ -11,6 +11,7 @@
 #include <b1nix/panic.h>
 #include <b1nix/ptrace.h>
 #include <b1nix/perf_event.h>
+#include <b1nix/kvm_hooks.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
@@ -1325,6 +1326,9 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
  * `b1nix.trace-teardown`. */
 void user_address_space_cleanup(struct task *t) {
   if (!t) return;
+  /* KVM's MMU notifiers let go of the whole space before any of it is
+   * unmapped (M131). */
+  kvm_hook_mm_release(t->pml4_phys);
 
   extern int bootinfo_has_flag(const char *flag);
   /* Cycles, not ticks: teardown runs with interrupts off in places, so the
@@ -2040,6 +2044,8 @@ static int user_run_elf_image(struct user_loaded_image *image) {
    * time, not to whatever loaded it. */
   sched_acct_leave_kernel();
 
+  interrupts_disable();
+  kvm_hook_return_to_user();
   x86_user_jump((usize)image->entry, (usize)image->address_space.stack_base,
                 (usize)image->argc,
                 (usize)(image->address_space.stack_base + sizeof(usize)),

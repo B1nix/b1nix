@@ -156,10 +156,18 @@ static inline bool refcount_dec_and_lock_irqsave(refcount_t *r, spinlock_t *lock
 #define write_unlock(l)  spin_unlock(l)
 #define write_trylock(l) spin_trylock(l)
 #define read_trylock(l)  spin_trylock(l)
-#define read_lock_irqsave(l, f)       spin_lock_irqsave(l, &(f))
+#define read_lock_irqsave(l, f)       spin_lock_irqsave(l, f)
 #define read_unlock_irqrestore(l, f)  spin_unlock_irqrestore(l, f)
-#define write_lock_irqsave(l, f)      spin_lock_irqsave(l, &(f))
+#define write_lock_irqsave(l, f)      spin_lock_irqsave(l, f)
 #define write_unlock_irqrestore(l, f) spin_unlock_irqrestore(l, f)
+#define read_lock_irq(l)              spin_lock_irq(l)
+#define read_unlock_irq(l)            spin_unlock_irq(l)
+#define write_lock_irq(l)             spin_lock_irq(l)
+#define write_unlock_irq(l)           spin_unlock_irq(l)
+#define raw_spin_lock_irqsave(l, f)   spin_lock_irqsave(l, f)
+#define raw_spin_unlock_irqrestore(l, f) spin_unlock_irqrestore(l, f)
+#define raw_spin_lock_irq(l)          spin_lock_irq(l)
+#define raw_spin_unlock_irq(l)        spin_unlock_irq(l)
 
 /* Is the lock held by anyone? */
 static inline int spin_is_locked(spinlock_t *l) { return l->raw != 0; }

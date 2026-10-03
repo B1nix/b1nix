@@ -118,6 +118,9 @@ IRQ 65
  * (M28 #6). EOI inside the handler; never takes the BKL. */
 IRQ 66
 
+/* Cross-CPU function call — vector 0x43 = 67 (smp_call.c). */
+IRQ 67
+
 /* LAPIC spurious vector — must match LAPIC_SPURIOUS_VECTOR (0xFF). The CPU
  * delivers this when a pending interrupt is cancelled mid-flight; per Intel
  * SDM the handler must NOT issue an EOI. Without an IDT gate the CPU would

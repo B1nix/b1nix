@@ -132,6 +132,14 @@ static void x86_enable_write_protect(void) {
   __asm__ volatile("movq %0, %%cr0" : : "r"(cr0) : "memory");
 }
 
+/* CPU `cpu`'s task-state segment: its linear address, which a VMCS's host
+ * state names so the TR base is right after a VM exit (M131). */
+u64 arch_tss_base(int cpu) {
+  if (cpu < 0 || cpu >= MAX_CPUS)
+    return 0;
+  return (u64)&x86_tss_arr[cpu];
+}
+
 /* Build CPU `cpu`'s TSS descriptor in the shared GDT and load it (ltr). The
  * descriptor pair lives at gdt64_tss[cpu*2 .. cpu*2+1] (selector
  * X86_TSS_SELECTOR + cpu*16). */
@@ -574,6 +582,9 @@ void arch_tsc_reanchor(u64 counter_ns) {
    * three-second sleep as minus five hundred years. */
   tsc_vdso_publish();
 }
+
+/* The TSC rate the clock was calibrated to, in kHz (0 before calibration). */
+u32 arch_tsc_khz(void) { return g_cpu_khz; }
 
 u64 arch_tsc_monotonic_ns(void) {
   if (!g_tsc_usable)

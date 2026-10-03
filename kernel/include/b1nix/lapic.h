@@ -98,6 +98,10 @@ struct runqueue {
  * runqueue. EOI inside the handler; no other state. */
 #define RESCHEDULE_VECTOR        0x42
 
+/* Cross-CPU function call (M131): run a function on a given CPU. See
+ * kernel/arch/x86_64/smp_call.c. */
+#define CALL_FUNCTION_VECTOR     0x43
+
 /* NMI IPI vector */
 #define SMP_NMI_IPI_VECTOR       0x30
 
@@ -181,8 +185,21 @@ struct percpu {
      * CPU has to reprogram that timer, and this is what says whether it needs
      * to: see sched_note_deadline and arch_kick_idle_before. */
     u64 timer_deadline_tick;
-    u8 __pad[3768];  /* pad to 4KB total */
+    /* Up to the two words KVM reads at the end of the page (checked below). */
+    u8 __pad[3928];
+    /* KVM's entry code reads these %gs-relative (<b1nix/percpu_kvm.h>). Last
+     * in the page, so the offsets stay put when fields are added above. */
+    u64 kvm_spec_ctrl;
+    u64 kvm_svm_hsave_pa;
 } __attribute__((aligned(4096)));
+#ifdef __x86_64__
+#include <b1nix/percpu_kvm.h>
+_Static_assert(__builtin_offsetof(struct percpu, kvm_spec_ctrl) == PERCPU_KVM_SPEC_CTRL,
+               "see <b1nix/percpu_kvm.h>");
+_Static_assert(__builtin_offsetof(struct percpu, kvm_svm_hsave_pa) == PERCPU_KVM_SVM_HSAVE_PA,
+               "see <b1nix/percpu_kvm.h>");
+_Static_assert(sizeof(struct percpu) == 4096, "struct percpu is one page");
+#endif
 
 /* Segment base management */
 #ifdef __x86_64__

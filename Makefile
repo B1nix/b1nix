@@ -492,7 +492,7 @@ ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -m
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86_64/linker.ld
 ASM_SOURCES := kernel/arch/x86_64/s3_asm.S kernel/arch/x86_64/hib_asm.S kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S
-ARCH_SOURCES := kernel/arch/x86_64/s3.c kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_panel.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c kernel/arch/x86_64/memtype.c kernel/arch/x86_64/pkeys.c
+ARCH_SOURCES := kernel/arch/x86_64/s3.c kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_panel.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/smp_call.c kernel/virt/kvm_hooks.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c kernel/arch/x86_64/memtype.c kernel/arch/x86_64/pkeys.c
 else ifeq ($(ARCH),aarch64)
 TARGET := aarch64-unknown-elf
 ARCH_CFLAGS := --target=$(TARGET) -mcpu=cortex-a53 -mgeneral-regs-only -DAARCH64
@@ -559,7 +559,7 @@ KERNEL_BASE ?= 0x40080000
 ARCH_LDFLAGS += --defsym=KERNEL_LOAD_BASE=$(KERNEL_BASE)
 LINKER_SCRIPT := kernel/arch/aarch64/linker.ld
 ASM_SOURCES := kernel/arch/aarch64/boot.S kernel/arch/aarch64/context_switch.S kernel/arch/aarch64/isr.S kernel/arch/aarch64/fpu.S
-ARCH_SOURCES := kernel/arch/aarch64/arch.c kernel/arch/aarch64/platform.c kernel/arch/aarch64/bootinfo.c kernel/arch/aarch64/smp.c kernel/arch/aarch64/gicv3.c kernel/arch/aarch64/gicv3_its.c kernel/arch/aarch64/console.c kernel/arch/aarch64/fb_panel.c kernel/arch/aarch64/io.c kernel/arch/aarch64/interrupts.c kernel/arch/aarch64/paging.c kernel/arch/aarch64/serial.c kernel/arch/aarch64/signal.c kernel/arch/aarch64/coredump.c kernel/arch/aarch64/gdbstub.c kernel/arch/aarch64/memtype.c kernel/arch/aarch64/qcom_restart.c
+ARCH_SOURCES := kernel/arch/aarch64/arch.c kernel/arch/aarch64/platform.c kernel/arch/aarch64/bootinfo.c kernel/arch/aarch64/smp.c kernel/arch/aarch64/gicv3.c kernel/arch/aarch64/gicv3_its.c kernel/arch/aarch64/console.c kernel/arch/aarch64/fb_panel.c kernel/arch/aarch64/io.c kernel/arch/aarch64/interrupts.c kernel/arch/aarch64/paging.c kernel/arch/aarch64/serial.c kernel/arch/aarch64/signal.c kernel/arch/aarch64/coredump.c kernel/arch/aarch64/gdbstub.c kernel/arch/aarch64/memtype.c kernel/arch/aarch64/qcom_restart.c kernel/virt/kvm_hooks.c
 else
 $(error Unsupported ARCH=$(ARCH). Active builds support ARCH=x86_64 and ARCH=aarch64)
 endif
@@ -609,6 +609,7 @@ KERNEL_SOURCES := \
 	kernel/mm/psi.c \
 	kernel/mm/eviction.c \
 	kernel/sched/scheduler.c \
+	kernel/sched/ktimer.c \
 	kernel/perf/perf_event.c \
 	kernel/perf/pmu_x86.c \
 	kernel/trace/tracepoint.c \
@@ -1323,16 +1324,100 @@ fs-fetch:
 fs-probe:
 	@sh tools/import/fs/probe-headers.sh --syntax
 
+# ── M131: Linux's KVM, imported ──────────────────────────────────────────
+#
+# arch/x86/kvm (the core and VMX) and virt/kvm, from the same pinned release as
+# the filesystem and DRM imports, compiled unmodified against linuxkpi. The
+# headers KVM needs beyond the shared shim sit in kernel/include/kvm-shim, first
+# on its include path; the glue that implements them against b1nix is
+# kernel/lkpi/kvm_*.c. x86_64 only (aarch64 KVM is a later item), and gated on
+# the staged tree the same way i915 is: `make kvm-fetch` stages it.
+KVM_IMPORT_DIR := build/src/kvm-$(LKPI_LINUX_VERSION)
+B1NIX_KVM ?= 1
+ifeq ($(ARCH),x86_64)
+ifeq ($(B1NIX_KVM),1)
+ifneq ($(wildcard $(KVM_IMPORT_DIR)/virt/kvm/kvm_main.c),)
+KVM_IMPORT_NAMES := \
+	virt/kvm/kvm_main.c virt/kvm/eventfd.c virt/kvm/binary_stats.c \
+	virt/kvm/coalesced_mmio.c virt/kvm/irqchip.c virt/kvm/async_pf.c \
+	virt/kvm/pfncache.c virt/kvm/dirty_ring.c \
+	arch/x86/kvm/x86.c arch/x86/kvm/emulate.c arch/x86/kvm/irq.c \
+	arch/x86/kvm/lapic.c arch/x86/kvm/cpuid.c arch/x86/kvm/pmu.c \
+	arch/x86/kvm/mtrr.c arch/x86/kvm/debugfs.c arch/x86/kvm/mmu/mmu.c \
+	arch/x86/kvm/mmu/page_track.c arch/x86/kvm/mmu/spte.c \
+	arch/x86/kvm/mmu/tdp_iter.c arch/x86/kvm/mmu/tdp_mmu.c \
+	arch/x86/kvm/i8259.c arch/x86/kvm/i8254.c arch/x86/kvm/ioapic.c \
+	arch/x86/kvm/vmx/vmx.c arch/x86/kvm/vmx/pmu_intel.c \
+	arch/x86/kvm/vmx/vmcs12.c arch/x86/kvm/vmx/nested.c \
+	arch/x86/kvm/vmx/posted_intr.c arch/x86/kvm/vmx/main.c \
+	arch/x86/kvm/svm/svm.c arch/x86/kvm/svm/pmu.c arch/x86/kvm/svm/nested.c \
+	arch/x86/kvm/svm/avic.c
+KVM_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/$(KVM_IMPORT_DIR)/%.o,$(KVM_IMPORT_NAMES)) \
+	$(BUILD_DIR)/$(KVM_IMPORT_DIR)/arch/x86/kvm/vmx/vmenter.o \
+	$(BUILD_DIR)/$(KVM_IMPORT_DIR)/arch/x86/kvm/svm/vmenter.o
+KVM_GLUE_SOURCES := $(wildcard kernel/lkpi/kvm_*.c)
+KVM_GLUE_SOURCES := $(filter-out kernel/lkpi/kvm_asm_offsets.c,$(KVM_GLUE_SOURCES))
+KVM_GLUE_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(KVM_GLUE_SOURCES))
+KVM_IMPORT_OBJECTS += $(KVM_GLUE_OBJECTS) $(BUILD_DIR)/kernel/virt/kvm_bridge.o
+$(BUILD_DIR)/kernel/main.o: COMMON_CFLAGS += -DB1NIX_KVM=1
+
+KVM_GEN_DIR := $(BUILD_DIR)/kvm-gen
+KVM_INCLUDES := -I kernel/include/kvm-shim -I kernel/include -I kernel/include/uapi \
+	-I $(DRM_IMPORT_DIR)/include -I $(DRM_IMPORT_DIR)/include/uapi \
+	-I $(KVM_IMPORT_DIR)/include -I $(KVM_IMPORT_DIR)/include/uapi \
+	-I $(KVM_IMPORT_DIR)/arch/x86/include -I $(KVM_IMPORT_DIR)/arch/x86/include/uapi \
+	-I $(KVM_IMPORT_DIR)/arch/x86/kvm -I $(KVM_IMPORT_DIR)/virt/kvm
+KVM_IMPORT_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
+	-fno-stack-protector -fno-pic -w -g -MMD -MP $(KERNEL_OPT) \
+	$(FILE_PREFIX_MAP) \
+	-D__KERNEL__ -D__linux__ -DKBUILD_MODNAME='"kvm"' \
+	$(DRM_IMPORT_ARCH_FLAGS) \
+	-isystem $(CLANG_RESOURCE_INC) $(KVM_INCLUDES) \
+	-include kvm_kconfig.h -include linux/compiler_types.h -include linux/types.h \
+	-include kvm_prelude.h -include kvm_linux_extra.h
+
+$(BUILD_DIR)/$(KVM_IMPORT_DIR)/%.o: $(KVM_IMPORT_DIR)/%.c $(DRM_FLAGS_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(KVM_IMPORT_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
+
+# The VMX and SVM entry code, and the offsets they read (upstream's
+# asm-offsets step).
+$(KVM_GEN_DIR)/kvm-asm-offsets.h: kernel/lkpi/kvm_asm_offsets.c
+	@mkdir -p $(dir $@)
+	$(CC) $(KVM_IMPORT_CFLAGS) $(ARCH_CFLAGS) -S $< -o $(KVM_GEN_DIR)/kvm-asm-offsets.s
+	@sed -n 's/.*"->\([A-Za-z_0-9]*\) \$$\{0,1\}\([0-9-]*\) .*/#define \1 \2/p' \
+		$(KVM_GEN_DIR)/kvm-asm-offsets.s > $@.tmp && mv $@.tmp $@
+
+$(BUILD_DIR)/$(KVM_IMPORT_DIR)/arch/x86/kvm/%/vmenter.o: \
+		$(KVM_IMPORT_DIR)/arch/x86/kvm/%/vmenter.S $(KVM_GEN_DIR)/kvm-asm-offsets.h
+	@mkdir -p $(dir $@)
+	$(CC) -D__ASSEMBLY__ -D__KERNEL__ -nostdinc -I $(KVM_GEN_DIR) $(KVM_INCLUDES) \
+		-include kvm_kconfig.h $(ARCH_CFLAGS) -c $< -o $@
+
+# The glue is ours: KVM's include path, b1nix's warnings.
+$(KVM_GLUE_OBJECTS): $(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(call lkpi_shim_cflags,$(KVM_IMPORT_CFLAGS)) -I kernel/include $(ARCH_CFLAGS) -c $< -o $@
+endif
+endif
+endif
+
+.PHONY: kvm-fetch kvm-objs
+kvm-fetch:
+	@LINUX_VERSION=$(LKPI_LINUX_VERSION) sh tools/import/kvm/fetch-kvm.sh
+kvm-objs: $(KVM_IMPORT_OBJECTS)
+
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES)) \
 	$(DRM_IMPORT_OBJECTS) \
 	$(FS_IMPORT_OBJECTS) \
-	$(I915_IMPORT_OBJECTS)
+	$(I915_IMPORT_OBJECTS) \
+	$(KVM_IMPORT_OBJECTS)
 KERNEL_DEPS := $(patsubst %.c,$(BUILD_DIR)/%.d,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.d,$(ASM_SOURCES)) $(MODULE_KOS:.ko=.d) \
 	$(DRM_IMPORT_OBJECTS:.o=.d) $(I915_IMPORT_OBJECTS:.o=.d) \
-	$(FS_IMPORT_OBJECTS:.o=.d)
+	$(FS_IMPORT_OBJECTS:.o=.d) $(KVM_IMPORT_OBJECTS:.o=.d)
 
 -include $(KERNEL_DEPS)
 # For a recursive make that builds something no kernel object feeds (a test

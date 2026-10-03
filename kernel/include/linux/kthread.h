@@ -4,6 +4,7 @@
 #include <lkpi/env.h>
 #include <lkpi/kthread_worker.h>
 #include <linux/err.h>
+#include <linux/sprintf.h>
 #include <linux/types.h>
 /* Onto lkpi's kthread_worker (M101) and b1nix's kthread_create. A worker's
  * items run in submission order on a thread the caller owns. */
@@ -21,10 +22,14 @@ static inline bool kthread_should_stop(void) { return lkpi_kthread_should_stop()
 /* sched_set_fifo lives in <linux/sched.h>; defining it here too is a
  * redefinition in every file that includes both. */
 
-/* Linux names the worker with a format string; lkpi takes a plain name, and
- * the extra arguments describe a device the name would only decorate. */
-#define kthread_create_worker(flags, namefmt, ...) \
-	kthread_create_worker(namefmt)
+/* Linux names the worker with a format string; the lkpi worker takes the
+ * formatted name (the scheduler keeps a copy of it). */
+#define kthread_create_worker(flags, namefmt, ...)                            \
+	({                                                                        \
+		char __kw_name[32];                                                   \
+		snprintf(__kw_name, sizeof(__kw_name), namefmt, ##__VA_ARGS__);       \
+		kthread_create_worker(__kw_name);                                     \
+	})
 /*
  * Create a kernel thread and start it.
  *

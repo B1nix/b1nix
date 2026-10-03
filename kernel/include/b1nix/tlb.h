@@ -40,6 +40,8 @@ void tlb_shootdown_mm(u64 pml4_phys);
 /* IPI handler entry point — called from x86_irq_handler_inner for
  * TLB_SHOOTDOWN_VECTOR. Must EOI itself. */
 void tlb_shootdown_handler(void);
+/* Service a shootdown aimed at this CPU from inside a spin loop. */
+void tlb_shootdown_poll(void);
 
 /* Runtime gate on whether tlb_shootdown_page / _all actually fire an IPI.
  * Default OFF: under the current Big Kernel Lock model (M24b), only one CPU

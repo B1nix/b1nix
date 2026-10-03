@@ -20,6 +20,7 @@
 #include <linux/err.h>
 #include <linux/mm.h>
 #include <linux/file.h>
+#include <linux/eventfd.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/shmem_fs.h>
@@ -152,6 +153,11 @@ struct file *fget(unsigned int fd)
 	void *h = lkpi_fd_lookup((int)fd);
 	if (!h)
 		return 0;
+	/* A process eventfd has no struct file of its own: it gets one standing
+	 * for it (KVM_IRQFD hands one in). Any other native descriptor's private
+	 * slot is not a struct file either, only a linuxkpi one's is. */
+	if (lkpi_handle_is_eventfd(h))
+		return lkpi_eventfd_file((int)fd);
 	struct file *f = (struct file *)lkpi_handle_private(h);
 	if (!f)
 		return 0;
@@ -285,11 +291,62 @@ static void lkpi_file_put(void *file)
 	fput((struct file *)file);
 }
 
+/* One page of an mmap of the file: the driver's mmap sets up a vma, and its
+ * fault handler names the page at the offset -- which is how KVM hands out a
+ * vCPU's run area. The reference the handler takes is dropped again: the
+ * mapping holds its own on the frame. */
+static int lkpi_file_mmap_page(void *file, u64 offset, u64 *phys)
+{
+	struct file *f = file;
+	struct vm_area_struct vma;
+	struct vm_fault vmf;
+	vm_fault_t ret;
+	int r;
+
+	if (!f->f_op || !f->f_op->mmap)
+		return -ENODEV;
+	memset(&vma, 0, sizeof(vma));
+	vma.vm_file = f;
+	vma.vm_pgoff = (unsigned long)(offset >> PAGE_SHIFT);
+	vma.vm_flags = VM_READ | VM_WRITE | VM_SHARED;
+	r = f->f_op->mmap(f, &vma);
+	if (r)
+		return r;
+	if (!vma.vm_ops || !vma.vm_ops->fault)
+		return -ENODEV;
+	memset(&vmf, 0, sizeof(vmf));
+	vmf.vma = &vma;
+	vmf.pgoff = (unsigned long)(offset >> PAGE_SHIFT);
+	ret = vma.vm_ops->fault(&vmf);
+	if ((ret & (VM_FAULT_SIGBUS | VM_FAULT_OOM | VM_FAULT_HWPOISON)) || !vmf.page)
+		return -EFAULT;
+	*phys = vmf.page->phys;
+	put_page(vmf.page);
+	return 0;
+}
+
+static long lkpi_file_read(void *file, void *user_buf, usize len, u64 *pos)
+{
+	struct file *f = file;
+	loff_t p;
+	ssize_t r;
+
+	if (!f->f_op || !f->f_op->read)
+		return -EINVAL;
+	p = pos ? (loff_t)*pos : f->f_pos;
+	r = f->f_op->read(f, (char __user *)user_buf, len, &p);
+	if (r >= 0 && !pos)
+		f->f_pos = p;
+	return r;
+}
+
 static const struct lkpi_file_bridge lkpi_file_bridge = {
 	.llseek = lkpi_file_llseek,
 	.poll = lkpi_file_poll,
 	.ioctl = lkpi_file_ioctl,
 	.put = lkpi_file_put,
+	.mmap_page = lkpi_file_mmap_page,
+	.read = lkpi_file_read,
 };
 
 /*
@@ -311,6 +368,19 @@ static void lkpi_fd_install_owned(unsigned int fd, struct file *f)
 	lkpi_handle_set_owned_file(h);
 	if (!f->f_handle)
 		f->f_handle = h;
+}
+
+/* For callers that want Linux's fd_install semantics outright -- the
+ * descriptor owns the file and every file operation reaches the driver (M131:
+ * KVM's VM and vCPU descriptors). */
+void lkpi_fd_install_owned_file(unsigned int fd, struct file *f)
+{
+	lkpi_fd_install_owned(fd, f);
+}
+
+void lkpi_file_bridge_ensure(void)
+{
+	lkpi_file_bridge_register(&lkpi_file_bridge);
 }
 
 void fd_install(unsigned int fd, struct file *f)

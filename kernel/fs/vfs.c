@@ -3856,6 +3856,12 @@ void vfs_populate_dev(void) {
    * arch that has a PCI bus — which this port does now. AC'97 stays x86: its
    * register file is reached through I/O ports, which do not exist here. */
   sound_module_dev_init();
+  /* Misc devices of the imported drivers (/dev/kvm, M131). */
+  {
+    extern void lkpi_misc_dev_init(void);
+
+    lkpi_misc_dev_init();
+  }
 #if defined(__x86_64__)
   ac97_dev_init();
 #endif
@@ -5087,6 +5093,15 @@ isize vfs_read_user(int fd, void *user_buf, usize size) {
   if (!h || !h->ops || !h->ops->read_user)
     return -EBADF;
   return h->ops->read_user(h, user_buf, size);
+}
+
+isize vfs_pread_user(int fd, void *user_buf, usize size, u64 offset) {
+  struct vfs_handle *h = get_handle(fd);
+  if (!h)
+    return -EBADF;
+  if (!h->ops || !h->ops->pread_user)
+    return -ESPIPE;
+  return h->ops->pread_user(h, user_buf, size, offset);
 }
 
 /* Positioned read/write: read/write at `offset` WITHOUT touching the descriptor's

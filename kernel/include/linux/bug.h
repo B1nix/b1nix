@@ -18,13 +18,16 @@ extern int oops_in_progress;
 #define WARN_ON(cond)                                     \
 	({                                                    \
 		int __c = !!(cond);                               \
-		if (__c) lkpi_printk("drm: WARN_ON(%s)\n", #cond); \
+		if (__c) lkpi_printk("drm: WARN_ON(%s) at %s:%d\n", #cond, __FILE__, __LINE__); \
 		__c;                                              \
 	})
 #define WARN(cond, fmt, ...)                              \
 	({                                                    \
 		int __c = !!(cond);                               \
-		if (__c) lkpi_printk("drm: " fmt, ##__VA_ARGS__); \
+		if (__c) {                                        \
+			lkpi_printk("drm: WARN at %s:%d: ", __FILE__, __LINE__); \
+			lkpi_printk(fmt, ##__VA_ARGS__);              \
+		}                                                 \
 		__c;                                              \
 	})
 /* Once per call site, as upstream: a condition an imported path reaches on
@@ -35,7 +38,8 @@ extern int oops_in_progress;
 		int __c = !!(cond);                                       \
 		if (__c && !__warned) {                                   \
 			__warned = 1;                                         \
-			lkpi_printk("drm: " fmt, ##__VA_ARGS__);              \
+			lkpi_printk("drm: WARN at %s:%d: ", __FILE__, __LINE__); \
+			lkpi_printk(fmt, ##__VA_ARGS__);                      \
 		}                                                         \
 		__c;                                                      \
 	})
@@ -45,7 +49,8 @@ extern int oops_in_progress;
 		int __c = !!(cond);                                       \
 		if (__c && !__warned) {                                   \
 			__warned = 1;                                         \
-			lkpi_printk("drm: WARN_ON_ONCE(%s)\n", #cond);        \
+			lkpi_printk("drm: WARN_ON_ONCE(%s) at %s:%d\n", #cond, \
+				    __FILE__, __LINE__);                          \
 		}                                                         \
 		__c;                                                      \
 	})

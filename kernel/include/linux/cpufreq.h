@@ -29,6 +29,7 @@ struct cpufreq_cpuinfo { unsigned int max_freq; unsigned int min_freq; };
 struct cpufreq_policy {
 	struct cpufreq_cpuinfo cpuinfo;
 	unsigned int cpu;
+	struct cpumask *cpus;
 	unsigned int cur;
 	unsigned int max;
 	unsigned int min;

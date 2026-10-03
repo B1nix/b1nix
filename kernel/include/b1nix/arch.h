@@ -158,6 +158,8 @@ static inline void interrupts_restore(u64 f) {
 #define ARCH_XSAVE_MAX_SIZE 1088
 
 void arch_fpu_save(void *area);
+/* x86_64: CPU `cpu`'s TSS linear address (0 when out of range). */
+u64 arch_tss_base(int cpu);
 void arch_fpu_restore(void *area);
 void arch_fpu_capture_clean(void *area);
 void arch_xsave(void *area, u64 mask);
@@ -196,6 +198,7 @@ u32 arch_cpu_max_khz(void);
 /* Exact TSC rate in kHz from CPUID leaf 15h, or 0 when the CPU does not
  * publish one and it has to be measured instead. */
 u32 arch_tsc_khz_from_cpuid(void);
+u32 arch_tsc_khz(void);
 #if defined(__aarch64__)
 /* Publish the generic timer's counter to the vDSO data page (aarch64 arch.c).
  * Called once EL0 may read CNTVCT_EL0. */
