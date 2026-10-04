@@ -65,11 +65,12 @@
  *         serialises them. io.max is a ceiling on those two rates, enforced by
  *         making the next command wait.
  *
- * What is NOT here: per-cgroup pressure files (memory.pressure and friends).
- * PSI is measured machine-wide in kernel/mm/psi.c and published under
- * /proc/pressure; a per-cgroup file would have to be a copy of the global one,
- * which is worse than the honest absence a kernel without CONFIG_PSI_PER_CGROUP
- * presents.
+ * pressure  cpu.pressure, memory.pressure and io.pressure, in every cgroup.
+ *         The tick samples which tasks are inside a stall region (psi.c) and
+ *         which are runnable, charges each cgroup and its ancestors, and folds
+ *         the totals into the same averages /proc/pressure prints. The root's
+ *         files are /proc/pressure's. Triggers (writing a threshold and
+ *         polling for it) are not implemented: the files are read-only.
  */
 
 #include <b1nix/cgroup.h>
@@ -79,6 +80,7 @@
 #include <b1nix/ktime.h>
 #include <b1nix/mm.h>
 #include <b1nix/namespace.h>
+#include <b1nix/psi.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/thp.h>
@@ -179,6 +181,9 @@ struct cgroup {
    * often either may run. */
   u64 mem_oom_at_ns;
   u64 mem_high_at_ns;
+  /* Pages charged while over memory.high since the last throttle; a penalty
+   * is paid per CG_MEM_HIGH_BATCH of them (cg_mem_high_penalty). */
+  u64 mem_over_high_pages;
   /* When reclaim last found nothing to take. A cgroup whose pages are all hot,
    * or whose swap is full, would otherwise sweep the whole eviction ring on
    * every fault -- a page-table walk per page of RAM, inside a page fault. */
@@ -204,6 +209,14 @@ struct cgroup {
    * touches a device or names one in io.max. */
   u32 io_weight;
   struct cg_io_dev io_dev[CG_IO_DEVS];
+  /* ── pressure ──
+   * The cgroup's own cpu/memory/io.pressure. The two counters are one
+   * sample's scratch: members (and members of descendants) stalled on the
+   * resource, and members getting work done meanwhile. */
+  struct psi_group psi[PSI_NR_RES];
+  u32 psi_nr_stalled[PSI_NR_RES];
+  u32 psi_nr_working[PSI_NR_RES];
+
   int populated;        /* last value published in cgroup.events */
   int scratch;          /* cg_events_refresh's single-pass accumulator */
   int is_root;
@@ -878,6 +891,7 @@ static usize cg_mem_over_limit(struct cgroup *cg, u64 max_pages) {
   spin_unlock_irqrestore(&cg_lock, flags);
   int cooled = dry && ktime_monotonic_ns() - dry < CG_MEM_ACTION_COOLDOWN_NS;
 
+  psi_stall_begin(PSI_MEM);
   for (usize round = 0; round < CG_RECLAIM_ROUNDS && now > max_pages; round++) {
     usize freed = cg_reclaim(cg, now - max_pages > CG_RECLAIM_BATCH
                                      ? CG_RECLAIM_BATCH
@@ -888,6 +902,7 @@ static usize cg_mem_over_limit(struct cgroup *cg, u64 max_pages) {
     total += freed;
     now = now > freed ? now - freed : 0;
   }
+  psi_stall_end(PSI_MEM);
   if (total) {
     now = cg_mem_refresh(cg);
     if (now <= max_pages)
@@ -962,9 +977,56 @@ static void cg_mem_check_high(struct cgroup *cg) {
   spin_lock_irqsave(&cg_lock, &flags);
   cg->mem_ev_high++;
   spin_unlock_irqrestore(&cg_lock, flags);
-  if (cg_reclaim(cg, now - high) > 0 && cg_mem_refresh(cg) <= high)
-    return; /* back inside the soft limit: no reason to hold the task up */
-  scheduler_sleep_ticks(1);
+  /* Reclaiming for a limit is time the task spends waiting for memory, as on
+   * Linux, where it runs under psi_memstall_enter(). */
+  psi_stall_begin(PSI_MEM);
+  cg_reclaim(cg, now - high);
+  psi_stall_end(PSI_MEM);
+}
+
+/* memory.high's throttle: Linux's mem_cgroup_handle_over_high().
+ *
+ * A cgroup above memory.high is slowed, never killed, and slowed in proportion
+ * to how far above it is: the penalty grows with the square of the overage, so
+ * a cgroup a little over barely notices and one far over all but stops. It is
+ * paid per batch of pages charged over the limit and capped at two seconds a
+ * batch, exactly Linux's arithmetic (calculate_high_delay). One tick per
+ * reclaim attempt, which is what this used to be, held nothing back: a program
+ * reading /dev/zero into one growing buffer went from a 16 MiB memory.high to a
+ * 512 MiB memory.max in a sixth of a second.
+ *
+ * The time is memory stall time -- it is what systemd-oomd reads from the
+ * cgroup's memory.pressure -- and a SIGKILL ends it at once. */
+#define CG_MEM_HIGH_BATCH 64ull           /* Linux's MEMCG_CHARGE_BATCH */
+#define CG_MEM_HIGH_PRECISION_SHIFT 20u   /* MEMCG_DELAY_PRECISION_SHIFT */
+#define CG_MEM_HIGH_SCALING_SHIFT 14u     /* MEMCG_DELAY_SCALING_SHIFT */
+#define CG_MEM_HIGH_MAX_DELAY_MS 2000ull  /* MEMCG_MAX_HIGH_DELAY_JIFFIES */
+
+static void cg_mem_high_penalty(u64 usage, u64 high, u64 nr_pages) {
+  if (!high || usage <= high || !current_task)
+    return;
+  u64 overage = ((usage - high) << CG_MEM_HIGH_PRECISION_SHIFT) / high;
+  /* Linux computes jiffies at HZ; milliseconds are the same formula at 1000. */
+  u64 ms = (overage * overage * 1000ull) >> CG_MEM_HIGH_PRECISION_SHIFT >>
+           CG_MEM_HIGH_SCALING_SHIFT;
+  ms = ms * nr_pages / CG_MEM_HIGH_BATCH;
+  if (ms > CG_MEM_HIGH_MAX_DELAY_MS)
+    ms = CG_MEM_HIGH_MAX_DELAY_MS;
+  /* Under ten milliseconds is not worth a sleep, as on Linux. */
+  if (ms < 10)
+    return;
+  u64 ticks = ms * SCHED_TICKS_PER_SEC / 1000ull;
+  if (!ticks)
+    ticks = 1;
+  psi_stall_begin(PSI_MEM);
+  for (u64 i = 0; i < ticks; i++) {
+    if (__atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE) &
+        (1ULL << (SIGKILL - 1)))
+      break;
+    if (scheduler_sleep_ticks_state(1, 0) == SLEEP_GONE)
+      break;
+  }
+  psi_stall_end(PSI_MEM);
 }
 
 /* How many cgroups want memory accounting -- a limit, or the controller
@@ -1017,6 +1079,7 @@ void cgroup_mem_charge_pages(u64 npages) {
 
   struct cgroup *over = 0, *high = 0;
   u64 over_max = 0;
+  u64 high_usage = 0, high_limit = 0, high_batch = 0;
   u64 flags;
 
   spin_lock_irqsave(&cg_lock, &flags);
@@ -1028,8 +1091,16 @@ void cgroup_mem_charge_pages(u64 npages) {
 
     if (est > a->mem_peak)
       a->mem_peak = est;
-    if (!high && a->mem_high != CG_LIM_MAX && est > a->mem_high)
+    if (!high && a->mem_high != CG_LIM_MAX && est > a->mem_high) {
       high = a;
+      a->mem_over_high_pages += npages;
+      if (a->mem_over_high_pages >= CG_MEM_HIGH_BATCH) {
+        high_batch = a->mem_over_high_pages;
+        high_usage = est;
+        high_limit = a->mem_high;
+        a->mem_over_high_pages = 0;
+      }
+    }
     if (a->mem_max == CG_LIM_MAX)
       continue;
     if (!over && est > a->mem_max) {
@@ -1053,6 +1124,8 @@ void cgroup_mem_charge_pages(u64 npages) {
     if (act)
       cg_mem_check_high(high);
   }
+  if (high_batch)
+    cg_mem_high_penalty(high_usage, high_limit, high_batch);
   if (!over)
     return;
 
@@ -1173,6 +1246,84 @@ static void cg_sched_clear_all(void) {
   }
 }
 
+/* How often the per-cgroup pressure is sampled. A sample charges this much
+ * time, so it is fine enough for avg10 and still a walk only a hundred times a
+ * second -- and only while something on the machine is stalled at all. */
+#define CG_PSI_SAMPLE_NS 10000000ull
+
+/* One pressure sample: who is stalled on what, and who is getting work done,
+ * charged to every cgroup up the tree. A task counts as stalled on memory or
+ * io while it is inside a psi stall region, and on the CPU while it is
+ * runnable but not running; it counts as working while it runs (or, for
+ * memory and io, is runnable) without being stalled on that resource. `some`
+ * is any member stalled; `full` is a stall with no member working, Linux's
+ * "every non-idle task in the group is stalled". Caller holds cg_lock. */
+static void cg_psi_sample(u64 now) {
+  static u64 last_ns, window_ns;
+
+  if (!last_ns) {
+    last_ns = window_ns = now;
+    return;
+  }
+  u64 period = now - last_ns;
+  if (period < CG_PSI_SAMPLE_NS)
+    return;
+  last_ns = now;
+  /* A tickless CPU that slept for a while comes back with a long gap; nothing
+   * was running to stall in it, so it is not charged. */
+  if (period > 2 * CG_PSI_SAMPLE_NS)
+    period = CG_PSI_SAMPLE_NS;
+
+  if (psi_machine_stalled()) {
+    for (struct cgroup *c = cg_all; c; c = c->next)
+      for (int r = 0; r < PSI_NR_RES; r++) {
+        c->psi_nr_stalled[r] = 0;
+        c->psi_nr_working[r] = 0;
+      }
+    usize slots = scheduler_task_slots();
+
+    for (usize i = 0; i < slots; i++) {
+      struct task *t = scheduler_task_slot(i);
+
+      if (!cg_task_live(t))
+        continue;
+      int st = (int)__atomic_load_n(&t->state, __ATOMIC_RELAXED);
+      int runnable = (st == TASK_RUNNING || st == TASK_READY);
+      int stalled[PSI_NR_RES], working[PSI_NR_RES];
+
+      stalled[PSI_MEM] = psi_task_stalled(t, PSI_MEM);
+      stalled[PSI_IO] = psi_task_stalled(t, PSI_IO);
+      stalled[PSI_CPU] = (st == TASK_READY);
+      working[PSI_MEM] = !stalled[PSI_MEM] && runnable;
+      working[PSI_IO] = !stalled[PSI_IO] && runnable;
+      working[PSI_CPU] = (st == TASK_RUNNING);
+      if (!stalled[PSI_MEM] && !stalled[PSI_IO] && !runnable)
+        continue; /* idle: neither side of any ratio */
+      for (struct cgroup *a = cg_of(t->id); a; a = a->parent)
+        for (int r = 0; r < PSI_NR_RES; r++) {
+          a->psi_nr_stalled[r] += (u32)stalled[r];
+          a->psi_nr_working[r] += (u32)working[r];
+        }
+    }
+    for (struct cgroup *c = cg_all; c; c = c->next) {
+      if (c->is_root)
+        continue; /* the root's files are /proc/pressure's */
+      for (int r = 0; r < PSI_NR_RES; r++)
+        psi_group_sample(&c->psi[r], c->psi_nr_stalled[r] != 0,
+                         c->psi_nr_working[r] == 0, period);
+    }
+  }
+
+  if (now - window_ns >= PSI_WINDOW_NS) {
+    u64 elapsed = now - window_ns;
+
+    window_ns = now;
+    for (struct cgroup *c = cg_all; c; c = c->next)
+      for (int r = 0; r < PSI_NR_RES; r++)
+        psi_group_fold(&c->psi[r], elapsed);
+  }
+}
+
 void cgroup_tick(void) {
   if (!cg_root)
     return;
@@ -1183,6 +1334,7 @@ void cgroup_tick(void) {
   int sweep;
 
   spin_lock_irqsave(&cg_lock, &flags);
+  cg_psi_sample(now);
   sweep = (last_sweep_ns == 0 ||
            now - last_sweep_ns >= (u64)CG_SWEEP_MS * 1000000ull);
   if (sweep)
@@ -1562,6 +1714,9 @@ enum cg_file {
   CGF_IO_STAT,
   CGF_IO_MAX,
   CGF_IO_WEIGHT,
+  CGF_CPU_PRESSURE,
+  CGF_MEM_PRESSURE,
+  CGF_IO_PRESSURE,
 };
 
 struct cg_filenode {
@@ -1894,6 +2049,24 @@ static usize cg_render(struct cgroup *cg, enum cg_file kind, char *buf,
     break;
   }
   /* ── cpu ── */
+  case CGF_CPU_PRESSURE:
+  case CGF_MEM_PRESSURE:
+  case CGF_IO_PRESSURE: {
+    enum psi_res res = kind == CGF_CPU_PRESSURE   ? PSI_CPU
+                       : kind == CGF_MEM_PRESSURE ? PSI_MEM
+                                                  : PSI_IO;
+    if (cg->is_root) {
+      len = psi_render(res, buf, cap);
+      break;
+    }
+    spin_lock_irqsave(&cg_lock, &flags);
+    struct psi_group g = cg->psi[res];
+    spin_unlock_irqrestore(&cg_lock, flags);
+    /* A cgroup's CPU pressure has a `full` line, unlike the machine's: its
+     * members can all be waiting while other cgroups run. */
+    len = psi_group_render(&g, 1, buf, cap);
+    break;
+  }
   case CGF_CPU_STAT: {
     spin_lock_irqsave(&cg_lock, &flags);
     u64 us = cg->cpu_usage_ns / 1000, uu = cg->cpu_user_ns / 1000;
@@ -2578,6 +2751,9 @@ static void cg_populate(struct cgroup *cg) {
   cg_mkfile(cg, "cgroup.controllers", CGF_CONTROLLERS, 0);
   cg_mkfile(cg, "cgroup.subtree_control", CGF_SUBTREE_CONTROL, 1);
   cg_mkfile(cg, "cgroup.stat", CGF_STAT, 0);
+  cg_mkfile(cg, "cpu.pressure", CGF_CPU_PRESSURE, 0);
+  cg_mkfile(cg, "memory.pressure", CGF_MEM_PRESSURE, 0);
+  cg_mkfile(cg, "io.pressure", CGF_IO_PRESSURE, 0);
   if (!cg->is_root) {
     cg->events_node = cg_mkfile(cg, "cgroup.events", CGF_EVENTS, 0);
     cg_mkfile(cg, "cgroup.type", CGF_TYPE, 0);

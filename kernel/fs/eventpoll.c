@@ -1269,7 +1269,16 @@ static int epoll_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
     inner.events = (short)(w->events & 0xffff);
     inner.revents = 0;
     th->ops->poll(th, &inner);
-    if (epoll_match(w, (u32)(unsigned short)inner.revents)) {
+    u32 matched = epoll_match(w, (u32)(unsigned short)inner.revents);
+    /* The same rule the real wait applies (vfs_epoll_wait): an edge-triggered
+     * watch is ready only on a change it has not reported yet. Looking at the
+     * level alone called libmount's epoll ready for ever -- mountinfo is always
+     * readable and libmount watches it EPOLLET -- while the wait on it returned
+     * nothing, so systemd's mount monitor fired on every turn of its loop,
+     * sd-event rate-limited it, and systemd held back every mount job. */
+    if (matched && (w->events & B1NIX_EPOLLET) && matched == w->last_revents)
+      matched = 0;
+    if (matched) {
       pfd->revents = B1NIX_POLLIN;
       break;
     }

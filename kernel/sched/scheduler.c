@@ -4441,6 +4441,32 @@ sched_sigwait_notify(T(i), sig);
   return -ESRCH;
 }
 
+/* Lift a ptrace stop: make a STOPPED task runnable again without posting
+ * anything to it. Resuming a tracee used to go through SIGCONT, which left a
+ * real SIGCONT pending -- a handler ran for it, the parent was told the child
+ * had continued, and a tracee re-injected into a group-stop found that stale
+ * SIGCONT and left the stop it had just entered. */
+int scheduler_resume_stopped(usize pid) {
+  u64 flags = interrupts_save();
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->id != pid || T(i)->state == TASK_UNUSED ||
+        T(i)->state == TASK_DEAD || T(i)->state == TASK_REAPING)
+      continue;
+    enum task_state expected = TASK_STOPPED;
+    int woke = __atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
+                                           0, __ATOMIC_ACQUIRE,
+                                           __ATOMIC_RELAXED);
+    if (woke)
+      sched_wake_enqueue(T(i));
+    interrupts_restore(flags);
+    if (woke)
+      ipi_reschedule_all();
+    return 0;
+  }
+  interrupts_restore(flags);
+  return -ESRCH;
+}
+
 /* ── ioprio(2) ───────────────────────────────────────────────────────────────
  * Per-task I/O scheduling class + level. b1nix issues one device command at a
  * time, and the block layer's admission gate (kernel/dev/blk.c) hands a busy
@@ -5139,7 +5165,15 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
    * SP-alignment fault (ESR EC 0x26) on a Cortex-A76, which has that check
    * enabled out of reset — which is how net_task died on the first real
    * arm64 hardware this kernel ran on. */
-  u64 initial_rsp = stack_top;
+  /* But this thread's C frames must start BELOW the slot its user frame is
+   * written to. clone_thread_kentry builds the frame in a local and copies it
+   * to the top of this stack before the eret -- and with C frames starting at
+   * the very top, that local sat inside the slot: the copy overlapped its own
+   * source. Which bytes survived depended on how the compiler laid out the
+   * function, so it worked for months and then, rebuilt by a newer clang,
+   * every vfork child resumed at its syscall number (elr = x8 = 220). */
+  u64 initial_rsp =
+      stack_top - ((sizeof(struct interrupt_frame) + 15) & ~(u64)15);
 #else
   u64 initial_rsp = stack_top - 8;
 #endif

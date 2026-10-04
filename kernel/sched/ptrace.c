@@ -131,6 +131,8 @@ void ptrace_task_cleanup(struct task *t) {
   spin_lock_irqsave(&g_ptrace_lock, &flags);
   usize kill_pids[PTRACE_MAX];
   usize nkill = 0;
+  usize wake_pids[PTRACE_MAX];
+  usize nwake = 0;
   for (usize i = 0; i < PTRACE_MAX; i++) {
     if (!g_links[i].used)
       continue;
@@ -145,6 +147,15 @@ void ptrace_task_cleanup(struct task *t) {
        * parked forever if the handler itself dies. */
       if ((g_links[i].options & PTRACE_O_EXITKILL) && g_links[i].tracee)
         kill_pids[nkill++] = g_links[i].tracee->id;
+      else if (g_links[i].tracee) {
+        /* Otherwise the tracee is released, as Linux's __ptrace_detach does:
+         * a tracer killed outright (strace under SIGKILL) used to leave its
+         * tracee parked in a ptrace stop nothing would ever lift. */
+        if (g_links[i].pending_event)
+          __atomic_fetch_and(&g_links[i].tracee->pending_signals,
+                             ~(1ULL << (SIGTRAP - 1)), __ATOMIC_RELAXED);
+        wake_pids[nwake++] = g_links[i].tracee->id;
+      }
       g_links[i].used = 0;
       __atomic_fetch_sub(&g_link_count, 1, __ATOMIC_RELAXED);
     }
@@ -152,6 +163,8 @@ void ptrace_task_cleanup(struct task *t) {
   spin_unlock_irqrestore(&g_ptrace_lock, flags);
   for (usize i = 0; i < nkill; i++)
     scheduler_kill(kill_pids[i], SIGKILL);
+  for (usize i = 0; i < nwake; i++)
+    scheduler_resume_stopped(wake_pids[i]);
 }
 
 /* ── attach permission (Linux ptrace_may_access + yama ptrace_scope) ── */
@@ -653,8 +666,14 @@ int ptrace_fault_info(struct task *t, int *signo, u64 *addr, int *code) {
 }
 
 /* Park the tracee and tell its tracer. Called with no locks held. */
+/* An armed event (fork, exec, PTRACE_INTERRUPT) is carried by a SIGTRAP and
+ * belongs to the stop that SIGTRAP causes. Only that stop takes it: a syscall
+ * stop or another signal's stop that happens to come first used to swallow it,
+ * and a tracer then read a syscall stop as an event. */
+#define PTRACE_STOP_TAKE_EVENT (-1)
+
 static void ptrace_do_stop(struct task *t, struct ptrace_link *l, int signo,
-                           struct interrupt_frame *frame) {
+                           struct interrupt_frame *frame, int event) {
   u64 flags;
   spin_lock_irqsave(&g_ptrace_lock, &flags);
   l->snapshot = *frame;
@@ -662,8 +681,14 @@ static void ptrace_do_stop(struct task *t, struct ptrace_link *l, int signo,
   l->stopped = 1;
   l->regs_dirty = 0;
   l->stop_signal = signo;
-  l->stop_event = l->pending_event;
-  l->pending_event = 0;
+  if (event == PTRACE_STOP_TAKE_EVENT) {
+    event = 0;
+    if (signo == SIGTRAP) {
+      event = l->pending_event;
+      l->pending_event = 0;
+    }
+  }
+  l->stop_event = event;
   spin_unlock_irqrestore(&g_ptrace_lock, flags);
 
   t->last_stop_signal = signo;
@@ -688,6 +713,27 @@ static void ptrace_do_stop(struct task *t, struct ptrace_link *l, int signo,
     if (__atomic_load_n(&t->pending_signals, __ATOMIC_ACQUIRE) &
         (1ULL << (SIGKILL - 1)))
       break;
+    /* PTRACE_LISTEN: the group-stop this tracee sits in ends with a SIGCONT,
+     * and the tracer learns of it as a fresh PTRACE_EVENT_STOP trap, exactly
+     * as on Linux. The SIGCONT stays pending and is reported in its turn. */
+    if (__atomic_load_n(&t->pending_signals, __ATOMIC_ACQUIRE) &
+        (1ULL << (SIGCONT - 1))) {
+      spin_lock_irqsave(&g_ptrace_lock, &flags);
+      int was_listening = l->used && l->listening;
+      if (was_listening) {
+        l->listening = 0;
+        l->stop_signal = SIGTRAP;
+        l->stop_event = PTRACE_EVENT_STOP;
+      }
+      usize tracer = l->tracer_pid;
+      spin_unlock_irqrestore(&g_ptrace_lock, flags);
+      if (was_listening) {
+        t->last_stop_signal = SIGTRAP;
+        t->stop_report_pending = 1;
+        if (tracer)
+          scheduler_notify_wait_event(tracer);
+      }
+    }
     t->state = TASK_STOPPED;
     scheduler_yield();
   }
@@ -744,7 +790,7 @@ int ptrace_signal_stop(struct task *t, int signo,
   }
   spin_unlock_irqrestore(&g_ptrace_lock, flags);
 
-  ptrace_do_stop(t, l, signo, frame);
+  ptrace_do_stop(t, l, signo, frame, PTRACE_STOP_TAKE_EVENT);
 
   /* The tracer decides what the tracee sees: PTRACE_CONT with a signal
    * re-injects it, PTRACE_CONT with 0 swallows it. */
@@ -756,6 +802,46 @@ int ptrace_signal_stop(struct task *t, int signo,
   if (inject > 0 && inject != signo)
     scheduler_kill(t->id, inject);
   return inject == 0 ? 1 : (inject == signo ? 0 : 1);
+}
+
+int ptrace_group_stop(struct task *t, int signo,
+                      struct interrupt_frame *frame) {
+  if (!t || !frame)
+    return 0;
+#if defined(__aarch64__)
+  if ((frame->spsr & 0xF) != 0)
+    return 0;
+#else
+  if (frame->cs != 0x1B && frame->cs != 0x23)
+    return 0;
+#endif
+  u64 flags;
+  spin_lock_irqsave(&g_ptrace_lock, &flags);
+  struct ptrace_link *l = link_of(t);
+  if (!l || l->stopped) {
+    spin_unlock_irqrestore(&g_ptrace_lock, flags);
+    return 0;
+  }
+  /* A seized tracee reports its group-stop as PTRACE_EVENT_STOP with the stop
+   * signal, which is what lets the tracer PTRACE_LISTEN; an attached one
+   * reports the plain stop signal. */
+  int event = l->seized ? PTRACE_EVENT_STOP : 0;
+  spin_unlock_irqrestore(&g_ptrace_lock, flags);
+  __atomic_fetch_and(&t->pending_signals, ~(1ULL << (signo - 1)),
+                     __ATOMIC_RELAXED);
+  ptrace_do_stop(t, l, signo, frame, event);
+  return 1;
+}
+
+u64 ptrace_forced_pending(struct task *t) {
+  if (!t || !ptrace_any_traced())
+    return 0;
+  u64 flags;
+  spin_lock_irqsave(&g_ptrace_lock, &flags);
+  struct ptrace_link *l = link_of(t);
+  int armed = l && l->pending_event;
+  spin_unlock_irqrestore(&g_ptrace_lock, flags);
+  return armed ? (1ULL << (SIGTRAP - 1)) : 0;
 }
 
 /* ── syscall-entry / syscall-exit stops (PTRACE_SYSCALL) ─────────────────── */
@@ -795,7 +881,7 @@ void ptrace_syscall_stop(struct task *t, struct interrupt_frame *frame,
   /* Linux marks a syscall stop by setting bit 7 of the reported signal when
    * PTRACE_O_TRACESYSGOOD is on; that is how a tracer distinguishes it from a
    * real SIGTRAP. */
-  ptrace_do_stop(t, l, sysgood ? (SIGTRAP | 0x80) : SIGTRAP, frame);
+  ptrace_do_stop(t, l, sysgood ? (SIGTRAP | 0x80) : SIGTRAP, frame, 0);
 }
 
 /* ── PTRACE_O_TRACEEXIT ──────────────────────────────────────────────────── */
@@ -867,7 +953,7 @@ int ptrace_handle_debug_trap(struct interrupt_frame *frame) {
 #ifdef __x86_64__
   frame->rflags &= ~X86_RFLAGS_TF;
 #endif
-  ptrace_do_stop(t, l, SIGTRAP, frame);
+  ptrace_do_stop(t, l, SIGTRAP, frame, 0);
   return 1;
 }
 
@@ -1171,7 +1257,12 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
     }
     if (stopped)
       return 0;
-    scheduler_post_signal(pid, SIGSTOP);
+    /* An interrupt is a trap, never a signal: posting SIGSTOP here gave the
+     * tracer a SIGSTOP to re-inject, the tracee then group-stopped for real,
+     * and strace -p 1 left systemd stopped with every job waiting. */
+    if (!l->seized)
+      return -EIO;
+    ptrace_arm_event(t, PTRACE_EVENT_STOP, 0);
     return 0;
   }
   case PTRACE_SETREGS: {
@@ -1200,11 +1291,17 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
     l->stopped = 0;
     spin_unlock_irqrestore(&g_ptrace_lock, flags);
     t->stop_report_pending = 0;
-    scheduler_kill(pid, SIGCONT); /* the scheduler's own stop->ready path */
+    scheduler_resume_stopped(pid);
     return 0;
   }
   case PTRACE_DETACH: {
     spin_lock_irqsave(&g_ptrace_lock, &flags);
+    /* A trap armed for an event the tracee has not reached yet must not
+     * outlive the link: delivered untraced, the SIGTRAP would kill it. */
+    if (l->pending_event)
+      __atomic_fetch_and(&t->pending_signals, ~(1ULL << (SIGTRAP - 1)),
+                         __ATOMIC_RELAXED);
+    l->pending_event = 0;
     l->single_step = 0;
     l->inject_signal = (int)data;
     l->listening = 0;
@@ -1214,7 +1311,7 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
     l->used = 0;
     __atomic_fetch_sub(&g_link_count, 1, __ATOMIC_RELAXED);
     spin_unlock_irqrestore(&g_ptrace_lock, flags);
-    scheduler_kill(pid, SIGCONT); /* the scheduler's own stop->ready path */
+    scheduler_resume_stopped(pid);
     return 0;
   }
   case PTRACE_KILL:

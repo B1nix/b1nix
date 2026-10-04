@@ -548,6 +548,21 @@ static int r_meminfo(usize pid, struct sbuf *s) {
   sb_addf(s, "Slab:           %lu kB\n", (unsigned long)(slab / 1024));
   sb_addf(s, "SReclaimable:   %lu kB\n", 0UL);
   sb_addf(s, "SUnreclaim:     %lu kB\n", (unsigned long)(slab / 1024));
+  /* Present whether or not a swap area is active, with zeros when none is, as
+   * Linux prints them: free(1) reads its Swap row here, and systemd-oomd
+   * refuses to start at all when SwapTotal is missing. */
+  {
+    u64 swap_total = 0, swap_used = 0;
+
+    if (swap_stats(&swap_total, &swap_used) != 0)
+      swap_total = swap_used = 0;
+    if (swap_used > swap_total)
+      swap_used = swap_total;
+    sb_addf(s, "SwapCached:     %lu kB\n", 0UL);
+    sb_addf(s, "SwapTotal:      %lu kB\n", (unsigned long)(swap_total * 4));
+    sb_addf(s, "SwapFree:       %lu kB\n",
+            (unsigned long)((swap_total - swap_used) * 4));
+  }
   sb_addf(s, "MemUsed:        %lu kB\n", (unsigned long)(used / 1024));
   return 0;
 }

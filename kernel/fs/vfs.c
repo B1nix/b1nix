@@ -197,6 +197,19 @@ struct vfs_mount_entry {
 /* Monotonic mount counter — see vfs_mount_entry::seq. Never reset, never
  * reused. */
 static u64 mount_seq_next = 1;
+
+/* Mounts added per mount namespace, the counterpart of Linux's ns->event: a
+ * watcher of /proc/self/mountinfo is told about changes to ITS namespace and
+ * no other. Bucketed by id; two namespaces sharing a bucket only cost each
+ * other a spurious wake. */
+#define MNT_NS_EVENT_BUCKETS 256
+static u64 g_mnt_ns_events[MNT_NS_EVENT_BUCKETS];
+
+/* The next mount sequence number, for an entry being added to namespace `ns`. */
+static u64 mount_seq_take(u32 ns) {
+  g_mnt_ns_events[ns % MNT_NS_EVENT_BUCKETS]++;
+  return mount_seq_next++;
+}
 static u32 pivot_group_next = 1;
 
 /* Sized at vfs_init() from RAM, never reallocated — see MAX_MOUNTS in vfs.h for
@@ -231,8 +244,19 @@ static usize mount_hwm;
  * never wakes -- a bug that would show up as a mount unit failing on a machine
  * where the filesystem is plainly mounted. Reading a few tens of slots costs
  * nothing next to a poll that blocks for seconds. */
+static u32 vfs_current_mnt_ns(void);
+static int mount_visible_in(usize i, u32 ns);
+
 u64 vfs_mount_generation(void) {
   u64 g = 1469598103934665603ULL; /* FNV-1a offset basis */
+  /* The CALLER'S namespace only, as Linux's mounts_poll compares the reader's
+   * ns->event. A generation over every namespace woke systemd for each mount
+   * a service made in its own private namespace -- four or five per unit for
+   * credentials alone -- and sd-event rate-limited the mount monitor, which
+   * makes systemd hold back every mount job until the limit lifts: boot.mount
+   * and tmp.mount sat waiting and the boot never reached local-fs.target. */
+  u32 ns = vfs_current_mnt_ns();
+  int scoped = namespace_active();
 
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
@@ -244,10 +268,10 @@ u64 vfs_mount_generation(void) {
    * that (every `mount`/`umount` pair, and libmount's own verification) was
    * invisible. `mount_seq_next` only ever grows, so any mutation that adds an
    * entry changes this value for good. */
-  g ^= mount_seq_next;
+  g ^= scoped ? g_mnt_ns_events[ns % MNT_NS_EVENT_BUCKETS] : mount_seq_next;
   g *= 1099511628211ULL;
   for (usize i = 0; i < mount_hwm; i++) {
-    if (!mounts[i].used)
+    if (!mount_visible_in(i, ns))
       continue;
     g ^= (u64)i + 1;
     g *= 1099511628211ULL;
@@ -7151,7 +7175,7 @@ static void vfs_mount_propagate(int midx) {
     mounts[slot] = mounts[midx];
     mounts[slot].mnt_ns = mounts[i].mnt_ns;
     mounts[slot].peer_group = child_group;
-    mounts[slot].seq = mount_seq_next++;
+    mounts[slot].seq = mount_seq_take(mounts[slot].mnt_ns);
     mounts[slot].pivot_group = 0;
     mounts[slot].parent_seq =
         mounts[midx].parent_seq == mounts[parent].seq ? mounts[i].seq : 0;
@@ -7272,7 +7296,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   mounts[midx].peer_group = 0;
   mounts[midx].owner = fs->owner;
   mounts[midx].mnt_ns = vfs_current_mnt_ns();
-  mounts[midx].seq = mount_seq_next++;
+  mounts[midx].seq = mount_seq_take(mounts[midx].mnt_ns);
   mounts[midx].pivot_group = 0;
   mounts[midx].parent_seq = parent_mnt;
   mounts[midx].copied_from = 0;
@@ -7638,7 +7662,7 @@ static void vfs_bind_copy_submounts(const char *src, u64 src_mnt, int bind) {
       mount_hwm = (usize)j + 1;
     mounts[j] = mounts[next];
     copy_path(mounts[j].target, sizeof(mounts[j].target), target);
-    mounts[j].seq = mount_seq_next++;
+    mounts[j].seq = mount_seq_take(mounts[j].mnt_ns);
     mounts[j].parent_seq = parent;
     mounts[j].copied_from = mounts[next].seq;
     mounts[j].pivot_group = 0;
@@ -7782,7 +7806,7 @@ int vfs_bind_mount(const char *source, const char *target, u64 flags) {
   mounts[midx].locked_flags = src_locked;
   mounts[midx].owner = 0;
   mounts[midx].mnt_ns = vfs_current_mnt_ns();
-  mounts[midx].seq = mount_seq_next++;
+  mounts[midx].seq = mount_seq_take(mounts[midx].mnt_ns);
   mounts[midx].pivot_group = 0;
   mounts[midx].parent_seq = parent_mnt;
   mounts[midx].copied_from = 0;
@@ -8516,7 +8540,7 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
     mounts[freeidx].propagation = MS_PRIVATE;
     mounts[freeidx].peer_group = 0;
     mounts[freeidx].locked_flags = 0;
-    mounts[freeidx].seq = mount_seq_next++;
+    mounts[freeidx].seq = mount_seq_take(mounts[freeidx].mnt_ns);
     mounts[freeidx].pivot_group = 0;
     mounts[freeidx].parent_seq = old_parent;
     mounts[freeidx].copied_from = 0;

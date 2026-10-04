@@ -634,6 +634,12 @@ static isize sock_recv_once(struct vfs_handle *h, void *buf, usize len,
 
   if (s->type == B1NIX_SOCK_DGRAM || s->type == B1NIX_SOCK_RAW ||
       s->domain == B1NIX_AF_NETLINK) {
+    /* A netlink overrun is reported once, ahead of whatever is still queued,
+     * as Linux's skb_recv_datagram reports sk_err. */
+    if (s->domain == B1NIX_AF_NETLINK && s->so_error == ENOBUFS) {
+      s->so_error = 0;
+      return -ENOBUFS;
+    }
     u64 deadline = sock_deadline(s->so_rcvtimeo_ms);
     while (s->udp_q_count == 0) {
       /* MSG_DONTWAIT is a per-call O_NONBLOCK: `nonblock` above already folds
@@ -680,9 +686,13 @@ static isize sock_recv_once(struct vfs_handle *h, void *buf, usize len,
         kfree(s->udp_q_big[slot]);
         s->udp_q_big[slot] = 0;
       }
-      s->udp_q_head = (u8)((s->udp_q_head + 1) % SOCK_DGRAM_Q_SLOTS);
-      s->udp_q_count--;
-      s->recv_len = (s->udp_q_count > 0) ? s->udp_q_len[s->udp_q_head] : 0;
+      if (s->domain == B1NIX_AF_NETLINK) {
+        netlink_dequeue_head(s);
+      } else {
+        s->udp_q_head = (u8)((s->udp_q_head + 1) % SOCK_DGRAM_Q_SLOTS);
+        s->udp_q_count--;
+        s->recv_len = (s->udp_q_count > 0) ? s->udp_q_len[s->udp_q_head] : 0;
+      }
     }
     return (isize)((flags & B1NIX_MSG_TRUNC) ? pkt_len : to_copy);
   }
@@ -1162,6 +1172,8 @@ static int socket_teardown(struct vfs_handle *h) {
   for (int i = 0; i < SOCK_DGRAM_Q_SLOTS; i++)
     if (s->udp_q_big[i])
       kfree(s->udp_q_big[i]);
+  if (s->domain == B1NIX_AF_NETLINK)
+    netlink_backlog_free(s);
   if (s->udp_cork)
     kfree(s->udp_cork);
   kfree(s);
@@ -2700,6 +2712,8 @@ int vfs_socket_wants_peer_pidfd(int fd) {
  * is option 20: a datagram socket that sets it is told, per message, which
  * local address the datagram was addressed to. */
 #define SOCK_SOL_IP 0
+#define SOCK_SOL_NETLINK 270
+#define SOCK_NETLINK_NO_ENOBUFS 5
 #define SOCK_IP_RECVORIGDSTADDR 20
 /* What KIND of socket this is, as three separate questions. A program handed a
  * descriptor it did not create asks them before trusting it: dbus-broker
@@ -3007,6 +3021,14 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
     if (s->type != B1NIX_SOCK_DGRAM)
       return -ENOPROTOOPT;
     s->ip_recvorigdst = v ? 1 : 0;
+    return 0;
+  }
+  /* NETLINK_NO_ENOBUFS: a listener that would rather lose messages quietly
+   * than be told about an overrun (netlink_enqueue). */
+  if (level == SOCK_SOL_NETLINK && optname == SOCK_NETLINK_NO_ENOBUFS) {
+    if (s->domain != B1NIX_AF_NETLINK)
+      return -ENOPROTOOPT;
+    s->nl_no_enobufs = v ? 1 : 0;
     return 0;
   }
 

@@ -58,5 +58,10 @@ void netlink_uevent_broadcast(const void *payload, usize len);
 struct vfs_handle;
 int netlink_kernel_unicast(struct vfs_handle *h, const void *payload,
                            usize len);
+/* The receiver consumed the ring's head message: advance the ring and refill
+ * it from the socket's backlog. */
+void netlink_dequeue_head(struct vfs_socket_state *s);
+/* Free whatever is still in the backlog (socket teardown). */
+void netlink_backlog_free(struct vfs_socket_state *s);
 
 #endif

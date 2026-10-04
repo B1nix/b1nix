@@ -131,8 +131,10 @@ systemd)
 	# unit can ever activate.
 	# systemd-container is systemd-nspawn, the distribution's own container
 	# manager: what the namespaces probe runs (M123).
+	# systemd-oomd is the userspace OOM killer reading per-cgroup memory
+	# pressure (phase C of docs/distro/roadmap.md).
 	PACKAGES="${PACKAGES:-systemd systemd-sysv udev dbus procps libproc2-0 libncursesw6 \
-systemd-container}"
+systemd-container systemd-oomd}"
 	RESOLVE_DEPS="${RESOLVE_DEPS:-1}"
 	;;
 graphics)
@@ -1588,6 +1590,63 @@ if [ -n "$__psi0" ] && [ -n "$__psi1" ] && [ "$__psi1" -gt "$__psi0" ] 2>/dev/nu
 else
 	say "SYSTEMD-SMOKE: FAIL pressure cpu=${__psi0:-?}->${__psi1:-?} mem='$(head -1 /proc/pressure/memory 2>&1)' io='$(sed -n 2p /proc/pressure/io 2>&1)'"
 fi
+
+# systemd-oomd acting on a slice's memory pressure. The slice asks to be
+# watched (ManagedOOMMemoryPressure=kill) with a low limit and oomd is told to
+# act after two seconds; the unit inside it lives above its memory.high, so it
+# spends its time being reclaimed for and held back -- memory stall time, which
+# is what the slice's own memory.pressure reports and what oomd reads. The
+# check is that oomd, and not the limit, ended the unit.
+mkdir -p /run/systemd/oomd.conf.d
+cat >/run/systemd/oomd.conf.d/b1nix-smoke.conf <<'EOF'
+[OOM]
+DefaultMemoryPressureDurationSec=2s
+EOF
+cat >/run/systemd/system/b1nix-oomd.slice <<'EOF'
+[Slice]
+MemoryAccounting=yes
+ManagedOOMMemoryPressure=kill
+ManagedOOMMemoryPressureLimit=10%
+EOF
+sd_load b1nix-oomd.slice
+timeout 30 systemctl restart systemd-oomd.service >/dev/null 2>&1
+__oomd_up=$(timeout 10 systemctl is-active systemd-oomd.service 2>&1)
+systemctl reset-failed b1nix-oomd-hog.service >/dev/null 2>&1
+timeout 60 systemd-run --unit=b1nix-oomd-hog.service --slice=b1nix-oomd.slice \
+	-p MemoryHigh=16M -p MemoryMax=512M -p Restart=no \
+	/bin/sh -c 'exec tail /dev/zero' >/dev/null 2>&1
+__opsi=$CG/b1nix.slice/b1nix-oomd.slice/memory.pressure
+[ -f "$__opsi" ] || __opsi=$CG/b1nix-oomd.slice/memory.pressure
+__i=0
+__opeak=""
+while [ $__i -lt 60 ]; do
+	case "$(systemctl is-active b1nix-oomd-hog.service 2>&1)" in
+	active | activating) ;;
+	*) break ;;
+	esac
+	__opeak=$(head -1 "$__opsi" 2>/dev/null)
+	__i=$((__i + 1))
+	sleep 1
+done
+__ocode=$(systemctl show -p ExecMainCode --value b1nix-oomd-hog.service 2>&1)
+__ostatus=$(systemctl show -p ExecMainStatus --value b1nix-oomd-hog.service 2>&1)
+__ores=$(systemctl show -p Result --value b1nix-oomd-hog.service 2>&1)
+__olog=$(timeout 20 journalctl -u systemd-oomd.service --no-pager -o cat 2>/dev/null |
+	grep -a 'b1nix-oomd-hog' | grep -ai 'kill' | tail -1)
+say "SYSTEMD-SMOKE:   oomd up=$__oomd_up waited=${__i}s code=$__ocode status=$__ostatus result=$__ores pressure='$__opeak'"
+say "SYSTEMD-SMOKE:   oomd log: ${__olog:-none}"
+# Killed by a signal, while still under its 512M ceiling, with oomd saying it
+# did it. memory.max would have left a kernel OOM kill in memory.events instead.
+if [ "$__oomd_up" = "active" ] && [ "$__ocode" = "2" ] && [ "$__ostatus" = "9" ] &&
+   [ -n "$__olog" ]; then
+	say "SYSTEMD-SMOKE: ok oomd-kills-on-pressure"
+else
+	say "SYSTEMD-SMOKE: FAIL oomd-kills-on-pressure"
+	timeout 20 journalctl -u systemd-oomd.service --no-pager -n 8 -o cat 2>/dev/null |
+		while IFS= read -r l; do say "SYSTEMD-SMOKE:   oomd| $l"; done
+fi
+systemctl stop b1nix-oomd-hog.service >/dev/null 2>&1
+systemctl reset-failed b1nix-oomd-hog.service >/dev/null 2>&1
 
 # The journal, asked for ONE unit rather than the whole boot: that is its index,
 # not its ability to append.

@@ -1206,10 +1206,49 @@ static isize netlink_uevent_send(struct vfs_socket_state *s, const void *buf,
 
 /* ── Queue plumbing ─────────────────────────────────────────────────────── */
 
+/* One netlink message waiting behind a full ring. */
+struct nl_backlog_msg {
+  struct nl_backlog_msg *next;
+  u32 len;
+  u32 groups;
+  u32 portid;
+  u32 cred[3];
+  u8 data[];
+};
+
+/* What a message costs against so_rcvbuf: its bytes and its bookkeeping, the
+ * way Linux charges an skb's truesize rather than its payload. */
+#define NL_BACKLOG_OVERHEAD ((u32)sizeof(struct nl_backlog_msg) + 64u)
+/* However much SO_RCVBUFFORCE asked for, kernel heap is finite. */
+#define NL_BACKLOG_MAX_BYTES (16u * 1024u * 1024u)
+
+/* Guards every socket's ring indices and backlog. Senders run in any context
+ * (a uevent from a kernel thread, a reply in the requester's own context) and
+ * the receiver advances the ring from another CPU. */
+static spinlock_t g_nl_q_lock = SPINLOCK_INIT;
+
+static void nl_ring_put(struct vfs_socket_state *s, const u8 *data, usize len,
+                        u32 groups, u32 portid, const u32 cred[3]) {
+  u8 slot = s->udp_q_tail;
+  memcpy(s->udp_q_buf[slot], data, len);
+  s->udp_q_len[slot] = len;
+  s->udp_q_nlgroups[slot] = groups;
+  s->udp_q_nlportid[slot] = portid;
+  s->udp_q_cred[slot][0] = cred[0];
+  s->udp_q_cred[slot][1] = cred[1];
+  s->udp_q_cred[slot][2] = cred[2];
+  s->udp_q_tail = (u8)((s->udp_q_tail + 1) % SOCK_DGRAM_Q_SLOTS);
+  s->udp_q_count++;
+  s->recv_len = s->udp_q_len[s->udp_q_head];
+}
+
+static u32 nl_backlog_limit(const struct vfs_socket_state *s) {
+  u32 lim = s->so_rcvbuf > 0 ? (u32)s->so_rcvbuf : 0;
+  return lim > NL_BACKLOG_MAX_BYTES ? NL_BACKLOG_MAX_BYTES : lim;
+}
+
 static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
                             usize len) {
-  if (s->udp_q_count >= SOCK_DGRAM_Q_SLOTS)
-    return;
   /* A socket filter runs before the datagram is queued and decides how much of
    * it the socket accepts; zero means the message is not for this listener.
    * systemd's device monitor relies on this to see only tagged devices. */
@@ -1221,28 +1260,115 @@ static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
     if (keep < len)
       len = keep;
   }
-  u8 slot = s->udp_q_tail;
   usize copy = len > NL_SLOT_MAX ? NL_SLOT_MAX : len;
-  memcpy(s->udp_q_buf[slot], data, copy);
-  s->udp_q_len[slot] = copy;
   /* Recorded per message, because that is the granularity SCM_CREDENTIALS
    * has. netlink_enqueue runs in the SENDER's context: a uevent posted by the
    * kernel has no task behind it and is credited to pid 0 / uid 0, which is
    * what a udev monitor requires before it will look at the message. */
-  s->udp_q_nlgroups[slot] = nl_enqueue_groups;
-  s->udp_q_nlportid[slot] = nl_enqueue_from_kernel ? 0u : nl_enqueue_portid;
+  u32 cred[3];
   {
     struct cred *c = nl_enqueue_from_kernel ? 0 : scheduler_get_current_cred();
-    s->udp_q_cred[slot][0] =
-        nl_enqueue_from_kernel ? 0u : (u32)scheduler_get_pid();
-    s->udp_q_cred[slot][1] = c ? (u32)c->euid : 0u;
-    s->udp_q_cred[slot][2] = c ? (u32)c->egid : 0u;
+    cred[0] = nl_enqueue_from_kernel ? 0u : (u32)scheduler_get_pid();
+    cred[1] = c ? (u32)c->euid : 0u;
+    cred[2] = c ? (u32)c->egid : 0u;
   }
-  s->udp_q_tail = (u8)((s->udp_q_tail + 1) % SOCK_DGRAM_Q_SLOTS);
-  s->udp_q_count++;
-  s->recv_len = s->udp_q_len[s->udp_q_head];
+  u32 groups = nl_enqueue_groups;
+  u32 portid = nl_enqueue_from_kernel ? 0u : nl_enqueue_portid;
+
+  /* The backlog node is allocated before the lock is taken: kmalloc may
+   * reclaim, and reclaim must never run under a spinlock. */
+  struct nl_backlog_msg *m = 0;
+  u64 flags;
+  spin_lock_irqsave(&g_nl_q_lock, &flags);
+  int ring_full = s->udp_q_count >= SOCK_DGRAM_Q_SLOTS || s->nl_backlog_head;
+  spin_unlock_irqrestore(&g_nl_q_lock, flags);
+  if (ring_full) {
+    m = (struct nl_backlog_msg *)kmalloc(sizeof(*m) + copy);
+    if (m) {
+      m->next = 0;
+      m->len = (u32)copy;
+      m->groups = groups;
+      m->portid = portid;
+      m->cred[0] = cred[0];
+      m->cred[1] = cred[1];
+      m->cred[2] = cred[2];
+      memcpy(m->data, data, copy);
+    }
+  }
+
+  spin_lock_irqsave(&g_nl_q_lock, &flags);
+  if (s->udp_q_count < SOCK_DGRAM_Q_SLOTS && !s->nl_backlog_head) {
+    nl_ring_put(s, data, copy, groups, portid, cred);
+  } else if (m && s->nl_backlog_bytes + m->len + NL_BACKLOG_OVERHEAD <=
+                      nl_backlog_limit(s)) {
+    /* Behind a full ring, in order: the reader refills the ring from here
+     * (netlink_dequeue_head). Sixteen slots used to be the whole queue, and
+     * the coldplug burst systemd-udev-trigger sends before udevd is reading
+     * lost every add past the sixteenth -- the root partition's among them,
+     * so its device unit never became plugged and the boot waited for ever. */
+    if (s->nl_backlog_tail)
+      ((struct nl_backlog_msg *)s->nl_backlog_tail)->next = m;
+    else
+      s->nl_backlog_head = m;
+    s->nl_backlog_tail = m;
+    s->nl_backlog_bytes += m->len + NL_BACKLOG_OVERHEAD;
+    m = 0;
+  } else {
+    /* A real overrun. Linux's netlink_overrun: the message is lost, and the
+     * receiver learns it from ENOBUFS on its next receive, so udevd knows to
+     * re-trigger rather than miss a device silently. */
+    if (!s->nl_no_enobufs)
+      s->so_error = ENOBUFS;
+  }
+  spin_unlock_irqrestore(&g_nl_q_lock, flags);
+  if (m)
+    kfree(m);
   scheduler_wake_all(s);
   scheduler_wake_all(vfs_poll_chan);
+}
+
+void netlink_dequeue_head(struct vfs_socket_state *s) {
+  struct nl_backlog_msg *done = 0;
+  u64 flags;
+  spin_lock_irqsave(&g_nl_q_lock, &flags);
+  if (s->udp_q_count > 0) {
+    s->udp_q_head = (u8)((s->udp_q_head + 1) % SOCK_DGRAM_Q_SLOTS);
+    s->udp_q_count--;
+  }
+  /* Refill the ring while the backlog has messages; order is preserved
+   * because nothing enters the ring while the backlog is non-empty. */
+  while (s->udp_q_count < SOCK_DGRAM_Q_SLOTS && s->nl_backlog_head) {
+    struct nl_backlog_msg *m = (struct nl_backlog_msg *)s->nl_backlog_head;
+    s->nl_backlog_head = m->next;
+    if (!m->next)
+      s->nl_backlog_tail = 0;
+    s->nl_backlog_bytes -= m->len + NL_BACKLOG_OVERHEAD;
+    nl_ring_put(s, m->data, m->len, m->groups, m->portid, m->cred);
+    m->next = done;
+    done = m;
+  }
+  s->recv_len = (s->udp_q_count > 0) ? s->udp_q_len[s->udp_q_head] : 0;
+  spin_unlock_irqrestore(&g_nl_q_lock, flags);
+  while (done) {
+    struct nl_backlog_msg *n = done->next;
+    kfree(done);
+    done = n;
+  }
+}
+
+void netlink_backlog_free(struct vfs_socket_state *s) {
+  u64 flags;
+  spin_lock_irqsave(&g_nl_q_lock, &flags);
+  struct nl_backlog_msg *m = (struct nl_backlog_msg *)s->nl_backlog_head;
+  s->nl_backlog_head = 0;
+  s->nl_backlog_tail = 0;
+  s->nl_backlog_bytes = 0;
+  spin_unlock_irqrestore(&g_nl_q_lock, flags);
+  while (m) {
+    struct nl_backlog_msg *n = m->next;
+    kfree(m);
+    m = n;
+  }
 }
 
 /* A message the kernel addresses to one netlink socket directly, not through a

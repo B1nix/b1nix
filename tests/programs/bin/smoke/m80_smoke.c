@@ -755,10 +755,77 @@ static void test_seize(void) {
   reap(pid);
   close(sv[0]);
 
+  /* An interrupt is a trap, reported as SIGTRAP | PTRACE_EVENT_STOP << 8 --
+   * never a SIGSTOP, which a tracer would re-inject and so stop the tracee
+   * for real. */
   check("ptrace-seize",
         sz == 0 && early == 0 && in == 0 && w == pid && WIFSTOPPED(status) &&
-            gr == 0 && REGS_IP(regs) != 0,
-        (long)sz);
+            WSTOPSIG(status) == SIGTRAP &&
+            (status >> 16) == PTRACE_EVENT_STOP && gr == 0 &&
+            REGS_IP(regs) != 0,
+        (long)status);
+}
+
+/* ── group-stop of a seized tracee, the way strace -p handles it ─────────────
+ * SIGSTOP arrives as a signal-delivery-stop; the tracer re-injects it, the
+ * tracee group-stops and reports PTRACE_EVENT_STOP with SIGSTOP; the tracer
+ * parks it with PTRACE_LISTEN; a SIGCONT ends the group-stop with another
+ * PTRACE_EVENT_STOP; and after PTRACE_DETACH the tracee runs on its own. */
+static void test_group_stop(void) {
+  int sv[2];
+  if (pipe(sv) != 0) {
+    fail("ptrace-group-stop", -1);
+    return;
+  }
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(sv[0]);
+    for (;;) {
+      char c = 'r';
+      write(sv[1], &c, 1);
+      usleep(20000);
+    }
+  }
+  if (pid < 0) {
+    fail("ptrace-group-stop", pid);
+    return;
+  }
+  close(sv[1]);
+  char c = 0;
+  read_timeout(sv[0], &c, 1, 5000);
+
+  long sz = ptrace(PTRACE_SEIZE, pid, 0, 0);
+  kill(pid, SIGSTOP);
+  int st1 = 0;
+  int got1 = wait_stop(pid, &st1, 10000) == pid;
+  int delivery = got1 && WIFSTOPPED(st1) && WSTOPSIG(st1) == SIGSTOP &&
+                 (st1 >> 16) == 0;
+  long re = delivery ? ptrace(PTRACE_CONT, pid, 0, SIGSTOP) : -1;
+  int st2 = 0;
+  int got2 = re == 0 && wait_stop(pid, &st2, 10000) == pid;
+  int group = got2 && WIFSTOPPED(st2) && WSTOPSIG(st2) == SIGSTOP &&
+              (st2 >> 16) == PTRACE_EVENT_STOP;
+  long li = group ? ptrace(PTRACE_LISTEN, pid, 0, 0) : -1;
+  /* Drain what the child wrote before it stopped, then prove it is stopped. */
+  while (read_timeout(sv[0], &c, 1, 100) == 1)
+    ;
+  int quiet = read_timeout(sv[0], &c, 1, 300) != 1;
+  kill(pid, SIGCONT);
+  int st3 = 0;
+  int got3 = li == 0 && wait_stop(pid, &st3, 10000) == pid;
+  int cont_event = got3 && WIFSTOPPED(st3) && (st3 >> 16) == PTRACE_EVENT_STOP;
+  long de = cont_event ? ptrace(PTRACE_DETACH, pid, 0, 0) : -1;
+  int runs = de == 0 && read_timeout(sv[0], &c, 1, 3000) == 1;
+
+  reap(pid);
+  close(sv[0]);
+  printf("group-stop: sz=%ld st1=0x%x re=%ld st2=0x%x li=%ld quiet=%d st3=0x%x "
+         "de=%ld runs=%d\n",
+         sz, st1, re, st2, li, quiet, st3, de, runs);
+  check("ptrace-group-stop",
+        sz == 0 && delivery && group && li == 0 && quiet && cont_event &&
+            de == 0 && runs,
+        (long)st2);
 }
 
 /* ── yama ptrace_scope ───────────────────────────────────────────────────── */
@@ -1826,6 +1893,7 @@ int main(void) {
   test_ptrace_siginfo();
   test_regsets_and_capture();
   test_seize();
+  test_group_stop();
   test_ptrace_fork_event();
   test_ptrace_exec_event();
   test_listen_and_xstate();

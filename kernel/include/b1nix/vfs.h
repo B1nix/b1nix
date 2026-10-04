@@ -1271,6 +1271,16 @@ struct vfs_socket_state {
   u32 nl_last_groups;
   u32 nl_last_portid;
   int nl_have_cred;
+  /* Netlink messages beyond the SOCK_DGRAM_Q_SLOTS ring, oldest first,
+   * bounded by so_rcvbuf as Linux bounds a netlink socket (see
+   * netlink_enqueue). udev's kernel socket asks for 128 MiB precisely so
+   * that coldplug's burst of add events survives until udevd reads it. */
+  void *nl_backlog_head;
+  void *nl_backlog_tail;
+  u32 nl_backlog_bytes;
+  /* NETLINK_NO_ENOBUFS: an overrun drops silently instead of reporting
+   * ENOBUFS on the next receive. */
+  u8 nl_no_enobufs;
   u8 udp_last_src_ip[16];
   u16 udp_last_src_port;
   u8 udp_last_src_is6;

@@ -262,8 +262,11 @@ static void arch_deliver_signals_body(struct interrupt_frame *frame) {
 
     /* Acquire-load: another CPU's scheduler_kill sets bits with a release
      * fetch_or. blocked_signals is task-local. */
-    u64 pending = __atomic_load_n(&current_task->pending_signals,
-                                  __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
+    u64 raw_pending = __atomic_load_n(&current_task->pending_signals,
+                                      __ATOMIC_ACQUIRE);
+    u64 pending = raw_pending & ~current_task->blocked_signals;
+    /* A ptrace trap is not subject to the mask (ptrace_forced_pending). */
+    pending |= raw_pending & ptrace_forced_pending(current_task);
 
     if (pending == 0) {
         interrupts_enable();
@@ -328,6 +331,13 @@ static void arch_deliver_signals_body(struct interrupt_frame *frame) {
                     }
                 } else if (i == SIGSTOP || i == SIGTSTP ||
                            i == SIGTTIN || i == SIGTTOU) {
+                    /* A tracee's group-stop is reported to its tracer. */
+                    if (ptrace_is_traced(current_task)) {
+                        interrupts_enable();
+                        if (ptrace_group_stop(current_task, i, frame))
+                            return;
+                        interrupts_disable();
+                    }
                     scheduler_self_stop(i);
                     interrupts_enable();
                     scheduler_yield();

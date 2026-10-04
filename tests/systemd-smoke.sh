@@ -238,6 +238,7 @@ check_output "SYSTEMD-SMOKE: ok sandbox-ProtectKernelTunables" "ProtectKernelTun
 check_output "SYSTEMD-SMOKE: ok sandbox-MemoryDenyWriteExecute" "MemoryDenyWriteExecute=yes"
 check_output "SYSTEMD-SMOKE: units-loaded=[0-9]* failed=0" "no unit in the whole boot is left in the failed state"
 check_output "SYSTEMD-SMOKE: ok pressure" "/proc/pressure/cpu moves under that load, and memory and io print the some/full lines Linux prints"
+check_output "SYSTEMD-SMOKE: ok oomd-kills-on-pressure" "systemd-oomd kills a unit whose slice's own memory.pressure stays over ManagedOOMMemoryPressureLimit"
 check_output "SYSTEMD-SMOKE: ok journal-filter-unit" "journalctl -u returns one unit's entries, so the journal is indexed rather than only appended"
 check_output "SYSTEMD-SMOKE: ok unit-enable-disable" "systemctl enable/disable moves the unit between enabled and disabled"
 check_output "SYSTEMD-SMOKE: ok unit-mask-refuses" "a masked unit refuses to start even when asked directly"

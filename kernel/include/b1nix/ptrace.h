@@ -142,6 +142,15 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
  * (the caller must not deliver it), 0 otherwise. */
 int ptrace_signal_stop(struct task *t, int signo, struct interrupt_frame *frame);
 
+/* The default action of a stop signal, for a traced task: a group-stop the
+ * tracer sees (PTRACE_EVENT_STOP for a seized tracee, so PTRACE_LISTEN works).
+ * Returns 1 when the task stopped this way, 0 when it is not traced. */
+int ptrace_group_stop(struct task *t, int signo, struct interrupt_frame *frame);
+
+/* Signals a traced task must act on even while it blocks them: the SIGTRAP
+ * that carries an armed event or PTRACE_INTERRUPT. */
+u64 ptrace_forced_pending(struct task *t);
+
 /* Debug exception (#DB) after PTRACE_SINGLESTEP: returns 1 if it belonged to a
  * traced task and was handled by stopping it. */
 int ptrace_handle_debug_trap(struct interrupt_frame *frame);

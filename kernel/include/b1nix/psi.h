@@ -4,6 +4,8 @@
 
 #include <b1nix/types.h>
 
+struct task;
+
 /*
  * PSI — pressure stall information (kernel/mm/psi.c).
  *
@@ -57,5 +59,45 @@ void psi_report_cpu_waiters(u32 waiting);
 
 /* Render one resource's two lines into `buf`; returns the length written. */
 usize psi_render(enum psi_res res, char *buf, usize cap);
+
+/* ── per-cgroup pressure (cpu.pressure, memory.pressure, io.pressure) ──────
+ *
+ * The same bookkeeping, kept per cgroup by kernel/fs/cgroup/cgroup.c: it
+ * samples which tasks are stalled and which are getting work done, charges
+ * each cgroup and its ancestors, and folds the totals into the same decaying
+ * averages. A cgroup's `full` is its own: every non-idle member stalled at
+ * once, which is what systemd-oomd watches a unit's memory.pressure for. */
+#define PSI_WINDOW_NS (2000000000ull)
+
+struct psi_group {
+  /* How many tasks are inside a stall region for this resource. Used only by
+   * the machine-wide groups; touched from ISR-adjacent paths (the block layer
+   * completes under an interrupt), so it moves only with atomics. */
+  volatile int nr_stalled;
+  u64 some_ns;
+  u64 full_ns;
+  /* What the last window started from, so a window measures a difference. */
+  u64 some_ns_at_window;
+  u64 full_ns_at_window;
+  u32 some_avg[3];
+  u32 full_avg[3];
+};
+
+/* Charge one sample of `period_ns` to `g`: `some` when a task was stalled,
+ * `full` when nothing was getting done besides. */
+void psi_group_sample(struct psi_group *g, int some, int full, u64 period_ns);
+/* Fold the window that just ended (`elapsed_ns` long) into the averages. */
+void psi_group_fold(struct psi_group *g, u64 elapsed_ns);
+/* Render a group's lines. `with_full` is 0 only for the machine-wide CPU. */
+usize psi_group_render(const struct psi_group *g, int with_full, char *buf,
+                       usize cap);
+
+/* Is anything on the machine stalled right now -- a task in a memory or io
+ * stall region, or one waiting for a CPU? When nothing is, no cgroup can be
+ * either, and the per-cgroup sample has nothing to walk for. */
+int psi_machine_stalled(void);
+
+/* Is task `t` inside a stall region for `res` (memory or io) right now? */
+int psi_task_stalled(const struct task *t, enum psi_res res);
 
 #endif /* B1NIX_PSI_H */
