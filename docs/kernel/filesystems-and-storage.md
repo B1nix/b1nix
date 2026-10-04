@@ -16,9 +16,9 @@ process's root after a `chroot`.
 The kernel provides these filesystems itself: tmpfs and ramfs, the initramfs
 tarfs, procfs and sysfs with dynamic per-process entries (M34), devtmpfs,
 devpts, cgroup2, mqueue, debugfs, 9p for host shares, and the new mount
-API (`fsopen`, `fsmount`, `open_tree`, `move_mount`). FAT32, exFAT, ISO 9660
-and read-only NTFS are native drivers (M43). NTFS, isofs and a few other pieces
-are loadable modules. `/dev/fuse` exists but is only a placeholder: FUSE
+API (`fsopen`, `fsmount`, `open_tree`, `move_mount`). FAT32, exFAT and
+read-only NTFS are native drivers (M43). NTFS and a few other pieces are
+loadable modules. ISO 9660 is Linux's own isofs, imported (below). `/dev/fuse` exists but is only a placeholder: FUSE
 filesystems do not work yet.
 
 9p's `readdir` is wrong and is the sys lane's `M110-9P: ok readdir` failure.
@@ -41,6 +41,14 @@ directory: a patch to anything under the staged tree would be a bug in the shim.
 `B1NIX_FS_IMPORT` chooses btrfs alone or btrfs with ext4. ext2, ext3 and ext4
 are all mounted by the imported ext4, and there are no native ext or btrfs
 drivers. The root image is btrfs on both architectures.
+
+FAT (`vfat`, `msdos`) and ISO 9660 come the same way, on the same buffer heads.
+isofs reads Rock Ridge and Joliet names and zisofs-compressed files, and is
+registered as both `iso9660` and `isofs`; every mount of it is read-only
+(`VFS_FS_RDONLY`), as a CD is on Linux. There is no Uniform CD-ROM layer, so
+`disk_to_cdi()` answers NULL and a multisession disc is read from its first
+session. Mount options (`-o norock`, `iocharset=`, ...) do not reach any
+imported filesystem yet: the bridge mounts with the defaults.
 
 The bridge has two halves because the two VFS models cannot share a translation
 unit: `kernel/lkpi/fs_bridge.c` works in Linux's terms and `kernel/fs/lkpifs.c`

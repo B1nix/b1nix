@@ -1,0 +1,12 @@
+[Unit]
+Description=b1nix live medium smoke checks
+ConditionKernelCommandLine=b1nix.live-smoke
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/b1nix/installer/b1nix-live-smoke
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target

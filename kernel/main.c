@@ -61,7 +61,6 @@
 #include <lkpi/dma-mapping.h>
 #include <b1nix/filelock.h>
 #include <b1nix/errno.h>
-#include <b1nix/isofs.h>
 #include <b1nix/loop.h>
 #include <b1nix/md.h>
 #include <b1nix/mtd.h>
@@ -908,6 +907,19 @@ void kernel_main(usize arg0, usize arg1)
 				klog_error("lkpi-fs: imported FAT failed to initialise");
 			else
 				klog_info("lkpi-fs: imported vfat/msdos registered");
+		}
+		/*
+		 * ISO 9660, on the same buffer heads, with Joliet names converted
+		 * through the nls tables registered just above and zisofs files
+		 * inflated by the imported zlib.
+		 */
+		{
+			extern int lkpi_initcall_init_iso9660_fs(void);
+
+			if (lkpi_initcall_init_iso9660_fs() != 0)
+				klog_error("lkpi-fs: imported isofs failed to initialise");
+			else
+				klog_info("lkpi-fs: imported iso9660 registered");
 		}
 #endif
 

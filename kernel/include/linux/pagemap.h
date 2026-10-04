@@ -124,6 +124,17 @@ struct page *find_or_create_page(struct address_space *mapping, pgoff_t index,
                                  gfp_t gfp_mask);
 struct page *grab_cache_page_write_begin(struct address_space *mapping,
                                          pgoff_t index);
+
+/* A locked page at `index`, created if missing, or NULL rather than waiting
+ * for a lock someone else holds. zisofs fills the neighbours of the page it
+ * was asked for this way and simply skips one that is busy. */
+static inline struct page *grab_cache_page_nowait(struct address_space *mapping,
+                                                  pgoff_t index)
+{
+	return pagecache_get_page(mapping, index,
+	                          FGP_LOCK | FGP_CREAT | FGP_NOFS | FGP_NOWAIT,
+	                          mapping_gfp_mask(mapping));
+}
 struct page *read_cache_page(struct address_space *mapping, pgoff_t index,
                              int (*filler)(struct file *, struct folio *),
                              struct file *file);

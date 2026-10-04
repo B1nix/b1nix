@@ -1,0 +1,108 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Finish an installed b1nix: run by Calamares (shellprocess@b1nix-target) after
+# the root has been copied, outside the target, with the target's root as $1.
+#
+#   1. the kernel from the live medium onto the ESP (mounted at <root>/boot),
+#      and an initramfs for it built inside the target
+#   2. Limine: the boot entries (b1nix-update-bootloader, the same writer an
+#      installed system uses on every kernel upgrade), BOOTX64.EFI at the
+#      removable-media path and the BIOS stages in the BIOS boot partition
+#   3. snapper on a btrfs root, with its snapshots in the @snapshots subvolume
+#
+# Calamares' own bootloader module installs GRUB or systemd-boot; b1nix boots
+# with Limine, so this replaces it.
+set -eu
+
+ROOT="${1:-}"
+MEDIUM="${MEDIUM:-/run/live/medium}"
+BIOS_BOOT_GUID=21686148-6449-6e6f-744e-656564454649
+
+say() { echo "b1nix-install-target: $*"; }
+die() {
+	echo "b1nix-install-target: $*" >&2
+	exit 1
+}
+
+[ -n "$ROOT" ] && [ -d "$ROOT" ] || die "usage: $0 <target root>"
+mountpoint -q "$ROOT/boot" || die "the ESP is not mounted at $ROOT/boot"
+
+# ── 1. the kernel ───────────────────────────────────────────────────────────
+release=$(ls "$ROOT/usr/lib/modules" | head -1)
+[ -n "$release" ] || die "no kernel release under $ROOT/usr/lib/modules"
+[ -f "$MEDIUM/boot/b1nix" ] || die "no kernel on the live medium at $MEDIUM/boot/b1nix"
+say "installing kernel $release"
+cp "$MEDIUM/boot/b1nix" "$ROOT/boot/b1nix-$release"
+chroot "$ROOT" mkinitramfs -o "/boot/initrd-$release" "$release" ||
+	die "building the initramfs failed"
+
+# ── 2. the boot entries ─────────────────────────────────────────────────────
+root_dev=$(findmnt -n -o SOURCE --target "$ROOT" | sed 's/\[.*\]$//')
+root_fs=$(findmnt -n -o FSTYPE --target "$ROOT")
+root_uuid=$(blkid -s UUID -o value "$root_dev")
+[ -n "$root_uuid" ] || die "no UUID on the root device $root_dev"
+extra=""
+[ "$root_fs" != btrfs ] || extra="rootflags=subvol=@"
+# The console the medium was booted with is the console the system uses: a
+# machine installed over a serial line keeps answering on it.
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in
+	console=*) extra="$extra $arg" ;;
+	esac
+done
+cat >"$ROOT/etc/default/b1nix-boot" <<EOF
+CMDLINE_EXTRA="$extra"
+TIMEOUT=3
+EOF
+chroot "$ROOT" env ESP=/boot ROOT_SPEC="UUID=$root_uuid" /usr/sbin/b1nix-update-bootloader ||
+	die "writing the boot entries failed"
+
+limine_data="$ROOT/usr/share/limine"
+[ -f "$limine_data/BOOTX64.EFI" ] || die "limine is not installed in the target"
+mkdir -p "$ROOT/boot/EFI/BOOT"
+cp "$limine_data/BOOTX64.EFI" "$ROOT/boot/EFI/BOOT/BOOTX64.EFI"
+cp "$limine_data/limine-bios.sys" "$ROOT/boot/limine-bios.sys"
+
+esp_dev=$(findmnt -n -o SOURCE --target "$ROOT/boot")
+disk=/dev/$(lsblk -n -o PKNAME "$esp_dev" | head -1)
+[ -b "$disk" ] || die "could not find the disk the ESP $esp_dev is on"
+# The BIOS stages go into the BIOS boot partition when there is one (Calamares
+# makes it on a machine that booted the medium through BIOS); a disk installed
+# from UEFI boots through BOOTX64.EFI alone.
+bios_part=""
+for part in $(lsblk -n -l -o NAME "$disk" | tail -n +2); do
+	if [ "$(blkid -p -s PART_ENTRY_TYPE -o value "/dev/$part" 2>/dev/null)" = "$BIOS_BOOT_GUID" ]; then
+		bios_part=$(blkid -p -s PART_ENTRY_NUMBER -o value "/dev/$part")
+		break
+	fi
+done
+if [ -n "$bios_part" ]; then
+	say "installing Limine's BIOS stages into $disk partition $bios_part"
+	chroot "$ROOT" limine bios-install "$disk" "$bios_part" ||
+		die "limine bios-install failed"
+fi
+sync
+
+# ── 3. snapper ──────────────────────────────────────────────────────────────
+# snapper create-config makes its own .snapshots subvolume inside the root; the
+# layout keeps snapshots in @snapshots instead, beside @ rather than under it,
+# so a rollback of @ does not take the snapshots with it.
+if [ "$root_fs" = btrfs ] && chroot "$ROOT" sh -c 'command -v snapper' >/dev/null; then
+	say "configuring snapper for the root"
+	umount "$ROOT/.snapshots"
+	rmdir "$ROOT/.snapshots"
+	chroot "$ROOT" snapper --no-dbus -c root create-config / ||
+		die "snapper create-config failed"
+	btrfs subvolume delete "$ROOT/.snapshots" >/dev/null ||
+		die "could not drop the .snapshots subvolume snapper made"
+	mkdir "$ROOT/.snapshots"
+	mount -o subvol=@snapshots "$root_dev" "$ROOT/.snapshots" ||
+		die "could not mount @snapshots back"
+	chmod 0750 "$ROOT/.snapshots"
+fi
+# ── 4. the live session's leftovers ─────────────────────────────────────────
+# The live root logs in without a password; the installed system administers
+# through sudo, as Debian does when no root password is given, so root is
+# locked rather than left open.
+chroot "$ROOT" passwd -l root >/dev/null || die "could not lock root"
+say "done"

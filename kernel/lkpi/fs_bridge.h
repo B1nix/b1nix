@@ -69,6 +69,10 @@ int lkpi_bridge_iterate(void *dir, unsigned long long cookie,
 int lkpi_bridge_create(void *dir, const char *name, unsigned int mode);
 int lkpi_bridge_mkdir(void *dir, const char *name, unsigned int mode);
 int lkpi_bridge_mknod(void *dir, const char *name, unsigned int mode);
+/* Any other ioctl on a file or directory of an imported filesystem: handed to
+ * the filesystem's own unlocked_ioctl, which reads and writes `arg` in the
+ * caller's memory itself. -ENOTTY when the filesystem has none. */
+long lkpi_bridge_ioctl(void *node, unsigned int cmd, unsigned long arg);
 int lkpi_bridge_fitrim(void *node, unsigned long long start,
                        unsigned long long len, unsigned long long minlen,
                        unsigned long long *trimmed);

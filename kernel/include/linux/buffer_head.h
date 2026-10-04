@@ -256,6 +256,12 @@ void bh_readahead_batch(int nr, struct buffer_head *bhs[], blk_opf_t op_flags);
 void __bh_read_batch(int nr, struct buffer_head *bhs[], blk_opf_t op_flags,
                      bool force_lock);
 
+/* Read every one of them and wait, as upstream's inline does. */
+static inline void bh_read_batch(int nr, struct buffer_head *bhs[])
+{
+	__bh_read_batch(nr, bhs, 0, true);
+}
+
 void mark_buffer_dirty(struct buffer_head *bh);
 void mark_buffer_dirty_inode(struct buffer_head *bh, struct inode *inode);
 void mark_buffer_write_io_error(struct buffer_head *bh);

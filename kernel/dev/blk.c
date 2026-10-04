@@ -488,9 +488,20 @@ int blk_unregister(struct block_device *dev) {
 
 /* Bijective base-26 suffix: 0 -> a, 25 -> z, 26 -> aa, 701 -> zz, 702 -> aaa.
  * Same sequence Linux's disk_name() produces. */
+/* CD-ROMs are numbered, not lettered: sr0, sr1, as Linux names them. udev's
+ * cdrom rules match sr[0-9]* and nothing else, so a drive named "sra" was
+ * never asked what disc it held and its medium never got a by-label link. */
+static int blk_prefix_numbered(const char *prefix) {
+  return prefix && strcmp(prefix, "sr") == 0;
+}
+
 void blk_disk_name(const char *prefix, usize index, char *out, usize out_size) {
   if (!out || out_size == 0)
     return;
+  if (blk_prefix_numbered(prefix)) {
+    snprintf(out, out_size, "%s%lu", prefix, (unsigned long)index);
+    return;
+  }
   char suffix[8];
   usize n = 0;
   long i = (long)index;
@@ -536,8 +547,13 @@ static usize blk_next_disk_index(const char *prefix) {
     const char *suffix = dev->name + plen;
     if (*suffix == '\0')
       continue;
-    while (*suffix >= 'a' && *suffix <= 'z')
-      suffix++;
+    if (blk_prefix_numbered(prefix)) {
+      while (*suffix >= '0' && *suffix <= '9')
+        suffix++;
+    } else {
+      while (*suffix >= 'a' && *suffix <= 'z')
+        suffix++;
+    }
     if (*suffix != '\0')
       continue; /* e.g. "sd"-prefixed but not a letter name — not in sequence */
     used++;

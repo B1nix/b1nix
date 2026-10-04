@@ -58,7 +58,7 @@ mkdir -p "$SRC_PARENT"
 
 # Bumped whenever this script stages something new, so a tree staged by an
 # older copy of it is replaced rather than silently built without the addition.
-STAGE_REV=3
+STAGE_REV=4
 if [ -f "$STAGE_DIR/B1NIX-OBJECTS" ] &&
 	[ "$(cat "$STAGE_DIR/B1NIX-STAGE-REV" 2>/dev/null)" = "$STAGE_REV" ]; then
 	echo "$STAGE_DIR"
@@ -83,7 +83,7 @@ if [ "$have" != "$LINUX_SHA256" ]; then
 	exit 1
 fi
 
-echo "fetch-linux-fs: staging fs/{btrfs,ext4,jbd2} from linux-${LINUX_VERSION}" >&2
+echo "fetch-linux-fs: staging fs/{btrfs,ext4,jbd2,fat,isofs} from linux-${LINUX_VERSION}" >&2
 rm -rf "$STAGE_DIR.tmp"
 mkdir -p "$STAGE_DIR.tmp"
 
@@ -169,6 +169,17 @@ tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
 	"linux-${LINUX_VERSION}/include/linux/msdos_fs.h" \
 	"linux-${LINUX_VERSION}/include/uapi/linux/msdos_fs.h"
 
+# ISO 9660, which is what a CD and every hybrid live image is: Rock Ridge
+# names, Joliet names and zisofs-compressed files are all extensions of the
+# same format, and the imported driver reads all three. It stands on buffer
+# heads, as FAT does, on the nls tables for Joliet and on lib/zlib_inflate for
+# zisofs, all already here. iso_fs.h is the on-disk layout; cdrom.h is the
+# ioctl structures it asks a CD drive for the last session through.
+tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
+	"linux-${LINUX_VERSION}/fs/isofs" \
+	"linux-${LINUX_VERSION}/include/uapi/linux/iso_fs.h" \
+	"linux-${LINUX_VERSION}/include/uapi/linux/cdrom.h"
+
 # The uapi headers the three trees include. Named individually rather than
 # staging include/uapi/linux wholesale: that directory is 500 files, most of
 # them nothing to do with a filesystem, and a wholesale copy would shadow the
@@ -232,6 +243,9 @@ emit_objs() {
 	# msdos-y is a one-line assignment followed by a blank line, so the range
 	# above runs on into the KUnit line after it; KUnit is not built here.
 	emit_objs fs/fat fat-y vfat-y msdos-y | grep -v '_test\.c$'
+	# Joliet and zisofs are Kconfig-gated additions to the -y set; both are
+	# built (CONFIG_JOLIET, CONFIG_ZISOFS), so all three lists are taken.
+	emit_objs fs/isofs isofs-y 'isofs-\$(CONFIG_JOLIET)' 'isofs-\$(CONFIG_ZISOFS)'
 	echo "fs/nls/nls_base.c"
 	echo "fs/nls/nls_cp437.c"
 	echo "fs/nls/nls_iso8859-1.c"

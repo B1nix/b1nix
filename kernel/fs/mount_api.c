@@ -135,6 +135,17 @@ static void fsctx_release(struct vfs_handle *h) {
 static void mountfd_release(struct vfs_handle *h) {
   struct mountfd_state *m = h->private_data;
 
+  /* The descriptor is a directory descriptor on the mount's root, and a
+   * handle with release ops of its own gets no automatic put of its node
+   * (vfs_handle_release does one or the other). Without this put the root
+   * kept one reference per fsmount/open_tree descriptor ever closed, and the
+   * mount could never be unmounted: umount answered EBUSY. It also goes
+   * before the detached release below, whose umount counts the root's
+   * references. */
+  if (h->kind == VFS_HANDLE_NODE && h->node) {
+    vfs_node_put(h->node);
+    h->node = 0;
+  }
   if (!m)
     return;
   if (!m->attached && m->detached_id >= 0)

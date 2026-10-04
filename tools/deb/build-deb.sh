@@ -38,6 +38,8 @@ CHROOT="$ROOT_DIR/tools/deb/debian-chroot.sh"
 # Makefile, so all its package needs is binutils that read the target's ELF.
 CHROOT_ARCH="${CHROOT_ARCH:-amd64}"
 B1CC_DIR="${B1CC_DIR:-$ROOT_DIR/third_party/b1cc}"
+# Upstream release tarballs (Limine), fetched once and checked every time.
+UPSTREAM_CACHE="${UPSTREAM_CACHE:-$ROOT_DIR/build/packages/upstream}"
 
 log() { printf '\033[1;34m[build-deb]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[build-deb] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -77,6 +79,10 @@ DATE=$(date -uR)
 # repository's commit date, commit count and hash, under a 0~ that any real
 # b1cc release number sorts above.
 B1CC_COMMIT=$(git -C "$B1CC_DIR" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
+# Limine is not in Debian, so its revision says whose package it is; 0b1nix1
+# sorts below a Debian upload of the same upstream version, should one appear.
+LIMINE_VERSION=$(sed -n 's/^VERSION=//p' "$ROOT_DIR/packaging/limine/release.conf")
+LIMINE_DEB_VERSION="$LIMINE_VERSION-0b1nix1"
 B1CC_DEB_VERSION="0~git$(git -C "$B1CC_DIR" log -1 --format=%cd --date=format:%Y%m%d 2>/dev/null || echo 0).$(git -C "$B1CC_DIR" rev-list --count HEAD 2>/dev/null || echo 0).$B1CC_COMMIT-1"
 
 # The release packages published before this one.
@@ -135,6 +141,8 @@ render() { # src-file dst-file
 	    -e "s|@REPO_SUITE@|$REPO_SUITE|g" \
 	    -e "s|@B1CC_DEB_VERSION@|$B1CC_DEB_VERSION|g" \
 	    -e "s|@B1CC_COMMIT@|$B1CC_COMMIT|g" \
+	    -e "s|@LIMINE_VERSION@|$LIMINE_VERSION|g" \
+	    -e "s|@LIMINE_DEB_VERSION@|$LIMINE_DEB_VERSION|g" \
 	    "$1" >"$2"
 }
 
@@ -188,6 +196,18 @@ build_b1nix_kernel() {
 	# to compile against.
 	mkdir -p "$_dst/artifacts/include"
 	cp -a "$ROOT_DIR/kernel/include/." "$_dst/artifacts/include/"
+	# The loadable modules and their index. The kernel loads isofs, ntfs,
+	# hda, ipv6 and their dependencies from /lib/modules/<release> once the
+	# root is up; a package without them leaves an installed system with no
+	# IPv6 and no way to mount a CD.
+	mkdir -p "$_dst/artifacts/modules"
+	ls "$KERNEL_BUILD_DIR"/modules/*.ko >/dev/null 2>&1 ||
+		die "no modules in $KERNEL_BUILD_DIR/modules -- build the kernel first"
+	cp "$KERNEL_BUILD_DIR"/modules/*.ko "$_dst/artifacts/modules/"
+	for f in modules.dep modules.alias modules.builtin; do
+		cp "$KERNEL_BUILD_DIR/inc/.modules-stage/$f" "$_dst/artifacts/modules/" ||
+			die "no $f for the kernel modules"
+	done
 
 	run_build b1nix-kernel "$_dst"
 }
@@ -216,6 +236,27 @@ build_b1cc() {
 		cp -a "$B1CC_DIR/$f" "$_dst/"
 	done
 	run_build b1cc "$_dst"
+}
+
+build_limine() {
+	_conf="$ROOT_DIR/packaging/limine/release.conf"
+	_url=$(sed -n 's/^URL=//p' "$_conf")
+	_sum=$(sed -n 's/^SHA256=//p' "$_conf")
+	_tar="$UPSTREAM_CACHE/limine-$LIMINE_VERSION-binary.tar.xz"
+	mkdir -p "$UPSTREAM_CACHE"
+	if [ ! -f "$_tar" ]; then
+		log "fetching Limine $LIMINE_VERSION"
+		curl -sSfL -o "$_tar.part" "$_url" || die "could not fetch $_url"
+		mv "$_tar.part" "$_tar"
+	fi
+	[ "$(sha256sum "$_tar" | cut -d' ' -f1)" = "$_sum" ] ||
+		die "$_tar does not match the checksum in $_conf -- refusing it"
+	_dst=$(stage_source limine)
+	mkdir -p "$_dst/upstream"
+	tar -C "$_dst/upstream" --strip-components=1 -xJf "$_tar" ||
+		die "could not unpack $_tar"
+	rm -f "$_dst/release.conf"
+	run_build limine "$_dst"
 }
 
 run_build() { # name staged-dir
@@ -260,7 +301,7 @@ mkdir -p "$OUT/src"
 if [ $# -gt 0 ]; then
 	TARGETS="$*"
 elif [ "$DEB_ARCH" = "$CHROOT_ARCH" ]; then
-	TARGETS="b1nix-kernel b1nix-meta b1cc"
+	TARGETS="b1nix-kernel b1nix-meta b1cc limine b1nix-installer-config"
 else
 	# The architecture-independent packages are built once, natively; another
 	# architecture adds its kernel.
@@ -272,6 +313,8 @@ for t in $TARGETS; do
 	b1nix-kernel) build_b1nix_kernel ;;
 	b1nix-meta) build_b1nix_meta ;;
 	b1cc) build_b1cc ;;
+	limine) build_limine ;;
+	b1nix-installer-config) run_build b1nix-installer-config "$(stage_source b1nix-installer-config)" ;;
 	*) die "unknown source package '$t'" ;;
 	esac
 done
@@ -289,7 +332,10 @@ for d in "$OUT"/*.deb; do
 	_pkg=$(basename "$d" | sed 's/_.*//')
 	_ver=$(basename "$d" | sed 's/^[^_]*_//; s/_[^_]*$//')
 	_want="$DEB_VERSION"
-	[ "$_pkg" != "b1cc" ] || _want="$B1CC_DEB_VERSION"
+	case "${_pkg%-dbgsym}" in
+	b1cc) _want="$B1CC_DEB_VERSION" ;;
+	limine) _want="$LIMINE_DEB_VERSION" ;;
+	esac
 	[ "$_ver" != "$_want" ] || continue
 	log "removing superseded $(basename "$d")"
 	rm -f "$d"

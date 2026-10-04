@@ -97,7 +97,7 @@ MODULE_OUT_DIR := $(BUILD_DIR)/modules
 # port I/O, none of which exist on the aarch64 port (QEMU virt exposes no HDA
 # and this kernel has no PCI driver there). Shipping a module that can never
 # load just leaves a permanently unloadable file in /lib/modules.
-MODULE_NAMES := isofs ntfs hda ipv6 ndp ntp
+MODULE_NAMES := ntfs hda ipv6 ndp ntp
 MODULE_KOS := $(patsubst %,$(MODULE_OUT_DIR)/%.ko,$(MODULE_NAMES))
 INITRAMFS_MODULES_INC := $(INC_DIR)/initramfs_modules.inc
 
@@ -1193,6 +1193,9 @@ COMMON_CFLAGS += -isystem $(FS_IMPORT_DIR)/include -isystem $(FS_IMPORT_DIR)/inc
 ifeq ($(B1NIX_FS_IMPORT),1)
 # ext4 and jbd2 are in this link as well, so main.c runs their entry points too.
 COMMON_CFLAGS += -DB1NIX_FS_IMPORT_EXT4=1
+# So are FAT and isofs; isofs used to be a module, and modprobe/depmod are
+# told it is built in now rather than missing.
+MODULES_BUILTIN += fs/isofs/isofs
 else
 COMMON_CFLAGS += -DB1NIX_FS_IMPORT_EXT4=0
 endif
@@ -1209,7 +1212,7 @@ FS_IMPORT_ALL_NAMES := $(shell cat $(FS_IMPORT_DIR)/B1NIX-OBJECTS 2>/dev/null)
 ifeq ($(B1NIX_FS_IMPORT),btrfs)
 # lib/maple_tree.c stays: btrfs uses it too, so it is not part of what ext4
 # brings with it.
-FS_IMPORT_NAMES := $(filter-out fs/ext4/% fs/jbd2/% fs/mbcache.c fs/fat/% fs/nls/%,$(FS_IMPORT_ALL_NAMES))
+FS_IMPORT_NAMES := $(filter-out fs/ext4/% fs/jbd2/% fs/mbcache.c fs/fat/% fs/isofs/% fs/nls/%,$(FS_IMPORT_ALL_NAMES))
 else
 FS_IMPORT_NAMES := $(FS_IMPORT_ALL_NAMES)
 endif
@@ -1239,6 +1242,7 @@ FS_IMPORT_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
 	-DCONFIG_FAT_DEFAULT_IOCHARSET='"iso8859-1"' \
 	-DCONFIG_FAT_DEFAULT_UTF8=1 \
 	-DCONFIG_NLS_DEFAULT='"iso8859-1"' \
+	-DCONFIG_JOLIET=1 -DCONFIG_ZISOFS=1 \
 	-DB1NIX_FS_IMPORT=1 \
 	-DCONFIG_CPU_LITTLE_ENDIAN=1 -D__LITTLE_ENDIAN=1234 \
 	-D__BYTE_ORDER=1234 \
@@ -1708,7 +1712,6 @@ $$(MODULE_OUT_DIR)/$(1).ko: $(2) kernel/include/b1nix/module.h kernel/include/b1
 	fi
 endef
 
-$(eval $(call B1NIX_MODULE_RULE,isofs,kernel/fs/isofs/isofs.c))
 $(eval $(call B1NIX_MODULE_RULE,ntfs,kernel/fs/ntfs/ntfs.c))
 $(eval $(call B1NIX_MODULE_RULE,hda,kernel/dev/hda.c))
 $(eval $(call B1NIX_MODULE_RULE,ipv6,kernel/net/ipv6.c))
@@ -2933,9 +2936,13 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 	@# thing nobody can review.
 	@sh tools/image/mk-btrfs-test-image.sh $(BUILD_DIR) || true
 	@if [ -f $(BUILD_DIR)/btrfs-test.img ]; then $(CIC) $(BUILD_DIR)/btrfs-test.img $(BUILD_DIR)/rootfs/btrfs-test.img; fi
-	@# And an ISO 9660 one, for the module tests: what they check is that a
-	@# mounted filesystem pins the module providing it, and btrfs stopped being
-	@# a module when the imported implementation replaced ours.
+	@# An NTFS one, for the module tests: what they check is that a mounted
+	@# filesystem pins the module providing it, and btrfs and isofs both
+	@# stopped being modules when the imported implementations replaced ours.
+	@sh tools/image/mk-ntfs-test-image.sh $(BUILD_DIR) || true
+	@if [ -f $(BUILD_DIR)/ntfs-test.img ]; then $(CIC) $(BUILD_DIR)/ntfs-test.img $(BUILD_DIR)/rootfs/ntfs-test.img; fi
+	@# And an ISO 9660 one with Rock Ridge, Joliet and zisofs, for the iso9660
+	@# smoke (long names, symlinks, large and compressed files).
 	@sh tools/image/mk-isofs-test-image.sh $(BUILD_DIR) || true
 	@if [ -f $(BUILD_DIR)/isofs-test.img ]; then $(CIC) $(BUILD_DIR)/isofs-test.img $(BUILD_DIR)/rootfs/isofs-test.img; fi
 	@# Self-contained TLS test PKI. The loopback HTTPS smokes (M32 curl, M53

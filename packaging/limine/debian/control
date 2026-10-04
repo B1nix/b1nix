@@ -1,0 +1,20 @@
+Source: limine
+Section: admin
+Priority: optional
+Maintainer: b1nix maintainers <maintainers@b1nix.invalid>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Homepage: https://limine-bootloader.org
+Rules-Requires-Root: no
+
+Package: limine
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: modern multiprotocol boot loader
+ Limine boots b1nix on BIOS and UEFI machines. This package carries the
+ firmware-side loaders (BOOTX64.EFI, BOOTAA64.EFI, the BIOS stages and the
+ CD images) and the `limine` tool that installs the BIOS stages into a disk's
+ boot sector and partition.
+ .
+ Built by the b1nix project from Limine's binary release, because Debian does
+ not package Limine.

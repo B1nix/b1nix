@@ -47,9 +47,9 @@ LIMINE_DATADIR="${LIMINE_DATADIR:-$(limine --print-datadir 2>/dev/null || echo /
 
 # What an installed b1nix needs to reach a login prompt. Deliberately short:
 # the desktop is a separate package and a separate phase.
-SYSTEM_PKGS="${SYSTEM_PKGS:-systemd-sysv udev dbus-broker kmod initramfs-tools \
-	util-linux e2fsprogs btrfs-progs iproute2 iputils-ping ca-certificates \
-	less nano procps strace}"
+# The package list lives in its own file because the live medium is built from
+# the same root (tools/image/mk-b1nix-iso.sh).
+SYSTEM_PKGS="${SYSTEM_PKGS:-$(grep -v '^#' "$ROOT_DIR/tools/image/b1nix-system-packages" | tr '\n' ' ')}"
 
 log() { printf '\033[1;34m[mk-image]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[mk-image] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -300,6 +300,11 @@ if command -v strace >/dev/null 2>&1; then
 		say "strace-pid1=FAIL state=$_p1"
 	fi
 fi
+# Ownership as Debian set it: an image built by an ordinary user once recorded
+# every file as that user's.
+say "shadow-owner=$(stat -c %U:%G /etc/shadow 2>&1)"
+# The modules the kernel loads from /lib/modules once the root is up.
+say "modules=$(awk '{print $1}' /proc/modules 2>/dev/null | sort | tr '\n' ' ')"
 # The policy calls Debian units use, answered by the kernel rather than guessed.
 say "sched-idle=$(chrt --idle 0 true 2>&1 | head -1; echo rc=$?)"
 
@@ -460,13 +465,16 @@ ROOT_IMG="$WORK/root-$PROFILE.img"
 rm -f "$ROOT_IMG"
 # /boot lives on the ESP; leaving its content in the root filesystem too would
 # double the kernel and hide which copy is actually booted.
-rm -rf "$WORK/stage-$PROFILE"
+sh "$CHROOT" nsrun "rm -rf '$WORK/stage-$PROFILE'" || die "could not clear the old stage"
 mkdir -p "$WORK/stage-$PROFILE"
-tar -C "$ROOTFS" --exclude=./boot/* --exclude=./proc/* --exclude=./sys/* \
-	--exclude=./src --exclude=./.b1nix-chroot-ready -cf - . |
-	tar -C "$WORK/stage-$PROFILE" -xf -
-mke2fs -q -t ext4 -L "$ROOT_LABEL" -d "$WORK/stage-$PROFILE" "$ROOT_IMG" "${ROOT_MIB}m" ||
-	die "mke2fs failed"
+# Both inside the chroot's user namespace (debian-chroot.sh nsrun), where the
+# tree's files carry their real owners: run as the host user, mke2fs recorded
+# every file as owned by whoever built the image.
+STAGE="$WORK/stage-$PROFILE"
+sh "$CHROOT" nsrun "tar -C '$ROOTFS' --exclude=./boot/* --exclude=./proc/* --exclude=./sys/* \
+	--exclude=./src --exclude=./.b1nix-chroot-ready -cf - . | tar -C '$STAGE' --same-owner -xf - &&
+	mke2fs -q -t ext4 -L '$ROOT_LABEL' -d '$STAGE' '$ROOT_IMG' '${ROOT_MIB}m'" ||
+	die "staging or mke2fs failed"
 
 # ── 4. the disk ─────────────────────────────────────────────────────────────
 # Three partitions: a BIOS boot partition for Limine's stage 2, the ESP, and

@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# What scripts/b1nix-live needs in the initramfs: a klibc initramfs has a
+# shell and mount but not losetup, btrfs, readlink -f or sed.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "${1:-}" in
+prereqs) prereqs; exit 0 ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+for tool in /usr/sbin/losetup /usr/bin/btrfs /usr/bin/mount /usr/bin/readlink \
+	/usr/bin/sed /usr/bin/sleep /usr/bin/tr /usr/sbin/blkid /usr/bin/dd /usr/bin/head /usr/bin/ls; do
+	copy_exec "$tool"
+done
+copy_exec /usr/sbin/insmod
+# isofs.ko by path: the module index is the kernel's own format, which the
+# initramfs tools do not read, and the script loads it by name anyway.
+[ -f "/usr/lib/modules/${version}/isofs.ko" ] &&
+	copy_file module "/usr/lib/modules/${version}/isofs.ko"
+exit 0

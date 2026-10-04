@@ -113,6 +113,10 @@ fi
 
 # ── stage 3: install into a clean chroot ────────────────────────────────────
 info "installing from the repository into a clean $SUITE chroot"
+# Fresh every run: a chroot left from the last one already has the overlay
+# installed -- its shipped apt source included -- and is no longer the clean
+# machine this stage is about.
+CHROOT_BASE="$TEST_BASE" sh "$CHROOT" clean >>"$LOG" 2>&1 || stage_die clean-test-chroot
 CHROOT_BASE="$TEST_BASE" BUILD_DEPS="$TEST_DEPS" sh "$CHROOT" create >>"$LOG" 2>&1 ||
 	stage_die create-test-chroot
 # Prove the tools the checks depend on are really there. A missing readelf
@@ -207,6 +211,12 @@ if in_test_chroot "readelf -S /boot/b1nix-$release >/tmp/sections && grep -q kal
 	ok "kernel-keeps-kallsyms"
 else
 	bad "kernel-keeps-kallsyms" "the .kallsyms blob did not survive the strip: panics would print bare addresses"
+fi
+
+if in_test_chroot "test -f /usr/lib/modules/$release/isofs.ko && test -f /usr/lib/modules/$release/ipv6.ko && grep -q '^ipv6.ko:' /usr/lib/modules/$release/modules.dep" >>"$LOG" 2>&1; then
+	ok "kernel-modules"
+else
+	bad "kernel-modules" "/usr/lib/modules/$release lacks the loadable modules or their modules.dep"
 fi
 
 if in_test_chroot "grep -q '^ID=b1nix' /etc/os-release && grep -q '^ID_LIKE=debian' /etc/os-release" >>"$LOG" 2>&1; then

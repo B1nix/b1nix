@@ -1,0 +1,38 @@
+Source: b1nix-installer-config
+Section: admin
+Priority: optional
+Maintainer: b1nix maintainers <maintainers@b1nix.invalid>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Homepage: https://github.com/B1nix/b1nix
+Rules-Requires-Root: no
+
+Package: b1nix-installer-config
+Architecture: all
+Depends: ${misc:Depends},
+         initramfs-tools,
+         btrfs-progs,
+         kmod,
+         limine,
+         calamares,
+         polkitd,
+         snapper,
+         rsync,
+         dosfstools,
+         xserver-xorg-core,
+         xserver-xorg-video-fbdev,
+         xinit,
+         xvfb,
+         xdotool,
+         x11-utils,
+         fonts-dejavu-core
+Description: b1nix live medium and installer configuration
+ What turns the b1nix root tree into a live medium and an installer: the
+ initramfs boot script that runs the live session from the medium (boot=
+ b1nix-live), the live session itself (an automatic root login and the
+ b1nix-install launcher), the Calamares configuration and branding, and the
+ script that installs Limine onto the target instead of Calamares' own
+ bootloader module.
+ .
+ Installed on the live medium only; the installer removes it from the system
+ it installs.

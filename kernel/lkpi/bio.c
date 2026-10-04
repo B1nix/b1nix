@@ -427,6 +427,7 @@ static int bio_submit_range(struct block_device *dev, unsigned int op,
 	u64 byte_off = sector << LKPI_SECTOR_SHIFT;
 	u64 lba;
 	u32 count;
+	int rc;
 
 	if (block_size == 0 || (byte_off % block_size) != 0 ||
 	    (len % block_size) != 0) {
@@ -436,9 +437,19 @@ static int bio_submit_range(struct block_device *dev, unsigned int op,
 	}
 	lba = byte_off / block_size;
 	count = (u32)(len / block_size);
+	/*
+	 * Success is any non-negative answer, and it is folded to 0 here because
+	 * the caller tests for exactly 0. The block cache answers 0 itself, but a
+	 * device it does not cache -- anything whose blocks are not 512 bytes, a
+	 * CD-ROM's 2048 -- is read straight through its driver, and a driver may
+	 * answer with the block count: every read of a CD through this path
+	 * succeeded and was reported as an I/O error.
+	 */
 	if (op == LKPI_REQ_OP_READ)
-		return blk_read_cached(dev, lba, count, buf);
-	return blk_write_cached(dev, lba, count, buf);
+		rc = blk_read_cached(dev, lba, count, buf);
+	else
+		rc = blk_write_cached(dev, lba, count, buf);
+	return rc < 0 ? -1 : 0;
 }
 
 void submit_bio(struct lkpi_bio *bio)

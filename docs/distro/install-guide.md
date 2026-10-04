@@ -88,15 +88,9 @@ b1nix keeps the previous kernel installed and both appear in the boot menu.
 After three failed attempts with a new kernel, the previous one becomes the
 default automatically.
 
-To recover by hand: boot the USB stick, choose the rescue entry, then
-
-```
-sudo mount /dev/sdXn /mnt              # your root partition
-sudo mount /dev/sdXm /mnt/boot         # your EFI partition
-sudo mount --rbind /dev /mnt/dev && sudo mount --rbind /proc /mnt/proc && sudo mount --rbind /sys /mnt/sys
-sudo chroot /mnt
-apt install --reinstall b1nix-kernel-<previous version>
-```
+To recover by hand, boot the USB stick: its live session is the rescue
+system. [rescue.md](rescue.md) has the steps -- rewriting the boot entries,
+reinstalling a kernel, undoing an upgrade with snapper.
 
 ## Reporting a problem
 

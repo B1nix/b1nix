@@ -18,6 +18,11 @@ struct tm {
 };
 
 void time64_to_tm(time64_t totalsecs, int offset, struct tm *result);
+/* The inverse: a calendar date and time (month 1..12, full year) as seconds
+ * since the epoch. ISO 9660 stores its timestamps this way. */
+time64_t mktime64(const unsigned int year, const unsigned int mon,
+                  const unsigned int day, const unsigned int hour,
+                  const unsigned int min, const unsigned int sec);
 
 /* The machine's timezone as settimeofday last set it. FAT stores local time,
  * and converts through this. */

@@ -4,6 +4,7 @@
 #include <b1nix/ahci.h>
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
+#include <b1nix/errno.h>
 #include <b1nix/ktime.h>
 #include <b1nix/irq.h>
 #include <b1nix/mm.h>
@@ -275,6 +276,8 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
  */
 static int ahci_wait_ci_clear_bounded(volatile struct ahci_port *p,
                                       u32 slot_mask, u64 timeout_ms);
+static int ahci_port_tf_error(volatile struct ahci_port *p);
+static void ahci_port_error_recover(volatile struct ahci_port *p);
 static void ahci_port_disable(struct ahci_port_state *port,
                               volatile struct ahci_port *p, const char *why);
 
@@ -342,17 +345,32 @@ static int ahci_packet_command_bounded(struct ahci_port_state *port,
   p->ci = 1;
 
   if (timeout_ms) {
-    if (ahci_wait_ci_clear_bounded(p, 1, timeout_ms) != 0) {
+    int w = ahci_wait_ci_clear_bounded(p, 1, timeout_ms);
+    if (w == -2) {
+      ahci_port_error_recover(p);
+      ahci_port_unlock(port);
+      return -1;
+    }
+    if (w != 0) {
       ahci_port_disable(port, p, "did not answer a packet command");
       ahci_port_unlock(port);
       return -1;
     }
   } else {
-    ahci_wait_ci_clear(port, p, 1, "packet", port->port_num);
+    /* The I/O path may wait for ever, but not on a command the device has
+     * already failed: that one never clears. */
+    while (p->ci & 1) {
+      if (ahci_port_tf_error(p))
+        break;
+      for (int i = 0; i < 256; i++)
+        cpu_relax();
+      scheduler_yield();
+    }
   }
 
   u32 tfd = p->tfd;
   if (tfd & 0x01) {
+    ahci_port_error_recover(p);
     ahci_port_unlock(port);
     return -1;
   }
@@ -660,6 +678,49 @@ static int ahci_blk_read(struct block_device *dev, u64 lba, u32 count,
   return ahci_port_read(port, lba, count, buffer);
 }
 
+/* SCSI pass-through for SG_IO and the CDROM_* ioctls: udev's cdrom_id asks
+ * the drive what it is and what medium it holds with INQUIRY, GET
+ * CONFIGURATION, READ TOC and their kin, and without answers to those a CD is
+ * never given its /dev/disk/by-label link -- which is how a live medium finds
+ * itself. ATAPI carries exactly these commands, so they go to the drive as
+ * they are. Bounded: a command the drive never completes stops the port
+ * rather than holding the caller for ever. */
+#define AHCI_SCSI_TIMEOUT_MS 10000
+static int ahci_blk_scsi_cmd(struct block_device *dev, const u8 *cdb,
+                             u32 cdb_len, void *buf, u32 len, u8 *sense,
+                             u32 sense_len, u32 *sense_out) {
+  struct ahci_port_state *port = (struct ahci_port_state *)dev->priv;
+  u8 acmd[12];
+
+  if (sense_out)
+    *sense_out = 0;
+  if (!cdb || cdb_len == 0 || cdb_len > sizeof(acmd))
+    return -EINVAL; /* ATAPI packets are 12 bytes; there is no 16-byte form */
+  if (len > 0xFFFE)
+    return -EINVAL; /* the byte-count limit register is 16 bits */
+  memset(acmd, 0, sizeof(acmd));
+  memcpy(acmd, cdb, cdb_len);
+  if (ahci_packet_command_bounded(port, acmd, len ? buf : 0, len,
+                                  AHCI_SCSI_TIMEOUT_MS) == 0)
+    return 0;
+  if (!port->present)
+    return -EIO;
+  /* CHECK CONDITION: fetch the sense data the error left behind. */
+  u8 rs[12] = {0x03, 0, 0, 0, 18, 0};
+  u8 sbuf[18];
+  memset(sbuf, 0, sizeof(sbuf));
+  if (ahci_packet_command_bounded(port, rs, sbuf, sizeof(sbuf),
+                                  AHCI_SCSI_TIMEOUT_MS) != 0)
+    return -EIO;
+  if (sense && sense_len) {
+    u32 n = sense_len < sizeof(sbuf) ? sense_len : (u32)sizeof(sbuf);
+    memcpy(sense, sbuf, n);
+    if (sense_out)
+      *sense_out = n;
+  }
+  return 1;
+}
+
 /* A CD-ROM's blocks, through the packet path. Read-only: a write to it fails
  * rather than pretending, because there is no write path here to take it. */
 static int ahci_blk_packet_read(struct block_device *dev, u64 lba, u32 count,
@@ -780,10 +841,37 @@ static void ahci_port_init(struct ahci_port_state *port,
  * userspace, every time it was booted on q35.
  *
  * Returns 0 when the slot cleared, -1 on the deadline. */
+/* The device answered the command with an error: the task file shows ERR with
+ * BSY clear. The HBA then stops processing the command list and leaves the
+ * command's PxCI bit SET -- waiting for it to clear waits for ever. */
+static int ahci_port_tf_error(volatile struct ahci_port *p) {
+  u32 tfd = p->tfd;
+  return (tfd & 0x01) && !(tfd & 0x80);
+}
+
+/* AHCI 1.3 section 6.2.2.1, the recovery a task-file error requires: stop the
+ * command engine (which also clears PxCI), clear the error state, start it
+ * again. A packet device reports every CHECK CONDITION this way -- a TEST
+ * UNIT READY after a disc change, an INQUIRY for a page it lacks -- and
+ * without this the port answered nothing after its first one. */
+static void ahci_port_error_recover(volatile struct ahci_port *p) {
+  p->cmd &= ~AHCI_PxCMD_ST;
+  u64 deadline = ktime_monotonic_ns() + 500ull * 1000000ull;
+  while ((p->cmd & AHCI_PxCMD_CR) && ktime_monotonic_ns() < deadline)
+    cpu_relax();
+  p->serr = p->serr;
+  p->is = p->is;
+  p->cmd |= AHCI_PxCMD_ST;
+}
+
+/* Returns 0 when the command completed, -2 when the device answered with an
+ * error (the caller recovers the port), -1 on the deadline. */
 static int ahci_wait_ci_clear_bounded(volatile struct ahci_port *p,
                                       u32 slot_mask, u64 timeout_ms) {
   u64 deadline = ktime_monotonic_ns() + timeout_ms * 1000000ull;
   while (p->ci & slot_mask) {
+    if (ahci_port_tf_error(p))
+      return -2;
     for (int i = 0; i < 256; i++)
       cpu_relax();
     if (ktime_monotonic_ns() >= deadline)
@@ -1086,6 +1174,7 @@ void ahci_init(void) {
         dev->priv = &ports[i];
         dev->read_blocks = ahci_blk_packet_read;
         dev->write_blocks = 0; /* read-only medium */
+        dev->scsi_cmd = ahci_blk_scsi_cmd;
         dev->rotational = 1;
         blk_register_disk(dev, "sr", BLK_BUS_ATA);
         ahci_device_count++;

@@ -27,7 +27,9 @@
  *   lsmod           lsmod's output agrees with /proc/modules row for row.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -245,8 +247,8 @@ static void t_sysfs_params(void) {
   }
   /* Also present for a module with no parameters of its own: the per-module
    * directory itself. */
-  if (access("/sys/module/isofs/refcnt", R_OK) != 0) {
-    fail("sysfs-params", "no /sys/module/isofs/refcnt");
+  if (access("/sys/module/ntfs/refcnt", R_OK) != 0) {
+    fail("sysfs-params", "no /sys/module/ntfs/refcnt");
     return;
   }
   ok("sysfs-params");

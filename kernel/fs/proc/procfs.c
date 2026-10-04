@@ -1299,7 +1299,7 @@ static int w_sys_coredump_max(usize pid, const char *buf, usize len) {
 static int r_filesystems(usize pid, struct sbuf *s) {
   (void)pid;
   /* The live registry, not a fixed list: a filesystem that arrives with a
-   * module (isofs.ko, ntfs.ko, btrfs.ko) has to show up here, and disappear
+   * module (ntfs.ko) has to show up here, and disappear
    * again when the module is removed. */
   struct vfs_fs_info fs[48];
   usize n = vfs_list_filesystems(fs, sizeof(fs) / sizeof(fs[0]));

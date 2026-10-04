@@ -2,6 +2,7 @@
 #include <b1nix/termios_abi.h>
 #include <b1nix/arch.h>
 #include <b1nix/blk.h>
+#include <b1nix/ktime.h>
 #include <b1nix/loop.h>
 #include <b1nix/md.h>
 #include <b1nix/mtd.h>
@@ -2934,7 +2935,7 @@ isize vfs_readdir_children(struct vfs_node *dir, usize offset,
 
   usize start = offset, idx = 0, count = 0;
   if (idx >= start && count < max_entries) {
-    copy_path(buf[count].name, 64, ".");
+    copy_path(buf[count].name, sizeof(buf[count].name), ".");
     buf[count].type = (u32)VFS_DIRECTORY;
     buf[count].is_dir = 1;
     buf[count].is_exec = 1;
@@ -2944,7 +2945,7 @@ isize vfs_readdir_children(struct vfs_node *dir, usize offset,
   }
   idx++;
   if (idx >= start && count < max_entries) {
-    copy_path(buf[count].name, 64, "..");
+    copy_path(buf[count].name, sizeof(buf[count].name), "..");
     buf[count].type = (u32)VFS_DIRECTORY;
     buf[count].is_dir = 1;
     buf[count].is_exec = 1;
@@ -2962,7 +2963,7 @@ isize vfs_readdir_children(struct vfs_node *dir, usize offset,
     if (child->deleted)
       continue;
     if (idx >= start) {
-      copy_path(buf[count].name, 64, child->name);
+      copy_path(buf[count].name, sizeof(buf[count].name), child->name);
       buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
       buf[count].is_exec = 0;
@@ -2987,7 +2988,7 @@ isize vfs_readdir_children_filtered(struct vfs_node *dir, usize offset,
   for (int dot = 0; dot < 2; dot++, idx++) {
     if (idx < start || count >= max_entries)
       continue;
-    copy_path(buf[count].name, 64, dot ? ".." : ".");
+    copy_path(buf[count].name, sizeof(buf[count].name), dot ? ".." : ".");
     buf[count].type = (u32)VFS_DIRECTORY;
     buf[count].is_dir = 1;
     buf[count].is_exec = 1;
@@ -3004,7 +3005,7 @@ isize vfs_readdir_children_filtered(struct vfs_node *dir, usize offset,
     if (child->deleted || !keep(child))
       continue;
     if (idx >= start) {
-      copy_path(buf[count].name, 64, child->name);
+      copy_path(buf[count].name, sizeof(buf[count].name), child->name);
       buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
       buf[count].is_exec = 0;
@@ -6000,8 +6001,8 @@ static u64 fs_magic_for_type(const char *fstype) {
     return 0xEF53ull;
   if (strcmp(fstype, "vfat") == 0 || strcmp(fstype, "fat32") == 0)
     return 0x4d44ull; /* MSDOS_SUPER_MAGIC */
-  if (strcmp(fstype, "iso9660") == 0)
-    return 0x9660ull;
+  if (strcmp(fstype, "iso9660") == 0 || strcmp(fstype, "isofs") == 0)
+    return 0x9660ull; /* ISOFS_SUPER_MAGIC */
   if (strcmp(fstype, "btrfs") == 0)
     return 0x9123683Eull;
   if (strcmp(fstype, "ntfs") == 0)
@@ -7236,6 +7237,8 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
     vfs_node_put(target_node);
     return -ENODEV;
   }
+  if (fs->flags & VFS_FS_RDONLY)
+    flags |= MS_RDONLY;
 
   /* Pin the module for as long as the mount lives: without this, rmmod frees
    * the text every operation on the mount calls into. Fails only when the
@@ -7913,7 +7916,7 @@ static void mount_table_trace(const char *why) {
   }
 }
 
-int vfs_move_mount(const char *source, const char *target) {
+static int vfs_move_mount_impl(const char *source, const char *target) {
   if (!vfs_may_mount())
     return -EPERM;
   if (!source || !source[0] || !target || !target[0])
@@ -8014,6 +8017,40 @@ int vfs_move_mount(const char *source, const char *target) {
     module_boot_root_arrived();
   mount_table_trace(dst);
   return 0;
+}
+
+/* Is the mount at `path` (resolved) a devtmpfs? */
+static int mount_is_devtmpfs_at(const char *path) {
+  int found = 0;
+
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  u32 ns = vfs_current_mnt_ns();
+  for (usize i = 0; i < mount_hwm; i++)
+    if (mount_visible_in(i, ns) && strcmp(mounts[i].target, path) == 0)
+      found = strcmp(mounts[i].fstype, "devtmpfs") == 0;
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  return found;
+}
+
+int vfs_move_mount(const char *source, const char *target) {
+  int rc = vfs_move_mount_impl(source, target);
+
+  /* A devtmpfs arriving at /dev is populated there. mount(2) populates as it
+   * mounts, because its target is /dev from the start; the new mount API's
+   * fsmount() mounts it at a private place first, where the device nodes --
+   * created by absolute path -- went into the /dev underneath, and
+   * move_mount() then covered that /dev with an empty filesystem. util-linux
+   * mount(8) takes this route, and an initramfs that used it had no
+   * /dev/null and no /dev/console. */
+  if (rc == 0) {
+    char dst[VFS_MAX_PATH];
+
+    vfs_resolve_path(target, dst);
+    if (strcmp(dst, "/dev") == 0 && mount_is_devtmpfs_at(dst))
+      vfs_populate_dev();
+  }
+  return rc;
 }
 
 /* Is this block device the source of a live mount? A self-test that wants a
@@ -9290,7 +9327,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     u64 cookie = (u64)offset;
     usize count = 0;
     if (cookie == 0 && count < max_entries) {
-      copy_path(buf[count].name, 64, ".");
+      copy_path(buf[count].name, sizeof(buf[count].name), ".");
       buf[count].type = (u32)VFS_DIRECTORY;
       buf[count].is_dir = 1;
       buf[count].is_exec = 1;
@@ -9299,7 +9336,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
       cookie = 1;
     }
     if (cookie == 1 && count < max_entries) {
-      copy_path(buf[count].name, 64, "..");
+      copy_path(buf[count].name, sizeof(buf[count].name), "..");
       buf[count].type = (u32)VFS_DIRECTORY;
       buf[count].is_dir = 1;
       buf[count].is_exec = 1;
@@ -9312,7 +9349,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     vfs_tree_read_acquire(&tflags);
     struct vfs_node *child = next_child_by_seq(dir, seq_above);
     while (child && count < max_entries) {
-      copy_path(buf[count].name, 64, child->name);
+      copy_path(buf[count].name, sizeof(buf[count].name), child->name);
       buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
       buf[count].is_exec = 0;
@@ -9394,7 +9431,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
         child = next_child_by_seq(dir, seq_above);
         continue;
       }
-      copy_path(buf[count].name, 64, child->name);
+      copy_path(buf[count].name, sizeof(buf[count].name), child->name);
       buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
       buf[count].is_exec = 0;
@@ -9425,7 +9462,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
   usize count = 0;
 
   if (idx >= start && count < max_entries) {
-    copy_path(buf[count].name, 64, ".");
+    copy_path(buf[count].name, sizeof(buf[count].name), ".");
     buf[count].type = (u32)VFS_DIRECTORY;
     buf[count].is_dir = 1;
     buf[count].is_exec = 1;
@@ -9434,7 +9471,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
   }
   idx++;
   if (idx >= start && count < max_entries) {
-    copy_path(buf[count].name, 64, "..");
+    copy_path(buf[count].name, sizeof(buf[count].name), "..");
     buf[count].type = (u32)VFS_DIRECTORY;
     buf[count].is_dir = 1;
     buf[count].is_exec = 1;
@@ -9457,7 +9494,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
       continue;
     }
     if (idx >= start) {
-      copy_path(buf[count].name, 64, child->name);
+      copy_path(buf[count].name, sizeof(buf[count].name), child->name);
       buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
       buf[count].is_exec = 0;
@@ -10333,6 +10370,151 @@ static int vfs_ioctl_fitrim(struct vfs_node *node, void *arg) {
   return syscall_copyout(arg, &range, sizeof(range)) < 0 ? -EFAULT : 0;
 }
 
+/* ── SG_IO and the CD-ROM ioctls ─────────────────────────────────────────
+ * For a block device whose driver passes SCSI commands through (scsi_cmd).
+ * The structures are Linux's: sg_io_hdr is <scsi/sg.h>'s, and only its
+ * interface 'S' exists on a block device there too. */
+struct lx_sg_io_hdr {
+  i32 interface_id;
+  i32 dxfer_direction;
+  u8 cmd_len;
+  u8 mx_sb_len;
+  u16 iovec_count;
+  u32 dxfer_len;
+  u64 dxferp;
+  u64 cmdp;
+  u64 sbp;
+  u32 timeout;
+  u32 flags;
+  i32 pack_id;
+  u64 usr_ptr;
+  u8 status;
+  u8 masked_status;
+  u8 msg_status;
+  u8 sb_len_wr;
+  u16 host_status;
+  u16 driver_status;
+  i32 resid;
+  u32 duration;
+  u32 info;
+};
+
+#define LX_SG_IO 0x2285
+#define LX_SG_DXFER_NONE (-1)
+#define LX_SG_DXFER_FROM_DEV (-3)
+#define LX_CDROM_MEDIA_CHANGED 0x5325
+#define LX_CDROM_DRIVE_STATUS 0x5326
+#define LX_CDROM_LOCKDOOR 0x5329
+#define LX_CDROM_GET_CAPABILITY 0x5331
+#define LX_CDC_LOCK 0x4
+#define LX_CDC_MEDIA_CHANGED 0x80
+#define LX_CDC_DRIVE_STATUS 0x800
+#define LX_CDC_GENERIC_PACKET 0x1000
+#define LX_CDS_NO_DISC 1
+#define LX_CDS_DISC_OK 4
+#define LX_SCSI_CHECK_CONDITION 0x02
+#define LX_DRIVER_SENSE 0x08
+#define LX_SG_INFO_CHECK 0x1
+
+static int vfs_blk_cdrom_ioctl(struct block_device *bd, u64 request,
+                               void *arg) {
+  switch (request) {
+  case LX_CDROM_GET_CAPABILITY:
+    /* What this driver really does: report the drive's state, lock the tray
+     * and pass packets through. No audio, no tray motor, no speed control. */
+    return LX_CDC_LOCK | LX_CDC_MEDIA_CHANGED | LX_CDC_DRIVE_STATUS |
+           LX_CDC_GENERIC_PACKET;
+  case LX_CDROM_DRIVE_STATUS: {
+    /* TEST UNIT READY: GOOD means a readable disc is in the drive. A drive
+     * reports UNIT ATTENTION once after a disc goes in (and after a reset),
+     * which says nothing about whether one is there now: Linux's
+     * scsi_test_unit_ready() asks again, and so does this. Answering "no
+     * disc" to that first question made blkid skip the live medium. */
+    for (int attempt = 0; attempt < 3; attempt++) {
+      u8 tur[6] = {0};
+      u8 sense[18];
+      u32 sense_n = 0;
+      int rc = bd->scsi_cmd(bd, tur, sizeof(tur), 0, 0, sense, sizeof(sense),
+                            &sense_n);
+      if (rc < 0)
+        return rc;
+      if (rc == 0)
+        return LX_CDS_DISC_OK;
+      if (sense_n < 3 || (sense[2] & 0x0F) != 0x06) /* not UNIT ATTENTION */
+        return LX_CDS_NO_DISC;
+    }
+    return LX_CDS_NO_DISC;
+  }
+  case LX_CDROM_MEDIA_CHANGED:
+    /* The medium is fixed for the life of the device here: a changed disc
+     * re-registers it. */
+    return 0;
+  case LX_CDROM_LOCKDOOR: {
+    /* PREVENT ALLOW MEDIUM REMOVAL, prevent bit from the argument. */
+    u8 pamr[6] = {0x1E, 0, 0, 0, (u8)((usize)arg ? 1 : 0), 0};
+    int rc = bd->scsi_cmd(bd, pamr, sizeof(pamr), 0, 0, 0, 0, 0);
+    return rc < 0 ? rc : (rc == 0 ? 0 : -EIO);
+  }
+  case LX_SG_IO: {
+    struct lx_sg_io_hdr h;
+    if (!arg || syscall_copyin(&h, arg, sizeof(h)) < 0)
+      return -EFAULT;
+    if (h.interface_id != 'S')
+      return -EINVAL;
+    if (h.iovec_count)
+      return -EINVAL; /* scatter lists are not taken */
+    if (h.dxfer_direction != LX_SG_DXFER_NONE &&
+        h.dxfer_direction != LX_SG_DXFER_FROM_DEV)
+      return -EINVAL; /* nothing here writes through a packet */
+    if (h.cmd_len == 0 || h.cmd_len > 16 || !h.cmdp)
+      return -EINVAL;
+    u32 len = h.dxfer_direction == LX_SG_DXFER_FROM_DEV ? h.dxfer_len : 0;
+    if (len > 65536)
+      return -EINVAL;
+    u8 cdb[16];
+    if (syscall_copyin(cdb, (const void *)(usize)h.cmdp, h.cmd_len) < 0)
+      return -EFAULT;
+    u8 *buf = 0;
+    if (len) {
+      buf = kzalloc(len);
+      if (!buf)
+        return -ENOMEM;
+    }
+    u8 sense[32];
+    u32 sense_n = 0;
+    u32 sense_cap = h.mx_sb_len < sizeof(sense) ? h.mx_sb_len : sizeof(sense);
+    u64 t0 = ktime_monotonic_ns();
+    int rc = bd->scsi_cmd(bd, cdb, h.cmd_len, buf, len, sense, sense_cap,
+                          &sense_n);
+    if (rc < 0) {
+      kfree(buf);
+      return rc;
+    }
+    if (rc == 0 && len &&
+        syscall_copyout((void *)(usize)h.dxferp, buf, len) < 0) {
+      kfree(buf);
+      return -EFAULT;
+    }
+    kfree(buf);
+    if (sense_n && h.sbp &&
+        syscall_copyout((void *)(usize)h.sbp, sense, sense_n) < 0)
+      return -EFAULT;
+    h.status = rc ? LX_SCSI_CHECK_CONDITION : 0;
+    h.masked_status = h.status >> 1;
+    h.msg_status = 0;
+    h.sb_len_wr = (u8)sense_n;
+    h.host_status = 0;
+    h.driver_status = rc ? LX_DRIVER_SENSE : 0;
+    h.resid = 0;
+    h.duration = (u32)((ktime_monotonic_ns() - t0) / 1000000ull);
+    h.info = rc ? LX_SG_INFO_CHECK : 0;
+    return syscall_copyout(arg, &h, sizeof(h)) < 0 ? -EFAULT : 0;
+  }
+  default:
+    return -ENOTTY;
+  }
+}
+
 int vfs_ioctl(int fd, u64 request, void *arg) {
   /* Handles with their own ioctl op (pty master/slave) take priority — they
    * are raw handles with no backing VFS node. */
@@ -10539,6 +10721,19 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
     return md_autorun() > 0 ? 0 : -ENODEV;
   }
 
+
+  /* SG_IO and the CD-ROM ioctls, for a device that passes SCSI commands
+   * through (an ATAPI CD-ROM). Linux answers these on /dev/sr*, and udev's
+   * cdrom_id is built on them: without them the drive is not recognised as
+   * one, its medium is never probed, and the medium gets no by-label link. */
+  if (node->inode->blk_dev && node->inode->blk_dev->scsi_cmd)
+  {
+    struct block_device *bd = node->inode->blk_dev;
+    int rc = vfs_blk_cdrom_ioctl(bd, request, arg);
+
+    if (rc != -ENOTTY)
+      return rc;
+  }
 
   if (!arg)
     return -EINVAL;

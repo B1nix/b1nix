@@ -57,6 +57,7 @@ override_dh_auto_install:
 	# /usr/lib, not /lib: trixie is merged-/usr and a package that writes to
 	# the aliased path is an error, not a style question.
 	install -d debian/$(PKG)/usr/lib/modules/$(RELEASE)
+	install -m 0644 artifacts/modules/* debian/$(PKG)/usr/lib/modules/$(RELEASE)/
 	# ── what every release shares ───────────────────────────────────────
 	# The boot-counting mechanism: the initramfs hook that spends a try, and
 	# the unit that marks a boot good. docs/distro/boot-counting.md says why

@@ -4266,7 +4266,7 @@ check_output "$LOG" "M86-SMOKE: done" "M86 CPU-accounting/signal-targeting suite
 check_output "$LOG" "M95-SMOKE: ok proc-modules" "/proc/modules lists every .ko in /lib/modules, all Live and mapped in the 0xffffffffc0000000 module region"
 check_output "$LOG" "M95-SMOKE: ok bb-modutils" "BusyBox modinfo, rmmod/insmod and depmod -n work against the real module ABI and index"
 check_output "$LOG" "M95-SMOKE: ok modinfo" "a .ko's .modinfo carries name/license and a vermagic matching the running kernel release"
-check_output "$LOG" "M95-SMOKE: ok fs-modules" "isofs and ntfs arrived as modules and btrfs is built in; all three registered themselves in /proc/filesystems"
+check_output "$LOG" "M95-SMOKE: ok fs-modules" "ntfs arrived as a module and btrfs and iso9660 are built in; all three registered themselves in /proc/filesystems"
 check_output "$LOG" "M95-SMOKE: ok sound-module" "the HDA driver is a live module and its sysfs coresize matches /proc/modules"
 check_output "$LOG" "M95-SMOKE: ok rmmod-insmod" "unloading ntfs withdraws the filesystem type; loading it back restores it"
 check_output "$LOG" "M95-SMOKE: ok refcount" "ipv6 is referenced by ndp, sysfs refcnt agrees, and removing it reports EBUSY"
@@ -4274,20 +4274,38 @@ check_output "$LOG" "M95-SMOKE: ok dup-load" "loading an already-loaded module r
 check_output "$LOG" "M95-SMOKE: ok vermagic-reject" "a .ko whose vermagic was corrupted is refused with ENOEXEC while the intact one still loads"
 check_output "$LOG" "M95-SMOKE: ok init-module" "init_module(2) loads a module image straight out of process memory"
 check_output "$LOG" "M95-SMOKE: ok unpriv" "an unprivileged process cannot delete a module (EPERM) and the module survives"
-# The guest proves this by mounting the btrfs image and then trying to unload
-# btrfs.ko, so it needs an image -- and there is none when mkfs.btrfs was absent
-# when the disks were made. The guest already reports that case as a skip with
-# the reason; without the same condition here the harness demanded an "ok" the
-# guest had correctly declined to print, and a host without btrfs-progs failed a
-# check about module reference counting.
-if command -v mkfs.btrfs >/dev/null 2>&1; then
+# The guest proves this by mounting the ntfs image and then trying to unload
+# ntfs.ko, so it needs an image -- and there is none when python3 was absent
+# when the machine was built (tools/image/mk-ntfs-test-image.sh lays the volume
+# out with it). The guest already reports that case as a skip with the reason;
+# without the same condition here the harness demanded an "ok" the guest had
+# correctly declined to print.
+if command -v python3 >/dev/null 2>&1; then
 	check_output "$LOG" "M95-SMOKE: ok fs-in-use" "a module providing a mounted filesystem cannot be unloaded (EBUSY), and can again once it is unmounted"
 else
 	skipped "a module providing a mounted filesystem cannot be unloaded (EBUSY)" \
-		"no btrfs image on this host (mkfs.btrfs absent), so there is no mounted module-backed filesystem to pin"
+		"no ntfs image on this host (python3 absent), so there is no mounted module-backed filesystem to pin"
 fi
 check_output "$LOG" "M95-SMOKE: ok filesystems-nodev" "/proc/filesystems marks every pseudo filesystem nodev and no block-backed one"
 check_output "$LOG" "M95-SMOKE: done" "M95 loadable-kernel-module suite completes"
+# ── iso9660: the imported Linux isofs ──
+# The image is built with xorriso (tools/image/mk-isofs-test-image.sh); the
+# guest says "skip loop" when it is missing, and so does the harness.
+if command -v xorriso >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+	check_output "$LOG" "ISOFS-SMOKE: ok fsmount-loop" "an ISO on a loop device mounts through fsopen/fsconfig/fsmount/move_mount with Rock Ridge names, a symlink, a 5 MiB file and a zisofs file all reading back exactly"
+	check_output "$LOG" "ISOFS-SMOKE: ok mount-loop" "mount(2) of an ISO without MS_RDONLY gives the same tree, recorded ro, with writes refused EROFS"
+	check_output "$LOG" "ISOFS-SMOKE: ok loop-on-iso" "a file on a mounted ISO attached to a loop device reads back through it, as a live system reaches its root image"
+	check_output "$LOG" "ISOFS-SMOKE: ok isofs-alias" "the iso9660 driver also mounts under its driver name, isofs"
+else
+	skipped "the imported isofs mounts a Rock Ridge ISO on a loop device" \
+		"no xorriso/python3 on this host, so there is no ISO image in the machine"
+fi
+if [ "$ARCH" = "x86_64" ]; then
+	check_output "$LOG" "ISOFS-SMOKE: ok cdrom" "mount -t iso9660 -o ro mounts the AHCI boot CD (2048-byte sectors) and the kernel ELF on it reads whole"
+else
+	skipped "the boot CD mounts as iso9660" "the aarch64 machine boots without a CD drive"
+fi
+check_output "$LOG" "ISOFS-SMOKE: done" "iso9660 suite completes"
 # ── M96: network protocol modules, module parameters, modprobe ──
 check_output "$LOG" "M96-SMOKE: ok proto-modules" "ipv6, ndp and ntp are loaded as modules and the IPv6 stack is serving"
 check_output "$LOG" "M96-SMOKE: ok sysfs-params" "/sys/module/<name>/parameters exposes a module parameter with its compiled-in default"

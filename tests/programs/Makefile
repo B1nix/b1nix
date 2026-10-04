@@ -345,6 +345,9 @@ endif
 BINARIES += $(BUILD)/bin/m86_smoke
 BINARIES += $(BUILD)/bin/m95_smoke
 BINARIES += $(BUILD)/bin/m96_smoke
+# The imported Linux isofs: Rock Ridge, zisofs, the new mount API, a loop
+# device and (x86_64) the AHCI boot CD.
+BINARIES += $(BUILD)/bin/isofs_smoke
 BINARIES += $(BUILD)/bin/m107_smoke
 # M109: AF_PACKET, pivot_root(2), volume identity, and UTS/mount namespaces.
 # M109: the merged /dev listing, findfs/blkid, and mount(MS_MOVE).

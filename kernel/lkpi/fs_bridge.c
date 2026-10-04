@@ -892,6 +892,30 @@ int lkpi_bridge_setattr(void *nodep, unsigned int mode, unsigned int uid,
 	return ret;
 }
 
+/* The filesystem's own ioctls -- btrfs's whole management interface (device
+ * add, subvolumes, snapshots, balance), which btrfs-progs, snapper and every
+ * installer drive -- go to its unlocked_ioctl on a file assembled for the
+ * call, as reads and writes do. The handler copies its arguments from the
+ * caller's memory itself; this runs in the caller's system call. */
+long lkpi_bridge_ioctl(void *nodep, unsigned int cmd, unsigned long arg)
+{
+	struct dentry *d = nodep;
+	struct file f;
+	long ret;
+
+	if (!d || !d->d_inode)
+		return -EINVAL;
+	ret = bridge_open(&f, d, 0);
+	if (ret)
+		return ret;
+	if (!f.f_op || !f.f_op->unlocked_ioctl)
+		ret = -ENOTTY;
+	else
+		ret = f.f_op->unlocked_ioctl(&f, cmd, arg);
+	bridge_close(&f);
+	return ret;
+}
+
 /* FITRIM. The ioctl copies its range from user memory, so the filesystems'
  * own trim entry points are called with a kernel copy instead. */
 /* ext4 is in the link only with B1NIX_FS_IMPORT=1, a flag these objects are

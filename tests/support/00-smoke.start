@@ -253,6 +253,7 @@ run_test /bin/m108_smoke sys
 run_test /bin/m86_smoke posix
 run_test /bin/m95_smoke posix
 run_test /bin/m96_smoke posix
+run_test /bin/isofs_smoke posix
 run_test /bin/m107_smoke posix
 # M109: the uevent hot-plug channel. Creates and destroys /dev/loop8 and runs
 # mdev, so it must not overlap another test touching /dev — hence the same

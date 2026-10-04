@@ -1,0 +1,13 @@
+[Unit]
+Description=b1nix unattended installation (INSTALL-SMOKE)
+ConditionKernelCommandLine=b1nix.install-smoke
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/b1nix/installer/b1nix-install-smoke
+StandardOutput=journal
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

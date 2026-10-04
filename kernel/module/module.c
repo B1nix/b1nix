@@ -1410,10 +1410,10 @@ int request_module(const char *name) {
 
 /* The modules the kernel itself asks for at boot. Each is optional: a kernel
  * whose initramfs carries none of them still boots, just without the optional
- * filesystems, the sound device and the IPv6 stack. btrfs is no longer one of
- * them: it is built in, the imported implementation. */
+ * filesystems, the sound device and the IPv6 stack. btrfs and isofs are no
+ * longer among them: both are built in, the imported implementations. */
 static const char *const module_boot_list[] = {
-    "isofs", "ntfs", "hda", "ndp", "ipv6", "ntp",
+    "ntfs", "hda", "ndp", "ipv6", "ntp",
 };
 
 static int g_module_boot_deferred;
@@ -1440,8 +1440,8 @@ void module_boot_root_arrived(void) {
 void module_init_builtin_deps(void) {
   for (usize i = 0; i < sizeof(module_boot_list) / sizeof(module_boot_list[0]);
        i++) {
-    /* 60 + index, so a boot that stops in here names the module: 60 isofs,
-     * 61 ntfs, 62 btrfs, 63 hda, 64 ndp, 65 ipv6, 66 ntp. */
+    /* 60 + index, so a boot that stops in here names the module: 60 ntfs,
+     * 61 hda, 62 ndp, 63 ipv6, 64 ntp. */
     BOOTMARK(60 + (int)i);
     int rc = request_module(module_boot_list[i]);
     if (rc != 0 && rc != -EEXIST) {

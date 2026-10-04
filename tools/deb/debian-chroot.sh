@@ -166,6 +166,16 @@ enter() {
 	'
 }
 
+# Run a HOST command inside the user namespace the chroot's files belong to:
+# there the tree's root-owned files are uid 0 and its system users their own
+# ids again. Anything that copies the tree into an image -- tar, mke2fs -d,
+# mkfs.btrfs --rootdir -- has to run here, or the image records every file as
+# owned by the person who built it.
+cmd_nsrun() {
+	NS_CMD="$1" unshare -r --map-auto -m sh -c 'eval "$NS_CMD"' ||
+		die "in the user namespace: $1"
+}
+
 cmd_create() {
 	mkdir -p "$CACHE" "$CHROOT_BASE"
 	if verify_layer; then
@@ -182,10 +192,11 @@ cmd_create() {
 	nsrm "$ROOTFS"
 	mkdir -p "$ROOTFS"
 	log "unpacking the base layer"
-	# --no-same-owner: we are an ordinary user on the host side. Ownership
-	# inside the chroot is irrelevant to a build that runs as its fake root,
-	# and dpkg records the ownership it wants in the package itself.
-	tar -C "$ROOTFS" --no-same-owner -xzf "$LAYER_TGZ"
+	# Unpacked inside the user namespace, so the layer's owners survive: the
+	# same tree becomes the distribution's images, and an image whose
+	# /etc/shadow belongs to root:root -- not root:shadow -- because the host
+	# side could not set the group is an image with a broken passwd(1).
+	cmd_nsrun "tar -C '$ROOTFS' --same-owner -xzf '$LAYER_TGZ'"
 
 	cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf" 2>/dev/null || true
 	# apt drops privileges to _apt for downloads, which cannot work when the
@@ -229,7 +240,8 @@ cmd_clean() {
 case "${1:-create}" in
 create) cmd_create ;;
 run) shift; cmd_run "$@" ;;
+nsrun) shift; cmd_nsrun "$@" ;;
 shell) cmd_shell ;;
 clean) cmd_clean ;;
-*) die "usage: $0 [create|run <cmd...>|shell|clean]" ;;
+*) die "usage: $0 [create|run <cmd...>|nsrun <host cmd>|shell|clean]" ;;
 esac

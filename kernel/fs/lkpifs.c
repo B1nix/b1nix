@@ -131,6 +131,7 @@ static int lkpifs_statfs(struct vfs_node *node, struct b1nix_statfs *st);
 static int lkpifs_fitrim(struct vfs_node *node, u64 start, u64 len, u64 minlen,
                          u64 *trimmed);
 static int lkpifs_fsync(struct vfs_node *node);
+static int lkpifs_ioctl(struct vfs_node *node, u64 request, void *arg);
 /* ── extended attributes ────────────────────────────────────────── */
 
 /*
@@ -267,6 +268,7 @@ static void install_ops(struct vfs_node *node, void *handle,
 	node->inode->setflags_cb = lkpifs_setflags;
 	node->inode->statfs_cb = lkpifs_statfs;
 	node->inode->fitrim_cb = lkpifs_fitrim;
+	node->inode->ioctl_cb = lkpifs_ioctl;
 	node->inode->getxattr_cb = lkpifs_getxattr;
 	node->inode->setxattr_cb = lkpifs_setxattr;
 	node->inode->removexattr_cb = lkpifs_removexattr;
@@ -551,11 +553,14 @@ static int lkpifs_emit(void *arg, const char *name, int len,
 	memcpy(f->buf[f->count].name, name, n);
 	f->buf[f->count].name[n] = '\0';
 	/* DT_DIR is 4 and DT_LNK 10 in the getdents ABI the filesystem reports
-	 * against; everything else is listed as a plain file, which is what the
-	 * caller's stat then corrects. */
+	 * against; the other known types are listed as a plain file, which is
+	 * what the caller's stat then corrects. DT_UNKNOWN (0) stays unknown:
+	 * isofs reports every entry that way, and calling its directories files
+	 * sent `find` and every other d_type reader past them. */
 	f->buf[f->count].type = (u32)(type == 4 ? VFS_DIRECTORY
 	                              : type == 10 ? VFS_SYMLINK
 	                              : type == 1 ? VFS_FIFO
+	                              : type == 0 ? 0
 	                                          : VFS_FILE);
 	f->buf[f->count].is_dir = (type == 4);
 	f->buf[f->count].is_exec = 0;
@@ -915,6 +920,16 @@ static int lkpifs_fitrim(struct vfs_node *node, u64 start, u64 len, u64 minlen,
 	return rc;
 }
 
+static int lkpifs_ioctl(struct vfs_node *node, u64 request, void *arg)
+{
+	void *handle = node_handle(node);
+
+	if (!handle)
+		return -EINVAL;
+	return (int)lkpi_bridge_ioctl(handle, (unsigned int)request,
+	                              (unsigned long)(usize)arg);
+}
+
 static int lkpifs_statfs(struct vfs_node *node, struct b1nix_statfs *st)
 {
 	struct lkpi_bridge_statfs b;
@@ -1101,6 +1116,27 @@ static struct vfs_fs lkpifs_fat_types[] = {
 	{ .name = "vfat", .mount = lkpifs_mount_vfat, .umount = lkpifs_umount },
 	{ .name = "msdos", .mount = lkpifs_mount_msdos, .umount = lkpifs_umount },
 };
+
+static struct vfs_node *lkpifs_mount_iso9660(const char *source, u64 flags,
+                                             void *data)
+{
+	(void)data;
+	return lkpifs_mount_type("iso9660", source, flags);
+}
+
+/* isofs is built with FAT, on the same buffer heads. "iso9660" is the type
+ * every fstab, mount(8) and blkid say; "isofs" is the driver's own name, which
+ * older scripts pass. Both are the one imported driver.
+ *
+ * VFS_FS_RDONLY because Linux's isofs refuses a read-write superblock
+ * (EACCES), and a CD mounted without -o ro is read-only on Linux rather than
+ * an error: the drive's block device is read-only and mount(8) retries. */
+static struct vfs_fs lkpifs_iso_types[] = {
+	{ .name = "iso9660", .mount = lkpifs_mount_iso9660, .umount = lkpifs_umount,
+	  .flags = VFS_FS_RDONLY },
+	{ .name = "isofs", .mount = lkpifs_mount_iso9660, .umount = lkpifs_umount,
+	  .flags = VFS_FS_RDONLY },
+};
 #endif
 
 void lkpifs_init(void)
@@ -1114,6 +1150,9 @@ void lkpifs_init(void)
 	for (usize i = 0; i < sizeof(lkpifs_fat_types) / sizeof(lkpifs_fat_types[0]); i++)
 		vfs_register_fs(&lkpifs_fat_types[i]);
 	klog_info("lkpifs: vfat/msdos registered (imported Linux " LKPI_FS_LINUX_VERSION " fat)");
+	for (usize i = 0; i < sizeof(lkpifs_iso_types) / sizeof(lkpifs_iso_types[0]); i++)
+		vfs_register_fs(&lkpifs_iso_types[i]);
+	klog_info("lkpifs: iso9660/isofs registered (imported Linux " LKPI_FS_LINUX_VERSION " isofs)");
 #endif
 }
 
@@ -1201,8 +1240,10 @@ void lkpifs_selftest_type(const char *dev_name, const char *fstype,
 	/* List the root: the entries come from the imported filesystem. */
 	{
 		int fd = vfs_open(mnt);
-		struct dirent ents[16];
-		isize n = fd >= 0 ? vfs_getdents(fd, ents, 16) : -1;
+		/* On the heap: sixteen entries of NAME_MAX names are more than a
+		 * kernel stack frame should carry. */
+		struct dirent *ents = kmalloc(16 * sizeof(*ents));
+		isize n = (fd >= 0 && ents) ? vfs_getdents(fd, ents, 16) : -1;
 		int saw_hello = 0, saw_big = 0, saw_dir = 0;
 
 		for (isize i = 0; i < n; i++) {
@@ -1215,6 +1256,7 @@ void lkpifs_selftest_type(const char *dev_name, const char *fstype,
 		}
 		if (fd >= 0)
 			vfs_close(fd);
+		kfree(ents);
 		if (saw_hello && saw_big && saw_dir) {
 			snprintf(line, sizeof(line), "LKPI-BRIDGE: ok readdir entries=%d\n",
 			         (int)n);

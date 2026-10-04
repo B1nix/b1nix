@@ -1,0 +1,19 @@
+# What an installed b1nix needs to reach a login prompt, one Debian package per
+# line. Deliberately short: the desktop is a separate package and a separate
+# phase. Read by mk-b1nix-image.sh and mk-b1nix-iso.sh, so the image and the
+# live medium are the same root.
+systemd-sysv
+udev
+dbus-broker
+kmod
+initramfs-tools
+util-linux
+e2fsprogs
+btrfs-progs
+iproute2
+iputils-ping
+ca-certificates
+less
+nano
+procps
+strace

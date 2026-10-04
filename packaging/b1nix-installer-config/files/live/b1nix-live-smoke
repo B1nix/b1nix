@@ -1,0 +1,27 @@
+#!/bin/sh
+say() { printf 'LIVE-SMOKE: %s\n' "$*" >/dev/console; }
+i=0
+while [ $i -lt 60 ]; do
+	st=$(timeout 10 systemctl is-system-running 2>&1)
+	case "$st" in running | degraded) break ;; esac
+	jobs=$(timeout 10 systemctl list-jobs --no-legend --no-pager 2>/dev/null | grep -c '[a-z]')
+	[ "$jobs" = "1" ] && break
+	say "startup=$st jobs=$jobs after ${i}s"
+	i=$((i + 5))
+	sleep 5
+done
+say "uname=$(uname -r)"
+say "firmware=$([ -d /sys/firmware/efi ] && echo uefi || echo bios)"
+say "root=$(findmnt -n -o FSTYPE,SOURCE / 2>&1 | tr -s ' ')"
+say "medium=$(findmnt -n -o FSTYPE /run/live/medium 2>&1)"
+if echo b1nix >/var/tmp/live-write-test && [ "$(cat /var/tmp/live-write-test)" = b1nix ]; then
+	say "root-writable=yes"
+else
+	say "root-writable=no"
+fi
+say "seed=$(btrfs filesystem show / 2>&1 | grep -c devid) devices"
+systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' |
+	while read -r u; do [ -n "$u" ] && say "failed-unit=$u"; done
+say "state=$(systemctl is-system-running 2>&1)"
+say "done"
+systemctl poweroff --no-block 2>/dev/null || { sync; echo o >/proc/sysrq-trigger; }

@@ -6,8 +6,13 @@
 
 /* Directory entry returned by SYS_READDIR */
 struct dirent {
-	char  name[64];   /* File/directory name */
-	u32   type;        /* 1 = file, 2 = device, 3 = directory */
+	/* File/directory name: NAME_MAX (255) bytes and the NUL. Every name a
+	 * filesystem can hold has to fit -- Rock Ridge, VFAT and ext4 names run
+	 * to 255 -- or getdents hands out a truncated name that no lookup finds. */
+	char  name[256];
+	/* 1 = file, 2 = device, 3 = directory, 0 = not known from the listing
+	 * (getdents then reports DT_UNKNOWN and the caller stats the entry) */
+	u32   type;
 	u32   is_dir;      /* 1 if directory */
 	u32   is_exec;     /* 1 if executable */
 	u64   size;        /* File size */

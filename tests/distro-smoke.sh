@@ -158,6 +158,19 @@ for _m in boot:vfat tmp:tmpfs runlock:tmpfs; do
 	esac
 done
 
+# The package's modules reach the machine: IPv6 and the CD filesystem are
+# loadable modules, loaded from /lib/modules/<release> after the root mounts.
+_mods=$(marker "$BOOT_LOG" "modules=")
+case "$_mods" in
+*ipv6*isofs* | *isofs*ipv6*) ok "kernel-modules-loaded" ;;
+*) bad "kernel-modules-loaded" "ipv6 and isofs are not in /proc/modules: '${_mods#*modules=}'" ;;
+esac
+
+case "$(marker "$BOOT_LOG" "shadow-owner=")" in
+*shadow-owner=root:shadow) ok "file-ownership" ;;
+*) bad "file-ownership" "/etc/shadow is '$(marker "$BOOT_LOG" "shadow-owner=" | sed 's/.*=//')', not root:shadow" ;;
+esac
+
 case "$(marker "$BOOT_LOG" "strace-pid1=")" in
 *strace-pid1=ok) ok "strace-pid1" ;;
 *) bad "strace-pid1" "tracing PID 1 left it stopped, or strace never ran" ;;

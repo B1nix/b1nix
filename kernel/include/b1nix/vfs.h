@@ -532,6 +532,12 @@ struct vfs_node {
  * nodes by path from inside its callback and would build them in the wrong
  * place. */
 #define VFS_FS_DETACHABLE 0x2
+/* A filesystem with no write path (ISO 9660). Every mount of the type is
+ * read-only whatever the caller asked, and is recorded so: /proc/mounts says
+ * "ro" and a write through it fails with EROFS at the mount, before reaching
+ * the filesystem. On Linux a CD mounts read-only by the same rule, enforced
+ * there by the drive's read-only block device and mount(8)'s retry. */
+#define VFS_FS_RDONLY 0x8
 
 struct module;
 

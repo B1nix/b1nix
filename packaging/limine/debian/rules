@@ -1,0 +1,34 @@
+#!/usr/bin/make -f
+# The loaders are prebuilt by upstream (they are firmware binaries built with
+# Limine's own cross toolchain); only the host tool is compiled here, with the
+# data directory the loaders are installed to compiled in, so that
+# `limine --print-datadir` answers it.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+include /usr/share/dpkg/buildflags.mk
+
+DATADIR := /usr/share/limine
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c99 -D_FILE_OFFSET_BITS=64 \
+		-DLIMINE_DATADIR='"$(DATADIR)"' $(LDFLAGS) upstream/limine.c -o limine
+
+override_dh_auto_install:
+	install -D -m 0755 limine debian/limine/usr/bin/limine
+	for f in BOOTX64.EFI BOOTAA64.EFI BOOTIA32.EFI limine-bios.sys \
+		limine-bios-cd.bin limine-uefi-cd.bin limine-bios-pxe.bin; do \
+		install -D -m 0644 upstream/$$f debian/limine$(DATADIR)/$$f; \
+	done
+
+# The EFI and BIOS images are firmware payloads, not host objects: stripping
+# them would break them, and they have no shared-library dependencies.
+override_dh_strip:
+	dh_strip -Xusr/share/limine
+
+override_dh_dwz:
+
+override_dh_auto_clean:
+	rm -f limine

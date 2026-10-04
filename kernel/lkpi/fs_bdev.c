@@ -306,6 +306,41 @@ static struct block_device *bdev_for(struct b1nix_block_device *dev)
 /* ── opening ────────────────────────────────────────────────────── */
 
 /*
+ * Re-read what the device is, on the first open after it was last closed.
+ *
+ * The pairing above is kept for the device's lifetime, but what is behind a
+ * device can change while nobody has it open: a loop device is detached and
+ * attached to another file, with another size and other contents. The size
+ * and block size cached at the first mount then described the old file --
+ * an ISO mounted from loop0 left loop0 at 5760 blocks, and the next ext4 image
+ * attached there was refused ("block count 32768 exceeds size of device") --
+ * and the device's page cache still held the old file's blocks.
+ *
+ * Linux learns the new capacity from the loop driver (set_capacity) and drops
+ * the old pages at LOOP_CLR_FD; here the first opener does both. Nothing can
+ * hold a buffer of the device while nothing has it open: the last close was
+ * an unmount, which wrote everything back.
+ */
+static void bdev_refresh(struct block_device *bdev)
+{
+	struct lkpi_bdev_link *link = (struct lkpi_bdev_link *)bdev;
+	struct b1nix_block_device *dev = bdev->bd_b1nix;
+
+	if (atomic_read(&bdev->bd_openers) != 0)
+		return;
+	bdev_fill_limits(link, dev);
+	bdev->bd_block_size = link->queue.limits.logical_block_size;
+	bdev->bd_nr_sectors = lkpi_blk_block_count(dev) *
+	                      (bdev->bd_block_size / 512);
+	if (bdev->bd_inode) {
+		bdev->bd_inode->i_size = (loff_t)bdev->bd_nr_sectors << SECTOR_SHIFT;
+		if (bdev->bd_inode->i_mapping)
+			invalidate_mapping_pages(bdev->bd_inode->i_mapping, 0,
+			                         (pgoff_t)-1);
+	}
+}
+
+/*
  * Resolve the device name a mount option gave.
  *
  * b1nix names its disks `sata0`, `nvme0n1` and so on, and a mount passes
@@ -349,6 +384,7 @@ struct block_device *blkdev_get_by_path(const char *path, blk_mode_t mode,
 			return ERR_PTR(-EBUSY);
 		bdev->bd_holder = holder;
 	}
+	bdev_refresh(bdev);
 	bdev->bd_read_only = (mode & BLK_OPEN_WRITE) ? 0 : 1;
 	atomic_inc(&bdev->bd_openers);
 	return bdev;
@@ -371,6 +407,7 @@ struct block_device *blkdev_get_by_dev(dev_t dev, blk_mode_t mode, void *holder,
 			return ERR_PTR(-EBUSY);
 		bdev->bd_holder = holder;
 	}
+	bdev_refresh(bdev);
 	atomic_inc(&bdev->bd_openers);
 	return bdev;
 }

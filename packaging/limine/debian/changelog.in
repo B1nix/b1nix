@@ -1,0 +1,5 @@
+limine (@LIMINE_DEB_VERSION@) @SUITE@; urgency=medium
+
+  * Limine @LIMINE_VERSION@ binary release, packaged for b1nix.
+
+ -- b1nix maintainers <maintainers@b1nix.invalid>  @DATE@

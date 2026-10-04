@@ -1958,6 +1958,13 @@ void d_delete_notify(struct inode *dir, struct dentry *dentry);
 char *d_path(const struct path *path, char *buf, int buflen);
 char *file_path(struct file *file, char *buf, int buflen);
 void nd_terminate_link(void *name, size_t len, size_t maxlen);
+/* The symlink operations for a filesystem that keeps the target as the
+ * inode's first page of data (isofs's Rock Ridge symlinks): get_link reads it
+ * through the mapping's read_folio. */
+extern const struct inode_operations page_symlink_inode_operations;
+/* The file operations of a read-only filesystem's regular files: read through
+ * the page cache, seek, and map read-only. */
+extern const struct file_operations generic_ro_fops;
 const char *page_get_link(struct dentry *dentry, struct inode *inode,
                           struct delayed_call *done);
 const char *simple_get_link(struct dentry *dentry, struct inode *inode,

@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# initramfs-tools boot script for the b1nix live medium: boot=b1nix-live.
+#
+# The medium carries the root filesystem as /live/root.img, a btrfs image made
+# from the same Debian tree as the installed image, compressed with zstd and
+# flagged as a SEED device. A seed is read-only; adding a writable device to a
+# mounted seed "sprouts" a filesystem whose new writes land on the added
+# device. That is the live session's writable layer: a zram device, so the
+# session runs from compressed RAM and the medium is never written. It is
+# btrfs's own copy-on-write doing what an overlay would, which this kernel
+# does not have (docs/kernel/abi-gaps.md).
+#
+# Every step says what failed: a live medium that stops silently is the worst
+# thing a person trying the system can meet.
+
+# panic() offers a shell when there is a console to type into and returns when
+# there is not; either way the boot must not go on to the next step.
+live_fail() {
+	echo "b1nix-live: $*" >&2
+	panic "b1nix-live: $*"
+	exit 1
+}
+
+live_label() {
+	for x in $(cat /proc/cmdline); do
+		case "$x" in
+		b1nix.live-label=*) echo "${x#b1nix.live-label=}"; return ;;
+		esac
+	done
+	echo B1NIX_LIVE
+}
+
+mountroot() {
+	label=$(live_label)
+	medium=/run/live/medium
+	mkdir -p "$medium"
+
+	# Found by its ISO volume label, read with blkid from every block device.
+	# /dev/disk/by-label is not enough: Debian's initramfs carries no cdrom
+	# rules, so on a CD drive udev never probes the disc and never makes the
+	# link -- which is why Debian's own live-boot scans the same way.
+	log_begin_msg "Waiting for the live medium $label"
+	dev=""
+	i=0
+	while [ $i -lt 300 ] && [ -z "$dev" ]; do
+		for b in /sys/class/block/*; do
+			n=${b##*/}
+			case "$n" in loop* | ram* | zram* | md* | nbd*) continue ;; esac
+			if [ "$(blkid -o value -s LABEL "/dev/$n" 2>/dev/null)" = "$label" ]; then
+				dev="/dev/$n"
+				break
+			fi
+		done
+		[ -n "$dev" ] && break
+		sleep 0.2
+		i=$((i + 1))
+	done
+	log_end_msg
+	if [ -z "$dev" ]; then
+		# What was there instead: which block devices exist and what udev
+		# knows of them is the whole question when the medium is missing.
+		for b in /sys/class/block/*; do
+			n=${b##*/}
+			case "$n" in loop* | ram* | zram* | md* | nbd*) continue ;; esac
+			echo "b1nix-live: saw $n: $(udevadm info -q property -n "/dev/$n" 2>&1 | tr '\n' ' ')" >&2
+			echo "b1nix-live: probe $n: $(blkid -p "/dev/$n" 2>&1 | tr '\n' ' ') pvd=$(dd if="/dev/$n" bs=2048 skip=16 count=1 2>&1 | tr -dc 'A-Za-z0-9_ ' | head -c 60)" >&2
+		done
+		live_fail "no device labelled $label appeared"
+	fi
+
+	# The CD filesystem is a loadable module, and the kernel only loads its
+	# boot modules once a root is mounted -- which is what this is doing.
+	grep -q '^isofs ' /proc/modules 2>/dev/null ||
+		insmod "/usr/lib/modules/$(uname -r)/isofs.ko" ||
+		live_fail "could not load isofs.ko"
+	mount -t iso9660 -o ro "$dev" "$medium" ||
+		live_fail "could not mount $dev as iso9660"
+	if [ ! -f "$medium/live/root.img" ]; then
+		echo "b1nix-live: $dev holds: $(ls -a "$medium" "$medium/live" 2>&1 | tr '\n' ' ')" >&2
+		live_fail "$dev has no /live/root.img"
+	fi
+
+	loop=$(losetup --find --show --read-only "$medium/live/root.img") ||
+		live_fail "could not attach $medium/live/root.img to a loop device"
+
+	# The writable layer: half of RAM as compressed swap-less zram.
+	[ -e /sys/block/zram0 ] || modprobe zram 2>/dev/null
+	[ -e /sys/block/zram0 ] || live_fail "no zram device for the writable layer"
+	mem_kb=$(sed -n 's/^MemTotal: *\([0-9]*\) kB/\1/p' /proc/meminfo)
+	[ -n "$mem_kb" ] || live_fail "could not read MemTotal"
+	echo zstd >/sys/block/zram0/comp_algorithm 2>/dev/null
+	echo "$((mem_kb / 2))K" >/sys/block/zram0/disksize ||
+		live_fail "could not size zram0"
+
+	mount -t btrfs -o ro "$loop" "${rootmnt}" ||
+		live_fail "could not mount the seed image $loop"
+	btrfs device add -f /dev/zram0 "${rootmnt}" ||
+		live_fail "could not add zram0 to the seed filesystem"
+	mount -o remount,rw,compress=zstd:1 "${rootmnt}" ||
+		live_fail "could not remount the sprouted filesystem read-write"
+
+	# The medium stays mounted for the installer, which copies from it.
+	mkdir -p "${rootmnt}/run/live/medium"
+	mount -o move "$medium" "${rootmnt}/run/live/medium" 2>/dev/null ||
+		mount --move "$medium" "${rootmnt}/run/live/medium" ||
+		live_fail "could not hand the medium to the live root"
+}

@@ -1024,6 +1024,13 @@ static void page_put_link(void *arg)
  * delayed call, because the string returned points into it.
  */
 const char *page_get_link(struct dentry *dentry, struct inode *inode,
+                          struct delayed_call *done);
+
+const struct inode_operations page_symlink_inode_operations = {
+	.get_link = page_get_link,
+};
+
+const char *page_get_link(struct dentry *dentry, struct inode *inode,
                           struct delayed_call *done)
 {
 	struct address_space *mapping = inode->i_mapping;
@@ -1465,6 +1472,25 @@ int generic_encode_ino32_fh(struct inode *inode, __u32 *fh, int *max_len,
  * timezone is not stored, so FAT's local time is UTC -- what Linux does too
  * until something sets one. */
 struct timezone sys_tz;
+
+/* Gauss's algorithm, as upstream's kernel/time/time.c has it: months are
+ * counted from March so that February, with its leap day, comes last. */
+time64_t mktime64(const unsigned int year0, const unsigned int mon0,
+                  const unsigned int day, const unsigned int hour,
+                  const unsigned int min, const unsigned int sec)
+{
+	unsigned int mon = mon0, year = year0;
+
+	/* 1..12 -> 11,12,1..10 */
+	if (0 >= (int)(mon -= 2)) {
+		mon += 12; /* Puts Feb last since it has leap day */
+		year -= 1;
+	}
+
+	return ((((time64_t)(year / 4 - year / 100 + year / 400 + 367 * mon / 12 + day) +
+	          year * 365 - 719499) *
+	             24 + hour) * 60 + min) * 60 + sec;
+}
 
 /* Seconds since the epoch, plus `offset`, as a calendar date. Days to a civil
  * date by the era method: exact for every year, no tables. */

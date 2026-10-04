@@ -29,9 +29,10 @@
  *                    delete a module (EPERM) and the module stays loaded.
  *   init-module      the raw init_module(2) entry point loads an image read
  *                    into this process's own memory.
- *   fs-in-use        with an isofs image mounted through a loop device, rmmod
- *                    isofs reports EBUSY and the type survives; after the
- *                    umount the very same unload succeeds.
+ *   fs-in-use        with an ntfs image mounted through a loop device (and a
+ *                    file on it read back), rmmod ntfs reports EBUSY and the
+ *                    type survives; after the umount the very same unload
+ *                    succeeds.
  *   filesystems-nodev  /proc/filesystems marks every pseudo filesystem nodev
  *                    and no block-backed one.
  *   bb-modutils      the module utilities are BusyBox applets: modinfo reads a
@@ -39,7 +40,9 @@
  *                    and depmod -n reproduces the shipped modules.dep.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <dirent.h>
 #include <elf.h>
 #include <errno.h>
@@ -345,9 +348,9 @@ static void t_proc_modules(void) {
 
 static void t_modinfo(void) {
   size_t size = 0;
-  char *buf = slurp(modpath("isofs.ko"), &size);
+  char *buf = slurp(modpath("ntfs.ko"), &size);
   if (!buf) {
-    fail("modinfo", "cannot read isofs.ko");
+    fail("modinfo", "cannot read ntfs.ko");
     return;
   }
   size_t milen = 0;
@@ -360,7 +363,7 @@ static void t_modinfo(void) {
   const char *name = modinfo_value(mi, milen, "name");
   const char *lic = modinfo_value(mi, milen, "license");
   const char *vm = modinfo_value(mi, milen, "vermagic");
-  if (!name || strcmp(name, "isofs") != 0) {
+  if (!name || strcmp(name, "ntfs") != 0) {
     fail("modinfo", "name tag wrong");
     free(buf);
     return;
@@ -387,11 +390,11 @@ static void t_modinfo(void) {
 }
 
 static void t_fs_modules(void) {
-  /* Each of these is a filesystem the kernel has to be offering: isofs and
-   * ntfs as loaded modules, btrfs built in since the imported implementation
-   * replaced the hand-written one. What is checked is the same either way —
-   * the type is there only if its init function ran. */
-  static const char *fs[] = {"isofs", "ntfs", "btrfs"};
+  /* Each of these is a filesystem the kernel has to be offering: ntfs as a
+   * loaded module, btrfs and iso9660 built in since the imported
+   * implementations replaced the hand-written ones. What is checked is the
+   * same either way — the type is there only if its init function ran. */
+  static const char *fs[] = {"ntfs", "btrfs", "iso9660"};
   for (unsigned i = 0; i < sizeof(fs) / sizeof(fs[0]); i++) {
     if (!file_contains_word("/proc/filesystems", fs[i])) {
       fail("fs-modules", "a loaded filesystem module is not in /proc/filesystems");
@@ -505,7 +508,7 @@ static void t_refcount(void) {
 
 static void t_dup_load(void) {
   errno = 0;
-  if (insmod_path(modpath("isofs.ko"), "") == 0) {
+  if (insmod_path(modpath("ntfs.ko"), "") == 0) {
     fail("dup-load", "loading an already-loaded module succeeded");
     return;
   }
@@ -573,21 +576,21 @@ static void t_vermagic_reject(void) {
 
 static void t_init_module(void) {
   /* The raw init_module(2) path: the image comes from this process's memory,
-   * not from a descriptor. Unload isofs, load it back this way, and check the
+   * not from a descriptor. Unload ntfs, load it back this way, and check the
    * filesystem type reappears. */
   size_t size = 0;
-  char *buf = slurp(modpath("isofs.ko"), &size);
+  char *buf = slurp(modpath("ntfs.ko"), &size);
   if (!buf) {
-    fail("init-module", "cannot read isofs.ko");
+    fail("init-module", "cannot read ntfs.ko");
     return;
   }
-  if (rmmod("isofs") != 0) {
-    fail("init-module", "could not unload isofs");
+  if (rmmod("ntfs") != 0) {
+    fail("init-module", "could not unload ntfs");
     free(buf);
     return;
   }
-  if (file_contains_word("/proc/filesystems", "iso9660")) {
-    fail("init-module", "iso9660 type survived the unload");
+  if (file_contains_word("/proc/filesystems", "ntfs")) {
+    fail("init-module", "ntfs type survived the unload");
     free(buf);
     return;
   }
@@ -597,8 +600,8 @@ static void t_init_module(void) {
     fail("init-module", "init_module failed");
     return;
   }
-  if (!file_contains_word("/proc/filesystems", "iso9660")) {
-    fail("init-module", "iso9660 type not restored");
+  if (!file_contains_word("/proc/filesystems", "ntfs")) {
+    fail("init-module", "ntfs type not restored");
     return;
   }
   ok("init-module");
@@ -614,7 +617,7 @@ static void t_unpriv(void) {
     if (setgid(65534) != 0 || setuid(65534) != 0)
       _exit(2);
     errno = 0;
-    long rc = syscall(SYS_delete_module, "isofs", 0);
+    long rc = syscall(SYS_delete_module, "ntfs", 0);
     if (rc == 0)
       _exit(3); /* unprivileged removal succeeded — a hole */
     _exit(errno == EPERM ? 0 : 4);
@@ -640,42 +643,36 @@ static void t_unpriv(void) {
   /* And the module is still there. */
   struct modrow rows[64];
   int n = read_modules(rows, 64);
-  if (n <= 0 || !find_mod(rows, n, "isofs")) {
+  if (n <= 0 || !find_mod(rows, n, "ntfs")) {
     fail("unpriv", "the module disappeared anyway");
     return;
   }
   ok("unpriv");
 }
 
-/* A mounted filesystem pins the module that provides it. Built by hand: the
- * btrfs mount path only needs the superblock magic at BTRFS_SUPER_INFO_OFFSET,
- * so a sparse file plus eight bytes is a mountable image. */
-/* A real btrfs filesystem, built by mkfs.btrfs at image-build time. Kept for
- * the tests that want a block filesystem to mount; the module-pinning test
- * below uses the isofs image instead, because btrfs is no longer a module.
- * It used to
- * be fabricated here by writing the btrfs magic into an empty file, which the
- * driver accepted only while it read nothing but the magic; it reads the
- * filesystem now, so a made-up one is correctly refused. */
-#define BTRFS_IMG   "/btrfs-test.img"
-#define BTRFS_MNT   "/tmp/m95-btrfs-mnt"
-/* The filesystem this test pins is one that comes FROM a module: btrfs is
- * built in now. */
-#define ISOFS_IMG   "/isofs-test.img"
-#define ISOFS_MNT   "/tmp/m95-isofs-mnt"
+/* A mounted filesystem pins the module that provides it.
+ *
+ * The filesystem this test pins is one that comes FROM a module: btrfs and
+ * isofs are built in now, the imported Linux implementations. The image is
+ * laid out by tools/image/mk-ntfs-test-image.sh and holds one file whose
+ * content is checked through the mount, so the mount is shown to be a real
+ * one before anything is asked of the module under it. */
+#define NTFS_IMG    "/ntfs-test.img"
+#define NTFS_MNT    "/tmp/m95-ntfs-mnt"
+#define NTFS_HELLO  "ntfs test volume\n"
 
 #define LOOP_SET_FD       0x4C00
 #define LOOP_CLR_FD       0x4C01
 #define LOOP_CTL_GET_FREE 0x4C82
 
 static void t_fs_in_use(void) {
-  int img = open(ISOFS_IMG, O_RDWR);
+  int img = open(NTFS_IMG, O_RDWR);
 
   if (img < 0) {
-    /* No image means btrfs-progs was absent when the machine was built. Said
-     * out loud rather than passed: a check that could not run is not a check
-     * that succeeded. */
-    skip("fs-in-use", "no isofs image in the machine (no ISO tool at build time)");
+    /* No image means python3 was absent when the machine was built. Said out
+     * loud rather than passed: a check that could not run is not a check that
+     * succeeded. */
+    skip("fs-in-use", "no ntfs image in the machine (no python3 at build time)");
     return;
   }
 
@@ -700,41 +697,51 @@ static void t_fs_in_use(void) {
   }
   close(img);
 
-  mkdir(ISOFS_MNT, 0755);
-  if (mount(dev, ISOFS_MNT, "isofs", 0, NULL) != 0) {
-    fail("fs-in-use", "mounting the loop image as isofs failed");
+  mkdir(NTFS_MNT, 0755);
+  if (mount(dev, NTFS_MNT, "ntfs", MS_RDONLY, NULL) != 0) {
+    fail("fs-in-use", "mounting the loop image as ntfs failed");
     goto out_loop;
+  }
+  {
+    char got[64];
+
+    if (read_first_line(NTFS_MNT "/hello.txt", got, sizeof(got)) != 0 ||
+        strncmp(got, NTFS_HELLO, strlen(NTFS_HELLO) - 1) != 0) {
+      fail("fs-in-use", "hello.txt on the mounted ntfs image does not read back");
+      umount(NTFS_MNT);
+      goto out_loop;
+    }
   }
 
   /* The unload must be refused while the mount is live — the module's text is
    * what every operation on that mount calls into. */
   errno = 0;
-  if (rmmod("isofs") == 0) {
-    fail("fs-in-use", "isofs unloaded with one of its filesystems mounted");
-    umount(ISOFS_MNT);
+  if (rmmod("ntfs") == 0) {
+    fail("fs-in-use", "ntfs unloaded with one of its filesystems mounted");
+    umount(NTFS_MNT);
     goto out_loop;
   }
   if (errno != EBUSY) {
     fail("fs-in-use", "unload of a mounted filesystem did not report EBUSY");
-    umount(ISOFS_MNT);
+    umount(NTFS_MNT);
     goto out_loop;
   }
-  if (!file_contains_word("/proc/filesystems", "isofs")) {
+  if (!file_contains_word("/proc/filesystems", "ntfs")) {
     fail("fs-in-use", "the filesystem type went away anyway");
-    umount(ISOFS_MNT);
+    umount(NTFS_MNT);
     goto out_loop;
   }
 
-  if (umount(ISOFS_MNT) != 0) {
+  if (umount(NTFS_MNT) != 0) {
     fail("fs-in-use", "umount failed");
     goto out_loop;
   }
   /* ... and the reference is given back, so the same unload now works. */
-  if (rmmod("isofs") != 0) {
-    fail("fs-in-use", "isofs still busy after umount");
+  if (rmmod("ntfs") != 0) {
+    fail("fs-in-use", "ntfs still busy after umount");
     goto out_loop;
   }
-  if (insmod_path(modpath("isofs.ko"), "") != 0) {
+  if (insmod_path(modpath("ntfs.ko"), "") != 0) {
     fail("fs-in-use", "reload failed");
     goto out_loop;
   }
@@ -743,7 +750,7 @@ static void t_fs_in_use(void) {
 out_loop:
   ioctl(loop, LOOP_CLR_FD, 0);
   close(loop);
-  rmdir(ISOFS_MNT);
+  rmdir(NTFS_MNT);
   /* The image belongs to the machine, not to this run: it is built into the
    * root filesystem and the next test to want one needs it too. */
 }

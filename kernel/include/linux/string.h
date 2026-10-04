@@ -8,6 +8,26 @@
  * that it does not. */
 static inline char *strim(char *s) { return s; }
 
+/* Case-insensitive comparison of at most `len` bytes, ASCII only, as
+ * upstream's lib/string.c has it. isofs matches its mount options' values
+ * ("map=off", "check=relaxed") this way. */
+static inline int strncasecmp(const char *s1, const char *s2, usize len)
+{
+	unsigned char c1 = 0, c2 = 0;
+
+	while (len--) {
+		c1 = (unsigned char)*s1++;
+		c2 = (unsigned char)*s2++;
+		if (c1 >= 'A' && c1 <= 'Z')
+			c1 = (unsigned char)(c1 - 'A' + 'a');
+		if (c2 >= 'A' && c2 <= 'Z')
+			c2 = (unsigned char)(c2 - 'A' + 'a');
+		if (c1 != c2 || !c1)
+			break;
+	}
+	return (int)c1 - (int)c2;
+}
+
 /*
  * Bounded copy that always terminates and reports truncation, which is what
  * makes it safer than strncpy: strncpy leaves the destination unterminated when

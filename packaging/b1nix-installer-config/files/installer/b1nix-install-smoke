@@ -1,0 +1,101 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# INSTALL-SMOKE's in-guest half: install b1nix onto the first disk with
+# Calamares, unattended, and report how it went. Runs only when the kernel
+# command line says b1nix.install-smoke, like the other lanes' checks.
+#
+# Calamares has no unattended mode in this version, so it is driven the way a
+# person drives it -- by the keyboard -- on an X server in memory (Xvfb). Each
+# step waits for the page it expects in Calamares' own debug log rather than
+# for a fixed time, and the log, a screenshot per step and the final verdict go
+# to the 9p share the lane passes in, as well as to the console.
+set -u
+say() { printf 'INSTALL-SMOKE: %s\n' "$*" >/dev/console; }
+export HOME=/root DISPLAY=:1 XDG_RUNTIME_DIR=/run/user/0 QT_QPA_PLATFORM=xcb
+SHARE=/run/install-smoke
+LOG="$HOME/.cache/calamares/session.log"
+mkdir -p "$XDG_RUNTIME_DIR" "$SHARE"
+chmod 0700 "$XDG_RUNTIME_DIR"
+mount -t 9p installsmoke "$SHARE" 2>/dev/null || say "share=none (results on the console only)"
+
+shot() { # name
+	command -v xwd >/dev/null 2>&1 && xwd -root -silent -display :1 >"$SHARE/$1.xwd" 2>/dev/null
+}
+wait_log() { # pattern seconds
+	n=0
+	while [ $n -lt "$2" ]; do
+		grep -q "$1" "$LOG" 2>/dev/null && return 0
+		sleep 1
+		n=$((n + 1))
+	done
+	return 1
+}
+key() { xdotool key --delay 150 "$@"; sleep 2; }
+finish() {
+	cp "$LOG" "$SHARE/calamares-session.log" 2>/dev/null
+	say "done"
+	sync
+	systemctl poweroff --no-block
+	exit 0
+}
+
+disk=$(lsblk -dn -o NAME,TYPE | awk '$2 == "disk" && $1 !~ /^(sr|loop|zram|ram|md|nbd)/ {print $1; exit}')
+say "target=${disk:-none}"
+[ -n "$disk" ] || { say "result=FAIL no target disk"; finish; }
+
+Xvfb :1 -screen 0 1280x800x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
+sleep 3
+xdpyinfo -display :1 >/dev/null 2>&1 || { say "result=FAIL Xvfb did not start"; finish; }
+rm -f "$LOG"
+calamares -d >/tmp/calamares.out 2>&1 &
+cpid=$!
+
+# welcome -> locale -> keyboard -> partition
+wait_log "welcome" 120 || { say "result=FAIL calamares did not show its first page"; shot fail-start; finish; }
+sleep 5
+shot 01-welcome
+for page in locale keyboard partition; do
+	key alt+n
+	shot "02-$page"
+done
+# The partition page opens on "erase disk" with btrfs (partition.conf);
+# the only disk is already chosen.
+sleep 3
+key alt+n
+shot 03-users
+# users: full name, login name, host name, password, repeat
+xdotool type --delay 80 "b1nix tester"
+key Tab
+key ctrl+a
+xdotool type --delay 80 "tester"
+key Tab
+key ctrl+a
+xdotool type --delay 80 "b1nix-installed"
+key Tab
+xdotool type --delay 80 "b1nix"
+key Tab
+xdotool type --delay 80 "b1nix"
+sleep 2
+shot 04-users-filled
+key alt+n
+shot 05-summary
+# summary: "Install", then the confirmation
+key alt+i
+sleep 2
+shot 06-confirm
+key Return
+say "install=started"
+if wait_log "Installation complete\|All jobs complete\|Finished\." 1500; then
+	sleep 5
+	shot 07-finished
+	if grep -q "Job.*failed\|ERROR" "$LOG"; then
+		say "result=FAIL a job failed: $(grep -m1 'failed\|ERROR' "$LOG")"
+	else
+		say "result=ok"
+	fi
+else
+	shot fail-exec
+	say "result=FAIL the installation did not finish: $(tail -3 "$LOG" | tr '\n' ' ')"
+fi
+kill "$cpid" 2>/dev/null
+finish

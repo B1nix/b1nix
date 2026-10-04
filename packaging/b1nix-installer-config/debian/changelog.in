@@ -1,0 +1,6 @@
+b1nix-installer-config (@DEB_VERSION@) @SUITE@; urgency=medium
+
+  * b1nix @DISTRO_RELEASE@ (@CODENAME_UI@) live medium and installer
+    configuration, built from @GIT_DESCRIBE@.
+
+ -- b1nix maintainers <maintainers@b1nix.invalid>  @DATE@

@@ -1,0 +1,5 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Start the graphical installer from the live session's console: an X server
+# on the framebuffer with Calamares as its only client.
+exec xinit /usr/bin/calamares -- /usr/bin/Xorg :0 vt7 -nolisten tcp

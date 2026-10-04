@@ -88,6 +88,15 @@ struct block_device {
 	 * offered the command. Never call this directly: go through
 	 * blk_discard_blocks(), which drops the stale cached copies first. */
 	int (*discard)(struct block_device *dev, u64 lba, u32 count);
+	/* Optional: a SCSI command passed through to the device, for SG_IO and
+	 * the CDROM_* ioctls (an ATAPI CD-ROM). `cdb` is cdb_len bytes; data
+	 * moves from the device into `buf` (len bytes, may be 0). Returns 0 when
+	 * the command completed, 1 on CHECK CONDITION with up to sense_len bytes
+	 * of sense data in `sense` (*sense_out set to how many), negative errno
+	 * when it could not be issued. Only device-to-host transfers exist. */
+	int (*scsi_cmd)(struct block_device *dev, const u8 *cdb, u32 cdb_len,
+	                void *buf, u32 len, u8 *sense, u32 sense_len,
+	                u32 *sense_out);
 	/* Whether the medium is rotating, as BLKROTATIONAL reports it. Set by the
 	 * driver from what the device says (ATA IDENTIFY word 217); every
 	 * non-ATA transport here is solid-state or memory, so the default 0 is
