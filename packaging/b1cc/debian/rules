@@ -1,0 +1,37 @@
+#!/usr/bin/make -f
+# b1cc's own Makefile, with Debian's compiler flags in place of the ones it
+# uses for development: -march=native would make the binary depend on the
+# build machine's CPU, and -flto adds nothing a distribution build wants.
+#
+# The upstream sources are copied beside debian/ by tools/deb/build-deb.sh,
+# from the submodule in third_party/b1cc.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+include /usr/share/dpkg/buildflags.mk
+include /usr/share/dpkg/architecture.mk
+
+# b1cc is C23. GCC spells that -std=c23 from 14 on and -std=c2x before.
+CSTD := $(shell $(CC) -std=c23 -E -x c /dev/null >/dev/null 2>&1 && echo -std=c23 || echo -std=c2x)
+INCS := -Isrc -Isrc/frontend -Isrc/ir -Isrc/backend -Isrc/linker -Isrc/utils
+# The Makefile links with $(CC) $(CFLAGS), so the hardening link flags travel
+# in CFLAGS; the compiler ignores them in the compile-only steps.
+B1CC_CFLAGS := $(CSTD) -D_GNU_SOURCE $(CPPFLAGS) $(CFLAGS) $(INCS) $(LDFLAGS)
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) build/b1cc CC="$(CC)" CFLAGS="$(B1CC_CFLAGS)"
+
+override_dh_auto_install:
+	install -D -m 0755 build/b1cc debian/b1cc/usr/libexec/b1cc/b1cc
+	sed -e 's|@DEB_HOST_GNU_CPU@|$(DEB_HOST_GNU_CPU)|g' files/b1cc.in >debian/b1cc.wrapper
+	install -D -m 0755 debian/b1cc.wrapper debian/b1cc/usr/bin/b1cc
+	install -D -m 0644 README.md debian/b1cc/usr/share/doc/b1cc/README.md
+
+# The test corpus needs the upstream tree and a Darwin or b1nix target; the
+# package lane (tests/packages-smoke.sh) compiles and runs a program instead.
+override_dh_auto_test:
+
+override_dh_auto_clean:
+	rm -rf build debian/b1cc.wrapper

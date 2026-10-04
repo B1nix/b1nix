@@ -4,6 +4,7 @@
 #
 #   sh tools/deb/build-deb.sh              # every source package
 #   sh tools/deb/build-deb.sh b1nix-meta   # one of them
+#   ARCH=aarch64 DEB_ARCH=arm64 sh tools/deb/build-deb.sh   # the arm64 kernel
 #
 # The packaging sources in packaging/ are templates: the release string, the
 # Debian version and the repository URL are substituted here, once, so that
@@ -32,6 +33,11 @@ REPO_URL="${REPO_URL:-https://b1nix.github.io/b1nix}"
 REPO_SUITE="${REPO_SUITE:-$SUITE}"
 
 CHROOT="$ROOT_DIR/tools/deb/debian-chroot.sh"
+# The architecture of the chroot the builds run in. A package for another
+# architecture is cross-built there: the kernel is compiled by the tree's own
+# Makefile, so all its package needs is binutils that read the target's ELF.
+CHROOT_ARCH="${CHROOT_ARCH:-amd64}"
+B1CC_DIR="${B1CC_DIR:-$ROOT_DIR/third_party/b1cc}"
 
 log() { printf '\033[1;34m[build-deb]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[build-deb] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -66,6 +72,12 @@ else
 	DEB_VERSION="$KVER+git$_date.$_count.$_sha-1"
 fi
 DATE=$(date -uR)
+
+# b1cc has its own upstream version, not the kernel's (packaging.md): its
+# repository's commit date, commit count and hash, under a 0~ that any real
+# b1cc release number sorts above.
+B1CC_COMMIT=$(git -C "$B1CC_DIR" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
+B1CC_DEB_VERSION="0~git$(git -C "$B1CC_DIR" log -1 --format=%cd --date=format:%Y%m%d 2>/dev/null || echo 0).$(git -C "$B1CC_DIR" rev-list --count HEAD 2>/dev/null || echo 0).$B1CC_COMMIT-1"
 
 # The release packages published before this one.
 #
@@ -121,6 +133,8 @@ render() { # src-file dst-file
 	    -e "s|@KERNEL_RELEASE@|$RELEASE|g" \
 	    -e "s|@REPO_URL@|$REPO_URL|g" \
 	    -e "s|@REPO_SUITE@|$REPO_SUITE|g" \
+	    -e "s|@B1CC_DEB_VERSION@|$B1CC_DEB_VERSION|g" \
+	    -e "s|@B1CC_COMMIT@|$B1CC_COMMIT|g" \
 	    "$1" >"$2"
 }
 
@@ -191,6 +205,19 @@ build_b1nix_meta() {
 	run_build b1nix-meta "$_dst"
 }
 
+build_b1cc() {
+	[ -f "$B1CC_DIR/Makefile" ] ||
+		die "no b1cc source at $B1CC_DIR -- git submodule update --init third_party/b1cc"
+	_dst=$(stage_source b1cc)
+	# The upstream tree as the build needs it, without its build output or the
+	# submodule's git metadata.
+	for f in Makefile README.md LICENSE LICENSING.md src include runtime; do
+		[ -e "$B1CC_DIR/$f" ] || continue
+		cp -a "$B1CC_DIR/$f" "$_dst/"
+	done
+	run_build b1cc "$_dst"
+}
+
 run_build() { # name staged-dir
 	_name="$1"
 	_dst="$2"
@@ -200,8 +227,22 @@ run_build() { # name staged-dir
 	# then exits non-zero over a missing file rather than over a tag, and the
 	# build looks broken when it is not.
 	rm -f "$OUT/src/${_name}_"*.changes "$OUT/src/${_name}_"*.buildinfo
-	log "building $_name in the $SUITE chroot"
-	sh "$CHROOT" run "cd '/src/$_rel' && dpkg-buildpackage -b -us -uc" ||
+	_bp="dpkg-buildpackage -b -us -uc"
+	if [ "$DEB_ARCH" != "$CHROOT_ARCH" ]; then
+		# A cross build. -d: the Build-Depends are tools for the build
+		# machine, and dpkg-checkbuilddeps would look for them as $DEB_ARCH
+		# packages. What the cross build really needs is installed here.
+		_gnu=$(DEB_ARCH="$CHROOT_ARCH" sh "$CHROOT" run "dpkg-architecture -a$DEB_ARCH -qDEB_HOST_GNU_TYPE 2>/dev/null") ||
+			die "dpkg-architecture does not know $DEB_ARCH"
+		DEB_ARCH="$CHROOT_ARCH" sh "$CHROOT" run "command -v $_gnu-objcopy >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y binutils-$_gnu" ||
+			die "could not install binutils for $_gnu in the chroot"
+		# -B: only the architecture-dependent packages. The arch-all ones
+		# come from the native build, and a second build of the same version
+		# would put two different files under one name in the pool.
+		_bp="dpkg-buildpackage -B -us -uc -a$DEB_ARCH -d"
+	fi
+	log "building $_name for $DEB_ARCH in the $SUITE chroot"
+	DEB_ARCH="$CHROOT_ARCH" sh "$CHROOT" run "cd '/src/$_rel' && $_bp" ||
 		die "$_name failed to build -- the rendered source is at $_dst"
 	log "lintian on $_name"
 	# Errors fail the build; tags below error level are printed and do not.
@@ -210,7 +251,7 @@ run_build() { # name staged-dir
 	# Only this package's .changes: a glob also picks up the ones left by
 	# earlier builds, whose .debs have already been moved to $OUT, and
 	# lintian exits non-zero over the missing file rather than over a tag.
-	sh "$CHROOT" run "cd '/src/$(dirname "$_rel")' && lintian --fail-on error ${_name}_*.changes" ||
+	DEB_ARCH="$CHROOT_ARCH" sh "$CHROOT" run "cd '/src/$(dirname "$_rel")' && lintian --fail-on error ${_name}_*_$DEB_ARCH.changes" ||
 		die "$_name has lintian errors"
 }
 
@@ -218,14 +259,19 @@ mkdir -p "$OUT/src"
 
 if [ $# -gt 0 ]; then
 	TARGETS="$*"
+elif [ "$DEB_ARCH" = "$CHROOT_ARCH" ]; then
+	TARGETS="b1nix-kernel b1nix-meta b1cc"
 else
-	TARGETS="b1nix-kernel b1nix-meta"
+	# The architecture-independent packages are built once, natively; another
+	# architecture adds its kernel.
+	TARGETS="b1nix-kernel"
 fi
 
 for t in $TARGETS; do
 	case "$t" in
 	b1nix-kernel) build_b1nix_kernel ;;
 	b1nix-meta) build_b1nix_meta ;;
+	b1cc) build_b1cc ;;
 	*) die "unknown source package '$t'" ;;
 	esac
 done
@@ -242,7 +288,9 @@ for d in "$OUT"/*.deb; do
 	[ -f "$d" ] || continue
 	_pkg=$(basename "$d" | sed 's/_.*//')
 	_ver=$(basename "$d" | sed 's/^[^_]*_//; s/_[^_]*$//')
-	[ "$_ver" != "$DEB_VERSION" ] || continue
+	_want="$DEB_VERSION"
+	[ "$_pkg" != "b1cc" ] || _want="$B1CC_DEB_VERSION"
+	[ "$_ver" != "$_want" ] || continue
 	log "removing superseded $(basename "$d")"
 	rm -f "$d"
 done

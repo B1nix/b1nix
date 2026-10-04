@@ -27,11 +27,8 @@ a full Plasma session is what M124 used as its own proof.
 | Gap | What it breaks | Milestone | Observed |
 |---|---|---|---|
 | Wi-Fi (mac80211/cfg80211, nl80211) | `iw`, `wpa_supplicant`, iwd, NetworkManager on anything wireless | M130 | — |
-| No ACPI events: no SCI handler, no GPE dispatch, no `Notify` | Nothing the platform raises reaches userspace — a lid close cannot suspend the machine, a power button press does nothing, and `upower`/`systemd-logind` see a battery that only changes when they poll it | M135 | The kernel has no SCI vector at all; `/sys/class/power_supply/BAT0` is re-evaluated on read and never announces a change |
-| `reboot(RB_POWER_OFF)` writes hard-coded QEMU/Bochs ports rather than `\_S5` through the FADT's PM1 control register | Powering off a real machine: the kernel prints "poweroff unsupported, halting" and leaves it running | M135 | `kernel/syscall/syscall.c` writes 0x604/0xB004/0x4004; the S3 path already reads the registers this needs |
-| cpufreq has no load-driven governor, no `policy*` layout and ignores `_PPC` | `cpupower`, `tuned` and every desktop power profile: the clock only moves when something writes a governor by hand, and the firmware's own ceiling on battery is not honoured | M135 | `/sys/devices/system/cpu/cpu0/cpufreq` offers `performance powersave` and no policy directory |
-| No hibernate (S4) and no `/sys/power/{disk,wakeup_count,mem_sleep,wakeup_sources}` | `systemctl hibernate`, and anything that counts wakeups before suspending (`systemd-sleep`'s race avoidance) | M135 | `/sys/power` has one file, `state` |
-| Thermal zones are published but nothing acts on them: no trip points, no cooling devices, no critical shutdown | A machine that overheats keeps running; `thermald` and the kernel's own throttling have nothing to work with | M135 | `/sys/class/thermal/thermal_zoneN` carries `type` and `temp` only |
+| PSI triggers: `cpu/memory/io.pressure` are read-only, a threshold cannot be written and polled | systemd's `MemoryPressureWatch=` and `sd_event_add_memory_pressure()` (journald, logind, udevd shed caches on pressure); oomd is unaffected, it polls the averages | — | The files exist in every cgroup and their averages move (oomd kills on them on the systemd lane), but they are created without a write handler, so there is nothing for a trigger to arm |
+| A rare boot wedge: tasks READY inside the block layer's admission wait are never picked while every CPU sits in cpuidle | The boot stops (about one boot in fifteen on the distribution image; the fourth fallback boot of DISTRO-SMOKE caught it) | — | gdb on the wedged guest: two tasks READY in `blk_io_begin`'s yield loop, readers behind them on `folio_lock`, CPUs 1–3 halted in `cpuidle_enter` and CPU 0 looping in `scheduler_yield_inner` without picking them; not reproduced in 50 further boots |
 | MTD/UBI | A handful of BusyBox applets | M107 | `wontfix`: no hardware in scope needs it |
 | DKMS-built out-of-tree modules | nvidia, virtualbox, zfs from Debian | — | Not planned: headers are shipped, the modules are not supported |
 
@@ -75,6 +72,20 @@ hunt:
   READ CAPACITY, and the AHCI probe waited for it for ever, so every q35 boot
   with an empty optical drive stopped before userspace. A bounded wait that
   stops the port before the buffer goes back has neither problem.
+
+- **A queue that drops silently.** A netlink socket held sixteen messages
+  whatever `SO_RCVBUF` said. Coldplug announces every device at once before
+  udevd is reading, so the seventeenth `add` -- the root partition's -- was
+  lost, its device unit never became plugged, and the boot waited behind it. A
+  full queue has to grow to the limit the program asked for and then say
+  `ENOBUFS`, never shrug.
+- **A notification for the wrong audience.** `/proc/self/mountinfo` changed
+  for every mount in every namespace, so each service's private credential
+  mounts woke PID 1. sd-event rate-limited the mount monitor and systemd held
+  back every mount job while it was limited. Linux scopes the event to the
+  reader's namespace; so must anything modelled on it. The same boot showed the
+  sibling bug: a nested epoll that ignored `EPOLLET` called libmount's epoll
+  ready for ever.
 
 ## Where to look when something breaks
 

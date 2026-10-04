@@ -42,6 +42,7 @@ mkdir -p "$OUT_DIR"
 qemu_boot() { # image serial-log
 	LOG="$2" REPO="$REPO" DEADLINE="$BOOT_TIMEOUT" SILENCE="${SILENCE:-45}" \
 		IMG_FORMAT="${IMG_FORMAT:-raw}" SNAPSHOT="${SNAPSHOT:-on}" \
+		FIRMWARE="${FIRMWARE:-bios}" \
 		sh "$ROOT_DIR/tools/run/run-distro.sh" "$1" >>"$LOG.run" 2>&1 || true
 }
 
@@ -145,6 +146,46 @@ if clean_log "$BOOT_LOG" | grep -aq "DISTRO-SMOKE: boot-state=.*good=1"; then
 	ok "boot-marked-good"
 else
 	bad "boot-marked-good" "no entry in the boot state is marked good after a successful boot"
+fi
+
+# The mounts systemd makes from units: the ESP from fstab, Debian's tmpfs units.
+for _m in boot:vfat tmp:tmpfs runlock:tmpfs; do
+	_what=${_m%%:*}
+	_fs=${_m#*:}
+	case "$(marker "$BOOT_LOG" "$_what-mounted=")" in
+	*"$_what-mounted=$_fs") ok "$_what-mounted" ;;
+	*) bad "$_what-mounted" "expected a $_fs mount, the guest said '$(marker "$BOOT_LOG" "$_what-mounted=" | sed 's/.*=//')'" ;;
+	esac
+done
+
+case "$(marker "$BOOT_LOG" "strace-pid1=")" in
+*strace-pid1=ok) ok "strace-pid1" ;;
+*) bad "strace-pid1" "tracing PID 1 left it stopped, or strace never ran" ;;
+esac
+
+# ── stage 2b: the same image under UEFI ─────────────────────────────────────
+# OVMF and Limine's EFI loader: the firmware path an installed machine with no
+# CSM takes. The kernel is relocatable for exactly this, so the load offset it
+# reports is printed beside the result.
+UEFI_LOG="$OUT_DIR/distro-smoke-uefi.log"
+info "booting the installed system under UEFI"
+FIRMWARE=uefi qemu_boot "$IMG" "$UEFI_LOG"
+if clean_log "$UEFI_LOG" | grep -aq "^Limine .*UEFI)"; then
+	ok "uefi-loader"
+else
+	bad "uefi-loader" "no Limine EFI banner -- see $UEFI_LOG"
+fi
+_off=$(clean_log "$UEFI_LOG" | sed -n 's/.*kernel: loaded at \(+0x[0-9a-f]*\).*/\1/p' | head -1)
+[ -z "$_off" ] || info "kernel load offset under UEFI: $_off"
+if clean_log "$UEFI_LOG" | grep -aq "DISTRO-SMOKE: done"; then
+	ok "uefi-reaches-multi-user"
+else
+	bad "uefi-reaches-multi-user" "the in-guest checks never ran to the end under UEFI"
+fi
+if clean_log "$UEFI_LOG" | grep -aq "DISTRO-SMOKE: boot-state=.*good=1"; then
+	ok "uefi-boot-marked-good"
+else
+	bad "uefi-boot-marked-good" "the UEFI boot did not mark its entry good"
 fi
 
 # ── stage 3: the fallback ───────────────────────────────────────────────────

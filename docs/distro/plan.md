@@ -183,9 +183,9 @@ This is the section that separates "a public release" from "a tarball on a
 page". None of it is hard; all of it is easy to forget.
 
 - **Repo signing.** An OpenPGP key that exists only offline, and a subkey on
-  the build host for signing `Release`. The public key ships in
-  `b1nix-base-files` and is published on the website with its fingerprint. Key
-  rotation is documented before it is needed, not after.
+  the build host for signing `Release`. The installer places the public key
+  and the website publishes its fingerprint. Key rotation is documented before
+  it is needed, not after: [archive-key.md](archive-key.md).
 - **Artifact signing.** Every ISO has a `SHA256SUMS` and a detached signature.
   The install guide shows the verification command as the first step, not the
   last.

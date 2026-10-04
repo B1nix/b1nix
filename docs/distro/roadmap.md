@@ -26,8 +26,8 @@ lane. Kernel milestones that a phase depends on are named where they block.
 - [x] `initial` `packaging/` in the tree: two source packages. `b1nix-kernel`
   produces the release-named kernel, its `-dbg` and `-headers` companions and
   the metapackage; `b1nix-meta` produces `b1nix-base-files`, `b1nix-desktop`
-  and `b1nix-tools`. `b1nix-artwork`, `b1nix-installer-config` and `b1cc` are
-  not packaged yet: the first two have no assets before phase D.
+  and `b1nix-tools`. `b1nix-artwork` and `b1nix-installer-config` belong
+  to phase D.
 - [x] `initial` `tools/deb/debian-chroot.sh` builds a trixie chroot as an
   ordinary user — the registry layer the Debian lane already uses, entered
   through a user namespace, with no sudo and no container runtime.
@@ -48,11 +48,18 @@ lane. Kernel milestones that a phase depends on are named where they block.
   b1nix, that Debian's kernel is pinned to -1, that `b1nix-report` produces its
   documented header, and that the bootloader generator writes a state file and
   a `limine.conf` offering both kernels with an uncounted rescue entry.
-  16 checks, all passing.
+  16 checks at the time; see below for the rest.
 - [x] `done` Proof: a clean trixie chroot adds the repository and installs
   `b1nix-kernel`, `b1nix-base-files` and `b1nix-tools` from it.
-- [ ] `planned` A signing key and its rotation note; `b1cc` packaged; the
-  kernel package built for `arm64` as well as `amd64`.
+- [x] `done` The repository is signed (`SIGN_KEY`, several keys during a
+  rotation) and the procedure is [archive-key.md](archive-key.md). `b1cc` is
+  packaged (its own upstream version, a wrapper that defaults to the host's
+  Linux target). `b1nix-kernel` is built for `arm64` too, cross-packaged from
+  the aarch64 kernel, and the repository indexes both architectures.
+- [x] `done` `PKG-SMOKE` grew to 25 checks: a signed publish that apt accepts
+  through `Signed-By` and refuses against another key, `b1cc` compiling and
+  running a C program in the clean chroot, and the arm64 kernel package
+  (AArch64, stripped, `.kallsyms` kept, visible to apt as `b1nix-kernel:arm64`).
 
 No kernel work. This phase exists so that everything after it has somewhere to
 ship to.
@@ -67,12 +74,10 @@ ship to.
 - [x] `initial` Limine integration: the config template, the `b1nix-kernel`
   postinst that writes it, the ESP layout, two-kernel retention and the
   fallback entry.
-- [ ] `partial` **The image boots through Limine's BIOS path, not UEFI.** The
-  kernel asks for a fixed load address at 1 MiB and the firmware is already
-  there, so Limine refuses; the tree's own ISOs fail the same way under OVMF.
-  The disk carries a BIOS boot partition and an ESP, so the layout is ready for
-  the day the kernel becomes relocatable. See
-  [../kernel/abi-gaps.md](../kernel/abi-gaps.md).
+- [x] `done` The image boots under BIOS and under UEFI: the kernel is
+  relocatable (M133), and under OVMF Limine's EFI loader places it at +8 MiB.
+  `DISTRO-SMOKE` boots the same image both ways and runs the in-guest checks
+  under each.
 - [x] `done` `/boot` is mounted and writable: the ESP is the imported Linux
   FAT (`vfat`/`msdos` through lkpi), so the boot-counting state reaches the
   disk and survives a reboot.
@@ -81,13 +86,16 @@ ship to.
   a bind into a prepared root needs. `systemd-udevd`, `systemd-logind`,
   `systemd-journald`, `dbus-broker` and `systemd-sysctl` all start now — the
   failed-unit list went from twelve to four.
-- [ ] `partial` Four units still fail, each with its own cause, all listed in
-  [../kernel/abi-gaps.md](../kernel/abi-gaps.md): `tmp.mount` and
-  `run-lock.mount` (the mount succeeds but is reported under the wrong path),
-  `e2scrub_reap` (`sched_setscheduler`) and `systemd-sysusers`.
-- [x] `initial` The repository reaches the guest over 9p — mounted by tag with
-  no options, which is all this kernel's 9p takes. `apt-get update` against it
-  still fails on a `symlink()` and on apt's `store:` method.
+- [x] `done` No unit fails: `tests/support/known-degraded.txt` is empty and
+  the lane holds it so. The four that failed were closed in M133; three more
+  boot stoppers found while reconciling this phase were kernel bugs, fixed: a
+  netlink queue that dropped udev's coldplug events past sixteen (the root
+  partition's device unit never appeared), mountinfo changes announced across
+  mount namespaces (systemd rate-limited its mount monitor and held back every
+  mount job), and `strace -p 1` leaving PID 1 stopped (PTRACE_INTERRUPT posted
+  a real SIGSTOP).
+- [x] `done` The repository reaches the guest over 9p, and `apt-get update`
+  and `apt-get install` work against it (M133).
 - [x] `done` Boot counting as designed in
   [boot-counting.md](boot-counting.md). The kernel runs a cpio initrd's
   `/init` as Linux does, so initramfs-tools' hooks run: the hook (with the
@@ -97,20 +105,29 @@ ship to.
   in [lanes.md](lanes.md). It boots the image, reads the in-guest checks, grades
   the failed units against `tests/support/known-degraded.txt`, and boots the
   broken-kernel image up to four times to see the fallback happen.
-- [x] `done` The lane is green, 9/9: multi-user, no unexpected failed units,
-  apt over 9p, a boot marked good, and the fallback to the good kernel on the
-  fourth boot of the broken image.
+- [x] `done` The lane checks 16 things: multi-user, no unexpected failed units,
+  apt over 9p, a boot marked good, `/boot`, `/tmp` and `/run/lock` mounted,
+  `strace -p 1` harmless, the UEFI boot (loader, multi-user, boot marked good),
+  and the fallback to the good kernel on the fourth boot of the broken image.
 
 ## Phase C: cgroup v2
 
 - [x] `done` Kernel milestone M127, pulled ahead of M125 because systemd's
   whole model rests on it: delegation, `MemoryMax`, `CPUWeight`,
   `memory.events`, PSI.
-- [x] `partial` Proof through the distribution: on the systemd lane a
+- [x] `done` Proof through the distribution: on the systemd lane a
   `MemoryMax=48M` unit's `tail /dev/zero` is SIGKILLed inside its own cgroup
   while PID 1 carries on, two `CPUWeight=` units at 100 and 1000 divide the CPU
   1:9.8 by their own `cpu.stat`, and `/proc/pressure/cpu` moves under that
-  load. `systemd-oomd` has not been run.
+  load.
+- [x] `done` `systemd-oomd` acts: a slice with
+  `ManagedOOMMemoryPressure=kill` and a 10% limit holds a unit living above its
+  `memory.high`; the kernel throttles it in proportion to the overage, the
+  slice's own `memory.pressure` reaches ~68%, and oomd kills the unit ("due to
+  memory pressure ... for > 2s"). The kernel side is per-cgroup PSI
+  (`cpu/memory/io.pressure` in every cgroup) and Linux's `memory.high`
+  penalty; PSI triggers are still a gap
+  ([../kernel/abi-gaps.md](../kernel/abi-gaps.md)).
 
 Detail in [../kernel/roadmap.md](../kernel/roadmap.md) under M127.
 

@@ -1,0 +1,5 @@
+b1cc (@B1CC_DEB_VERSION@) @SUITE@; urgency=medium
+
+  * b1cc built from upstream commit @B1CC_COMMIT@.
+
+ -- b1nix maintainers <maintainers@b1nix.invalid>  @DATE@

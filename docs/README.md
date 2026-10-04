@@ -33,6 +33,7 @@ lands when something is installable. They meet in
 | [distro/lanes.md](distro/lanes.md) | What a distribution smoke lane must look like |
 | [distro/b1nix-report.md](distro/b1nix-report.md) | The bug-report format, and the hardware list generated from it |
 | [distro/ci.md](distro/ci.md) | What runs in the cloud, what runs here, and how signing works |
+| [distro/archive-key.md](distro/archive-key.md) | The apt archive key: creating it, signing with it, rotating it |
 | [distro/install-guide.md](distro/install-guide.md) | Draft of the user-facing install guide |
 | [distro/release-checklist.md](distro/release-checklist.md) | The mechanical checklist for cutting a release |
 | [versioning.md](versioning.md) | Kernel, ABI, release and package versions |

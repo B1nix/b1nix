@@ -23,8 +23,8 @@
 #   Unchanged for SILENCE seconds means stuck, whether the guest is saying
 #   nothing or saying the same thing for ever.
 #
-# -machine pc, not q35: q35 carries an ICH9 AHCI controller with an empty ATAPI
-# port, and probing it is a known hang in this kernel.
+# -machine pc is the lane's reference shape. q35 boots as well since the AHCI
+# probe stopped hanging on an empty ATAPI port (M133); the q35 lane covers it.
 set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -43,6 +43,10 @@ CPUS="${CPUS:-4}"
 # own writable copy (usually a qcow2 overlay) with SNAPSHOT=off.
 IMG_FORMAT="${IMG_FORMAT:-raw}"
 SNAPSHOT="${SNAPSHOT:-on}"
+# FIRMWARE=uefi boots through OVMF and Limine's EFI loader instead of SeaBIOS
+# and Limine's BIOS stages. The image carries both, and an installed machine
+# boots whichever its firmware is.
+FIRMWARE="${FIRMWARE:-bios}"
 
 log() { printf '\033[1;34m[run-distro]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[run-distro] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -58,13 +62,34 @@ else
 	log "no writable /dev/kvm -- falling back to emulation, which is minutes slower"
 fi
 
+FW=""
+if [ "$FIRMWARE" = "uefi" ]; then
+	OVMF_CODE=""
+	OVMF_VARS=""
+	for d in /usr/share/edk2/x64 /usr/share/OVMF /usr/share/ovmf/x64 /usr/share/qemu; do
+		for c in OVMF_CODE.4m.fd OVMF_CODE.fd OVMF_CODE_4M.fd; do
+			[ -f "$d/$c" ] && { OVMF_CODE="$d/$c"; break; }
+		done
+		for v in OVMF_VARS.4m.fd OVMF_VARS.fd OVMF_VARS_4M.fd; do
+			[ -f "$d/$v" ] && { OVMF_VARS="$d/$v"; break; }
+		done
+		[ -n "$OVMF_CODE" ] && [ -n "$OVMF_VARS" ] && break
+	done
+	[ -n "$OVMF_CODE" ] && [ -n "$OVMF_VARS" ] || die "FIRMWARE=uefi but this host has no OVMF firmware"
+	# The variable store is written by the firmware: one private copy per boot.
+	cp -f "$OVMF_VARS" "$LOG.vars.fd"
+	FW="-drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE -drive if=pflash,format=raw,file=$LOG.vars.fd"
+elif [ "$FIRMWARE" != "bios" ]; then
+	die "FIRMWARE must be bios or uefi, not '$FIRMWARE'"
+fi
+
 VIRTFS=""
 [ ! -d "$REPO" ] ||
 	VIRTFS="-virtfs local,path=$REPO,mount_tag=b1nixrepo,security_model=none,readonly=on"
 
-log "booting $(basename "$IMG") (deadline ${DEADLINE}s, silence ${SILENCE}s)"
+log "booting $(basename "$IMG") under $FIRMWARE (deadline ${DEADLINE}s, silence ${SILENCE}s)"
 # shellcheck disable=SC2086
-qemu-system-x86_64 -machine pc $ACCEL -m "$MEM" -smp "$CPUS" \
+qemu-system-x86_64 -machine pc $ACCEL $FW -m "$MEM" -smp "$CPUS" \
 	-drive file="$IMG",format="$IMG_FORMAT",if=virtio,snapshot="$SNAPSHOT" \
 	$VIRTFS -display none -serial file:"$LOG" -no-reboot "$@" &
 QEMU=$!

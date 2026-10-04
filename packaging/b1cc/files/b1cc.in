@@ -1,0 +1,10 @@
+#!/bin/sh
+# b1cc's built-in default target is arm64-darwin on every host. On Debian the
+# useful default is this machine's own Linux target, so it is supplied unless
+# the command line names one.
+for a in "$@"; do
+	case "$a" in
+	--target=*) exec /usr/libexec/b1cc/b1cc "$@" ;;
+	esac
+done
+exec /usr/libexec/b1cc/b1cc --target=@DEB_HOST_GNU_CPU@-linux "$@"

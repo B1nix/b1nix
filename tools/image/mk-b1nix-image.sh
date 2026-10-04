@@ -174,41 +174,7 @@ in_rootfs "systemctl disable serial-getty@ttyS0.service" >/dev/null 2>&1 || true
 [ ! -f "$SHIPPED_SOURCE.build-disabled" ] || mv "$SHIPPED_SOURCE.build-disabled" "$SHIPPED_SOURCE"
 rm -f "$ROOTFS/etc/apt/sources.list.d/b1nix.list"
 
-# A diagnostic init, for booting with init=/usr/local/sbin/b1nix-diag. It runs
-# the kernel interfaces an init system needs, one per line with its result, and
-# then stops. When systemd fails with "Invalid argument" and no syscall trace
-# says why, this is what separates a kernel refusal from a systemd decision.
 mkdir -p "$ROOTFS/usr/local/sbin"
-cat >"$ROOTFS/usr/local/sbin/b1nix-diag" <<'DIAG'
-#!/bin/sh
-say() { printf 'DIAG %s=%s\n' "$1" "$2" >/dev/console; }
-mount -t proc proc /proc 2>/dev/null; say proc $?
-mount -t tmpfs tmpfs /mnt 2>/dev/null; say tmpfs-plain $?
-umount /mnt 2>/dev/null
-mount -t tmpfs -o mode=1777,strictatime,nosuid,nodev,size=50%,nr_inodes=1M tmpfs /mnt 2>/dev/null
-say tmpfs-systemd-opts $?
-umount /mnt 2>/dev/null
-mount -t tmpfs -o strictatime tmpfs /mnt 2>/tmp/e; say tmpfs-strictatime $?
-while read -r l; do say "strictatime-err=$l"; done </tmp/e
-# Which call refuses it, and with what. The result code alone cannot tell the
-# old mount(2) apart from the new fsopen/fsconfig sequence, and the two are
-# fixed in different places.
-strace -o /tmp/st -e trace=mount,fsopen,fsconfig,fsmount,move_mount,open_tree \
-	mount -t tmpfs -o strictatime tmpfs /mnt >/dev/null 2>&1
-while read -r l; do say "strace=$l"; done </tmp/st
-umount /mnt 2>/dev/null
-mount -t tmpfs -o size=50% tmpfs /mnt 2>/dev/null; say tmpfs-size-percent $?
-umount /mnt 2>/dev/null
-mount -t tmpfs -o nr_inodes=1M tmpfs /mnt 2>/dev/null; say tmpfs-nr-inodes $?
-umount /mnt 2>/dev/null
-unshare -m true 2>/dev/null; say unshare-mount-ns $?
-mount --make-rslave / 2>/dev/null; say make-rslave $?
-unshare -m sh -c 'mount --bind /etc /mnt' 2>/dev/null; say bind-in-ns $?
-say done 0
-exec /bin/sh
-DIAG
-chmod 0755 "$ROOTFS/usr/local/sbin/b1nix-diag"
-
 # The in-guest half of DISTRO-SMOKE. It is installed in every image and runs
 # only when the command line asks for it, so the image a lane boots is the same
 # image a person would install -- a lane that tests a special build tests the
@@ -270,17 +236,6 @@ done
 
 # The boot state, as the machine sees it: which entry booted, how many tries it
 # has left, and whether the unit that marks a boot good has run.
-# Why /boot is not mounted, when it is not: the ESP carries the boot state, and
-# the unit that marks a boot good writes it there. systemd generates boot.mount
-# from fstab and orders it after the device unit for /dev/vda2, so the answer is
-# either "no unit" (the generator skipped the line) or "no device" (udev never
-# announced the partition to systemd).
-say "boot-unit=$(timeout 15 systemctl show -p LoadState -p ActiveState -p Result boot.mount 2>&1 | tr '\n' ' ')"
-say "boot-device=$(timeout 15 systemctl show -p LoadState -p ActiveState dev-vda2.device 2>&1 | tr '\n' ' ')"
-say "boot-fstab=$(grep -a boot /etc/fstab 2>/dev/null | tr '\n' ' ')"
-timeout 15 journalctl -u boot.mount -n 5 --no-pager 2>&1 |
-	while read -r bl; do say "boot-log=$bl"; done
-
 if [ -r /boot/b1nix/boot-state ]; then
 	while read -r l; do say "boot-state=$l"; done </boot/b1nix/boot-state
 else
@@ -313,58 +268,38 @@ if mount -t 9p b1nixrepo /mnt 2>/tmp/9p.err; then
 		apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/b1nix-smoke.list \
 			-o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0 2>&1 |
 			tail -3 | while read -r l; do say "apt-err=$l"; done
-		# Which call failed, not which message apt printed. apt reports "read
-		# (22: Invalid argument)" without saying what it read, and the answer
-		# decides whether this is a kernel gap or apt's own fallback working as
-		# designed. strace is in the image for exactly this.
-		if command -v strace >/dev/null 2>&1; then
-			# Not silent, and short: the host kills a guest whose console has
-			# said nothing for 45 s, and a quiet trace looks exactly like the
-			# wedge this lane exists to catch.
-			say "apt-strace=starting"
-			timeout 30 strace -f -qq -e trace=openat,open,read,pread64,readv,preadv,preadv2,symlink,symlinkat,lseek,ioctl \
-				apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/b1nix-smoke.list \
-				-o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0 \
-				>/tmp/apt-strace.txt 2>&1
-			say "apt-strace=done ($(wc -l </tmp/apt-strace.txt) lines)"
-			grep -a -- "-1 E" /tmp/apt-strace.txt | tail -12 |
-				while IFS= read -r l; do say "apt-syscall=$l"; done
-			# The calls around the failing read, whatever strace made of them:
-			# a trace with no "-1 E" line at all still says what apt was doing.
-			grep -a -B6 "EINVAL\|Invalid argument" /tmp/apt-strace.txt | tail -20 |
-				while IFS= read -r l; do say "apt-around=$l"; done
-			# A trace this short is strace failing, not apt: say what it said.
-			if [ "$(wc -l </tmp/apt-strace.txt)" -lt 20 ]; then
-				while IFS= read -r l; do say "apt-strace-out=$l"; done </tmp/apt-strace.txt
-			fi
-			ls -la /var/lib/apt/lists/partial/ 2>&1 | tail -6 |
-				while IFS= read -r l; do say "apt-partial=$l"; done
-			# The same bytes read three ways: straight from the share, through
-			# the symlink apt made, and with a large read the way apt's FileFd
-			# reads. Which one fails says where the EINVAL comes from.
-			_pk=/mnt/dists/trixie/main/binary-amd64/Packages
-			say "apt-read-direct=$(cat "$_pk" 2>&1 | wc -c) $(cat "$_pk" 2>&1 >/dev/null | head -1)"
-			for _l in /var/lib/apt/lists/partial/*_Packages; do
-				say "apt-read-link=$(cat "$_l" 2>&1 | wc -c) $(cat "$_l" 2>&1 >/dev/null | head -1)"
-			done
-			say "apt-read-bigblock=$(dd if="$_pk" bs=1M count=4 2>&1 | tail -1)"
-		fi
 	fi
 else
 	say "repo-mounted=no"
 	while read -r l; do say "9p-err=$l"; done </tmp/9p.err
 fi
 
-# What the kernel says about /tmp, next to what systemd thinks of it. A mount
-# unit that reports "Result: protocol" means systemd could not see its mount
-# appear, so the interesting question is whether the mount is there at all and
-# under which name.
-say "tmp-mounted=$(awk '$5 == "/tmp" {print $5, $9; found=1} END {if (!found) print "no"}' /proc/self/mountinfo | head -1)"
-say "runlock-mounted=$(awk '$5 == "/run/lock" {print $5, $9; found=1} END {if (!found) print "no"}' /proc/self/mountinfo | head -1)"
-say "mountinfo-lines=$(wc -l </proc/self/mountinfo)"
-say "dev-vda=$(ls /dev/vda* 2>&1 | tr '\n' ' ')"
-say "boot-mount-try=$(mount /boot 2>&1 | head -1; echo rc=$?)"
-say "boot-mounted=$(awk '$5 == "/boot" {print $9; found=1} END {if (!found) print "no"}' /proc/self/mountinfo | head -1)"
+# The mounts systemd makes from units, as the kernel reports them. /boot is
+# the ESP that carries the boot state; /tmp and /run/lock are Debian's own
+# tmpfs units, which once failed with "Result: protocol" here.
+# The filesystem type is the field after the "-" separator; the optional
+# fields before it make its column vary.
+mounted_fs() {
+	awk -v t="$1" '$5 == t { for (i = 7; i <= NF; i++) if ($i == "-") { print $(i + 1); found = 1; exit } }
+		END { if (!found) print "no" }' /proc/self/mountinfo
+}
+say "tmp-mounted=$(mounted_fs /tmp)"
+say "runlock-mounted=$(mounted_fs /run/lock)"
+say "boot-mounted=$(mounted_fs /boot)"
+# Tracing PID 1 must leave it running. strace -p attaches with PTRACE_SEIZE and
+# PTRACE_INTERRUPT; when the interrupt was a real SIGSTOP, strace re-injected
+# it, systemd group-stopped, strace died on PTRACE_LISTEN, and the manager
+# stayed stopped with every job waiting.
+if command -v strace >/dev/null 2>&1; then
+	timeout 3 strace -qq -p 1 -o /dev/null 2>/dev/null
+	_p1=$(awk '{print $3}' /proc/1/stat)
+	if [ "$_p1" != "T" ] && [ "$_p1" != "t" ] &&
+		timeout 10 systemctl show -p Version --value >/dev/null 2>&1; then
+		say "strace-pid1=ok"
+	else
+		say "strace-pid1=FAIL state=$_p1"
+	fi
+fi
 # The policy calls Debian units use, answered by the kernel rather than guessed.
 say "sched-idle=$(chrt --idle 0 true 2>&1 | head -1; echo rc=$?)"
 
@@ -403,92 +338,24 @@ cat >"$ROOTFS/usr/local/sbin/b1nix-boot-probe" <<'PROBE'
 # be readable on the lane's ordinary command line.
 say() { printf 'BOOT-PROBE: %s\n' "$*" >/dev/console 2>/dev/null ||
 	echo "BOOT-PROBE: $*"; }
-# The two mount units Debian's local-fs.target waits for, asked about once:
-# their own journal carries systemd's reason, and a mount done by hand next to
-# them says whether the kernel or the manager is at fault.
-for u in run-lock.mount tmp.mount; do
-	timeout 15 systemctl show -p Result -p ActiveState "$u" 2>&1 |
-		while IFS= read -r l; do say "  $u $l"; done
-	timeout 15 journalctl -u "$u" -n 6 --no-pager 2>&1 |
-		while IFS= read -r l; do say "  $u| $l"; done
-done
-say "systemd $(timeout 10 systemctl --version 2>&1 | head -1)"
-# The table itself, line for line. Everything else about this is inference; the
-# bytes systemd's parser is handed are not.
-timeout 10 cat /proc/self/mountinfo | while IFS= read -r l; do say "  MI| $l"; done
-# And what the distribution's own libmount makes of it, which is the same
-# parser systemd uses.
-run findmnt --target /tmp --output TARGET,SOURCE,FSTYPE
-run findmnt --target /run/lock --output TARGET,SOURCE,FSTYPE
-# Which descriptors PID 1 holds, and what they name: the mount monitor is one of
-# them, and knowing whether it watches /proc/self/mountinfo directly or through
-# libmount's own epoll says which path has to carry the notification.
-for f in /proc/1/fd/*; do
-	[ -e "$f" ] || continue
-	say "  pid1 fd $(basename "$f") -> $(readlink "$f" 2>/dev/null)"
-done
-
-# Started again, now that the boot is quiet: a unit that fails at 0.9 s and
-# works at 7 s failed to a race, and one that fails both times does not.
-for u in tmp.mount run-lock.mount; do
-	timeout 20 systemctl reset-failed "$u" 2>/dev/null
-	if timeout 25 systemctl start "$u" >/tmp/probe-$u.err 2>&1 &&
-		[ "$(timeout 10 systemctl is-active "$u" 2>&1)" = "active" ]; then
-		say "retry $u: started"
-	else
-		say "retry $u: $(timeout 10 systemctl show -p Result -p ActiveState "$u" 2>&1 | tr '\n' ' ')$(head -1 /tmp/probe-$u.err 2>/dev/null)"
-	fi
-done
-
-# What PID 1 actually does when the mount table changes. strace is in the
-# image; eight seconds of it around a mount says whether the manager is told at
-# all -- whether its epoll returns the mountinfo descriptor and whether it then
-# opens the file again. Everything else about this bug is inference.
-if command -v strace >/dev/null 2>&1; then
-	( timeout 8 strace -qq -f -p 1 -e trace=epoll_wait,epoll_pwait,openat,ppoll \
-		>/tmp/probe-strace.txt 2>&1 ) &
-	sleep 2
-	mkdir -p /run/b1nix-strace-mnt
-	timeout 15 mount -t tmpfs tmpfs /run/b1nix-strace-mnt -o mode=1777 2>/dev/null
-	sleep 4
-	timeout 10 umount /run/b1nix-strace-mnt 2>/dev/null
-	wait
-	say "strace of pid 1 around a mount:"
-	grep -a "mountinfo" /tmp/probe-strace.txt | tail -6 |
-		while IFS= read -r l; do say "  st $l"; done
-	tail -8 /tmp/probe-strace.txt | while IFS= read -r l; do say "  st $l"; done
-fi
-
-mkdir -p /run/b1nix-probe-mnt
-if timeout 20 mount -t tmpfs tmpfs /run/b1nix-probe-mnt \
-	-o mode=1777,strictatime,nosuid,nodev,size=5242880 >/tmp/probe-mnt.err 2>&1; then
-	if awk '{print $5}' /proc/self/mountinfo | grep -qx /run/b1nix-probe-mnt; then
-		say "by-hand mount: mounted AND named in mountinfo"
-	else
-		say "by-hand mount: mounted but NOT in mountinfo"
-		timeout 10 awk '{print $1, $2, $5, $9}' /proc/self/mountinfo |
-			tail -10 | while IFS= read -r l; do say "  mi $l"; done
-	fi
-	timeout 10 umount /run/b1nix-probe-mnt 2>/dev/null
-else
-	say "by-hand mount FAILED: $(head -2 /tmp/probe-mnt.err | tr '\n' ' ')"
-fi
-
 i=0
 while [ $i -lt 24 ]; do
 	i=$((i + 1))
 	_state=$(timeout 10 systemctl is-system-running 2>&1)
+	case "$_state" in running | degraded) say "system is up"; exit 0 ;; esac
 	_jobs=$(timeout 10 systemctl list-jobs --no-legend --no-pager 2>/dev/null | wc -l)
 	say "t=$(cut -d\  -f1 /proc/uptime) state=$_state jobs=$_jobs"
-	timeout 10 systemctl list-jobs --no-legend --no-pager 2>/dev/null |
-		head -30 | while IFS= read -r l; do say "  job $l"; done
+	# What each waiting job waits FOR. A job with nothing listed under it is
+	# runnable and the manager is not running it -- the shape of a boot held
+	# by systemd's own rate limits rather than by a unit.
+	timeout 10 systemctl list-jobs --before --no-legend --no-pager 2>/dev/null |
+		head -40 | while IFS= read -r l; do say "  job $l"; done
 	timeout 10 systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null |
 		head -8 | while IFS= read -r l; do say "  failed $l"; done
 	# A unit stuck in "activating" is the one holding the boot: the jobs above
 	# are all merely waiting for it.
 	timeout 10 systemctl list-units --state=activating --no-legend --no-pager 2>/dev/null |
 		head -8 | while IFS= read -r l; do say "  activating $l"; done
-	case "$_state" in running | degraded) say "system is up"; exit 0 ;; esac
 	sleep 5
 done
 say "gave up watching"

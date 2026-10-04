@@ -1,0 +1,20 @@
+Source: b1cc
+Section: devel
+Priority: optional
+Maintainer: b1nix maintainers <maintainers@b1nix.invalid>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Homepage: https://github.com/B1nix/b1cc
+Rules-Requires-Root: no
+
+Package: b1cc
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, gcc, libc6-dev
+Description: small clean-room C compiler from the b1nix project
+ b1cc compiles a growing subset of C23 to x86_64 and AArch64 code. On Debian it
+ builds programs against the system C library: it preprocesses with the system
+ headers, writes the object itself and links through the platform's own
+ compiler driver.
+ .
+ This is the compiler b1nix grew up with, packaged as it is. It is not a
+ replacement for gcc or clang, and the C it accepts is documented upstream.
