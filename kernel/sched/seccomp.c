@@ -14,6 +14,7 @@
  * side-table load and the syscall hot path gates on it.
  */
 
+#include <b1nix/klog.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/linux_abi.h>
@@ -218,7 +219,10 @@ int seccomp_active(void) {
 
 static void filter_unref(struct seccomp_filter *f) {
   while (f) {
-    if (__atomic_sub_fetch(&f->refcount, 1, __ATOMIC_ACQ_REL) != 0)
+    int left = __atomic_sub_fetch(&f->refcount, 1, __ATOMIC_ACQ_REL);
+    KASSERT(left >= 0, "seccomp filter %p put at refcount %d", (void *)f,
+            left + 1);
+    if (left != 0)
       break; /* still shared by another task */
     struct seccomp_filter *prev = f->prev;
     kfree(f->prog);

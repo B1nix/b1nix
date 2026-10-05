@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/klog.h>
 #include <b1nix/syscall.h>
 #include <b1nix/vfs.h>
 #include <b1nix/errno.h>
@@ -220,10 +221,15 @@ static void pipe_release(struct vfs_handle *h) {
   struct vfs_pipe *pipe = (struct vfs_pipe *)h->private_data;
   if (!pipe) return;
   while (__atomic_test_and_set(&pipe->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+  /* One end closed twice, or closed by a handle that never counted itself. */
   if (h->kind == VFS_HANDLE_PIPE_READ) {
-    if (pipe->readers > 0) pipe->readers--;
+    KASSERT(pipe->readers > 0, "pipe %p reader closed with no readers",
+            (void *)pipe);
+    pipe->readers--;
   } else {
-    if (pipe->writers > 0) pipe->writers--;
+    KASSERT(pipe->writers > 0, "pipe %p writer closed with no writers",
+            (void *)pipe);
+    pipe->writers--;
   }
   int free_pipe = (pipe->readers <= 0 && pipe->writers <= 0);
   char *doomed = 0;
@@ -383,9 +389,13 @@ static void fifo_detach(struct vfs_inode *inode, struct vfs_pipe *fifo,
                         int was_reader, int was_writer) {
   u64 irq;
   spin_lock_irqsave(&fifo_attach_lock, &irq);
-  if (was_reader && fifo->readers > 0)
+  KASSERT(!was_reader || fifo->readers > 0, "fifo %p reader detached with "
+          "no readers", (void *)fifo);
+  KASSERT(!was_writer || fifo->writers > 0, "fifo %p writer detached with "
+          "no writers", (void *)fifo);
+  if (was_reader)
     fifo->readers--;
-  if (was_writer && fifo->writers > 0)
+  if (was_writer)
     fifo->writers--;
   if (fifo->readers <= 0 && fifo->writers <= 0) {
     if (inode && inode->fifo == fifo)

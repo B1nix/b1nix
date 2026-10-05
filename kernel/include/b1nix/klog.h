@@ -95,5 +95,26 @@ void panic_reboot_if_asked(void);
 		} \
 	} while (0)
 
+/*
+ * An invariant, with the values that broke it.
+ *
+ * The kernel panics on a broken invariant rather than carrying on: a refcount
+ * that went below zero, a free of something still linked, a ring index from a
+ * device past the ring. Carrying on is how a double free became black tiles on
+ * the screen weeks later, with nothing left to say where it started. The
+ * message is printf-style and names what was found, because "assertion
+ * failed" alone sends the reader back to reproduce it.
+ *
+ *   KASSERT(old > 0, "page %p put at refcount %d", page, old);
+ */
+void kassert_fail(const char *cond, const char *file, int line,
+                  const char *fmt, ...)
+	__attribute__((noreturn, format(printf, 4, 5)));
+#define KASSERT(condition, ...) \
+	do { \
+		if (__builtin_expect(!(condition), 0)) \
+			kassert_fail(#condition, __FILE__, __LINE__, __VA_ARGS__); \
+	} while (0)
+
 #endif
 

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/klog.h>
 #include <b1nix/kprof.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/lapic.h>
@@ -172,22 +173,27 @@ static inline u32 bcache_bucket(struct block_device *dev, u64 lba) {
 }
 
 /* Caller must hold bcache_lock. Unlinks block_cache[idx] from its hash chain
- * (a no-op if not currently linked, i.e. invalid/uninitialized entry). */
+ * (a no-op if it is not linked). */
 static void bcache_hash_remove(i32 idx) {
   struct block_buffer *b = &block_cache[idx];
-  if (!b->bdev) return; /* never inserted */
+  if (!(b->flags & BLK_CACHE_HASHED))
+    return;
   u32 h = bcache_bucket(b->bdev, b->block_no);
   i32 *pp = &bcache_hash[h];
   while (*pp != -1) {
     if (*pp == idx) {
       *pp = b->hash_next;
       b->hash_next = -1;
+      b->flags &= ~BLK_CACHE_HASHED;
       return;
     }
     pp = &block_cache[*pp].hash_next;
   }
-  /* If we get here the chain was inconsistent — leave gracefully. */
-  b->hash_next = -1;
+  /* Linked but not in the chain its key hashes to: the key changed after
+   * the insert, and the chain it really is in still points at it. */
+  KASSERT(0, "block cache entry %d (dev %p, block %llu) missing from its hash "
+          "chain %u", (int)idx, (void *)b->bdev, (unsigned long long)b->block_no,
+          h);
 }
 
 /* Caller must hold bcache_lock. Links idx at the head of its hash bucket. */
@@ -195,8 +201,12 @@ static void bcache_hash_insert(i32 idx) {
   struct block_buffer *b = &block_cache[idx];
   u32 h = bcache_bucket(b->bdev, b->block_no);
 
+  /* Linked twice would make the chain a cycle. */
+  KASSERT(!(b->flags & BLK_CACHE_HASHED), "block cache entry %d inserted "
+          "into the hash twice", (int)idx);
   b->hash_next = bcache_hash[h];
   bcache_hash[h] = idx;
+  b->flags |= BLK_CACHE_HASHED;
 }
 
 #include <b1nix/lockdep.h>

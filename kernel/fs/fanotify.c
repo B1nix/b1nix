@@ -18,6 +18,7 @@
  *   closing releases every waiter with an allow, because a scanner that has
  *   crashed must not become a lock on the filesystem.
  */
+#include <b1nix/klog.h>
 #include <b1nix/fanotify.h>
 
 #include <b1nix/errno.h>
@@ -97,7 +98,10 @@ int fanotify_active(void) {
 static void fan_put(struct fan_group *g) {
   if (!g)
     return;
-  if (__atomic_sub_fetch(&g->refs, 1, __ATOMIC_ACQ_REL) == 0)
+  int left = __atomic_sub_fetch(&g->refs, 1, __ATOMIC_ACQ_REL);
+  KASSERT(left >= 0, "fanotify group %p put at refcount %d", (void *)g,
+          left + 1);
+  if (left == 0)
     kfree(g);
 }
 

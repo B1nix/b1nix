@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/klog.h>
 #include <b1nix/console.h>
 #include <stdio.h>
 #include <b1nix/vfs.h>
@@ -203,7 +204,10 @@ static void unix_data_get(struct unix_socket_data *u) {
 
 static void unix_data_put(struct unix_socket_data *u) {
   if (!u) return;
-  if (__atomic_sub_fetch(&u->refcount, 1, __ATOMIC_ACQ_REL) == 0) {
+  int left = __atomic_sub_fetch(&u->refcount, 1, __ATOMIC_ACQ_REL);
+  KASSERT(left >= 0, "unix socket data %p put at refcount %d", (void *)u,
+          left + 1);
+  if (left == 0) {
     for (int i = 0; i < UNIX_CONTROL_SLOTS; i++)
       for (usize j = 0; j < u->control[i].nhandles; j++)
         if (u->control[i].handles[j])

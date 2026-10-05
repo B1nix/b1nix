@@ -407,6 +407,7 @@ static int buddy_release(u64 frame, int order) {
  * through it. */
 int pmm_frame_is_page_table(u64 frame);
 void pmm_report_page_table_history_pub(u64 frame);
+void pmm_report_frame_free_site(u64 frame);
 
 static void pmm_return_frame(u64 frame) {
   /* Every path back into the allocator goes through here, including the ones
@@ -438,6 +439,14 @@ static void pmm_return_frame(u64 frame) {
   }
   if (buddy_release(frame, 0) == 0) return;
   usize idx = frame_index(frame);
+  /* buddy_release refuses a frame outside the tree's region (the fallback
+   * below handles that) and a frame that is already free -- a double free,
+   * which the per-CPU marker check missed. That one is not a fallback case. */
+  if (buddy_region_valid(frame, 0) && !bitmap_get(idx)) {
+    pmm_report_frame_free_site(frame);
+    KASSERT(0, "frame 0x%llx returned to the allocator while already free",
+            (unsigned long long)frame);
+  }
   if (bitmap_get(idx)) {
     bitmap_clear(idx);
     pmm.free_frames++;
@@ -920,7 +929,14 @@ void pmm_ref_frame(u64 frame) {
   u64 flags;
   pmm_acquire(&flags);
   usize idx = frame / PAGE_SIZE;
+  KASSERT(frame < pmm.max_address && !(frame & (PAGE_SIZE - 1)),
+          "reference to frame 0x%llx outside RAM", (unsigned long long)frame);
   if (pmm.frame_refcounts) {
+    /* A second owner for a frame nobody owns is a use after free, and a
+     * count at the top of its range is about to wrap to "free". */
+    KASSERT(pmm.frame_refcounts[idx] > 0 && pmm.frame_refcounts[idx] < 0xFFFF,
+            "reference to frame 0x%llx at refcount %u",
+            (unsigned long long)frame, (unsigned)pmm.frame_refcounts[idx]);
     pmm.frame_refcounts[idx]++;
   }
   pmm_release(flags);
@@ -1116,10 +1132,17 @@ static u64 zero_pop_checked(struct pmm_pcp *pcp, const char *where) {
       pmm_report_frame_free_site(frame);
       console_lock_release_irqrestore(cflags);
     }
-    pcp->zero_head = 0;
-    pcp->zero_count = 0;
-    return 0;
+    /* Dropping the list here used to keep the machine running on memory
+     * that something else was still writing into. The history above names
+     * who freed the frame; stopping is what keeps it the last write. */
+    panic("pmm: zero bucket corrupt (a freed frame was written)");
   }
+  /* The link itself: a frame address, page-aligned. Anything else is a write
+   * into the first word of a parked frame, which the mark above does not see
+   * -- the mark is at offset 16. */
+  KASSERT((marker[0] & (PAGE_SIZE - 1)) == 0,
+          "zero bucket frame 0x%llx (in %s) has its link overwritten: 0x%llx",
+          (unsigned long long)frame, where, (unsigned long long)marker[0]);
   pcp->zero_head = marker[0];
   pcp->zero_count--;
   marker[0] = 0;
@@ -1290,6 +1313,8 @@ static void pmm_scrub_quarantine(void) {
         klog_warn("pmm: quarantine canary corrupted (UAF/OOB write into freed page)");
         corrupted++;
       }
+      pmm_report_frame_free_site(frame);
+      panic("pmm: a frame in quarantine was written after it was freed");
     }
     /* The zeroing the pre-zeroed pool is built around — deliberately here, on
      * an idle CPU, and not in the free path. */
@@ -1458,7 +1483,11 @@ void pmm_free_frame(u64 frame) {
      * zero-page PTEs — from any address space — land here. */
     return;
   }
-  if ((frame & (PAGE_SIZE - 1)) != 0 || frame >= pmm.max_address) {
+  /* A frame address is page-aligned, whoever passes it. One that is not is
+   * a value read from somewhere it should not have been. */
+  KASSERT((frame & (PAGE_SIZE - 1)) == 0, "free of misaligned frame 0x%llx "
+          "from %p", (unsigned long long)frame, __builtin_return_address(0));
+  if (frame >= pmm.max_address) {
     /* Out-of-range or misaligned frames reach here legitimately: unmapping a
      * shared/device mapping (e.g. the virtio-gpu framebuffer at ~0xfe000000,
      * which the device owns) hits a PTE whose frame is above usable RAM. We
@@ -1484,8 +1513,8 @@ void pmm_free_frame(u64 frame) {
       console_write_hex64((u64)(usize)__builtin_return_address(0));
       console_write("\n");
     }
-    klog_warn("pmm_free_frame: refused free of a live page-table frame");
-    return;
+    pmm_report_page_table_history_pub(frame);
+    panic("pmm: free of a frame still claimed as a live page table");
   }
 
   usize idx = frame / PAGE_SIZE;
@@ -1601,9 +1630,11 @@ void pmm_free_frame(u64 frame) {
             console_write("  not mapped anywhere in this task\n");
         }
         console_lock_release_irqrestore(cflags);
-        klog_warn("pmm_free_frame: double free (page already parked in a bucket)");
       }
-      return;
+      /* Refusing the second free and carrying on left the first owner's
+       * mistake in place: whoever still writes to this frame keeps writing to
+       * a page the allocator will hand out next. */
+      panic("pmm: double free (frame already parked in a bucket)");
     }
 
     /* Park in the quarantine queue, NOT the zero bucket: a freed page must age

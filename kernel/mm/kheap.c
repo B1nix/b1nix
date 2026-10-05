@@ -37,6 +37,9 @@ struct kheap_state {
  * twice and the allocator then handed one piece of memory to two owners —
  * whichever of them zeroed it destroyed the other's data. */
 #define KHEAP_MAG_MAGIC 0xB1A6A21E
+/* The fill of a small block waiting in a magazine, checked when it is handed
+ * out again (OpenBSD malloc's junk, for the blocks that are reused most). */
+#define KHEAP_JUNK_FREE 0xde
 #define KHEAP_HEADER_SIZE 32
 #define KHEAP_REUSE_MIN_SIZE 0
 
@@ -245,6 +248,18 @@ static void *kheap_mag_alloc(usize size) {
   spin_lock(&m->lock);
   if (m->count[cls] > 0) {
     struct kheap_block *block = m->slot[cls][--m->count[cls]];
+    const u8 *junk = (const u8 *)block + KHEAP_HEADER_SIZE;
+
+    /* What kheap_mag_free left: its mark, and every payload byte junked. A
+     * changed byte is a write through a pointer kept after kfree. */
+    KASSERT(block->magic == KHEAP_MAG_MAGIC,
+            "magazine block %p lost its mark: 0x%llx", (void *)block,
+            (unsigned long long)block->magic);
+    for (usize i = 0; i < block->size; i++)
+      KASSERT(junk[i] == KHEAP_JUNK_FREE,
+              "heap block %p (size %lu) written at +%lu after kfree: 0x%02x",
+              (void *)(junk), (unsigned long)block->size, (unsigned long)i,
+              junk[i]);
     block->magic = KHEAP_MAGIC;
     block->next = 0;
     ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
@@ -270,6 +285,7 @@ static int kheap_mag_free(struct kheap_block *block) {
   if (m->count[cls] < MAG_DEPTH) {
     block->next = 0;
     block->magic = KHEAP_MAG_MAGIC;
+    memset((u8 *)block + KHEAP_HEADER_SIZE, KHEAP_JUNK_FREE, block->size);
     m->slot[cls][m->count[cls]++] = block;
     cached = 1;
   }
@@ -1236,14 +1252,16 @@ static void *kmalloc_internal(usize size, u64 caller) {
         /* Detect free-list corruption (UAF / buffer overflow into a freed
          * neighbour). On corruption, sever this bucket here so we fall through
          * to bump allocation instead of crashing in a #GP/#PF. */
-        if (!is_canonical_addr(bp) ||
-            (bp & 0xF) != 0 ||
-            bp < heap.base + KHEAP_HEADER_SIZE ||
-            bp + KHEAP_HEADER_SIZE + cur->size > heap.end ||
-            cur->magic != KHEAP_FREED_MAGIC) {
-          *prev = 0;
-          break;
-        }
+        /* A link that is not a free block is a write into one: severing
+         * the bucket and allocating elsewhere used to keep the machine
+         * running on a heap something was still corrupting. */
+        KASSERT(is_canonical_addr(bp) && (bp & 0xF) == 0 &&
+                    bp >= heap.base + KHEAP_HEADER_SIZE &&
+                    bp + KHEAP_HEADER_SIZE + cur->size <= heap.end &&
+                    cur->magic == KHEAP_FREED_MAGIC,
+                "free list %d corrupt at %p (magic 0x%llx, size %lu)", bkt,
+                (void *)cur, (unsigned long long)cur->magic,
+                (unsigned long)cur->size);
         if (cur->size >= size) {
           *prev = cur->next;
           cur->next = 0;
@@ -1346,8 +1364,8 @@ void kfree(void *ptr) {
   if (!ptr)
     return;
   u64 p = (u64)(usize)ptr;
-  if (!is_canonical_addr(p))
-    return;
+  KASSERT(is_canonical_addr(p), "kfree of a non-canonical pointer %p from %p",
+          ptr, __builtin_return_address(0));
   if (p >= KLARGE_START && p < KLARGE_END) {
     /* A large block's header sits in the page below the pointer; unmapped
      * means the block was already freed. Name the second free's caller
@@ -1370,10 +1388,10 @@ void kfree(void *ptr) {
     klarge_free(ptr);
     return;
   }
-  if (heap.base != 0) {
-    if (p < heap.base + KHEAP_HEADER_SIZE || p >= heap.end)
-      return;
-  }
+  if (heap.base != 0)
+    KASSERT(p >= heap.base + KHEAP_HEADER_SIZE && p < heap.end,
+            "kfree of %p, which the heap never handed out, from %p", ptr,
+            __builtin_return_address(0));
 
   /* Fast path: cache small blocks in this CPU's magazine, lock-free. Validate
    * the magic here (same double-free guard the locked path applies) before
@@ -1468,17 +1486,10 @@ void kfree(void *ptr) {
   if (KHEAP_ENABLE_PAGE_RETURN && heap.last_block == block &&
       block->size >= KHEAP_SHRINK_MIN) {
     struct kheap_block *top = kheap_walk_topmost();
-    if (top != block) {
-      static unsigned lb_reported;
-      if (lb_reported < 8) {
-        console_write("kheap: last_block 0x");
-        console_write_hex64((u64)(usize)block);
-        console_write(" is not the topmost block (walk says 0x");
-        console_write_hex64((u64)(usize)top);
-        console_write(") — skipping tail return\n");
-        lb_reported++;
-      }
-    }
+    /* Either the cached tail is stale or a header in the chain is broken;
+     * both are corruption, and returning the tail would unmap live memory. */
+    KASSERT(top == block, "heap last_block %p is not the topmost block (the "
+            "walk says %p)", (void *)block, (void *)top);
   }
   if (KHEAP_ENABLE_PAGE_RETURN && heap.last_block == block &&
       block->size >= KHEAP_SHRINK_MIN &&

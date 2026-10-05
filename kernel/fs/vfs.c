@@ -1254,7 +1254,12 @@ static void vfs_inode_lock_read(struct vfs_inode *inode) {
 
 static void vfs_inode_unlock_read(struct vfs_inode *inode) {
   LOCKDEP_RELEASE_GLOBAL(LOCKDEP_LVL_INODE);
-  if (__atomic_add_fetch(&inode->rw_lock, -1, __ATOMIC_SEQ_CST) == 0) {
+  int left = __atomic_add_fetch(&inode->rw_lock, -1, __ATOMIC_SEQ_CST);
+  /* A read unlock of an inode nobody had read-locked: -1 is a writer's
+   * state, and anything below it a second unlock. */
+  KASSERT(left >= 0, "inode %llu read-unlocked with lock word %d",
+          (unsigned long long)inode->ino, left + 1);
+  if (left == 0) {
     vfs_inode_lock_clear_note(inode);
     if (__atomic_load_n(&inode->rw_waiters, __ATOMIC_SEQ_CST))
       scheduler_wake_all((void *)&inode->rw_lock);
@@ -1450,6 +1455,18 @@ static void vfs_inode_lock_write(struct vfs_inode *inode) {
 }
 
 static void vfs_inode_unlock_write(struct vfs_inode *inode) {
+  {
+    struct task *t = current_task;
+    int word = __atomic_load_n(&inode->rw_lock, __ATOMIC_SEQ_CST);
+    u64 owner = __atomic_load_n(&inode->rw_owner, __ATOMIC_RELAXED);
+
+    KASSERT(word == -1, "inode %llu write-unlocked with lock word %d",
+            (unsigned long long)inode->ino, word);
+    KASSERT(!t || owner == (u64)t->id,
+            "inode %llu write-unlocked by task %llu, locked by task %llu",
+            (unsigned long long)inode->ino,
+            (unsigned long long)(t ? t->id : 0), (unsigned long long)owner);
+  }
   vfs_wlock_untrack(inode);
   LOCKDEP_RELEASE_GLOBAL(LOCKDEP_LVL_INODE);
   vfs_inode_lock_clear_note(inode);
@@ -1919,6 +1936,10 @@ void vfs_node_put(struct vfs_node *node) {
     panic("vfs: node refcount underflow");
   }
   if (new_ref == 0 && node->deleted) {
+    /* Still threaded into its parent's child list, a freed node is reached
+     * by the next walk of that list. */
+    KASSERT(!node->next_sibling, "node %p ('%s') freed while still linked",
+            (void *)node, node->name);
     if (node->inode && node->inode->release_cb) {
       node->inode->release_cb(node);
     }
@@ -2968,17 +2989,23 @@ void vfs_detach_child(struct vfs_node *parent, struct vfs_node *child) {
   if (!parent || !child)
     return;
   u64 flags;
+  int found = 0;
   vfs_tree_write_acquire(&flags);
   struct vfs_node **pp = &parent->first_child;
   while (*pp) {
     if (*pp == child) {
       *pp = child->next_sibling;
       child->next_sibling = 0;
+      found = 1;
       break;
     }
     pp = &(*pp)->next_sibling;
   }
   vfs_tree_write_release(flags);
+  /* Detaching a child that is not there means two owners think they unlinked
+   * it, or it hangs under another parent. */
+  KASSERT(found, "node %p ('%s') detached from %p ('%s'), which does not "
+          "list it", (void *)child, child->name, (void *)parent, parent->name);
   /* A cached name→node entry would still resolve after the unlink. */
   dcache_invalidate(parent, child->name);
 }
@@ -3189,8 +3216,13 @@ int vfs_fd_for_node(struct vfs_node *node, int flags) {
 }
 
 void vfs_handle_retain(struct vfs_handle *h) {
-  if (!h || h->used != 1 || h->refcount <= 0)
+  if (!h)
     return;
+  /* Retaining a handle nobody holds is a use after free: it used to return
+   * quietly, and the caller went on with a pointer it did not own. */
+  KASSERT(h->used == 1 && h->refcount > 0,
+          "retain of a dead handle %p (used %d, refcount %d)", (void *)h,
+          (int)h->used, (int)h->refcount);
   /* SMP-safe: fork retains every shared fd's handle (scheduler.c) on the
    * forking CPU while the original holder may run on another. A non-atomic
    * increment would lose updates, breaking the refcount and ultimately
@@ -3215,12 +3247,13 @@ static void copy_path(char *dst, usize dst_size, const char *src) {
 }
 
 void vfs_handle_release(struct vfs_handle *h) {
-  if (!h || h->used != 1)
+  if (!h)
     return;
+  KASSERT(h->used == 1, "release of a dead handle %p (used %d)", (void *)h,
+          (int)h->used);
   int new_ref = __atomic_sub_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL);
-  if (new_ref < 0) {
-    panic("vfs: handle refcount underflow");
-  }
+  KASSERT(new_ref >= 0, "handle %p released at refcount %d", (void *)h,
+          new_ref + 1);
   if (new_ref > 0)
     return;
 
@@ -5584,7 +5617,11 @@ static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
     if (err < 0) {
       u64 _tlflags;
       vfs_tree_write_acquire(&_tlflags);
+      /* Undoing the insert just made: the new node went in at the head. */
+      KASSERT(parent->first_child == node, "undo of an insert that is not at the "
+              "head of '%s'", parent->name);
       parent->first_child = node->next_sibling;
+      node->next_sibling = 0;
       vfs_tree_write_release(_tlflags);
       res = err;
       goto out_node_put;
@@ -5776,7 +5813,11 @@ int vfs_mknod(const char *path, u32 mode, u64 dev) {
     if (err < 0) {
       u64 _tlflags;
       vfs_tree_write_acquire(&_tlflags);
+      /* Undoing the insert just made: the new node went in at the head. */
+      KASSERT(parent->first_child == node, "undo of an insert that is not at the "
+              "head of '%s'", parent->name);
       parent->first_child = node->next_sibling;
+      node->next_sibling = 0;
       vfs_tree_write_release(_tlflags);
       node->deleted = 1;
       __atomic_store_n(&node->refcount, 1, __ATOMIC_RELAXED);
@@ -5915,7 +5956,11 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
     if (err < 0) {
       u64 _tlflags;
       vfs_tree_write_acquire(&_tlflags);
+      /* Undoing the insert just made: the new node went in at the head. */
+      KASSERT(parent->first_child == node, "undo of an insert that is not at the "
+              "head of '%s'", parent->name);
       parent->first_child = node->next_sibling;
+      node->next_sibling = 0;
       vfs_tree_write_release(_tlflags);
       res = err;
       goto out_node_put;
@@ -6370,6 +6415,7 @@ static int vfs_remove_child_locked(struct vfs_node *parent, const char *r_path,
           prev->next_sibling = child->next_sibling;
         else
           parent->first_child = child->next_sibling;
+        child->next_sibling = 0;
         vfs_tree_write_release(_tlflags);
       }
       vfs_node_put(child);
@@ -6523,7 +6569,11 @@ int vfs_link(const char *target, const char *link_path) {
     if (res < 0) {
       u64 _tlflags;
       vfs_tree_write_acquire(&_tlflags);
+      /* Undoing the insert just made: the new node went in at the head. */
+      KASSERT(parent->first_child == new_node, "undo of an insert that is not at the "
+              "head of '%s'", parent->name);
       parent->first_child = new_node->next_sibling;
+      new_node->next_sibling = 0;
       vfs_tree_write_release(_tlflags);
       new_node->inode->nlink--;
       vfs_inode_put(new_node->inode); /* the ref taken just above */
@@ -6648,7 +6698,11 @@ int vfs_symlink(const char *target, const char *link_path) {
     if (err < 0) {
       u64 _tlflags;
       vfs_tree_write_acquire(&_tlflags);
+      /* Undoing the insert just made: the new node went in at the head. */
+      KASSERT(parent->first_child == node, "undo of an insert that is not at the "
+              "head of '%s'", parent->name);
       parent->first_child = node->next_sibling;
+      node->next_sibling = 0;
       vfs_tree_write_release(_tlflags);
       /* refcount-0 node: deleted=1 + refcount=1 before the put or it underflows
        * and leaks (R3-15, mirrors vfs_link). */
@@ -9995,14 +10049,21 @@ static int vfs_dup_min(int oldfd, int minfd) {
   if ((usize)minfd >= limit)
     return -EMFILE;
 
+  /* The descriptor's reference is taken before it is published: once it is
+   * in the table another thread can close it, and a retain after that would
+   * be on a handle that may already be gone. */
+  vfs_handle_retain(old_handle);
   for (usize fd = (usize)minfd; fd < limit; fd++) {
     if (scheduler_fd_get((int)fd) == 0) {
-      if (scheduler_fd_set((int)fd, old_handle) < 0)
-        return -EMFILE;
-      vfs_handle_retain(old_handle);
+      int rc = scheduler_fd_set((int)fd, old_handle);
+      if (rc == -EBUSY)
+        continue; /* another thread took it first */
+      if (rc < 0)
+        break;
       return (int)fd;
     }
   }
+  vfs_handle_release(old_handle);
   return -EMFILE;
 }
 
@@ -10022,11 +10083,21 @@ int vfs_dup2(int oldfd, int newfd) {
   if (oldfd == newfd)
     return newfd;
 
-  if (scheduler_fd_get(newfd) != 0)
-    vfs_close(newfd);
-  if (scheduler_fd_set(newfd, old_handle) < 0)
-    return -EMFILE;
-  vfs_handle_retain(old_handle);
+  /* Close-then-install, retried while another thread keeps installing into
+   * newfd between the two: dup2 replaces whatever is there. */
+  vfs_handle_retain(old_handle); /* before it is published: see vfs_dup */
+  for (;;) {
+    if (scheduler_fd_get(newfd) != 0)
+      vfs_close(newfd);
+    int rc = scheduler_fd_set(newfd, old_handle);
+    if (rc == -EBUSY)
+      continue;
+    if (rc < 0) {
+      vfs_handle_release(old_handle);
+      return -EMFILE;
+    }
+    break;
+  }
   return newfd;
 }
 

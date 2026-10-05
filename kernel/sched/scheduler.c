@@ -424,8 +424,13 @@ void scheduler_preempt_enable(void) {
   u64 flags = interrupts_save();
   int yield_now = 0;
 
-  if (current_task && g_task_preempt_depth[task_index(current_task)] > 0) {
+  if (current_task) {
     usize idx = task_index(current_task);
+
+    /* An enable without its disable: the depth is already zero. */
+    KASSERT(g_task_preempt_depth[idx] > 0,
+            "preempt_enable at depth 0 in task %llu",
+            (unsigned long long)current_task->id);
 
     g_task_preempt_depth[idx]--;
     if (g_task_preempt_depth[idx] == 0 && g_task_resched[idx] && irqs_on &&
@@ -1779,6 +1784,10 @@ static usize task_index(const struct task *task) {
       return (usize)MAX_TASKS + (usize)c;
     }
   }
+  /* Not a task at all. Answering 0 handed it the boot task's row in every
+   * side table -- preempt depth, fd lock, rlimits. */
+  KASSERT(!task, "task_index of %p, which is not in the task table",
+          (const void *)task);
   return 0;
 }
 
@@ -10349,6 +10358,14 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
     fdtable_publish_grown(new_table, new_flags, new_capacity);
   }
 
+  /* Installing over a descriptor would drop the handle that was there
+   * without releasing it. Callers check the slot first, but outside this lock:
+   * two threads can both see it empty, and the second one used to overwrite
+   * the first one's file. */
+  if (current_task->fd_table[fd]) {
+    fd_lock_release();
+    return -EBUSY;
+  }
   current_task->fd_table[fd] = handle;
   current_task->fd_flags[fd] = 0;
   fd_trace("set", fd, handle);

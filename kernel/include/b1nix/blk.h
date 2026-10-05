@@ -152,6 +152,10 @@ int blk_cache_writeback_inode(struct block_device *dev, u32 fsid, u64 ino);
  * could pick the same slot and DMA a different block into it — corrupting both
  * (observed under -smp4 parallel builds as the compiler reading garbage from a header). */
 #define BLK_CACHE_BUSY  0x04
+/* Linked into the block cache's hash. An entry can be off the hash with its
+ * key still set (a failed read unpublishes its slot), so the key alone does
+ * not say whether there is a chain to take it out of. */
+#define BLK_CACHE_HASHED 0x08
 
 struct block_buffer {
     u64 block_no;

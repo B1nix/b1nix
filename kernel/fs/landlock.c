@@ -16,6 +16,7 @@
  * Network rules (ABI 4) and scoping (ABI 6) are not implemented; a ruleset
  * that asks for them is refused as on a kernel whose ABI is 3.
  */
+#include <b1nix/klog.h>
 #include <b1nix/user_namespace.h>
 #include <b1nix/errno.h>
 #include <b1nix/landlock.h>
@@ -62,7 +63,12 @@ static usize g_domain_rows;
 static spinlock_t g_ll_lock = SPINLOCK_INIT;
 
 static void ruleset_put(struct ll_ruleset *rs) {
-  if (rs && __atomic_sub_fetch(&rs->refs, 1, __ATOMIC_ACQ_REL) == 0) {
+  if (!rs)
+    return;
+  int left = __atomic_sub_fetch(&rs->refs, 1, __ATOMIC_ACQ_REL);
+  KASSERT(left >= 0, "landlock ruleset %p put at refcount %d", (void *)rs,
+          left + 1);
+  if (left == 0) {
     for (u32 i = 0; i < rs->nrules; i++)
       kfree(rs->rules[i].path);
     kfree(rs);

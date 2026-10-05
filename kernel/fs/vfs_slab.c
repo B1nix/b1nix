@@ -3,6 +3,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/klog.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -23,6 +24,21 @@ static struct vfs_pool node_pool = { .obj_size = sizeof(struct vfs_node), .lock 
 static struct vfs_pool inode_pool = { .obj_size = sizeof(struct vfs_inode), .lock = SPINLOCK_INIT };
 static struct vfs_pool handle_pool = { .obj_size = sizeof(struct vfs_handle), .lock = SPINLOCK_INIT };
 
+/* A pooled object is filled with this while it waits for reuse, and checked
+ * when it is handed out again: a byte that changed is a write through a
+ * pointer somebody kept after freeing it. */
+#define POOL_JUNK 0x6b
+
+static void pool_check_junk(struct vfs_pool *pool, void *obj) {
+    const u8 *b = obj;
+
+    for (usize i = 0; i < pool->obj_size; i++)
+        KASSERT(b[i] == POOL_JUNK,
+                "vfs pool object %p (size %lu) written at +%lu after it was "
+                "freed: 0x%02x", obj, (unsigned long)pool->obj_size,
+                (unsigned long)i, b[i]);
+}
+
 static void *pool_alloc(struct vfs_pool *pool) {
     u64 flags;
     spin_lock_irqsave(&pool->lock, &flags);
@@ -30,6 +46,7 @@ static void *pool_alloc(struct vfs_pool *pool) {
         void *obj = pool->free_list[--pool->free_count];
         pool->free_list[pool->free_count] = NULL;
         spin_unlock_irqrestore(&pool->lock, flags);
+        pool_check_junk(pool, obj);
         memset(obj, 0, pool->obj_size);
         return obj;
     }
@@ -40,7 +57,13 @@ static void *pool_alloc(struct vfs_pool *pool) {
 static void pool_free(struct vfs_pool *pool, void *obj) {
     if (!obj) return;
     u64 flags;
+    /* Junk before it is published: the object is nobody's from here on. */
+    memset(obj, POOL_JUNK, pool->obj_size);
     spin_lock_irqsave(&pool->lock, &flags);
+    /* The same object twice in the pool would be handed to two owners. */
+    for (int i = 0; i < pool->free_count; i++)
+        KASSERT(pool->free_list[i] != obj, "vfs pool object %p freed twice",
+                obj);
     if (pool->free_count < POOL_FREE_MAX) {
         pool->free_list[pool->free_count++] = obj;
         spin_unlock_irqrestore(&pool->lock, flags);

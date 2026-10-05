@@ -20,6 +20,7 @@
  * and nsfs — the objects /proc/<pid>/ns/<kind> resolves to.
  */
 
+#include <b1nix/klog.h>
 #include <b1nix/cgroup.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -228,7 +229,7 @@ void ns_put_locked(int kind, u32 id) {
     console_write(" namespace ");
     console_write_dec(id);
     console_write("\n");
-    return;
+    panic("namespace: reference underflow");
   }
   if (--s->refs != 0)
     return;

@@ -1187,7 +1187,10 @@ void user_image_free(struct user_loaded_image *image) {
    * the same value and either double-free the image or free it while the other
    * core still references it — the heap/page-table corruption seen in the
    * fork-heavy M33 shell tests. Only the core that drops the count to 0 frees. */
-  if (__atomic_sub_fetch(&image->refcount, 1, __ATOMIC_ACQ_REL) > 0)
+  int left = __atomic_sub_fetch(&image->refcount, 1, __ATOMIC_ACQ_REL);
+  KASSERT(left >= 0, "user image %p freed with refcount %d", (void *)image,
+          left + 1);
+  if (left > 0)
     return;
 
   if (image->path)

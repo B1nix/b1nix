@@ -1540,9 +1540,12 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
 
 void page_cache_put_page(struct page_cache_entry *page) {
   lock_pc();
-  if (__atomic_load_n(&page->refcount, __ATOMIC_ACQUIRE) > 0)
-    __atomic_sub_fetch(&page->refcount, 1, __ATOMIC_ACQ_REL);
-  if (__atomic_load_n(&page->refcount, __ATOMIC_ACQUIRE) == 0 &&
+  /* A put without a get. Clamping it at zero used to hide the second put of
+   * an orphaned entry -- which then freed the frame a second time. */
+  int old = __atomic_fetch_sub(&page->refcount, 1, __ATOMIC_ACQ_REL);
+  KASSERT(old > 0, "page cache entry %p (frame 0x%llx) put at refcount %d",
+          (void *)page, (unsigned long long)page->frame, old);
+  if (old == 1 &&
       (page->flags & PAGE_CACHE_ORPHAN)) {
     /* Inode was destroyed while we held the reference; the entry is already
      * off the hash and LRU — finish its teardown now. */

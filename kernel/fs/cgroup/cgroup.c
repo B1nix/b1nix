@@ -73,6 +73,7 @@
  *         polling for it) are not implemented: the files are read-only.
  */
 
+#include <b1nix/klog.h>
 #include <b1nix/cgroup.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -432,6 +433,8 @@ void cgroup_ns_root_put(void *root) {
     return;
   u64 flags;
   spin_lock_irqsave(&cg_lock, &flags);
+  KASSERT(cg->ns_refs > 0, "cgroup %p namespace reference dropped at 0",
+          (void *)cg);
   int free_it = --cg->ns_refs == 0 && cg->removed;
   if (free_it)
     cg_id_reparent(cg);

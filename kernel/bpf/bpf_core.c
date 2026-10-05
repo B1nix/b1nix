@@ -30,6 +30,7 @@
  * arrived, and proving a loop ends is a great deal of machinery for something
  * no tracing program here needs.
  */
+#include <b1nix/klog.h>
 #include <b1nix/bpf.h>
 
 #if defined(__aarch64__)
@@ -291,7 +292,9 @@ static struct bpf_map *map_alloc(u32 type, u32 key_size, u32 value_size,
 static void map_put(struct bpf_map *m) {
   if (!m)
     return;
-  if (__atomic_sub_fetch(&m->refs, 1, __ATOMIC_ACQ_REL) > 0)
+  int left = __atomic_sub_fetch(&m->refs, 1, __ATOMIC_ACQ_REL);
+  KASSERT(left >= 0, "bpf map %p put at refcount %d", (void *)m, left + 1);
+  if (left > 0)
     return;
   kfree(m->values);
   kfree(m->present);
@@ -441,7 +444,9 @@ static u64 g_bpf_jitted;
 static void prog_put(struct bpf_prog *p) {
   if (!p)
     return;
-  if (__atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL) > 0)
+  int left = __atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL);
+  KASSERT(left >= 0, "bpf prog %p put at refcount %d", (void *)p, left + 1);
+  if (left > 0)
     return;
   for (int i = 0; i < p->nmaps; i++)
     map_put(p->maps[i]);
@@ -2226,7 +2231,11 @@ static void link_detach(struct bpf_link *l) {
 }
 
 static void link_put(struct bpf_link *l) {
-  if (!l || __atomic_sub_fetch(&l->refs, 1, __ATOMIC_ACQ_REL) > 0)
+  if (!l)
+    return;
+  int left = __atomic_sub_fetch(&l->refs, 1, __ATOMIC_ACQ_REL);
+  KASSERT(left >= 0, "bpf link %p put at refcount %d", (void *)l, left + 1);
+  if (left > 0)
     return;
   link_detach(l);
   if (l->target)

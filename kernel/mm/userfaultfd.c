@@ -29,6 +29,7 @@
  *   the same. The copy therefore goes through a freshly allocated frame
  *   addressed through the direct map, never through the faulter's mapping.
  */
+#include <b1nix/klog.h>
 #include <b1nix/userfaultfd.h>
 
 #include <b1nix/errno.h>
@@ -132,7 +133,9 @@ static void uffd_ctx_unlink(struct uffd_ctx *c) {
 static void uffd_put(struct uffd_ctx *c) {
   if (!c)
     return;
-  if (__atomic_sub_fetch(&c->refs, 1, __ATOMIC_ACQ_REL) == 0)
+  int left = __atomic_sub_fetch(&c->refs, 1, __ATOMIC_ACQ_REL);
+  KASSERT(left >= 0, "userfaultfd %p put at refcount %d", (void *)c, left + 1);
+  if (left == 0)
     kfree(c);
 }
 

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/klog.h>
 #include <b1nix/aio.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
@@ -91,6 +92,7 @@ static struct aio_context *aio_ctx_find_and_ref(struct task *owner) {
  * cannot race aio_task_cleanup's own free decision. */
 static void aio_ctx_unref(struct aio_context *ctx) {
   aio_ctx_list_acquire();
+  KASSERT(ctx->refcount > 0, "aio ctx %p unref at refcount 0", (void *)ctx);
   int freeit = (--ctx->refcount == 0) && ctx->dying;
   aio_ctx_list_release();
   if (freeit) {

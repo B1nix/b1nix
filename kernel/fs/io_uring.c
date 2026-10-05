@@ -5386,7 +5386,10 @@ static int iou_ctx_tryget(struct io_ring_ctx *ctx) {
 }
 
 static void iou_ctx_put(struct io_ring_ctx *ctx) {
-  if (__atomic_sub_fetch(&ctx->refs, 1, __ATOMIC_ACQ_REL) != 0)
+  int left = __atomic_sub_fetch(&ctx->refs, 1, __ATOMIC_ACQ_REL);
+  KASSERT(left >= 0, "io_uring ctx %p put at refcount %d", (void *)ctx,
+          left + 1);
+  if (left != 0)
     return;
 
   iou_list_lock();

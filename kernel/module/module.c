@@ -294,8 +294,8 @@ void module_put(struct module *mod) {
     return;
   u64 flags;
   spin_lock_irqsave(&module_lock, &flags);
-  if (mod->refcnt > 0)
-    mod->refcnt--;
+  KASSERT(mod->refcnt > 0, "module_put of %s at refcount 0", mod->name);
+  mod->refcnt--;
   spin_unlock_irqrestore(&module_lock, flags);
 }
 

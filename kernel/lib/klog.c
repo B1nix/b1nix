@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/serial.h>
@@ -839,6 +841,23 @@ void dump_uptime_summary(void) {
 void panic(const char *message)
 {
 	panic_at(message, 0, 0);
+}
+
+void kassert_fail(const char *cond, const char *file, int line,
+                  const char *fmt, ...)
+{
+	/* One buffer: a second CPU failing an assertion at the same moment is
+	 * already a panic, and the first message is the one that matters. */
+	static char msg[320];
+	int n = snprintf(msg, sizeof(msg), "assertion failed: %s: ", cond);
+	va_list ap;
+
+	if (n < 0 || (usize)n >= sizeof(msg))
+		n = 0;
+	va_start(ap, fmt);
+	vsnprintf(msg + n, sizeof(msg) - (usize)n, fmt, ap);
+	va_end(ap);
+	panic_at(msg, file, line);
 }
 
 void panic_at(const char *message, const char *file, int line)
