@@ -1653,3 +1653,21 @@ int lkpi_in_hardirq(void)
 	return t && t->irq_nest > 0;
 }
 
+void lkpi_list_bug(const char *what, const void *entry, const void *prev,
+                   const void *next)
+{
+	console_write("\nLIST CORRUPTION in ");
+	console_write(what);
+	console_write(": entry 0x");
+	console_write_hex64((u64)(usize)entry);
+	console_write(" prev 0x");
+	console_write_hex64((u64)(usize)prev);
+	console_write(" next 0x");
+	console_write_hex64((u64)(usize)next);
+	console_write(" from 0x");
+	console_write_hex64((u64)(usize)__builtin_return_address(0));
+	ksym_print((u64)(usize)__builtin_return_address(0));
+	console_write("\n");
+	panic("lkpi: list corruption");
+}
+

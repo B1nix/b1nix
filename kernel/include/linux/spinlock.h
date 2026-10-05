@@ -63,7 +63,8 @@ static inline int spin_trylock(spinlock_t *l) { return lkpi_spin_trylock(l); }
 #define write_lock(l)                spin_lock(l)
 #define write_unlock(l)              spin_unlock(l)
 
-#define assert_spin_locked(l)        do { (void)(l); } while (0)
+/* assert_spin_locked() checks the holder: see <linux/lockdep.h>. */
+#include <linux/lockdep.h>
 
 
 /*

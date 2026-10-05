@@ -3247,6 +3247,8 @@ check_output "$LOG" "M46-SMOKE: ok setpgid-eperm-pgrp" "setpgid into a nonexiste
 check_output "$LOG" "M46-SMOKE: ok getpgid" "getpgid(0) matches getpgrp()"
 check_output "$LOG" "M46-SMOKE: ok getpgid-esrch" "getpgid on a nonexistent pid returns ESRCH"
 check_output "$LOG" "M46-SMOKE: ok nice-roundtrip" "nice() and getpriority() round-trip"
+check_output "$LOG" "WITNESS-SMOKE: ok order-learned" "lock-order checking learns the order two locks are taken in"
+check_output "$LOG" "WITNESS-SMOKE: ok reversal-detected" "taking two locks in the opposite of a learned order is recognised as a lock order reversal"
 check_output "$LOG" "NOFAULT-SMOKE: ok read" "the no-fault user load reads a mapped word back exactly"
 check_output "$LOG" "NOFAULT-SMOKE: ok fixup" "a fault on the no-fault load resumes at its fixup with EFAULT instead of being serviced under a spinlock"
 check_output "$LOG" "M46-SCHED: ok stride-values" "the nice weighting is the stride it promises: -20 = 25, 0 = 50, 19 = 1000 (checked in-kernel, where the numbers are, not inferred from how often processes ran)"

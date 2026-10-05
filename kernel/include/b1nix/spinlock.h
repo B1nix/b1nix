@@ -58,9 +58,21 @@ void spin_unlock_unheld(volatile int *lock, u64 caller) __attribute__((noreturn)
 #endif
 int spin_owner_self(void);
 
-/* Count of native spinlocks the current task holds, kept for the checks that
- * it holds none when it sleeps or returns to user mode. */
-void spin_held_note(int delta);
+/* Every native lock acquire and release: the current task's held count (for
+ * the checks that it holds none when it sleeps or returns to user mode) and
+ * WITNESS, which learns the order locks are taken in and panics on a
+ * reversal. A trylock is counted and recorded but cannot wait, so it is not
+ * checked against the order. */
+#define SPIN_NOTE_ACQUIRE 1
+#define SPIN_NOTE_TRY     2
+#define SPIN_NOTE_RELEASE (-1)
+/* A sleeping lock (kmutex): ordered by witness, not counted as a spinlock. */
+#define SPIN_NOTE_SLEEP_ACQUIRE 3
+#define SPIN_NOTE_SLEEP_RELEASE (-2)
+void spin_note(volatile void *lock, int op);
+/* The same, naming the acquiring site: for a wrapper (linuxkpi's spinlock)
+ * whose own call into spin_lock would otherwise be every lock's site. */
+void spin_note_at(volatile void *lock, int op, u64 site);
 
 /* A lock released by a task that does not hold it, and a task spinning on a
  * lock it already holds (kernel/sched/lockdep.c). Neither returns. */
@@ -107,7 +119,7 @@ static inline u64 spin_stuck_cycles(void) {
 static inline u64 spin_rdtsc(void) { return 0; }
 #endif
 
-static inline void spin_lock(spinlock_t *lock) {
+static inline void spin_lock_at(spinlock_t *lock, u64 site) {
     int self = spin_owner_self();
     u64 deadline = 0;
 
@@ -148,10 +160,17 @@ static inline void spin_lock(spinlock_t *lock) {
         else if (spin_rdtsc() > deadline)
             spin_lock_stuck(lock, (u64)(usize)__builtin_return_address(0));
     }
-    spin_held_note(1);
+    if (site)
+        spin_note_at(lock, SPIN_NOTE_ACQUIRE, site);
+    else
+        spin_note(lock, SPIN_NOTE_ACQUIRE);
     /* Held now. Under LOCKDEP this records who to blame when another CPU spins
      * on it; in the default build it compiles to nothing. */
     LOCKDEP_NOTE_SPIN_ACQUIRE(lock, (u64)(usize)__builtin_return_address(0));
+}
+
+static inline void spin_lock(spinlock_t *lock) {
+    spin_lock_at(lock, 0);
 }
 
 static inline void spin_unlock(spinlock_t *lock) {
@@ -172,7 +191,7 @@ static inline void spin_unlock(spinlock_t *lock) {
     /* Drop the holder record before the lock itself, so no window exists in
      * which the lock is free but still attributed to this CPU. */
     LOCKDEP_NOTE_SPIN_RELEASE(lock);
-    spin_held_note(-1);
+    spin_note(lock, SPIN_NOTE_RELEASE);
     /* Store 0 with a release barrier so all previous writes are visible
      * before the lock is released. A compiler-only barrier is insufficient
      * on AArch64: another CPU may observe the unlocked word before the
@@ -190,12 +209,18 @@ static inline void spin_unlock(spinlock_t *lock) {
  * -- the panic path, which needs the console but cannot afford to hang on a
  * CPU that died holding it. */
 static inline int spin_trylock(spinlock_t *lock) {
+    int self = spin_owner_self();
     int seen = 0;
 
-    if (!__atomic_compare_exchange_n(lock, &seen, spin_owner_self(), 0,
-                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+    if (!__atomic_compare_exchange_n(lock, &seen, self, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        /* These locks do not recurse, so trying one already held is a bug
+         * whatever the answer would be (FreeBSD's mtx_trylock asserts it). */
+        if (__builtin_expect(seen == self && self != SPIN_OWNER_NOTASK, 0))
+            spin_lock_recursive(lock, (u64)(usize)__builtin_return_address(0));
         return 0;
-    spin_held_note(1);
+    }
+    spin_note(lock, SPIN_NOTE_TRY);
     LOCKDEP_NOTE_SPIN_ACQUIRE(lock, (u64)(usize)__builtin_return_address(0));
     return 1;
 }
@@ -232,6 +257,18 @@ static inline int spin_is_locked(spinlock_t *lock) {
     return *lock != 0;
 }
 
+/* mtx_assert(MA_OWNED): the calling task holds `lock`. For the *_locked
+ * helpers whose contract is "the caller holds X". */
+void spin_assert_held_failed(volatile int *lock, u64 caller)
+    __attribute__((noreturn));
+static inline void spin_assert_held(spinlock_t *lock) {
+    int self = spin_owner_self();
+
+    if (__builtin_expect(*lock != self && self != SPIN_OWNER_NOTASK &&
+                             *lock != SPIN_OWNER_NOTASK, 0))
+        spin_assert_held_failed(lock, (u64)(usize)__builtin_return_address(0));
+}
+
 /* IRQ-safe variants (save/restore interrupt flag). The acquire loop is in
  * spin_lock, which polls TLB shootdowns — so an IRQs-off waiter here still
  * drains them and cannot deadlock the initiator. */
@@ -250,6 +287,18 @@ static inline void spin_lock_irqsave(spinlock_t *lock, u64 *flags) {
     if (__builtin_expect(kprof_irqoff_on, 0) && KPROF_IRQ_WAS_ON(*flags))
         kprof_irqoff_begin(__builtin_return_address(0));
     spin_lock(lock);
+}
+
+/* spin_lock_irqsave on behalf of `site` (see spin_note_at). */
+static inline void spin_lock_irqsave_at(spinlock_t *lock, u64 *flags, u64 site) {
+#ifdef __x86_64__
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(*flags) : : "memory");
+#elif defined(__aarch64__)
+    u64 daif;
+    __asm__ volatile("mrs %0, daif; msr daifset, #2" : "=r"(daif) : : "memory");
+    *flags = daif;
+#endif
+    spin_lock_at(lock, site);
 }
 
 static inline void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {

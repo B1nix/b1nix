@@ -5,6 +5,7 @@
 
 #include <b1nix/types.h>
 #include <b1nix/arch.h>
+#include <b1nix/spinlock.h>
 
 /* Read-write spinlock for kernel-internal data that is overwhelmingly read
  * (the VFS parent/sibling chain is the canonical client). Many concurrent
@@ -44,12 +45,6 @@ static inline void rw_init(rwlock_t *lock) {
 }
 
 /* Shared with spinlock.h (kernel/sched/lockdep.c). */
-#ifndef SPIN_OWNER_NOTASK
-#define SPIN_OWNER_NOTASK 0x7fffffff
-#endif
-int spin_owner_self(void);
-void spin_held_note(int delta);
-void spin_lock_recursive(volatile int *lock, u64 caller) __attribute__((noreturn));
 /* A read unlock with no reader, or a write unlock by a task that is not the
  * writer (kernel/sched/lockdep.c). Does not return. */
 void rw_unlock_bad(rwlock_t *lock, int write, u64 caller) __attribute__((noreturn));
@@ -67,6 +62,7 @@ void tlb_shootdown_poll(void);
 
 static inline void rw_read_lock(rwlock_t *lock) {
     int self = spin_owner_self();
+    u64 deadline = 0;
 
     for (;;) {
         int s = __atomic_load_n(&lock->state, __ATOMIC_ACQUIRE);
@@ -77,6 +73,7 @@ static inline void rw_read_lock(rwlock_t *lock) {
                                             __ATOMIC_ACQUIRE,
                                             __ATOMIC_RELAXED))
                 break;
+            deadline = 0;
             continue;
         }
         /* A writer holds it. If that writer is this task, the wait never ends. */
@@ -85,8 +82,14 @@ static inline void rw_read_lock(rwlock_t *lock) {
                                 (u64)(usize)__builtin_return_address(0));
         cpu_relax();
         tlb_shootdown_poll();
+        /* The same lockup rule as spin_lock: ten seconds without ever seeing
+         * the writer let go is a deadlock, named, not a silent hang. */
+        if (deadline == 0)
+            deadline = spin_rdtsc() + SPIN_LOCK_STUCK_CYCLES;
+        else if (spin_rdtsc() > deadline)
+            spin_lock_stuck(&lock->state, (u64)(usize)__builtin_return_address(0));
     }
-    spin_held_note(1);
+    spin_note(lock, SPIN_NOTE_ACQUIRE);
 }
 
 static inline void rw_read_unlock(rwlock_t *lock) {
@@ -94,11 +97,12 @@ static inline void rw_read_unlock(rwlock_t *lock) {
 
     if (__builtin_expect(left < 0, 0))
         rw_unlock_bad(lock, 0, (u64)(usize)__builtin_return_address(0));
-    spin_held_note(-1);
+    spin_note(lock, SPIN_NOTE_RELEASE);
 }
 
 static inline void rw_write_lock(rwlock_t *lock) {
     int self = spin_owner_self();
+    u64 deadline = 0;
 
     for (;;) {
         int expected = 0;
@@ -113,9 +117,29 @@ static inline void rw_write_lock(rwlock_t *lock) {
                                 (u64)(usize)__builtin_return_address(0));
         cpu_relax();
         tlb_shootdown_poll();
+        /* Seen free since the last attempt: whoever held it is moving. */
+        if (__atomic_load_n(&lock->state, __ATOMIC_RELAXED) == 0) {
+            deadline = 0;
+            continue;
+        }
+        if (deadline == 0)
+            deadline = spin_rdtsc() + SPIN_LOCK_STUCK_CYCLES;
+        else if (spin_rdtsc() > deadline)
+            spin_lock_stuck(&lock->state, (u64)(usize)__builtin_return_address(0));
     }
     lock->writer = self;
-    spin_held_note(1);
+    spin_note(lock, SPIN_NOTE_ACQUIRE);
+}
+
+/* rw_assert(RA_WLOCKED): the calling task is the writer. */
+static inline void rw_assert_wlocked(rwlock_t *lock) {
+    int self = spin_owner_self();
+
+    if (__builtin_expect(lock->state != -1 ||
+                             (lock->writer != self && self != SPIN_OWNER_NOTASK &&
+                              lock->writer != SPIN_OWNER_NOTASK), 0))
+        spin_assert_held_failed(&lock->state,
+                                (u64)(usize)__builtin_return_address(0));
 }
 
 static inline void rw_write_unlock(rwlock_t *lock) {
@@ -126,7 +150,7 @@ static inline void rw_write_unlock(rwlock_t *lock) {
                               lock->writer != SPIN_OWNER_NOTASK), 0))
         rw_unlock_bad(lock, 1, (u64)(usize)__builtin_return_address(0));
     lock->writer = 0;
-    spin_held_note(-1);
+    spin_note(lock, SPIN_NOTE_RELEASE);
     __atomic_store_n(&lock->state, 0, __ATOMIC_RELEASE);
 }
 

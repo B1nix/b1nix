@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/kmutex.h>
 #include <b1nix/termios_abi.h>
 #include <b1nix/arch.h>
 #include <b1nix/blk.h>
@@ -80,7 +81,7 @@ static u64 max_inmemory_file_size(void) {
 static char poll_chan_obj;
 void *vfs_poll_chan = &poll_chan_obj;
 
-static volatile int vfs_mount_lock = 0;
+static kmutex_t vfs_mount_lock = KMUTEX_INIT;
 static u32 next_fs_id = 1;
 
 /* M28-B: rwlock protecting the parent/sibling chain of every vfs_node — i.e.
@@ -259,8 +260,7 @@ u64 vfs_mount_generation(void) {
   u32 ns = vfs_current_mnt_ns();
   int scoped = namespace_active();
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
   /* The number of mounts ever made, folded in first.
    *
    * Without it this is a hash of the table's CONTENTS, and a mount followed by
@@ -285,7 +285,7 @@ u64 vfs_mount_generation(void) {
       g *= 1099511628211ULL;
     }
   }
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   return g;
 }
 
@@ -416,8 +416,7 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   if (!node)
     return 0;
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
 
   /* Walk up the parent chain under the VFS tree rwlock (read side) — preemption
    * or a concurrent rmdir mid-walk lets another task free an ancestor and we'd
@@ -481,7 +480,7 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   }
 out:
   vfs_tree_read_release(flags);
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   return res;
 }
 
@@ -667,7 +666,7 @@ static u32 g_dcache_size = 0;
 static struct dcache_entry *dcache_lru_head = 0;
 static struct dcache_entry *dcache_lru_tail = 0;
 static int dcache_count = 0;
-static volatile int dcache_lock = 0;
+static spinlock_t dcache_lock = SPINLOCK_INIT;
 
 /* Spin, never yield. This lock is taken from find_child while the vfs_tree
  * read lock is held; yielding there would drop us into the scheduler with a
@@ -676,14 +675,11 @@ static volatile int dcache_lock = 0;
  * an LRU splice, so a plain spin with interrupts masked is cheaper than the
  * yield ever was. */
 static void dcache_acquire(u64 *flags) {
-  *flags = interrupts_save();
-  while (__atomic_test_and_set(&dcache_lock, __ATOMIC_ACQUIRE))
-    cpu_relax();
+  spin_lock_irqsave(&dcache_lock, flags);
 }
 
 static void dcache_release(u64 flags) {
-  __atomic_clear(&dcache_lock, __ATOMIC_RELEASE);
-  interrupts_restore(flags);
+  spin_unlock_irqrestore(&dcache_lock, flags);
 }
 
 /* Slab-like pool for dcache entries to avoid fragmentation and kmalloc overhead
@@ -962,15 +958,14 @@ static u32 g_icache_size = 0;
 static struct icache_entry *icache_lru_head = 0;
 static struct icache_entry *icache_lru_tail = 0;
 static int icache_count = 0;
-static volatile int icache_lock = 0;
+static kmutex_t icache_lock = KMUTEX_INIT;
 
 static void icache_acquire(void) {
-  while (__atomic_test_and_set(&icache_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&icache_lock);
 }
 
 static void icache_release(void) {
-  __atomic_clear(&icache_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&icache_lock);
 }
 
 static u32 icache_hash(u32 fs_id, u64 ino) {
@@ -2395,8 +2390,7 @@ restart_traversal:
       continue;
 
     if (strcmp(part, "..") == 0) {
-      while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-        scheduler_yield();
+      kmutex_lock(&vfs_mount_lock);
       u32 walk_ns = vfs_current_mnt_ns();
 
       /* At the root of the mount the walk is in, ".." leaves through that
@@ -2412,13 +2406,13 @@ restart_traversal:
       if (up >= 0) {
         struct vfs_node *mp = vfs_node_get(mounts[up].mount_point);
         cur_mnt = mounts[up].parent_seq;
-        __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+        kmutex_unlock(&vfs_mount_lock);
         vfs_inode_unlock_read(current->inode);
         vfs_node_put(current);
         current = mp;
         vfs_inode_lock_read(current->inode);
       } else {
-        __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+        kmutex_unlock(&vfs_mount_lock);
       }
 
       /* ".." must not escape a chroot: at the task's root it resolves to
@@ -7202,15 +7196,14 @@ static int vfs_path_in_mount(struct vfs_node *node, u64 seq, char *buf,
   char target[VFS_MAX_PATH];
   struct vfs_node *mroot = 0;
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
   for (usize i = 0; i < mount_hwm; i++)
     if (mount_visible(i) && mounts[i].seq == seq && mounts[i].root_node) {
       mroot = mounts[i].root_node;
       copy_path(target, sizeof(target), mounts[i].target);
       break;
     }
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   if (!mroot || mount_is_detached(target))
     return -1;
 
@@ -7428,8 +7421,7 @@ static void vfs_mount_propagate(int midx) {
    * six stray tmpfs mounts landed on /boot beneath the ESP and hid it. */
   if (mount_is_detached(mounts[midx].target))
     return;
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
 
   /* The mount this one was made INSIDE: the longest target that is a prefix of
    * ours, in our own namespace. */
@@ -7449,7 +7441,7 @@ static void vfs_mount_propagate(int midx) {
   }
   if (parent < 0 || mounts[parent].propagation != MS_SHARED ||
       !mounts[parent].peer_group) {
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     return;
   }
 
@@ -7491,7 +7483,7 @@ static void vfs_mount_propagate(int midx) {
     if (mounts[slot].owner)
       (void)try_module_get(mounts[slot].owner);
   }
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
 }
 
 static struct vfs_mount_entry *currently_mounting = NULL;
@@ -7569,8 +7561,7 @@ int vfs_mount_opts(const char *source, const char *target, const char *fstype,
   char rectgt[VFS_MAX_PATH];
   mount_record_target(target, target_node, rectgt, sizeof(rectgt));
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
 
   int midx = -1;
   for (usize i = 0; i < mount_slots; i++) {
@@ -7581,7 +7572,7 @@ int vfs_mount_opts(const char *source, const char *target, const char *fstype,
   }
 
   if (midx == -1) {
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     vfs_node_put(target_node);
     module_put(fs->owner);
     return -ENOMEM;
@@ -7616,7 +7607,7 @@ int vfs_mount_opts(const char *source, const char *target, const char *fstype,
   mounts[midx].pivot_group = 0;
   mounts[midx].parent_seq = parent_mnt;
   mounts[midx].copied_from = 0;
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   if (bootinfo_has_flag("b1nix.trace-mount")) {
     char ml[192];
     snprintf(ml, sizeof(ml),
@@ -7627,10 +7618,9 @@ int vfs_mount_opts(const char *source, const char *target, const char *fstype,
 
   currently_mounting = &mounts[midx];
   u32 new_fs_id;
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
   new_fs_id = next_fs_id++;
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   g_mounting_fs_id = new_fs_id;
   /* M107: filesystems resolve their device with blk_get(), which matches the
    * bare registration name ("sda", "loop0"). Every userspace mounter passes
@@ -7657,8 +7647,7 @@ int vfs_mount_opts(const char *source, const char *target, const char *fstype,
     return (int)PTR_ERR(root_node);
   }
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
   mounts[midx].root_node = root_node;
   /* st_dev for everything on this mount. A filesystem mounted from a block
    * device reports that device's number, so tools that map a file back to its
@@ -7675,7 +7664,7 @@ int vfs_mount_opts(const char *source, const char *target, const char *fstype,
     u32 devno = bdev ? blk_devno(bdev) : 0;
     root_node->inode->dev = devno ? devno : (next_anon_minor++ & 0xFFu);
   }
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
 
   vfs_mount_propagate(midx);
   return 0;
@@ -7725,8 +7714,7 @@ int vfs_set_propagation(const char *target, u64 flags) {
   int recursive = (flags & MS_REC) ? 1 : 0;
   int touched = 0;
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
   for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i))
       continue;
@@ -7759,7 +7747,7 @@ int vfs_set_propagation(const char *target, u64 flags) {
     }
     touched = 1;
   }
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   vfs_node_put(node);
 
   /* Linux allows a propagation change on any mountpoint; a path that is not
@@ -7794,8 +7782,7 @@ int vfs_remount(const char *target, u64 flags) {
   mount_record_target(target, node, canon, sizeof(canon));
 
   int found = 0;
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
   /* A remount changes the mount the path resolves to: the one stacked last
    * there. The ones it covers keep their flags — and their locks, which a
    * mount the caller stacked on top has no say over (bubblewrap binds
@@ -7816,7 +7803,7 @@ int vfs_remount(const char *target, u64 flags) {
       top = (int)i;
   }
   if (top >= 0 && (mounts[top].locked_flags & ~flags & MNT_LOCKABLE_FLAGS)) {
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     return -EPERM;
   }
   for (usize i = 0; top >= 0 && i < mount_hwm; i++) {
@@ -7828,7 +7815,7 @@ int vfs_remount(const char *target, u64 flags) {
     found = 1;
   }
   struct vfs_node *mroot = found ? mounts[top].root_node : 0;
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   vfs_node_put(node);
   /* The filesystem's half, outside the table lock: it may sleep. A bind
    * remount (MS_BIND) changes one mount's flags, not the superblock. */
@@ -8148,8 +8135,7 @@ int vfs_bind_mount(const char *source, const char *target, u64 flags) {
      * source's nodes can be on several mounts with different flags (a
      * read-only bind of "/" shares every node with the root it binds). */
     struct vfs_mount_entry *sm = 0;
-    while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-      scheduler_yield();
+    kmutex_lock(&vfs_mount_lock);
     for (usize i = 0; src_mnt && i < mount_hwm; i++)
       if (mount_visible(i) && mounts[i].seq == src_mnt)
         sm = &mounts[i];
@@ -8157,15 +8143,14 @@ int vfs_bind_mount(const char *source, const char *target, u64 flags) {
       src_flags = sm->flags & MNT_LOCKABLE_FLAGS;
       src_locked = sm->locked_flags;
     }
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     if (!sm && (sm = vfs_get_mount_for_node(src)) != 0) {
       src_flags = sm->flags & MNT_LOCKABLE_FLAGS;
       src_locked = sm->locked_flags;
     }
   }
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
   int midx = -1;
   for (usize i = 0; i < mount_slots; i++)
     if (!mounts[i].used) {
@@ -8173,7 +8158,7 @@ int vfs_bind_mount(const char *source, const char *target, u64 flags) {
       break;
     }
   if (midx < 0) {
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     vfs_node_put(src);
     vfs_node_put(tgt);
     return -ENOMEM;
@@ -8203,7 +8188,7 @@ int vfs_bind_mount(const char *source, const char *target, u64 flags) {
   mounts[midx].peer_group = 0;
   if (recsrc[0])
     vfs_bind_copy_submounts(recsrc, src_mnt, midx);
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   return 0;
 }
 
@@ -8349,8 +8334,7 @@ static int vfs_move_mount_impl(const char *source, const char *target) {
   mount_record_target(dst, dst_node, dst_rec, sizeof(dst_rec));
   path_strip_trailing_slash(dst_rec);
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
 
   /* The mount the source path resolves to. Several can share a root node --
    * systemd binds "/" recursively onto /run/systemd/unit-root and then moves
@@ -8368,7 +8352,7 @@ static int vfs_move_mount_impl(const char *source, const char *target) {
       midx = (int)i;
   }
   if (midx < 0) {
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     vfs_node_put(dst_node);
     vfs_node_put(src_node);
     return -EINVAL; /* not a mountpoint: nothing to move */
@@ -8394,7 +8378,7 @@ static int vfs_move_mount_impl(const char *source, const char *target) {
   mounts[midx].mount_point = dst_node; /* takes over the lookup reference */
   mounts[midx].parent_seq = dst_mnt;
   copy_path(mounts[midx].target, sizeof(mounts[midx].target), dst_rec);
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
 
   /* A working directory is a directory, not a path, so a process standing
    * inside the moved subtree moves with it. Here the directory is remembered
@@ -8423,13 +8407,12 @@ static int vfs_move_mount_impl(const char *source, const char *target) {
 static int mount_is_devtmpfs_at(const char *path) {
   int found = 0;
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
   u32 ns = vfs_current_mnt_ns();
   for (usize i = 0; i < mount_hwm; i++)
     if (mount_visible_in(i, ns) && strcmp(mounts[i].target, path) == 0)
       found = strcmp(mounts[i].fstype, "devtmpfs") == 0;
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   return found;
 }
 
@@ -8476,8 +8459,7 @@ int vfs_device_is_mounted(const char *name) {
  * go. */
 static int vfs_umount_one(const char *canon, int detach, u32 group,
                           u64 skip_seq, u64 want_seq) {
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
 
   int i = -1;
   for (usize k = 0; k < mount_hwm; k++) {
@@ -8490,7 +8472,7 @@ static int vfs_umount_one(const char *canon, int detach, u32 group,
       i = (int)k;
   }
   if (i < 0) {
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     return -EINVAL;
   }
   /* The root mount itself cannot go; a mount stacked over it can. Linux lets
@@ -8500,7 +8482,7 @@ static int vfs_umount_one(const char *canon, int detach, u32 group,
    * runtimes detaching "." until it fails stop on. */
   if (strcmp(canon, "/") == 0 && !group &&
       (!mounts[i].mount_point || mounts[i].mount_point == root_node)) {
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     return detach ? -EINVAL : -EBUSY;
   }
 
@@ -8520,7 +8502,7 @@ static int vfs_umount_one(const char *canon, int detach, u32 group,
   if (!detach && mount_fs_refs(mounts[i].root_node) <= 1 &&
       __atomic_load_n(&mounts[i].root_node->refcount, __ATOMIC_ACQUIRE) >
           (int)mount_root_refs(mounts[i].root_node)) {
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     return -EBUSY;
   }
 
@@ -8555,7 +8537,7 @@ static int vfs_umount_one(const char *canon, int detach, u32 group,
   struct module *owner = mounts[i].owner;
   mounts[i].used = 0;
   mounts[i].owner = 0;
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   if (fs_umount && root)
     fs_umount(root);
   module_put(owner);
@@ -8609,8 +8591,7 @@ int vfs_umount2(const char *target, int flags) {
       vfs_node_put(n);
   }
   int top = -1;
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
   for (usize k = 0; k < mount_hwm; k++) {
     if (!mount_visible(k) || strcmp(mounts[k].target, canon) != 0)
       continue;
@@ -8633,7 +8614,7 @@ int vfs_umount2(const char *target, int flags) {
    * "umount -r /" relies on EBUSY to fall back to a read-only remount --
    * unmounted the running root, and the rest of the shutdown found no shell. */
   int is_root = top >= 0 && !group && strcmp(canon, "/") == 0;
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   if (top < 0)
     return -EINVAL;
   if (is_root)
@@ -8656,8 +8637,7 @@ int vfs_umount2(const char *target, int flags) {
     char deepest[VFS_MAX_PATH];
     usize best = 0;
     deepest[0] = '\0';
-    while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-      scheduler_yield();
+    kmutex_lock(&vfs_mount_lock);
     for (usize k = 0; k < mount_hwm; k++) {
       if (!mount_visible(k) || mounts[k].seq == top_seq ||
           mounts[k].pivot_group != group)
@@ -8672,7 +8652,7 @@ int vfs_umount2(const char *target, int flags) {
         copy_path(deepest, sizeof(deepest), mounts[k].target);
       }
     }
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     if (!best)
       break;
     /* The stacked entry itself goes last. */
@@ -8772,12 +8752,11 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
       return (int)PTR_ERR(n);
     }
     int is_root = 0;
-    while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-      scheduler_yield();
+    kmutex_lock(&vfs_mount_lock);
     for (usize i = 0; new_mnt && i < mount_hwm; i++)
       if (mount_visible(i) && mounts[i].seq == new_mnt)
         is_root = mounts[i].root_node == n;
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     vfs_node_put(n);
     if (!is_root)
       new_mnt = 0;
@@ -8811,8 +8790,7 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
     old_parent = 0; /* no longer the mount the walk ended in */
   }
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
 
   /* Everything below is confined to the caller's mount namespace: a pivot in
    * a container moves the container's mounts and no one else's. */
@@ -8870,7 +8848,7 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
     /* Linux says EINVAL when new_root is not a mount point, and it means it:
      * pivoting onto a plain directory would leave "/" naming a subtree of the
      * filesystem it is supposed to be replacing. */
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     vfs_node_put(old_mp);
     kfree(new_abs);
     kfree(old_abs);
@@ -8915,7 +8893,7 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
     mounts[oidx].parent_seq = mounts[nidx].seq;
     if (prev_mp)
       vfs_node_put(prev_mp);
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     vfs_node_put(old_mp);
     vfs_pivot_rebase_cwds(pivot_ns, new_abs);
     kfree(new_abs);
@@ -8925,7 +8903,7 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
 
   char *tmp = kmalloc(VFS_MAX_PATH);
   if (!tmp) {
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     vfs_node_put(old_mp);
     kfree(new_abs);
     kfree(old_abs);
@@ -9000,7 +8978,7 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
     mounts[freeidx].parent_seq = old_parent;
     mounts[freeidx].copied_from = 0;
   } else {
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     vfs_node_put(old_mp);
     kfree(new_abs);
     kfree(old_abs);
@@ -9013,7 +8991,7 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
   vfs_pivot_reroot_mp(&mounts[nidx]);
   mounts[nidx].parent_seq = 0;
 
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   vfs_node_put(old_mp);
   vfs_pivot_rebase_cwds(pivot_ns, new_abs);
   kfree(new_abs);
@@ -9041,8 +9019,7 @@ int vfs_mnt_ns_clone(u32 from_ns, u32 to_ns) {
   int unprivileged =
       namespace_owner(NS_MNT, to_ns) != namespace_owner(NS_MNT, from_ns);
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
 
   /* Count first: a partially copied namespace would be a namespace missing its
    * root, so the copy is all-or-nothing. */
@@ -9054,7 +9031,7 @@ int vfs_mnt_ns_clone(u32 from_ns, u32 to_ns) {
       have++;
   }
   if (need > have) {
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
     return -ENOMEM;
   }
 
@@ -9097,7 +9074,7 @@ int vfs_mnt_ns_clone(u32 from_ns, u32 to_ns) {
     }
   }
 
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   return 0;
 }
 
@@ -9123,8 +9100,7 @@ void vfs_mnt_ns_destroy(u32 ns) {
     int (*umounts[MNT_RELEASE_BATCH])(struct vfs_node *);
     usize n = 0;
 
-    while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-      scheduler_yield();
+    kmutex_lock(&vfs_mount_lock);
 
     for (usize i = 0; i < mount_hwm && n < MNT_RELEASE_BATCH; i++) {
       if (!mounts[i].used || mounts[i].mnt_ns != ns)
@@ -9153,7 +9129,7 @@ void vfs_mnt_ns_destroy(u32 ns) {
       mounts[i].mount_point = 0;
     }
 
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
 
     if (n == 0)
       return; /* nothing left in this namespace */
@@ -9181,8 +9157,7 @@ static void vfs_mounts_drop_under(const char *path) {
     int (*umounts[MNT_RELEASE_BATCH])(struct vfs_node *);
     usize n = 0;
 
-    while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-      scheduler_yield();
+    kmutex_lock(&vfs_mount_lock);
 
     for (usize i = 0; i < mount_hwm && n < MNT_RELEASE_BATCH; i++) {
       if (!mounts[i].used || !path_is_under(mounts[i].target, path))
@@ -9208,7 +9183,7 @@ static void vfs_mounts_drop_under(const char *path) {
       mounts[i].mount_point = 0;
     }
 
-    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&vfs_mount_lock);
 
     if (n == 0)
       return;
@@ -11992,15 +11967,14 @@ struct vfs_detached_mount {
 };
 
 static struct vfs_detached_mount detached_mounts[MAX_DETACHED_MOUNTS];
-static volatile int detached_lock = 0;
+static kmutex_t detached_lock = KMUTEX_INIT;
 
 static void detached_acquire(void) {
-  while (__atomic_test_and_set(&detached_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&detached_lock);
 }
 
 static void detached_release_lock(void) {
-  __atomic_clear(&detached_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&detached_lock);
 }
 
 /* Is this mount one that has not been given a place yet? Such a mount is real
@@ -12114,8 +12088,7 @@ int vfs_detached_create(const char *fstype, const char *source, u64 flags,
 static int mounts_below(const char *canon) {
   int found = 0;
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
   for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i))
       continue;
@@ -12126,7 +12099,7 @@ static int mounts_below(const char *canon) {
       break;
     }
   }
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   return found;
 }
 
@@ -12220,8 +12193,7 @@ int vfs_detached_set_attr(int id, u64 attr_set, u64 attr_clr) {
   u64 clr = mount_attr_to_ms(attr_clr);
   int touched = 0;
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
   for (usize i = 0; i < mount_hwm; i++) {
     if (!mounts[i].used)
       continue;
@@ -12231,7 +12203,7 @@ int vfs_detached_set_attr(int id, u64 attr_set, u64 attr_clr) {
     mounts[i].flags &= ~clr;
     touched = 1;
   }
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
   return touched ? 0 : -EINVAL;
 }
 
@@ -12282,8 +12254,7 @@ int vfs_mount_setattr_path(const char *path, u64 attr_set, u64 attr_clr,
   u64 clr = mount_attr_to_ms(attr_clr);
   int touched = 0;
 
-  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&vfs_mount_lock);
   for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i))
       continue;
@@ -12328,7 +12299,7 @@ int vfs_mount_setattr_path(const char *path, u64 attr_set, u64 attr_clr,
       touched = 1;
     }
   }
-  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&vfs_mount_lock);
 
   return touched ? 0 : -EINVAL;
 }

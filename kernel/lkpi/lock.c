@@ -245,7 +245,10 @@ void lkpi_spin_lock(struct lkpi_spinlock *l)
 	 * did not turn them off, and recording it there buries the site that did. */
 	int was_on = lkpi_irqs_enabled();
 
-	spin_lock_irqsave((spinlock_t *)&l->raw, &f);
+	/* Witness keys a lock outside the kernel image by where it is taken, and
+	 * that is the imported caller, not this wrapper. */
+	spin_lock_irqsave_at((spinlock_t *)&l->raw, &f,
+	                     (u64)(usize)__builtin_return_address(0));
 	/* Read again with interrupts off: the value above was taken before,
 	 * when the task could still move. */
 	cpu = percpu_read(cpu_id);

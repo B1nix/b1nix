@@ -321,18 +321,187 @@ int spin_owner_self(void) {
     return spin_token_of(spin_current());
 }
 
-void spin_held_note(int delta) {
+/* ── WITNESS ─────────────────────────────────────────────────────────────────
+ *
+ * The order native locks are taken in, learned while the kernel runs, and a
+ * panic the first time two are taken the opposite way round -- the deadlock
+ * that order permits, reported before it happens rather than after (FreeBSD's
+ * witness(4)). Always on.
+ *
+ * A lock's class is the lock itself when it lives in the kernel image (the
+ * static locks, which is most of them), and otherwise the place it was taken:
+ * locks inside objects come and go and have no lasting identity of their own,
+ * but the code that takes them does. Two locks of one class are never ordered
+ * against each other.
+ *
+ * w_after[a] has bit b set when class b was taken while a was held. Taking b
+ * while holding a when bit a of w_after[b] is already set is the reversal.
+ * Only direct reversals are checked, not longer cycles. */
+#define W_CLASSES 2048u
+#define W_NONE 0xffffu
+
+static u64 w_key[W_CLASSES];
+static u64 w_first_site[W_CLASSES];
+static u8 w_after[W_CLASSES][W_CLASSES / 8];
+static volatile u32 w_table_full;
+
+extern char __kernel_start[], __kernel_end[];
+
+static u32 w_class(volatile void *lock, u64 site) {
+    u64 a = (u64)(usize)lock;
+    u64 key = (a >= (u64)(usize)__kernel_start && a < (u64)(usize)__kernel_end)
+                  ? a : site;
+    u32 h = (u32)(((key >> 3) * 0x9E3779B97F4A7C15ull) >> 32) % W_CLASSES;
+
+    for (u32 i = 0; i < W_CLASSES; i++) {
+        u32 slot = (h + i) % W_CLASSES;
+        u64 k = __atomic_load_n(&w_key[slot], __ATOMIC_ACQUIRE);
+
+        if (k == key)
+            return slot;
+        if (k == 0) {
+            u64 expected = 0;
+
+            if (__atomic_compare_exchange_n(&w_key[slot], &expected, key, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                w_first_site[slot] = site;
+                return slot;
+            }
+            if (expected == key)
+                return slot;
+        }
+    }
+    /* Out of classes: stop learning rather than guess. Said once. */
+    if (!__atomic_exchange_n(&w_table_full, 1, __ATOMIC_RELAXED))
+        console_write("witness: class table full; lock order no longer checked "
+                      "for new classes\n");
+    return W_NONE;
+}
+
+static int w_bit(u32 a, u32 b) {
+    return (__atomic_load_n(&w_after[a][b / 8], __ATOMIC_RELAXED) >> (b % 8)) & 1;
+}
+
+static void w_reversal(struct task *t, int held_ix, u32 c, volatile void *lock,
+                       u64 site) {
+    u32 h = t->w_held_cls[held_ix];
+
+    console_bust_lock();
+    console_write("\nLOCK ORDER REVERSAL (witness), pid ");
+    console_write_dec((u64)t->id);
+    console_write(":\n  taking   0x");
+    console_write_hex64((u64)(usize)lock);
+    console_write(" at 0x");
+    console_write_hex64(site);
+    ksym_print(site);
+    console_write("\n  holding  0x");
+    console_write_hex64((u64)(usize)t->w_held_lock[held_ix]);
+    console_write(" taken at 0x");
+    console_write_hex64(t->w_held_site[held_ix]);
+    ksym_print(t->w_held_site[held_ix]);
+    console_write("\n  but the first was held when the second was taken before;"
+                  " classes first seen at 0x");
+    console_write_hex64(w_first_site[c]);
+    ksym_print(w_first_site[c]);
+    console_write(" and 0x");
+    console_write_hex64(w_first_site[h]);
+    ksym_print(w_first_site[h]);
+    console_write("\n");
+    panic("witness: lock order reversal");
+}
+
+/* The held entry that taking class c would reverse, or -1. */
+static int w_find_reversal(const struct task *t, u32 c) {
+    for (int i = 0; i < (int)t->w_held_n; i++) {
+        u32 h = t->w_held_cls[i];
+
+        if (h != c && h != W_NONE && w_bit(c, h))
+            return i;
+    }
+    return -1;
+}
+
+/* Record that c is taken while each held class is held. */
+static void w_learn(const struct task *t, u32 c) {
+    for (int i = 0; i < (int)t->w_held_n; i++) {
+        u32 h = t->w_held_cls[i];
+
+        if (h != c && h != W_NONE && !w_bit(h, c))
+            __atomic_or_fetch(&w_after[h][c / 8], (u8)(1u << (c % 8)),
+                              __ATOMIC_RELAXED);
+    }
+}
+
+static void spin_note_impl(volatile void *lock, int op, u64 site);
+
+void spin_note(volatile void *lock, int op) {
+    spin_note_impl(lock, op, (u64)(usize)__builtin_return_address(0));
+}
+
+void spin_note_at(volatile void *lock, int op, u64 site) {
+    spin_note_impl(lock, op, site);
+}
+
+static void spin_note_impl(volatile void *lock, int op, u64 site) {
+    u64 flags = interrupts_save();
     struct task *t = spin_current();
 
-    if (!t)
+    if (!t) {
+        interrupts_restore(flags);
         return;
-    /* Only this task and interrupt handlers on its CPU change the count, and a
-     * handler's acquire and release are both done before it returns. */
-    t->spin_held += delta;
-    if (__builtin_expect(t->spin_held < 0, 0)) {
-        t->spin_held = 0;
-        panic("spinlock: task released more native spinlocks than it took");
     }
+    if (op == SPIN_NOTE_RELEASE || op == SPIN_NOTE_SLEEP_RELEASE) {
+        /* Only this task and interrupt handlers on its CPU change these, and
+         * interrupts are off here, so the update is whole. */
+        if (op == SPIN_NOTE_RELEASE) {
+            if (__builtin_expect(t->spin_held <= 0, 0)) {
+                t->spin_held = 0;
+                panic("spinlock: task released more native spinlocks than it took");
+            }
+            t->spin_held--;
+        }
+        {
+            int found = 0;
+
+            for (int i = (int)t->w_held_n - 1; i >= 0 && !found; i--) {
+                if (t->w_held_lock[i] != lock)
+                    continue;
+                for (int j = i; j + 1 < (int)t->w_held_n; j++) {
+                    t->w_held_cls[j] = t->w_held_cls[j + 1];
+                    t->w_held_lock[j] = t->w_held_lock[j + 1];
+                    t->w_held_site[j] = t->w_held_site[j + 1];
+                }
+                t->w_held_n--;
+                found = 1;
+            }
+            if (!found && t->w_untracked)
+                t->w_untracked--; /* one that did not fit the array */
+        }
+        interrupts_restore(flags);
+        return;
+    }
+
+    if (op != SPIN_NOTE_SLEEP_ACQUIRE)
+        t->spin_held++;
+    u32 c = w_class(lock, site);
+
+    if (c != W_NONE &&
+        (op == SPIN_NOTE_ACQUIRE || op == SPIN_NOTE_SLEEP_ACQUIRE)) {
+        int bad = w_find_reversal(t, c);
+
+        if (bad >= 0)
+            w_reversal(t, bad, c, lock, site);
+        w_learn(t, c);
+    }
+    if (t->w_held_n < SPIN_WITNESS_DEPTH) {
+        t->w_held_cls[t->w_held_n] = (u16)c;
+        t->w_held_lock[t->w_held_n] = (volatile int *)lock;
+        t->w_held_site[t->w_held_n] = site;
+        t->w_held_n++;
+    } else if (t->w_untracked < 255) {
+        t->w_untracked++;
+    }
+    interrupts_restore(flags);
 }
 
 void spin_unlock_foreign(volatile int *lock, int self, u64 caller) {
@@ -357,6 +526,21 @@ void spin_unlock_foreign(volatile int *lock, int self, u64 caller) {
         kheap_describe((u64)(usize)lock, "  lock lives in ");
     }
     panic("spinlock: unlock by a task that does not hold the lock");
+}
+
+void spin_assert_held_failed(volatile int *lock, u64 caller) {
+    console_bust_lock();
+    console_write("\nSPINLOCK not held where it must be: lock=0x");
+    console_write_hex64((u64)(usize)lock);
+    console_write(" holder token=0x");
+    console_write_hex64((u64)(unsigned)*lock);
+    console_write(" self token=0x");
+    console_write_hex64((u64)(unsigned)spin_owner_self());
+    console_write(" from 0x");
+    console_write_hex64(caller);
+    ksym_print(caller);
+    console_write("\n");
+    panic("spinlock: assertion that the caller holds the lock failed");
 }
 
 void spin_lock_recursive(volatile int *lock, u64 caller) {
@@ -458,3 +642,39 @@ void spin_lock_stuck(volatile int *lock, u64 caller) {
     scheduler_dump_tasks();
     panic("spinlock lockup");
 }
+
+/* WITNESS checked at boot: an order it is shown is learned, and the reverse
+ * of it is recognised -- by the same test the acquire path panics on, asked
+ * here without taking the lock that would trip it. */
+static spinlock_t w_test_a = SPINLOCK_INIT;
+static spinlock_t w_test_b = SPINLOCK_INIT;
+
+void witness_selftest(void) {
+    struct task *t = spin_current();
+    u32 ca, cb;
+    int learned, caught;
+
+    if (!t)
+        return;
+    spin_lock(&w_test_a);
+    spin_lock(&w_test_b);
+    spin_unlock(&w_test_b);
+    spin_unlock(&w_test_a);
+    ca = w_class(&w_test_a, 0);
+    cb = w_class(&w_test_b, 0);
+    learned = ca != W_NONE && cb != W_NONE && w_bit(ca, cb) && !w_bit(cb, ca);
+    console_write(learned ? "WITNESS-SMOKE: ok order-learned\n"
+                          : "WITNESS-SMOKE: FAIL order-learned\n");
+
+    spin_lock(&w_test_b);
+    {
+        u64 f = interrupts_save();
+
+        caught = w_find_reversal(t, ca) >= 0;
+        interrupts_restore(f);
+    }
+    spin_unlock(&w_test_b);
+    console_write(caught ? "WITNESS-SMOKE: ok reversal-detected\n"
+                         : "WITNESS-SMOKE: FAIL reversal-detected\n");
+}
+

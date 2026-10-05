@@ -3606,6 +3606,12 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
   // 1. Copy the task structure
   memcpy(child, parent, sizeof(struct task));
   child->id = claimed_id;
+  /* The parent's held locks and interrupt nesting are its own, not state a
+   * new task starts with. */
+  child->spin_held = 0;
+  child->irq_nest = 0;
+  child->w_held_n = 0;
+  child->w_untracked = 0;
   child->next_run = claimed_next_run;
   /* The memcpy copied the parent's fpu_state SAVE-AREA, which is only refreshed
    * on a context switch-out and may lag the parent's live FPU. Capture the
@@ -5769,6 +5775,13 @@ int scheduler_yield(void) {
   static int on = -1;
   struct task *me = current_task;
 
+  /* A voluntary yield with a native spinlock held strands every CPU that wants
+   * it for as long as this task stays off the CPU. Only the tick's
+   * preemption, which runs inside an interrupt handler, yields involuntarily
+   * -- and it does not preempt a task holding one (scheduler_on_timer_tick). */
+  KASSERT(!me || me->irq_nest > 0 || me->spin_held == 0,
+          "yield with %d native spinlock(s) held", me ? me->spin_held : 0);
+
   if (on < 0)
     on = bootinfo_has_flag("b1nix.trace-bootwait") ? 1 : 0;
   if (!on || !me || me->id != 0 || me->state == TASK_RUNNING ||
@@ -6562,10 +6575,25 @@ static int scheduler_yield_inner(void) {
  * across it strands every CPU that wants it (FreeBSD's sleepq check, Linux's
  * might_sleep). Checked at every way into a sleep. */
 static inline void sched_assert_may_sleep(const char *what) {
-  KASSERT(!current_task || current_task->spin_held == 0,
-          "%s with %d native spinlock(s) held", what, current_task->spin_held);
-  KASSERT(!current_task || current_task->irq_nest == 0,
-          "%s from an interrupt handler", what);
+  struct task *t = current_task;
+  extern int lkpi_holding_spinlock(void);
+
+  if (!t)
+    return;
+  KASSERT(t->spin_held == 0, "%s with %d native spinlock(s) held", what,
+          t->spin_held);
+  KASSERT(t->irq_nest == 0, "%s from an interrupt handler", what);
+  KASSERT(g_task_preempt_depth[task_index(t)] == 0,
+          "%s with preemption disabled (depth %u)", what,
+          (unsigned)g_task_preempt_depth[task_index(t)]);
+  {
+    /* The linuxkpi count is per CPU: read it where this task cannot move. */
+    u64 f = interrupts_save();
+    int held = lkpi_holding_spinlock();
+
+    interrupts_restore(f);
+    KASSERT(!held, "%s with %d linuxkpi spinlock(s) held", what, held);
+  }
 }
 
 void scheduler_block_current(void) {
@@ -7901,8 +7929,12 @@ void scheduler_on_timer_tick(void) {
    * preempts again. kwin_wayland kept a core to itself and a TLB shootdown
    * stalled behind it -- a worse failure than the one being chased. The
    * counter stays a diagnostic until the leak that makes it lie is found. */
+  /* Nor a task holding a native spinlock: spin_held is exact -- every lock and
+   * unlock passes spin_note, and an unbalanced pair panics -- so it is
+   * the count the comment above wished it had. */
   if (current_task->state == TASK_RUNNING &&
-      g_task_preempt_depth[task_index(current_task)] == 0) {
+      g_task_preempt_depth[task_index(current_task)] == 0 &&
+      current_task->spin_held == 0) {
     scheduler_yield();
   } else {
     scheduler_note_resched();
@@ -11732,6 +11764,7 @@ static struct vm_area *g_vma_retired;
 
 /* Drain what is safe to drain. Called with the list lock held. */
 static void vma_retire_drain_locked(void) {
+  spin_assert_held(&g_vma_lock);
   if (!g_vma_retired)
     return;
   if (__atomic_load_n(&g_vma_walkers, __ATOMIC_SEQ_CST) != 0)
@@ -11802,6 +11835,7 @@ static struct vma_index *vma_idx_of(u64 pml4) {
 }
 
 static void vma_idx_drain_locked(void) {
+  spin_assert_held(&g_vma_lock);
   if (!g_vma_idx_retired ||
       __atomic_load_n(&g_vma_walkers, __ATOMIC_SEQ_CST) != 0)
     return;
@@ -11817,6 +11851,7 @@ static void vma_idx_drain_locked(void) {
 }
 
 static void vma_idx_publish_locked(u32 slot, struct vma_index *ix) {
+  spin_assert_held(&g_vma_lock);
   struct vma_index *old = g_vma_idx[slot];
 
   __atomic_store_n(&g_vma_idx[slot], ix, __ATOMIC_RELEASE);
@@ -11858,6 +11893,7 @@ static u32 vma_idx_upper(const struct vma_index *ix, u64 addr) {
  * kept by the edits. A slot another space already holds is left to it: that
  * space goes without an index, which costs it walks, not answers. */
 static void vma_idx_insert_locked(struct task *t, struct vm_area *vma) {
+  spin_assert_held(&g_vma_lock);
   u64 pml4 = t ? t->pml4_phys : 0;
   u32 slot;
   struct vma_index *ix, *nx;
@@ -11909,6 +11945,7 @@ static void vma_idx_insert_locked(struct task *t, struct vm_area *vma) {
 }
 
 static void vma_idx_remove_locked(u64 pml4, struct vm_area *vma) {
+  spin_assert_held(&g_vma_lock);
   struct vma_index *ix = vma_idx_of(pml4);
   u32 slot = vma_idx_slot(pml4);
 

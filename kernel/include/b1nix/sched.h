@@ -261,6 +261,9 @@ struct rlimit {
 #define RLIMIT_AS     9
 #define RLIM_INFINITY ((rlim_t)-1)
 
+/* Native locks a task can hold at once and still have checked for order. */
+#define SPIN_WITNESS_DEPTH 16
+
 struct task {
   usize id;
   const char *name;
@@ -280,13 +283,21 @@ struct task {
    * sit halted with interrupts open while a handler spins on the lock it still
    * holds — silence, and the hang watchdog reporting it sixty seconds later. */
   int wait_irq_was_on;
-  /* Native spinlocks this task holds (spin_held_note). Sleeping or returning
+  /* Native spinlocks this task holds (spin_note). Sleeping or returning
    * to user mode with any held is a bug, and both places check it. */
   int spin_held;
   /* Hardware interrupt handlers running on this task's stack. Per task, not
    * per CPU: a timer interrupt may switch tasks from inside its handler, and
    * the task it switches to is not in an interrupt. */
   int irq_nest;
+  /* WITNESS (kernel/sched/lockdep.c): the native locks this task holds, in
+   * the order it took them -- each lock's class, address and acquiring site.
+   * Nesting deeper than the array is counted in w_untracked and not checked. */
+  u8 w_held_n;
+  u8 w_untracked;
+  u16 w_held_cls[SPIN_WITNESS_DEPTH];
+  volatile int *w_held_lock[SPIN_WITNESS_DEPTH];
+  u64 w_held_site[SPIN_WITNESS_DEPTH];
   void *wait_chan;
   int stdout_fd;
   struct vfs_handle **fd_table;

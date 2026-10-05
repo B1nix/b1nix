@@ -44,9 +44,18 @@ static inline void INIT_LIST_HEAD(struct list_head *list)
 	list->prev = list;
 }
 
+/* CONFIG_DEBUG_LIST, always: a link that does not point back, an entry added
+ * next to itself, and a poisoned entry used again are all reported where they
+ * happen (kernel/lkpi/env.c) instead of as a corrupt list found much later. */
+void lkpi_list_bug(const char *what, const void *entry, const void *prev,
+                   const void *next) __attribute__((noreturn));
+
 static inline void __list_add(struct list_head *item, struct list_head *prev,
                               struct list_head *next)
 {
+	if (__builtin_expect(next->prev != prev || prev->next != next ||
+	                         item == prev || item == next, 0))
+		lkpi_list_bug("list_add", item, prev, next);
 	next->prev = item;
 	item->next = next;
 	item->prev = prev;
@@ -69,14 +78,26 @@ static inline void __list_del(struct list_head *prev, struct list_head *next)
 	prev->next = next;
 }
 
+static inline void __list_del_entry_check(struct list_head *entry)
+{
+	struct list_head *prev = entry->prev, *next = entry->next;
+
+	if (__builtin_expect(prev == (struct list_head *)LIST_POISON2 ||
+	                         next == (struct list_head *)LIST_POISON1 ||
+	                         prev->next != entry || next->prev != entry, 0))
+		lkpi_list_bug("list_del", entry, prev, next);
+}
+
 /* Unlink without poisoning, for a caller that re-uses the entry immediately. */
 static inline void __list_del_entry(struct list_head *entry)
 {
+	__list_del_entry_check(entry);
 	__list_del(entry->prev, entry->next);
 }
 
 static inline void list_del(struct list_head *entry)
 {
+	__list_del_entry_check(entry);
 	__list_del(entry->prev, entry->next);
 	entry->next = (struct list_head *)LIST_POISON1;
 	entry->prev = (struct list_head *)LIST_POISON2;
@@ -84,6 +105,7 @@ static inline void list_del(struct list_head *entry)
 
 static inline void list_del_init(struct list_head *entry)
 {
+	__list_del_entry_check(entry);
 	__list_del(entry->prev, entry->next);
 	INIT_LIST_HEAD(entry);
 }

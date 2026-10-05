@@ -1434,8 +1434,20 @@ static void *kmalloc_internal(usize size, u64 caller) {
   return ptr;
 }
 
+/* What kmalloc hands out is not zeroed, and must not look as if it were: a
+ * fresh bump block came from zero pages, so a field the caller forgot to set
+ * read as 0 and the bug stayed hidden until the block was a reused one. Fill
+ * it with a pattern (FreeBSD's trash_ctor) so a read of an unset field shows
+ * up as 0xa5a5... the first time. Large blocks are left alone: they are
+ * whole process images, and kzalloc callers get zeros as before. */
+#define KHEAP_JUNK_ALLOC 0xa5
+
 void *kmalloc(usize size) {
-  return kmalloc_internal(size, (u64)__builtin_return_address(0));
+  void *p = kmalloc_internal(size, (u64)__builtin_return_address(0));
+
+  if (p && size < KLARGE_THRESHOLD)
+    memset(p, KHEAP_JUNK_ALLOC, size);
+  return p;
 }
 
 static void *kzalloc_internal(usize size, u64 caller) {

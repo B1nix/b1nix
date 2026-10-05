@@ -117,6 +117,7 @@ static void ns_copy_name(char *dst, usize len, const char *src) {
 /* Initial namespaces exist from the first use: there is no ordering guarantee
  * between the scheduler and an early sethostname(). */
 static void ns_ensure_init_locked(void) {
+  spin_assert_held(&ns_lock);
   if (ns_ready)
     return;
   ns_ready = 1;
@@ -214,12 +215,14 @@ u32 ns_alloc_locked(int kind, u32 owner) {
 }
 
 void ns_get_locked(int kind, u32 id) {
+  spin_assert_held(&ns_lock);
   if (id == 0 || kind < 0 || kind >= NS_KIND_COUNT || id >= ns_max[kind])
     return;
   ns_slots[kind][id].refs++;
 }
 
 void ns_put_locked(int kind, u32 id) {
+  spin_assert_held(&ns_lock);
   if (id == 0 || kind < 0 || kind >= NS_KIND_COUNT || id >= ns_max[kind])
     return;
   struct ns_slot *s = &ns_slots[kind][id];
@@ -260,6 +263,7 @@ void ns_put_locked(int kind, u32 id) {
 }
 
 static int ns_live_locked(int kind, u32 id) {
+  spin_assert_held(&ns_lock);
   if (kind < 0 || kind >= NS_KIND_COUNT || id >= ns_max[kind])
     return 0;
   if (id == 0)
@@ -434,6 +438,7 @@ u32 namespace_id_of(usize pid, int kind) {
 
 /* Drop every reference a row holds and mark it unused. */
 static void ns_row_clear_locked(struct ns_row *r) {
+  spin_assert_held(&ns_lock);
   if (!r->used)
     return;
   for (int k = 0; k < NS_KIND_COUNT; k++) {
@@ -1165,6 +1170,7 @@ static int nsfs_ioctl_cb(struct vfs_node *node, u64 request, void *arg) {
 /* ── UTS ────────────────────────────────────────────────────────────────── */
 
 static struct uts_data *uts_current_locked(void) {
+  spin_assert_held(&ns_lock);
   ns_ensure_init_locked();
   u32 id = namespace_current_id(NS_UTS);
   if (!ns_live_locked(NS_UTS, id))

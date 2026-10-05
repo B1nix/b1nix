@@ -70,6 +70,8 @@ void lkpi_lockdep_assert_failed(const void *l, const char *what,
 
 #define lockdep_is_held(l)          lkpi_lockdep_held_mode((l), 0)
 #define lockdep_is_held_type(l, r)  lkpi_lockdep_held_mode((l), (r) == 0 ? 1 : (r) == 1 ? 2 : 0)
+/* lock_is_held() is handed lockdep maps, not locks, and there are no maps
+ * here to consult: it answers "held", not checked rather than refused. */
 #define lock_is_held(l)             1
 #define lock_is_held_type(l, r)     1
 
@@ -133,12 +135,6 @@ void lkpi_lockdep_assert_failed(const void *l, const char *what,
 #define rwsem_release(l, i)            do { } while (0)
 #define lock_map_acquire(l)            do { } while (0)
 #define lock_map_release(l)            do { } while (0)
-#define lockdep_is_held_type(l, r)     1
-
-/* Whether the caller holds a given lock. With no lockdep there is nothing to
- * consult, and the answer is the one that makes an assertion pass rather than
- * fail — a false negative here would abort a correct caller. */
-#define lock_is_held_type(l, r) 1
 
 /* Dynamically allocated lock classes; nothing to register without lockdep. */
 #define lockdep_register_key(key)   do { (void)(key); } while (0)

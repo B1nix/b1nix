@@ -81,6 +81,7 @@ static inline u32 hash_v(usize vnr, u32 ns) {
 }
 
 static void pidmap_ensure_init_locked(void) {
+  spin_assert_held(&ns_lock);
   if (pidmap_ready)
     return;
   pidmap_ready = 1;
@@ -103,6 +104,7 @@ static void chain_unlink(u16 *head, u32 idx, int by_gid) {
 }
 
 static void pidmap_free_locked(u32 idx) {
+  spin_assert_held(&ns_lock);
   struct pidmap_ent *e = &pidmap[idx];
   if (!e->used)
     return;
@@ -116,6 +118,7 @@ static void pidmap_free_locked(u32 idx) {
 }
 
 static int pidmap_add_locked(u32 ns, usize gid, usize vnr) {
+  spin_assert_held(&ns_lock);
   pidmap_ensure_init_locked();
   if (!free_head)
     return -ENOSPC;
@@ -137,6 +140,7 @@ static int pidmap_add_locked(u32 ns, usize gid, usize vnr) {
 }
 
 static struct pidmap_ent *find_by_gid_locked(u32 ns, usize gid) {
+  spin_assert_held(&ns_lock);
   if (!pidmap_ready)
     return 0;
   for (u16 l = head_g[hash_g(gid, ns)]; l; l = pidmap[l - 1].next_g) {
@@ -148,6 +152,7 @@ static struct pidmap_ent *find_by_gid_locked(u32 ns, usize gid) {
 }
 
 static struct pidmap_ent *find_by_vnr_locked(u32 ns, usize vnr) {
+  spin_assert_held(&ns_lock);
   if (!pidmap_ready)
     return 0;
   for (u16 l = head_v[hash_v(vnr, ns)]; l; l = pidmap[l - 1].next_v) {
