@@ -325,9 +325,12 @@ static struct buffer_head *getblk_common(struct block_device *bdev,
 	}
 	atomic_inc(&bh->b_count);
 	folio_unlock(folio);
-	/* The folio reference stays: the buffer points into it, so it must not be
-	 * reclaimed while the buffer is held. It is released when the mapping is
-	 * invalidated at unmount. */
+	/* The lookup's reference goes back, as upstream's does: the buffers
+	 * attached to the folio hold one of their own (folio_attach_private), and
+	 * that is what keeps the folio while any buffer points into it. Keeping
+	 * this one as well leaked a reference per getblk, and a device folio
+	 * could never be freed. */
+	folio_put(folio);
 	return bh;
 }
 

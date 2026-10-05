@@ -1131,16 +1131,24 @@ void dma_resv_iter_begin(struct dma_resv_iter *cursor, struct dma_resv *obj,
 	cursor->fence_usage = usage;
 	cursor->index = 0;
 	cursor->is_restarted = false;
+	cursor->holds_ref = false;
+}
+
+/* The locked walk holds no reference -- the caller's ww_mutex keeps the
+ * fences alive. The _unlocked one holds one on its current fence. */
+static void iter_drop(struct dma_resv_iter *cursor)
+{
+	if (cursor->holds_ref && cursor->fence)
+		dma_fence_put(cursor->fence);
+	cursor->holds_ref = false;
+	cursor->fence = 0;
 }
 
 void dma_resv_iter_end(struct dma_resv_iter *cursor)
 {
 	if (!cursor)
 		return;
-	/* The iterator holds no reference: the caller's ww_mutex is what keeps the
-	 * fences alive for the walk, and taking one per fence would make the
-	 * common case — look, then drop — pay for a case nobody has. */
-	cursor->fence = 0;
+	iter_drop(cursor);
 	cursor->obj = 0;
 }
 
@@ -1178,14 +1186,39 @@ struct dma_fence *dma_resv_iter_next(struct dma_resv_iter *cursor)
 	return iter_advance(cursor);
 }
 
+/*
+ * Without the object's lock, as upstream's: each fence comes with a reference
+ * taken under the array's own lock. Reading the array bare let a concurrent
+ * dma_resv_reserve_fences free it under the walk, and the fence handed out
+ * could be freed while the caller waited on it -- i915 waits on exactly these
+ * (i915_gem_wait, i915_gem_busy, the sw_fence await).
+ */
+static struct dma_fence *iter_advance_unlocked(struct dma_resv_iter *cursor)
+{
+	if (!cursor || !cursor->obj)
+		return 0;
+	iter_drop(cursor);
+	cursor->fence = dma_resv_fence_get_from(cursor->obj, &cursor->index,
+	                                        cursor->usage, &cursor->fence_usage);
+	cursor->holds_ref = cursor->fence != 0;
+	return cursor->fence;
+}
+
 struct dma_fence *dma_resv_iter_first_unlocked(struct dma_resv_iter *cursor)
 {
-	return dma_resv_iter_first(cursor);
+	if (!cursor)
+		return 0;
+	iter_drop(cursor);
+	cursor->index = 0;
+	cursor->is_restarted = true;
+	return iter_advance_unlocked(cursor);
 }
 
 struct dma_fence *dma_resv_iter_next_unlocked(struct dma_resv_iter *cursor)
 {
-	return iter_advance(cursor);
+	if (cursor)
+		cursor->is_restarted = false;
+	return iter_advance_unlocked(cursor);
 }
 
 /* ── mapping a BAR ──────────────────────────────────────────────── */

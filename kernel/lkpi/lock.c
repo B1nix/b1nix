@@ -311,6 +311,12 @@ void lkpi_spin_unlock(struct lkpi_spinlock *l)
 	u64 f = l->flags;
 	int cpu = l->owner_cpu;
 
+	/* Unlocking a lock nobody holds used to take one off THIS CPU's count of
+	 * held locks -- some other lock's -- and the interrupt state it restores
+	 * after the last one went with it. */
+	KASSERT(cpu >= 0, "unlock of linuxkpi spinlock %p, which is not held",
+	        (void *)l);
+
 	/* Releasing a lock this CPU did not take is what would make the count lie,
 	 * and a count that lies is what made two attempted fixes for the probe
 	 * hang misfire. It cannot happen legitimately: these locks are held with

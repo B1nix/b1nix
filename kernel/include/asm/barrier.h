@@ -39,40 +39,62 @@
  * aarch64 is weakly ordered and needs a real barrier for all three: `dmb ish`,
  * inner-shareable, which is the domain the CPUs in one machine share.
  */
+/*
+ * Upstream's, instruction for instruction (arch/x86 and arch/arm64 barrier.h).
+ *
+ * mb/rmb/wmb order against devices as well as other CPUs: on x86 that is
+ * mfence/lfence/sfence -- write-combining stores, which a GPU ring written
+ * through a WC mapping is made of, are not ordered by the CPU's ordinary rules,
+ * and a doorbell written after them without sfence can reach the device first.
+ * These were compiler barriers here, which is the smp_ variant. On arm64 the
+ * device forms are dsb, full system; the dma_ forms are dmb over the outer
+ * shareable domain, which is where a device sits; only smp_ is inner.
+ */
 #ifndef mb
 #if defined(__x86_64__)
-#define mb()  __asm__ __volatile__("lock; addl $0,-4(%%rsp)" ::: "memory", "cc")
+#define mb()  __asm__ __volatile__("mfence" ::: "memory")
 #elif defined(__aarch64__)
-#define mb()  __asm__ __volatile__("dmb ish" ::: "memory")
+#define mb()  __asm__ __volatile__("dsb sy" ::: "memory")
 #else
 #define mb()  __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #endif
 #endif
 #ifndef rmb
 #if defined(__x86_64__)
-/* Loads are never reordered with loads on x86, so this is the compiler's job
- * alone; on aarch64 it is the CPU's too. */
-#define rmb() barrier()
+#define rmb() __asm__ __volatile__("lfence" ::: "memory")
 #else
-#define rmb() __asm__ __volatile__("dmb ishld" ::: "memory")
+#define rmb() __asm__ __volatile__("dsb ld" ::: "memory")
 #endif
 #endif
 #ifndef wmb
 #if defined(__x86_64__)
-#define wmb() barrier()
+#define wmb() __asm__ __volatile__("sfence" ::: "memory")
 #else
-#define wmb() __asm__ __volatile__("dmb ishst" ::: "memory")
+#define wmb() __asm__ __volatile__("dsb st" ::: "memory")
 #endif
 #endif
 
+#if defined(__x86_64__)
 #ifndef smp_mb
-#define smp_mb()  mb()
+#define smp_mb()  __asm__ __volatile__("lock; addl $0,-4(%%rsp)" ::: "memory", "cc")
 #endif
+/* x86 never reorders loads with loads or stores with stores between CPUs. */
 #ifndef smp_rmb
-#define smp_rmb() rmb()
+#define smp_rmb() barrier()
 #endif
 #ifndef smp_wmb
-#define smp_wmb() wmb()
+#define smp_wmb() barrier()
+#endif
+#else
+#ifndef smp_mb
+#define smp_mb()  __asm__ __volatile__("dmb ish" ::: "memory")
+#endif
+#ifndef smp_rmb
+#define smp_rmb() __asm__ __volatile__("dmb ishld" ::: "memory")
+#endif
+#ifndef smp_wmb
+#define smp_wmb() __asm__ __volatile__("dmb ishst" ::: "memory")
+#endif
 #endif
 
 /*
@@ -95,8 +117,14 @@
 #define smp_read_barrier_depends() do { } while (0)
 #define read_barrier_depends()     do { } while (0)
 
-#define dma_rmb() rmb()
-#define dma_wmb() wmb()
+#if defined(__x86_64__)
+/* Coherent DMA memory is ordered like any other on x86. */
+#define dma_rmb() barrier()
+#define dma_wmb() barrier()
+#else
+#define dma_rmb() __asm__ __volatile__("dmb oshld" ::: "memory")
+#define dma_wmb() __asm__ __volatile__("dmb oshst" ::: "memory")
+#endif
 
 #ifndef smp_mb__before_atomic
 #define smp_mb__before_atomic() smp_mb()

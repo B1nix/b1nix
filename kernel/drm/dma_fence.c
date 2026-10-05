@@ -9,6 +9,7 @@
 #include <b1nix/console.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/dma_fence.h>
+#include <lkpi/rcu.h>
 #include <linux/ktime.h>
 
 _Static_assert(sizeof(spinlock_t) == sizeof(int),
@@ -87,13 +88,19 @@ void dma_fence_init_named(struct dma_fence *f, u64 context, u64 seqno,
 	INIT_LIST_HEAD(&f->cb_list);
 }
 
+/*
+ * The count is atomic, and every path changes it atomically.
+ *
+ * get and put used to change it as a plain int under the fence's lock while
+ * dma_fence_get_rcu compare-exchanged it without that lock -- the two kinds of
+ * update could lose each other, and a put at zero ran release a second time.
+ * A get on a dead fence and a put below zero now stop the machine instead.
+ */
 struct dma_fence *dma_fence_get(struct dma_fence *f)
 {
 	if (!f)
 		return 0;
-	lkpi_spin_lock(f->lock);
 	kref_get(&f->refcount);
-	lkpi_spin_unlock(f->lock);
 	return f;
 }
 
@@ -101,13 +108,13 @@ void dma_fence_put(struct dma_fence *f)
 {
 	if (!f)
 		return;
-	lkpi_spin_lock(f->lock);
-	i32 left = kref_read(&f->refcount);
-	left = left ? --lkpi_kref_counter(&f->refcount) : 0;
-	dma_fence_release_fn release = f->release;
-	lkpi_spin_unlock(f->lock);
-	if (left == 0 && release)
-		release(f);
+	i32 old = __atomic_fetch_sub(&lkpi_kref_counter(&f->refcount), 1,
+	                             __ATOMIC_ACQ_REL);
+
+	if (old <= 0)
+		lkpi_refcount_bug("dma_fence_put", f, old);
+	if (old == 1 && f->release)
+		f->release(f);
 }
 
 /*
@@ -587,17 +594,22 @@ void dma_fence_enable_sw_signaling(struct dma_fence *fence)
 }
 
 /*
- * Free a fence's memory directly.
+ * Free a fence's memory after a grace period, as upstream does.
  *
- * For a driver whose release does nothing but free — upstream defers this
- * through the fence's rcu_head, because a fence may be looked up without a
- * reference held. Nothing in this port looks one up under RCU (see the note on
- * the rcu member in <b1nix/dma_fence.h>), so the free is immediate.
+ * A fence may be looked up without a reference: i915 reads a vma's or a
+ * resource's active fence under rcu_read_lock and then tries
+ * dma_fence_get_rcu() on it. Freeing at once let that read land in memory the
+ * heap had already handed to something else.
  */
+static void dma_fence_free_rcu(struct rcu_head *head)
+{
+	kfree((char *)head - __builtin_offsetof(struct dma_fence, rcu));
+}
+
 void dma_fence_free(struct dma_fence *fence)
 {
 	if (fence)
-		kfree(fence);
+		call_rcu(&fence->rcu, dma_fence_free_rcu);
 }
 
 /* Signal with the fence's lock already held by the caller: the same state

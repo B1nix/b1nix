@@ -66,23 +66,38 @@ static inline int spin_trylock(spinlock_t *l) { return lkpi_spin_trylock(l); }
 #define assert_spin_locked(l)        do { (void)(l); } while (0)
 
 
-/* Decrement, and take the lock only if the count reached zero. The point is
- * that the lock is not taken on the common path — the caller only needs it to
- * tear the object down, and taking it every time would serialise every put. */
-#define atomic_dec_and_lock_irqsave(atom, lock, flags)        \
-	({                                                        \
-		int __z = atomic_dec_and_test(atom);                  \
-		(void)(flags);                                        \
-		if (__z)                                              \
-			spin_lock(lock);                                  \
-		__z;                                                  \
+/*
+ * Decrement; if that was the last reference, return 1 holding the lock.
+ *
+ * The lock is not taken on the common path, but the final decrement is made
+ * under it -- upstream's order. Decrementing to zero first and locking after
+ * leaves a window in which a lookup under the same lock finds the object at
+ * zero and takes a reference to something about to be freed. The irqsave form
+ * fills in `flags`; it used to leave them unset for the caller's restore.
+ */
+#define atomic_dec_and_lock(atom, lock)                                     \
+	({                                                                  \
+		int __z = 0;                                                \
+		if (!atomic_add_unless((atom), -1, 1)) {                    \
+			spin_lock(lock);                                    \
+			if (atomic_dec_and_test(atom))                      \
+				__z = 1;                                    \
+			else                                                \
+				spin_unlock(lock);                          \
+		}                                                           \
+		__z;                                                        \
 	})
-#define atomic_dec_and_lock(atom, lock)                       \
-	({                                                        \
-		int __z = atomic_dec_and_test(atom);                  \
-		if (__z)                                              \
-			spin_lock(lock);                                  \
-		__z;                                                  \
+#define atomic_dec_and_lock_irqsave(atom, lock, flags)                      \
+	({                                                                  \
+		int __z = 0;                                                \
+		if (!atomic_add_unless((atom), -1, 1)) {                    \
+			spin_lock_irqsave(lock, flags);                     \
+			if (atomic_dec_and_test(atom))                      \
+				__z = 1;                                    \
+			else                                                \
+				spin_unlock_irqrestore(lock, flags);        \
+		}                                                           \
+		__z;                                                        \
 	})
 
 /* Interrupt control, spelled the way imported code asks for it. b1nix's own

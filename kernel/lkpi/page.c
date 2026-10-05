@@ -182,6 +182,15 @@ void __free_pages(struct page *page, u32 order)
 		return;
 	if (lkpi_free_split_page(page))
 		return;
+	/* Upstream's __free_pages drops a reference and frees on the last one;
+	 * freeing regardless pulled the run out from under anyone who had taken
+	 * one with get_page. The head carries the count for the run. */
+	i32 old = __atomic_fetch_sub(&page->count, 1, __ATOMIC_ACQ_REL);
+
+	KASSERT(old > 0, "__free_pages of page %p (frame 0x%llx) at refcount %d",
+	        (void *)page, (unsigned long long)page->phys, old);
+	if (old != 1)
+		return;
 	usize n = (usize)1 << order;
 	for (usize i = 0; i < n; i++) {
 		lkpi_page_unregister(&page[i]);
@@ -190,15 +199,28 @@ void __free_pages(struct page *page, u32 order)
 	lkpi_kfree(page);
 }
 
-void __free_page(struct page *page)
+/* The frame and the struct both go: what the last reference to a page from
+ * lkpi_alloc_page, a split run or alloc_pages(0) does. */
+static void lkpi_page_destroy(struct page *page)
 {
-	if (!page)
-		return;
 	if (lkpi_free_split_page(page))
 		return;
 	lkpi_page_unregister(page);
 	pmm_free_frame(page->phys);
 	lkpi_kfree(page);
+}
+
+void __free_page(struct page *page)
+{
+	if (!page)
+		return;
+	/* A reference dropped, as upstream's: see __free_pages. */
+	i32 old = __atomic_fetch_sub(&page->count, 1, __ATOMIC_ACQ_REL);
+
+	KASSERT(old > 0, "__free_page of page %p (frame 0x%llx) at refcount %d",
+	        (void *)page, (unsigned long long)page->phys, old);
+	if (old == 1)
+		lkpi_page_destroy(page);
 }
 
 void *page_address(const struct page *page)
@@ -210,15 +232,30 @@ void *page_address(const struct page *page)
 
 void get_page(struct page *page)
 {
-	if (page)
-		__atomic_fetch_add(&page->count, 1, __ATOMIC_RELAXED);
+	if (!page)
+		return;
+	i32 old = __atomic_fetch_add(&page->count, 1, __ATOMIC_RELAXED);
+
+	/* A reference to a page nobody owns: its frame is already free. */
+	KASSERT(old > 0, "get_page on page %p (frame 0x%llx) at refcount %d",
+	        (void *)page, (unsigned long long)page->phys, old);
 }
 
 int put_page(struct page *page)
 {
 	if (!page)
 		return 0;
-	if (__atomic_fetch_sub(&page->count, 1, __ATOMIC_ACQ_REL) == 1) {
+	i32 old = __atomic_fetch_sub(&page->count, 1, __ATOMIC_ACQ_REL);
+
+	KASSERT(old > 0, "put_page of page %p (frame 0x%llx) at refcount %d",
+	        (void *)page, (unsigned long long)page->phys, old);
+	/* A page allocated on its own has nothing else keeping its struct: the
+	 * last put frees both, whichever of put_page and folio_put it is. */
+	if (old == 1 && (page->order & LKPI_PAGE_SINGLE)) {
+		lkpi_page_destroy(page);
+		return 1;
+	}
+	if (old == 1) {
 		/* Off the frame-to-page registry first, exactly as __free_page does.
 		 *
 		 * Dropping the frame while leaving the page in the hash left an entry
@@ -240,14 +277,7 @@ int put_page(struct page *page)
 
 void lkpi_put_page_free(struct page *page)
 {
-	if (!page)
-		return;
-	if (!(page->order & LKPI_PAGE_SINGLE)) {
-		put_page(page);
-		return;
-	}
-	if (__atomic_fetch_sub(&page->count, 1, __ATOMIC_ACQ_REL) == 1)
-		__free_page(page);
+	put_page(page);
 }
 
 /* ── shmem-style page arrays ────────────────────────────────────── */
@@ -507,6 +537,12 @@ void lkpi_pagevec_release(struct page *pv, usize index)
 {
 	if (!pv || !pv[index].phys)
 		return;
+	/* The object's own reference is the only one left by now. Another means a
+	 * driver still holds the page -- a GPU mapping, an sg table -- and the
+	 * frame would go back to the allocator under it. */
+	KASSERT(pv[index].count <= 1, "object page %p (frame 0x%llx) released "
+	        "with %d references outstanding", (void *)&pv[index],
+	        (unsigned long long)pv[index].phys, (int)pv[index].count);
 	lkpi_page_unregister(&pv[index]);
 	pmm_free_frame(pv[index].phys);
 	pv[index].phys = 0;
@@ -585,7 +621,7 @@ void lkpi_page_register(struct page *page)
 				console_write("\n");
 			}
 		}
-		return;
+		panic("lkpi: a page registered twice (its struct was reused while still in the registry)");
 	}
 	page->hash_next = g_pfn_hash[b];
 	g_pfn_hash[b] = page;

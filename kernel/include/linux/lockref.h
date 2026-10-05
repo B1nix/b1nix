@@ -13,6 +13,7 @@
  * here call lkpi's directly for the same reason the type is spelled that way.
  */
 #include <lkpi/lock.h>
+#include <lkpi/kref.h>
 
 /*
  * A reference count and the spinlock that guards it, in one word.
@@ -33,9 +34,13 @@ struct lockref {
 	};
 };
 
+/* A dentry here starts at one and is freed at zero -- there is no unused
+ * list -- so a get on zero or below is a get on freed memory. */
 static inline void lockref_get(struct lockref *lockref)
 {
 	lkpi_spin_lock(&lockref->lock);
+	if (__builtin_expect(lockref->count <= 0, 0))
+		lkpi_refcount_bug("lockref_get", lockref, lockref->count);
 	lockref->count++;
 	lkpi_spin_unlock(&lockref->lock);
 }
@@ -59,6 +64,8 @@ static inline int lockref_get_not_zero(struct lockref *lockref)
 static inline int lockref_put_or_lock(struct lockref *lockref)
 {
 	lkpi_spin_lock(&lockref->lock);
+	if (__builtin_expect(lockref->count <= 0, 0))
+		lkpi_refcount_bug("lockref_put_or_lock", lockref, lockref->count);
 	if (lockref->count <= 1)
 		return 0;   /* returns holding the lock, as upstream does */
 	lockref->count--;
@@ -73,6 +80,10 @@ static inline int lockref_put_return(struct lockref *lockref)
 	lkpi_spin_lock(&lockref->lock);
 	count = --lockref->count;
 	lkpi_spin_unlock(&lockref->lock);
+	/* Below zero is a second dput of a freed dentry, which dput would free
+	 * again. */
+	if (__builtin_expect(count < 0, 0))
+		lkpi_refcount_bug("lockref_put_return", lockref, count + 1);
 	return count;
 }
 

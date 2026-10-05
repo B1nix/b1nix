@@ -1287,7 +1287,22 @@ void lkpi_might_sleep(const char *where)
   lkpi_snprintf(line, sizeof(line),
                 "lkpi: might_sleep() in a context that cannot block: %s",
                 where ? where : "<unknown>");
+  /* Before there is a task to block there is nothing wrong with the call:
+   * early driver init runs this way. After that, sleeping with interrupts
+   * off or a lock held is the deadlock waiting to happen, and the trace above
+   * is the place it starts. */
+  if (current_task)
+    panic(line);
   klog_warn(line);
+}
+
+void lkpi_refcount_bug(const char *what, const void *obj, int count)
+{
+  char line[128];
+
+  lkpi_snprintf(line, sizeof(line), "lkpi: %s on %p at refcount %d", what, obj,
+                count);
+  panic(line);
 }
 
 /* ── PCI windows ────────────────────────────────────────────────── */

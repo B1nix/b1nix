@@ -472,9 +472,15 @@ void discard_new_inode(struct inode *inode)
 	iput(inode);
 }
 
+/* Upstream WARNs here when the count was zero: ihold is for a caller that
+ * already holds a reference, and a zero count means the inode is on its way
+ * out. */
 void ihold(struct inode *inode)
 {
-	atomic_inc(&inode->i_count);
+	int old = __atomic_fetch_add(&inode->i_count.counter, 1, __ATOMIC_RELAXED);
+
+	if (__builtin_expect(old <= 0, 0))
+		lkpi_refcount_bug("ihold", inode, old);
 }
 
 struct inode *igrab(struct inode *inode)
@@ -553,8 +559,15 @@ void iput(struct inode *inode)
 
 	if (!inode)
 		return;
-	if (!atomic_dec_and_test(&inode->i_count))
-		return;
+	{
+		int left = __atomic_sub_fetch(&inode->i_count.counter, 1,
+		                              __ATOMIC_ACQ_REL);
+
+		if (__builtin_expect(left < 0, 0))
+			lkpi_refcount_bug("iput", inode, left + 1);
+		if (left != 0)
+			return;
+	}
 
 	sb = inode->i_sb;
 	drop = (sb && sb->s_op && sb->s_op->drop_inode) ?

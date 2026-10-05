@@ -34,6 +34,13 @@ void lkpi_irq_work_queue(struct irq_work *w);
 static inline void init_irq_work(struct irq_work *w, void (*func)(struct irq_work *))
 { w->func = func; }
 static inline bool irq_work_queue(struct irq_work *w) { lkpi_irq_work_queue(w); return true; }
-static inline void irq_work_sync(struct irq_work *w) { (void)w; }
+/* Wait until the work is not running: the caller is about to free what it
+ * touches. It runs from a workqueue here, so that is a flush; an empty sync
+ * let i915 free its breadcrumbs while their work still ran. */
+static inline void irq_work_sync(struct irq_work *w)
+{
+	if (w && w->work.func)
+		flush_work(&w->work);
+}
 
 #endif

@@ -5,6 +5,7 @@
 #include <linux/dma-fence.h>
 #include <linux/ww_mutex.h>
 #include <lkpi/ww_mutex.h>
+#include <lkpi/lock.h>
 
 /*
  * A buffer object's reservation: the lock that guards it, plus the fences that
@@ -39,6 +40,10 @@ struct dma_resv {
 	struct dma_resv_fence *fences;
 	u32 count;
 	u32 capacity;
+	/* Guards the array itself -- the pointer, the slots, the count -- for the
+	 * readers that do not hold `lock`: dma_resv_test_signaled and the
+	 * _unlocked iterators. Writers hold `lock` as well. */
+	struct lkpi_spinlock fence_lock;
 };
 
 void dma_resv_init(struct dma_resv *obj);
@@ -146,6 +151,9 @@ struct dma_resv_iter {
 	enum dma_resv_usage fence_usage;
 	unsigned int index;
 	bool is_restarted;
+	/* An _unlocked walk holds a reference on `fence`, dropped as it moves on
+	 * and at dma_resv_iter_end: nothing else keeps it alive. */
+	bool holds_ref;
 };
 
 void dma_resv_iter_begin(struct dma_resv_iter *cursor, struct dma_resv *obj,
@@ -153,6 +161,11 @@ void dma_resv_iter_begin(struct dma_resv_iter *cursor, struct dma_resv *obj,
 void dma_resv_iter_end(struct dma_resv_iter *cursor);
 struct dma_fence *dma_resv_iter_first(struct dma_resv_iter *cursor);
 struct dma_fence *dma_resv_iter_next(struct dma_resv_iter *cursor);
+/* The next fence matching `usage` at or after *index, with a reference, read
+ * under the array's lock; *index moves past it. NULL at the end. */
+struct dma_fence *dma_resv_fence_get_from(struct dma_resv *obj, unsigned int *index,
+                                          enum dma_resv_usage usage,
+                                          enum dma_resv_usage *found_usage);
 struct dma_fence *dma_resv_iter_first_unlocked(struct dma_resv_iter *cursor);
 struct dma_fence *dma_resv_iter_next_unlocked(struct dma_resv_iter *cursor);
 

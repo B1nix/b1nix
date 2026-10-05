@@ -7,20 +7,42 @@
  * shape lkpi uses, so the forward is direct. */
 #define kref_put(kref, release) kref_put((kref), (release))
 
-/* Release under a lock the caller names, taken only when the count reaches
- * zero. The point is the same as atomic_dec_and_lock's: the common put pays
- * nothing, and only the last one serialises. */
-#define kref_put_lock(kref, release, lock)                        \
-	({                                                            \
-		int __z = refcount_dec_and_test(&(kref)->refcount);        \
-		if (__z) { spin_lock(lock); release(kref); }               \
-		__z;                                                      \
+/*
+ * Release under a lock the caller names; `release` returns with it dropped.
+ *
+ * The last reference goes UNDER the lock, as upstream's refcount_dec_and_lock
+ * does: the common put (not the last) pays nothing, and the final one cannot
+ * race a lookup that takes a reference under the same lock. Decrementing to
+ * zero first and locking after let i915's frontbuffer lookup take a reference
+ * on an object whose release had already begun.
+ */
+#define kref_put_lock(kref, release, lock)                                  \
+	({                                                                  \
+		int __z = 0;                                                \
+		if (!refcount_dec_not_one(&(kref)->refcount)) {             \
+			spin_lock(lock);                                    \
+			if (refcount_dec_and_test(&(kref)->refcount)) {     \
+				release(kref);                              \
+				__z = 1;                                    \
+			} else {                                            \
+				spin_unlock(lock);                          \
+			}                                                   \
+		}                                                           \
+		__z;                                                        \
 	})
-#define kref_put_mutex(kref, release, mutex)                      \
-	({                                                            \
-		int __z = refcount_dec_and_test(&(kref)->refcount);        \
-		if (__z) { mutex_lock(mutex); release(kref); }             \
-		__z;                                                      \
+#define kref_put_mutex(kref, release, mutex)                                \
+	({                                                                  \
+		int __z = 0;                                                \
+		if (!refcount_dec_not_one(&(kref)->refcount)) {             \
+			mutex_lock(mutex);                                  \
+			if (refcount_dec_and_test(&(kref)->refcount)) {     \
+				release(kref);                              \
+				__z = 1;                                    \
+			} else {                                            \
+				mutex_unlock(mutex);                        \
+			}                                                   \
+		}                                                           \
+		__z;                                                        \
 	})
 
 #endif

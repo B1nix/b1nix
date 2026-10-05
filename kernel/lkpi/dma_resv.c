@@ -19,6 +19,7 @@
 #include <lkpi/dma-mapping.h>
 #include <lkpi/types.h>
 #include <lkpi/ww_mutex.h>
+#include <lkpi/lock.h>
 
 /*
  * Deliberately built against <lkpi/ww_mutex.h> rather than <linux/dma-resv.h>:
@@ -45,6 +46,10 @@ struct dma_resv {
 	struct dma_resv_fence *fences;
 	u32 count;
 	u32 capacity;
+	/* Guards the array itself -- the pointer, the slots, the count -- for the
+	 * readers that do not hold `lock`: dma_resv_test_signaled and the
+	 * _unlocked iterators. Writers hold `lock` as well. */
+	struct lkpi_spinlock fence_lock;
 };
 
 void dma_resv_init(struct dma_resv *obj);
@@ -61,6 +66,7 @@ void dma_resv_init(struct dma_resv *obj)
 	if (!obj)
 		return;
 	ww_mutex_init(&obj->lock);
+	lkpi_spin_lock_init(&obj->fence_lock);
 	obj->fences = 0;
 	obj->count = 0;
 	obj->capacity = 0;
@@ -100,12 +106,44 @@ int dma_resv_reserve_fences(struct dma_resv *obj, unsigned int num)
 	if (!fences)
 		return -ENOMEM;
 
+	/* The swap is what a reader must not see half-done; the old array is
+	 * freed once no reader can be looking at it. */
+	lkpi_spin_lock(&obj->fence_lock);
 	for (u32 i = 0; i < obj->count; i++)
 		fences[i] = obj->fences[i];
-	lkpi_kfree(obj->fences);
+	struct dma_resv_fence *old = obj->fences;
 	obj->fences = fences;
 	obj->capacity = capacity;
+	lkpi_spin_unlock(&obj->fence_lock);
+	lkpi_kfree(old);
 	return 0;
+}
+
+struct dma_fence *dma_resv_fence_get_from(struct dma_resv *obj, unsigned int *index,
+                                          enum dma_resv_usage usage,
+                                          enum dma_resv_usage *found_usage);
+
+struct dma_fence *dma_resv_fence_get_from(struct dma_resv *obj, unsigned int *index,
+                                          enum dma_resv_usage usage,
+                                          enum dma_resv_usage *found_usage)
+{
+	struct dma_fence *f = 0;
+
+	if (!obj || !index)
+		return 0;
+	lkpi_spin_lock(&obj->fence_lock);
+	while (*index < obj->count) {
+		struct dma_resv_fence *slot = &obj->fences[(*index)++];
+
+		if ((u32)slot->usage > (u32)usage || !slot->fence)
+			continue;
+		f = dma_fence_get(slot->fence);
+		if (found_usage)
+			*found_usage = slot->usage;
+		break;
+	}
+	lkpi_spin_unlock(&obj->fence_lock);
+	return f;
 }
 
 void dma_resv_add_fence(struct dma_resv *obj, struct dma_fence *fence,
@@ -122,7 +160,11 @@ void dma_resv_add_fence(struct dma_resv *obj, struct dma_fence *fence,
 		    obj->fences[i].fence->context == fence->context &&
 		    obj->fences[i].usage == usage) {
 			struct dma_fence *old = obj->fences[i].fence;
-			obj->fences[i].fence = dma_fence_get(fence);
+			struct dma_fence *new_ref = dma_fence_get(fence);
+
+			lkpi_spin_lock(&obj->fence_lock);
+			obj->fences[i].fence = new_ref;
+			lkpi_spin_unlock(&obj->fence_lock);
 			dma_fence_put(old);
 			return;
 		}
@@ -136,9 +178,13 @@ void dma_resv_add_fence(struct dma_resv *obj, struct dma_fence *fence,
 			return;
 	}
 
-	obj->fences[obj->count].fence = dma_fence_get(fence);
+	struct dma_fence *new_ref = dma_fence_get(fence);
+
+	lkpi_spin_lock(&obj->fence_lock);
+	obj->fences[obj->count].fence = new_ref;
 	obj->fences[obj->count].usage = usage;
 	obj->count++;
+	lkpi_spin_unlock(&obj->fence_lock);
 }
 
 /* Does a fence recorded with `have` have to be waited for by someone asking
@@ -149,14 +195,21 @@ static int usage_matches(enum dma_resv_usage have, enum dma_resv_usage want)
 	return (u32)have <= (u32)want;
 }
 
+/* Called without the object's lock, as upstream allows: each fence is taken
+ * with a reference under the array's lock and tested outside it, since
+ * testing can call into the driver. */
 int dma_resv_test_signaled(struct dma_resv *obj, enum dma_resv_usage usage)
 {
+	unsigned int index = 0;
+	struct dma_fence *f;
+
 	if (!obj)
 		return 1;
-	for (u32 i = 0; i < obj->count; i++) {
-		if (!usage_matches(obj->fences[i].usage, usage))
-			continue;
-		if (!dma_fence_is_signaled(obj->fences[i].fence))
+	while ((f = dma_resv_fence_get_from(obj, &index, usage, 0)) != 0) {
+		int done = dma_fence_is_signaled(f);
+
+		dma_fence_put(f);
+		if (!done)
 			return 0;
 	}
 	return 1;

@@ -38,6 +38,16 @@ typedef struct {
 	struct lkpi_atomic refs;
 } lkpi_refcount_t;
 
+/*
+ * A reference count that went wrong: a get on a dead object, a put below zero,
+ * or a count about to wrap. Panics, naming the object and the count it found
+ * (kernel/lkpi/env.c). FreeBSD's refcount(9) asserts the same under INVARIANTS;
+ * Linux saturates and warns. Either way it is a bug that has already happened,
+ * and carrying on turns it into a use after free somewhere else.
+ */
+void lkpi_refcount_bug(const char *what, const void *obj, int count)
+	__attribute__((noreturn));
+
 struct kref {
 	lkpi_refcount_t refcount;
 };
@@ -58,7 +68,11 @@ static inline i32 kref_read(const struct kref *kref)
 
 static inline void kref_get(struct kref *kref)
 {
-	__atomic_fetch_add(&kref->refcount.refs.counter, 1, __ATOMIC_RELAXED);
+	i32 old = __atomic_fetch_add(&kref->refcount.refs.counter, 1,
+	                             __ATOMIC_RELAXED);
+
+	if (__builtin_expect(old <= 0 || old == 0x7fffffff, 0))
+		lkpi_refcount_bug("kref_get", kref, old);
 }
 
 /*
@@ -91,7 +105,12 @@ static inline int kref_get_unless_zero(struct kref *kref)
  */
 static inline int kref_put(struct kref *kref, kref_release_t release)
 {
-	if (__atomic_fetch_sub(&kref->refcount.refs.counter, 1, __ATOMIC_ACQ_REL) == 1) {
+	i32 old = __atomic_fetch_sub(&kref->refcount.refs.counter, 1,
+	                             __ATOMIC_ACQ_REL);
+
+	if (__builtin_expect(old <= 0, 0))
+		lkpi_refcount_bug("kref_put", kref, old);
+	if (old == 1) {
 		if (release)
 			release(kref);
 		return 1;
