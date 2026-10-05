@@ -19,7 +19,7 @@ stage* failed, and they must never pass by accident.
 | `PKG-SMOKE` | the overlay packages build, publish and install into a clean Debian | A |
 | `DISTRO-SMOKE` | the installed image boots to a systemd target, apt works, the two-kernel fallback works | B |
 | `LIVE-SMOKE` | the live medium boots under BIOS and UEFI into a writable session, inside its size budget | D |
-| `INSTALL-SMOKE` | Calamares installs onto a blank disk, and the installed disk boots to a login, with and without a network | D |
+| `INSTALL-SMOKE` | `b1nix-install` installs onto a blank disk, and the installed disk boots to a login, with and without a network (two runs side by side); the medium stays within its size budget | D |
 | `DESKTOP-SMOKE` | login, browser, sound, and suspend once it exists | D |
 | `UPGRADE-SMOKE` | release N upgrades to N+1 through apt and still boots | G |
 

@@ -53,28 +53,34 @@ not work in this release, and it is shorter than the list of what does.
 
 ## 4. Install
 
-The installer asks for language and keyboard, timezone, your user, and where to
-install.
+The live session logs in on the console. Run
 
-- **Disk**: "erase disk" uses the whole disk with btrfs, which is what we
-  test and what lets the system take a snapshot before every upgrade. Manual
-  partitioning is available; keep an EFI partition of at least 512 MB, because
-  b1nix stores kernels there.
-- **Desktop**: the installer downloads it. If there is no network, this step is
-  skipped and you get a command-line system.
+```
+b1nix-install
+```
 
-Installation takes a while, most of it downloading.
+It lists the disks, then asks for the disk, the file system, the host name,
+your login name and password, the time zone and the keyboard layout, and
+installs once you type `YES`.
+
+- **Disk**: the whole disk is used: a small BIOS boot partition, a 512 MB
+  `/boot` for the kernels, and the rest as btrfs, which is what we test and
+  what lets the system keep snapshots. ext4 is offered instead.
+- **Desktop**: not part of the install yet; it is added from the network
+  afterwards (below).
+
+The install itself takes under a minute on an SSD.
 
 ## 5. First boot
 
-Remove the stick and boot. You get a login screen, or a console if the desktop
-was skipped.
+Remove the stick and boot. You get a console login; root is locked, and your
+user administers the system with `sudo`.
 
 ## Installing without a network
 
-The image contains a complete base system. With no cable, the installer
-finishes and leaves you a working command-line system. Connect a cable later
-and run:
+The image contains a complete base system, and the installer never uses the
+network: the result is the same with or without a cable. To add the desktop,
+connect and run:
 
 ```
 sudo apt update

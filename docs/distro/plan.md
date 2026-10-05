@@ -44,7 +44,7 @@ to drop when time runs out. The kernel's own milestones are in
 | Base | Debian trixie: glibc, systemd, apt |
 | Packages | Debian archive as-is + own overlay repo (10–20 packages) |
 | Build | Release artifacts on the Linux host; a self-host lane on b1nix as a kernel test |
-| Installer | Calamares, netinstall: the ISO carries the base system, the desktop comes over the network |
+| Installer | `b1nix-install`, a console installer: the ISO carries the base system, the desktop comes over the network |
 | Hosting | GitHub Releases (ISO) + GitHub Pages (apt repo), no domain at first |
 | Bootloader | Limine on both arches; kernel and initramfs on the ESP |
 | Root filesystem | btrfs with subvolumes, ext4 offered in the installer |
@@ -74,7 +74,7 @@ Own packages, and nothing more:
 | `b1nix-base-files` | `/etc/os-release`, `/etc/issue`, apt sources and pinning, default sysctl/udev, the metapackage dependency list |
 | `b1nix-desktop` | metapackage: Plasma, the default applications, fonts, the first-boot wizard |
 | `b1nix-artwork` | Plasma look-and-feel, bootloader theme, wallpapers, Plymouth theme |
-| `b1nix-installer-config` | Calamares branding and module configuration |
+| `b1nix-installer-config` | the live session and `b1nix-install` |
 | `b1nix-tools` | `b1nix-report`, the netconsole collector, the gdb-stub helper, the boot-timeline script |
 | `b1cc` | already ours |
 
@@ -217,7 +217,7 @@ but that integration has to be written, and it is real work:
 
 - **Nothing in Debian knows about Limine.** `b1nix-kernel`'s postinst writes
   the Limine configuration itself, from a template in `b1nix-base-files`, and
-  Calamares gets a small `shellprocess` module instead of its `bootloader` one.
+  the installer puts Limine on the disk with `b1nix-install-target`.
   Neither is difficult; both are ours to maintain forever.
 - **Boot counting is ours too.** systemd-boot would have given it for free;
   with Limine, the counter lives in a file on the ESP that the kernel's
@@ -293,11 +293,13 @@ The consequences are real and are not hidden from the user:
   can add the desktop later with `apt install b1nix-desktop`. This is the
   difference between "needs network" and "useless without network", and it is
   worth the few hundred megabytes it costs.
-- **The ISO is not 300 MB.** Calamares is Qt, so the installer environment
-  carries a graphical stack; with the offline base included, the honest target
-  is **900 MB–1.4 GB**, comfortably under the limit but nowhere near a classic
-  netinst. The number is fixed at phase D, written into the lane, and a release
-  that exceeds it either drops content or explains itself.
+- **The installer is a console program, so the ISO is small.** Calamares was
+  the first choice and the medium carried Qt, X and an Xvfb-driven test to go
+  with it: 384 MB, and twenty minutes per install in the lane. `b1nix-install`
+  asks its questions on the console or reads them from a file; the medium is
+  the base system and nothing else, **160 MB**, under a budget of **256 MB**
+  that the lane asserts. A release that exceeds it either drops content or
+  explains itself.
 - **A mirror is a dependency at install time.** If `deb.debian.org` is
   unreachable, the desktop step fails. The installer treats that as a
   recoverable step, not a failed install: the base system is already on disk.
@@ -319,7 +321,7 @@ the budget, and the release checklist records the actual size.
   Debian, with Chromium a Suggests: the known-harder test rather than the
   default.
 - **First boot**: a wizard for user, locale, keyboard, timezone, network. If
-  Calamares already asked, the wizard does not ask again — on a live install it
+  the installer already asked, the wizard does not ask again — on a live install it
   does nothing but show the known-issues page once.
 - **Locale and input**: full UTF-8, the usual locales generated, a keyboard
   layout switcher configured by default. Anything less makes the distribution
@@ -378,9 +380,11 @@ What a lane must look like — naming, stages, the known-degraded list — is in
 - `DISTRO-SMOKE` — the installed image boots to a systemd target,
   `systemctl is-system-running` is `running` or a known `degraded` set,
   `apt update` works.
-- `INSTALL-SMOKE` — unattended Calamares onto a blank disk in QEMU, then boot
-  the installed disk to a login. Exercises Qt, udisks, parted, loop devices,
-  GPT writes, LUKS and fsync — a hard kernel test disguised as a UX feature.
+- `INSTALL-SMOKE` — two unattended installs onto blank disks in QEMU (BIOS
+  with the network, UEFI without), then each installed disk booted to a login.
+  Exercises sfdisk and libblkid against sysfs, GPT writes, btrfs subvolumes
+  and their ioctls, a large copy through the imported filesystems, chroot and
+  fsync — a hard kernel test disguised as a UX feature.
 - `DESKTOP-SMOKE` — the existing graphics lanes, extended to: log in, open the
   browser, play a sound, suspend and resume once power management lands.
 - `UPGRADE-SMOKE` — install release N, upgrade to N+1 through apt, reboot,
@@ -442,7 +446,7 @@ later, so it is contained:
 The website is the distribution's face and can be a handful of static pages:
 
 - **Install guide** — verify the signature, write the USB, boot, Secure Boot
-  note, run Calamares, first boot, how to get back if it does not boot. Drafted
+  note, run the installer, first boot, how to get back if it does not boot. Drafted
   in [install-guide.md](install-guide.md).
 - **Hardware support** — the compatibility list and how to add to it.
 - **Known issues** — per release, honest, linked from the ISO's first boot.

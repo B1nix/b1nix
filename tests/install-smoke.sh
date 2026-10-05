@@ -1,8 +1,8 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
-# INSTALL-SMOKE: Calamares installs b1nix from the live medium onto a blank
+# INSTALL-SMOKE: b1nix-install installs b1nix from the live medium onto a blank
 # disk, unattended, and the installed disk boots to a login prompt -- once with
-# the network attached and once without.
+# the network attached and once without. The two runs go side by side.
 #
 #   sh tests/install-smoke.sh
 #
@@ -22,6 +22,9 @@ INSTALL_TIMEOUT="${INSTALL_TIMEOUT:-1800}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-300}"
 DISK_GIB="${DISK_GIB:-16}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+# The size budget of the install medium: a console live system and the root it
+# installs, no desktop -- that comes from the network after the install.
+ISO_MAX_MB="${ISO_MAX_MB:-256}"
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 pass=0
@@ -92,32 +95,51 @@ else
 		sh "$ROOT_DIR/tools/image/mk-b1nix-iso.sh" >>"$LOG" 2>&1 || stage_die build-iso
 fi
 
+iso_mb=$(( $(stat -c %s "$ISO") / 1048576 ))
+if [ "$iso_mb" -le "$ISO_MAX_MB" ]; then
+	ok "iso-size ${iso_mb}MB"
+else
+	bad "iso-size" "the medium is ${iso_mb} MB, over the ${ISO_MAX_MB} MB budget"
+fi
+
 # ── the two installs ────────────────────────────────────────────────────────
-for run in bios-online uefi-offline; do
+# One run: install, then boot the installed disk. A run writes its verdicts to
+# its own file -- the runs are separate processes -- and the totals are counted
+# from those once both have finished.
+one_run() { # bios-online | uefi-offline
+	run=$1
 	fw=${run%-*}
 	net=on
 	[ "${run#*-}" = offline ] && net=off
 	disk="$OUT_DIR/install-smoke-$run.qcow2"
 	share="$OUT_DIR/install-smoke-$run"
+	res="$OUT_DIR/install-smoke-$run.result"
 	rm -rf "$disk" "$share" "$OUT_DIR/install-smoke-$run"*.vars.fd
 	mkdir -p "$share"
-	qemu-img create -q -f qcow2 "$disk" "${DISK_GIB}G" || stage_die "disk-$run"
+	: >"$res"
+	r_ok() { echo "ok $1" >>"$res"; }
+	r_bad() { echo "bad $1 $2" >>"$res"; }
+	qemu-img create -q -f qcow2 "$disk" "${DISK_GIB}G" || { r_bad "$run-disk" "qemu-img failed"; return; }
 
 	info "$run: installing from the medium onto a blank ${DISK_GIB} GiB disk"
+	# cache=unsafe: the disk is thrown away after the run, and flushing every
+	# write through to the host's own disk was most of the install's time.
 	run_qemu "$run-install" "$fw" "$net" "$INSTALL_TIMEOUT" "INSTALL-SMOKE: done" \
 		-cdrom "$ISO" \
-		-drive file="$disk",format=qcow2,if=virtio \
+		-drive file="$disk",format=qcow2,if=virtio,cache=unsafe \
 		-virtfs local,path="$share",mount_tag=installsmoke,security_model=none ||
-		{ bad "$run-install" "no OVMF firmware"; continue; }
+		{ r_bad "$run-install" "no OVMF firmware"; return; }
 	ilog="$OUT_DIR/install-smoke-$run-install.log"
+	clean_log "$ilog" | grep -a "b1nix-install: step .* done in" |
+		sed "s/.*b1nix-install: step /  $run: /" >"$OUT_DIR/install-smoke-$run.steps"
 	if ! clean_log "$ilog" | grep -aq "INSTALL-SMOKE: done"; then
-		bad "$run-install" "the installer never finished -- see $ilog and $share"
-		continue
+		r_bad "$run-install" "the installer never finished -- see $ilog"
+		return
 	fi
 	case "$(marker "$ilog" "result=")" in
-	*result=ok) ok "$run-install" ;;
-	*) bad "$run-install" "$(marker "$ilog" "result=" | sed 's/.*result=//') -- see $share/calamares-session.log"
-	   continue ;;
+	*result=ok) r_ok "$run-install" ;;
+	*) r_bad "$run-install" "$(marker "$ilog" "result=" | sed 's/.*result=//') -- see $share/install.log"
+	   return ;;
 	esac
 
 	# The UEFI install keeps its variable store: the firmware boots the disk
@@ -125,20 +147,40 @@ for run in bios-online uefi-offline; do
 	info "$run: booting the installed disk"
 	cp -f "$OUT_DIR/install-smoke-$run-install.vars.fd" "$OUT_DIR/install-smoke-$run-boot.vars.fd" 2>/dev/null || true
 	run_qemu "$run-boot" "$fw" "$net" "$BOOT_TIMEOUT" "login:" \
-		-drive file="$disk",format=qcow2,if=virtio || true
+		-drive file="$disk",format=qcow2,if=virtio,cache=unsafe || true
 	blog="$OUT_DIR/install-smoke-$run-boot.log"
 	if clean_log "$blog" | grep -aq "^Limine"; then
-		ok "$run-bootloader"
+		r_ok "$run-bootloader"
 	else
-		bad "$run-bootloader" "Limine did not start from the installed disk -- see $blog"
-		continue
+		r_bad "$run-bootloader" "Limine did not start from the installed disk -- see $blog"
+		return
 	fi
 	if clean_log "$blog" | grep -aq "b1nix-installed login:"; then
-		ok "$run-login"
+		r_ok "$run-login"
 	else
-		bad "$run-login" "no login prompt from the installed system -- see $blog"
+		r_bad "$run-login" "no login prompt from the installed system -- see $blog"
 	fi
+}
+
+RUNS="${RUNS:-bios-online uefi-offline}"
+t0=$(date +%s)
+pids=""
+for run in $RUNS; do
+	one_run "$run" &
+	pids="$pids $!"
+done
+# shellcheck disable=SC2086
+wait $pids || true
+
+for run in $RUNS; do
+	res="$OUT_DIR/install-smoke-$run.result"
+	[ -s "$res" ] || { bad "$run" "the run left no verdict"; continue; }
+	while read -r verdict name reason; do
+		if [ "$verdict" = ok ]; then ok "$name"; else bad "$name" "$reason"; fi
+	done <"$res"
+	[ ! -s "$OUT_DIR/install-smoke-$run.steps" ] || cat "$OUT_DIR/install-smoke-$run.steps"
 done
 
-printf '\n%s: %d passed, %d failed (log: %s)\n' "$LANE" "$pass" "$fail" "$LOG"
+printf '\n%s: %d passed, %d failed in %ds (log: %s)\n' "$LANE" "$pass" "$fail" \
+	"$(($(date +%s) - t0))" "$LOG"
 [ "$fail" -eq 0 ] || exit 1

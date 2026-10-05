@@ -16,18 +16,16 @@ override_dh_auto_install:
 		$(PKG)/usr/lib/systemd/system/getty@tty1.service.d/b1nix-live.conf
 	install -D -m 0644 files/live/getty-autologin.conf \
 		$(PKG)/usr/lib/systemd/system/serial-getty@ttyS0.service.d/b1nix-live.conf
-	install -D -m 0755 files/live/b1nix-install $(PKG)/usr/bin/b1nix-install
+	install -D -m 0644 files/live/run-live-rootfs.mount \
+		$(PKG)/usr/lib/systemd/system/run-live-rootfs.mount
+	mkdir -p $(PKG)/usr/lib/systemd/system/local-fs.target.wants
+	ln -sf ../run-live-rootfs.mount \
+		$(PKG)/usr/lib/systemd/system/local-fs.target.wants/run-live-rootfs.mount
 	install -D -m 0644 files/live/b1nix-live-motd $(PKG)/etc/motd.d/b1nix-live
 	install -D -m 0755 files/live/b1nix-live-smoke \
 		$(PKG)/usr/lib/b1nix/installer/b1nix-live-smoke
 	# ── the installer ──────────────────────────────────────────────────
-	install -D -m 0644 files/calamares/settings.conf $(PKG)/etc/calamares/settings.conf
-	for f in files/calamares/modules/*.conf; do \
-		install -D -m 0644 $$f $(PKG)/etc/calamares/modules/$$(basename $$f); \
-	done
-	for f in files/calamares/branding/b1nix/*; do \
-		install -D -m 0644 $$f $(PKG)/etc/calamares/branding/b1nix/$$(basename $$f); \
-	done
+	install -D -m 0755 files/installer/b1nix-install $(PKG)/usr/sbin/b1nix-install
 	install -D -m 0755 files/installer/b1nix-install-target \
 		$(PKG)/usr/lib/b1nix/installer/b1nix-install-target
 	install -D -m 0755 files/installer/b1nix-install-smoke \

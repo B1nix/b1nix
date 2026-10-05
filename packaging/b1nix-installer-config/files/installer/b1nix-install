@@ -1,0 +1,359 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Install b1nix from the live medium onto a disk, from the console.
+#
+#   b1nix-install                   ask, then install
+#   b1nix-install --config FILE     install as FILE says, asking nothing
+#
+# The installed system is the live root itself (/run/live/rootfs, the root
+# with nothing mounted on it), copied onto the disk and then made into an
+# installed system: its own fstab, host name, user and boot loader, and the
+# live session's package removed. Nothing is downloaded, so an install without
+# a network is the same install.
+#
+# The disk layout, always GPT:
+#
+#   BIOS boot   1 MiB, unformatted: Limine's BIOS stage. Always made -- the
+#               kernel has no /sys/firmware/efi, so the installer cannot tell
+#               which firmware booted it, and a disk with both paths boots
+#               under either
+#   /boot       512 MiB FAT32, typed as an EFI system partition: Limine and
+#               the kernels, readable by Limine on BIOS and UEFI alike
+#   /           the rest: btrfs with @, @home and @snapshots, or ext4
+#
+# FILE holds KEY=VALUE lines (# starts a comment); it is read, not run:
+#
+#   DISK=/dev/vda           required
+#   FS=btrfs                btrfs (default) or ext4
+#   HOSTNAME=b1nix          the installed system's host name
+#   USERNAME=user           the account made for the person installing
+#   FULLNAME=
+#   PASSWORD=               the account's password; empty locks it
+#   TIMEZONE=UTC            a name under /usr/share/zoneinfo
+#   LOCALE=C.UTF-8
+#   KEYMAP=us
+#
+# Root is locked on the installed system; USERNAME administers it through sudo.
+set -eu
+
+SOURCE="${B1NIX_INSTALL_SOURCE:-/run/live/rootfs}"
+TARGET="${B1NIX_INSTALL_TARGET:-/run/b1nix-install/target}"
+LIB=/usr/lib/b1nix/installer
+BIOS_BOOT_TYPE=21686148-6449-6e6f-744e-656564454649
+ESP_TYPE=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+ROOT_TYPE=0fc63daf-8483-4772-8e79-3d69d8477de4
+# What the user is added to, when the installed system has the group.
+USER_GROUPS="sudo audio video plugdev netdev users"
+MIN_DISK_BYTES=$((4 * 1024 * 1024 * 1024))
+
+DISK="" FS=btrfs HOSTNAME=b1nix USERNAME=user FULLNAME="" PASSWORD=""
+TIMEZONE=UTC LOCALE=C.UTF-8 KEYMAP=us
+CONFIG=""
+
+say() { printf 'b1nix-install: %s\n' "$*"; }
+die() {
+	printf 'b1nix-install: %s\n' "$*" >&2
+	exit 1
+}
+
+# Each step names itself and says how long it took: the install lane reads
+# these to know where its minutes go.
+STEP_START=0
+step() {
+	step_end
+	STEP_NAME=$1
+	STEP_START=$(date +%s)
+	say "step $STEP_NAME"
+}
+step_end() {
+	[ "$STEP_START" -eq 0 ] || say "step $STEP_NAME done in $(($(date +%s) - STEP_START))s"
+	STEP_START=0
+}
+
+usage() {
+	sed -n '3,6p' "$0" | sed 's/^# \{0,1\}//'
+	exit "${1:-0}"
+}
+
+# ── the answers ─────────────────────────────────────────────────────────────
+
+read_config() { # file
+	[ -r "$1" ] || die "cannot read $1"
+	while IFS= read -r line || [ -n "$line" ]; do
+		case "$line" in
+		'' | '#'*) continue ;;
+		*=*) ;;
+		*) die "$1: not KEY=VALUE: $line" ;;
+		esac
+		key=${line%%=*}
+		value=${line#*=}
+		case "$key" in
+		DISK) DISK=$value ;;
+		FS) FS=$value ;;
+		HOSTNAME) HOSTNAME=$value ;;
+		USERNAME) USERNAME=$value ;;
+		FULLNAME) FULLNAME=$value ;;
+		PASSWORD) PASSWORD=$value ;;
+		TIMEZONE) TIMEZONE=$value ;;
+		LOCALE) LOCALE=$value ;;
+		KEYMAP) KEYMAP=$value ;;
+		*) die "$1: unknown key $key" ;;
+		esac
+	done <"$1"
+}
+
+ask() { # variable prompt
+	eval "cur=\$$1"
+	printf '%s [%s]: ' "$2" "$cur"
+	read -r reply || die "no answer"
+	[ -z "$reply" ] || eval "$1=\$reply"
+}
+
+ask_password() {
+	while :; do
+		stty -echo 2>/dev/null || true
+		printf 'Password for %s (empty locks the account): ' "$USERNAME"
+		read -r p1 || p1=""
+		printf '\nRepeat it: '
+		read -r p2 || p2=""
+		stty echo 2>/dev/null || true
+		printf '\n'
+		[ "$p1" = "$p2" ] && break
+		say "the two did not match"
+	done
+	PASSWORD=$p1
+}
+
+candidate_disks() {
+	lsblk -dn -b -o NAME,TYPE,SIZE,MODEL | awk -v min="$MIN_DISK_BYTES" \
+		'$2 == "disk" && $3 >= min && $1 !~ /^(sr|loop|zram|ram|md|nbd)/'
+}
+
+interactive() {
+	say "disks this system can be installed on:"
+	candidate_disks | awk '{ printf "  /dev/%-10s %6.1f GiB  %s\n", $1, $3 / 1073741824, substr($0, index($0, $4)) }'
+	first=$(candidate_disks | awk 'NR == 1 { print "/dev/" $1 }')
+	DISK=${DISK:-$first}
+	ask DISK "Disk to install on (everything on it is erased)"
+	ask FS "File system for / (btrfs or ext4)"
+	ask HOSTNAME "Host name"
+	ask USERNAME "Your login name"
+	ask FULLNAME "Your full name"
+	ask_password
+	ask TIMEZONE "Time zone"
+	ask KEYMAP "Keyboard layout"
+	printf '\nAll data on %s will be erased. Type YES to install: ' "$DISK"
+	read -r reply || reply=""
+	[ "$reply" = YES ] || die "not confirmed; nothing was changed"
+}
+
+check_answers() {
+	[ "$(id -u)" -eq 0 ] || die "run as root"
+	[ -d "$SOURCE/usr" ] || die "no live root at $SOURCE -- is this the live medium?"
+	[ -n "$DISK" ] || die "no disk given"
+	[ -b "$DISK" ] || die "$DISK is not a block device"
+	[ "$(lsblk -dn -o TYPE "$DISK")" = disk ] || die "$DISK is not a whole disk"
+	size=$(lsblk -dn -b -o SIZE "$DISK")
+	[ "$size" -ge "$MIN_DISK_BYTES" ] || die "$DISK is smaller than 4 GiB"
+	if lsblk -n -o MOUNTPOINTS "$DISK" | grep -q .; then
+		die "$DISK has mounted file systems"
+	fi
+	case "$FS" in btrfs | ext4) ;; *) die "FS must be btrfs or ext4, not $FS" ;; esac
+	printf '%s' "$HOSTNAME" | grep -Eqx '[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?' ||
+		die "not a host name: $HOSTNAME"
+	printf '%s' "$USERNAME" | grep -Eqx '[a-z_][a-z0-9_-]{0,31}' ||
+		die "not a login name: $USERNAME"
+	[ "$USERNAME" != root ] || die "the account cannot be root"
+	[ -f "$SOURCE/usr/share/zoneinfo/$TIMEZONE" ] || die "unknown time zone $TIMEZONE"
+}
+
+# ── the work ────────────────────────────────────────────────────────────────
+
+# /dev/vda -> /dev/vda1, /dev/nvme0n1 -> /dev/nvme0n1p1
+part() { # n
+	case "$DISK" in
+	*[0-9]) echo "${DISK}p$1" ;;
+	*) echo "${DISK}$1" ;;
+	esac
+}
+
+wait_for() { # device
+	n=0
+	until [ -b "$1" ]; do
+		n=$((n + 1))
+		[ "$n" -le 100 ] || die "$1 did not appear"
+		udevadm settle 2>/dev/null || sleep 0.1
+	done
+}
+
+cleanup() {
+	status=$?
+	if [ -d "$TARGET" ]; then
+		for m in $(findmnt -R -n -l -o TARGET "$TARGET" 2>/dev/null | sort -r); do
+			umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
+		done
+	fi
+	[ "$status" -eq 0 ] || say "install FAILED"
+	exit "$status"
+}
+
+partition() {
+	step partition
+	wipefs -a -q "$DISK" || die "could not wipe $DISK"
+	sfdisk -q -W always "$DISK" <<EOF || die "partitioning $DISK failed"
+label: gpt
+size=1MiB, type=$BIOS_BOOT_TYPE, name=BIOS-BOOT
+size=512MiB, type=$ESP_TYPE, name=B1NIX-ESP
+type=$ROOT_TYPE, name=b1nix-root
+EOF
+	ESP=$(part 2)
+	ROOT_DEV=$(part 3)
+	wait_for "$ESP"
+	wait_for "$ROOT_DEV"
+}
+
+make_filesystems() {
+	step filesystems
+	mkfs.vfat -F 32 -n B1NIX-ESP "$ESP" >/dev/null || die "mkfs.vfat $ESP failed"
+	if [ "$FS" = btrfs ]; then
+		mkfs.btrfs -q -f -L b1nix-root "$ROOT_DEV" || die "mkfs.btrfs $ROOT_DEV failed"
+		mkdir -p "$TARGET"
+		mount "$ROOT_DEV" "$TARGET" || die "could not mount $ROOT_DEV"
+		for sv in @ @home @snapshots; do
+			btrfs subvolume create "$TARGET/$sv" >/dev/null || die "could not make subvolume $sv"
+		done
+		umount "$TARGET"
+		ROOT_OPTS="noatime,compress=zstd:1"
+		mount -o "subvol=@,$ROOT_OPTS" "$ROOT_DEV" "$TARGET" || die "could not mount @"
+		mkdir -p "$TARGET/home" "$TARGET/.snapshots"
+		mount -o "subvol=@home,$ROOT_OPTS" "$ROOT_DEV" "$TARGET/home" || die "could not mount @home"
+		mount -o "subvol=@snapshots,$ROOT_OPTS" "$ROOT_DEV" "$TARGET/.snapshots" ||
+			die "could not mount @snapshots"
+	else
+		mkfs.ext4 -q -F -L b1nix-root "$ROOT_DEV" || die "mkfs.ext4 $ROOT_DEV failed"
+		mkdir -p "$TARGET"
+		mount -o noatime "$ROOT_DEV" "$TARGET" || die "could not mount $ROOT_DEV"
+	fi
+	mkdir -p "$TARGET/boot"
+	mount -o umask=0077 "$ESP" "$TARGET/boot" || die "could not mount the ESP"
+}
+
+copy_system() {
+	step copy
+	# What lives under these on the live system is the live session's own
+	# state; the installed system starts them empty.
+	rsync -aHAXS --numeric-ids \
+		--exclude='/boot/*' --exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' \
+		--exclude='/run/*' --exclude='/tmp/*' --exclude='/mnt/*' --exclude='/media/*' \
+		--exclude='/var/tmp/*' --exclude='/var/log/journal/*' \
+		"$SOURCE/" "$TARGET/" || die "copying the system failed"
+}
+
+in_target() {
+	chroot "$TARGET" "$@"
+}
+
+bind_target() {
+	for d in dev proc sys run; do
+		mkdir -p "$TARGET/$d"
+	done
+	mount --bind /dev "$TARGET/dev"
+	mount -t proc proc "$TARGET/proc"
+	mount -t sysfs sys "$TARGET/sys"
+	mount -t tmpfs tmpfs "$TARGET/run"
+}
+
+configure() {
+	step configure
+	bind_target
+	uuid_root=$(blkid -s UUID -o value "$ROOT_DEV")
+	uuid_esp=$(blkid -s UUID -o value "$ESP")
+	[ -n "$uuid_root" ] && [ -n "$uuid_esp" ] || die "no UUID on the new file systems"
+	{
+		echo "# <file system> <mount point> <type> <options> <dump> <pass>"
+		if [ "$FS" = btrfs ]; then
+			echo "UUID=$uuid_root / btrfs subvol=@,$ROOT_OPTS 0 0"
+			echo "UUID=$uuid_root /home btrfs subvol=@home,$ROOT_OPTS 0 0"
+			echo "UUID=$uuid_root /.snapshots btrfs subvol=@snapshots,$ROOT_OPTS 0 0"
+		else
+			echo "UUID=$uuid_root / ext4 noatime,errors=remount-ro 0 1"
+		fi
+		echo "UUID=$uuid_esp /boot vfat umask=0077 0 2"
+	} >"$TARGET/etc/fstab"
+
+	# A new identity: the live root's machine id is every live session's.
+	rm -f "$TARGET/etc/machine-id" "$TARGET/var/lib/dbus/machine-id"
+	systemd-machine-id-setup --root="$TARGET" >/dev/null || die "could not make a machine id"
+
+	printf '%s\n' "$HOSTNAME" >"$TARGET/etc/hostname"
+	cat >"$TARGET/etc/hosts" <<EOF
+127.0.0.1	localhost
+127.0.1.1	$HOSTNAME
+::1		localhost ip6-localhost ip6-loopback
+ff02::1		ip6-allnodes
+ff02::2		ip6-allrouters
+EOF
+	ln -sf "/usr/share/zoneinfo/$TIMEZONE" "$TARGET/etc/localtime"
+	printf '%s\n' "$TIMEZONE" >"$TARGET/etc/timezone"
+	printf 'LANG=%s\n' "$LOCALE" >"$TARGET/etc/default/locale"
+	printf 'KEYMAP=%s\n' "$KEYMAP" >"$TARGET/etc/vconsole.conf"
+
+	groups=""
+	for g in $USER_GROUPS; do
+		if in_target getent group "$g" >/dev/null; then
+			groups="${groups:+$groups,}$g"
+		fi
+	done
+	in_target useradd -m -s /bin/bash ${groups:+-G "$groups"} -c "$FULLNAME" "$USERNAME" ||
+		die "could not make the account $USERNAME"
+	if [ -n "$PASSWORD" ]; then
+		printf '%s:%s\n' "$USERNAME" "$PASSWORD" | in_target chpasswd ||
+			die "could not set the password"
+	else
+		in_target passwd -l "$USERNAME" >/dev/null
+	fi
+
+	# The live session -- autologin, this installer, the live boot script --
+	# is one package; removing it is what makes the copy an installed system.
+	# Before the initramfs is built, so the live boot script is not in it.
+	DEBIAN_FRONTEND=noninteractive in_target apt-get purge -q -y b1nix-installer-config \
+		>/dev/null || die "could not remove the live session from the target"
+}
+
+boot_loader() {
+	step bootloader
+	"$LIB/b1nix-install-target" "$TARGET" || die "installing the boot loader failed"
+}
+
+main() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--config)
+			[ $# -ge 2 ] || usage 1
+			CONFIG=$2
+			shift 2
+			;;
+		-h | --help) usage 0 ;;
+		*) usage 1 ;;
+		esac
+	done
+	if [ -n "$CONFIG" ]; then
+		read_config "$CONFIG"
+	else
+		interactive
+	fi
+	check_answers
+	trap cleanup EXIT
+	trap 'exit 130' INT TERM
+	t0=$(date +%s)
+	partition
+	make_filesystems
+	copy_system
+	configure
+	boot_loader
+	step_end
+	sync
+	say "installed b1nix on $DISK in $(($(date +%s) - t0))s; remove the medium and reboot"
+}
+
+main "$@"

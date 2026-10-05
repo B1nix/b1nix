@@ -145,11 +145,19 @@ started by anyone on the reference machines does not belong in Depends.
 
 ## b1nix-installer-config
 
-- Calamares branding and module configuration under `/etc/calamares/`.
-- The `shellprocess` module that installs Limine, since Calamares' own
-  bootloader module does not know it.
-- The partitioning defaults: btrfs with `@`, `@home`, `@snapshots`; a FAT ESP
-  mounted at `/boot`; ext4 offered as an alternative.
+- The live session: the initramfs boot script (`boot=b1nix-live`) that runs
+  the root from compressed RAM, the console autologin, the motd.
+- `b1nix-install` (`/usr/sbin`): the console installer. It asks, or reads
+  `--config FILE` (KEY=VALUE: `DISK`, `FS`, `HOSTNAME`, `USERNAME`,
+  `FULLNAME`, `PASSWORD`, `TIMEZONE`, `LOCALE`, `KEYMAP`), and prints how
+  long each step took.
+- The layout it makes: GPT with a 1 MiB BIOS boot partition, a 512 MiB FAT
+  ESP mounted at `/boot`, and the rest btrfs with `@`, `@home`,
+  `@snapshots` (ext4 offered as an alternative).
+- `b1nix-install-target`, which finishes the copied root: the kernel and its
+  initramfs, Limine's entries, `BOOTX64.EFI` and the BIOS stages, snapper,
+  and root locked in favour of the user's sudo.
+- The installer removes the package from the system it installs.
 - Installed only on the live ISO, not on the installed system.
 
 ## b1nix-tools

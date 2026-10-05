@@ -29,6 +29,14 @@ a full Plasma session is what M124 used as its own proof.
 | Wi-Fi (mac80211/cfg80211, nl80211) | `iw`, `wpa_supplicant`, iwd, NetworkManager on anything wireless | M130 | — |
 | PSI triggers: `cpu/memory/io.pressure` are read-only, a threshold cannot be written and polled | systemd's `MemoryPressureWatch=` and `sd_event_add_memory_pressure()` (journald, logind, udevd shed caches on pressure); oomd is unaffected, it polls the averages | — | The files exist in every cgroup and their averages move (oomd kills on them on the systemd lane), but they are created without a write handler, so there is nothing for a trigger to arm |
 | A rare boot wedge: tasks READY inside the block layer's admission wait are never picked while every CPU sits in cpuidle | The boot stops (about one boot in fifteen on the distribution image; the fourth fallback boot of DISTRO-SMOKE caught it) | — | gdb on the wedged guest: two tasks READY in `blk_io_begin`'s yield loop, readers behind them on `folio_lock`, CPUs 1–3 halted in `cpuidle_enter` and CPU 0 looping in `scheduler_yield_inner` without picking them; not reproduced in 50 further boots |
+| device-mapper / dm-crypt | Encrypted installs (`b1nix-install` offers none), `cryptsetup`, LVM | — | There is no `/dev/mapper/control`; the installer's LUKS option was left out rather than offered and broken |
+| No `/sys/firmware/efi`, no efivarfs | `efibootmgr`, `bootctl`, anything that registers a boot entry in NVRAM or asks which firmware booted it | — | The installer cannot tell BIOS from UEFI, so every install carries both Limine paths (BIOS-boot partition and `EFI/BOOT/BOOTX64.EFI`); LIVE-SMOKE reads the firmware from Limine's banner instead |
+| Static non-PIE executables linked at 0x400000 | Go binaries and other `ET_EXEC` programs | — | A glibc `-static` test program faults in a loop at its brk heap (0x4d6000): the page there is present, writable and not user, with the physical address equal to the virtual one -- a low supervisor mapping left in user page tables. Static-PIE runs |
+| `strace` startup: the first exec of a traced child arrives as "Stray PTRACE_EVENT_EXEC", and occasionally the child stays stopped | `strace prog` (attach with `-p` works) | — | strace prints the warning on every run; once in the session the startup child stayed in its SIGSTOP and strace never resumed it; under it every system call of the traced program is reported as a switch between x32 and 64-bit mode ("Process PID=242 runs in x32 mode") |
+| Executing a file straight from a 9p share loops in the page-fault path | Running programs off a host share | — | `/mnt/s/prog` on a virtio-9p mount: "page fault on an entry this CPU no longer has: retrying" without end; the same file copied to /tmp runs |
+| `/proc/net/unix` lists nothing; epoll fdinfo has no `tfd:` lines | `ss -x`, `lsof -U`, debuggers reading an epoll's interest list | — | Seen while debugging Xvfb: `grep -c . /proc/net/unix` is 1 (the header) with a dozen sockets open |
+| `/proc/<pid>/sessionid` absent (no audit session ids) | logind falls back; `auditctl` session filters | — | strace of logind during a tty1 login: `openat(/proc/262/sessionid) = ENOENT` |
+| `/proc/self/mountinfo` names `/` as the root of every mount | `findmnt -o FSROOT`, grub-probe and installers that read which btrfs subvolume a mount shows (`@`, `@home`) | — | Calamares' `subvol=@home` mount of the install target lists root `/` in mountinfo; the mount itself shows the subvolume's contents |
 | MTD/UBI | A handful of BusyBox applets | M107 | `wontfix`: no hardware in scope needs it |
 | DKMS-built out-of-tree modules | nvidia, virtualbox, zfs from Debian | — | Not planned: headers are shipped, the modules are not supported |
 
@@ -86,6 +94,16 @@ hunt:
   reader's namespace; so must anything modelled on it. The same boot showed the
   sibling bug: a nested epoll that ignored `EPOLLET` called libmount's epoll
   ready for ever.
+
+- **A stub the compiler accepted for the real thing.** `folio_put` was
+  declared when btrfs and ext4 were imported and never written; the DRM shim's
+  empty inline of the same name stood in for it, and C gave the later
+  declaration the inline's linkage without a warning. No file folio was ever
+  freed, so a large copy onto btrfs ran the machine out of memory however much
+  had been written back. Making it real then exposed the reference it had been
+  hiding: `folio_attach_private` took none, so btrfs' extent buffers lost
+  their pages the moment btrfs dropped its own. A no-op in a reference-counting
+  pair hides every imbalance on both sides of it.
 
 ## Where to look when something breaks
 

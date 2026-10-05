@@ -22,8 +22,8 @@ rewritten.
   changed default, a driver that now binds, a performance change big enough
   that someone would notice.
 - **PATCH** — fixes and internal work behind an unchanged surface.
-- **1.0.0** — cut with distribution release 1: the ISO installs through
-  Calamares onto a disk and the installed system boots to a desktop with a
+- **1.0.0** — cut with distribution release 1: the ISO installs b1nix onto a
+  disk and the installed system boots to a desktop with a
   working `apt`. Before that, everything is 0.x and nothing is promised.
 
 The milestone number lives in `docs/kernel/roadmap.md` and nowhere else. A release

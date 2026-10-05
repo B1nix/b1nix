@@ -1,0 +1,14 @@
+# The live root alone, without what is mounted on it: the installer copies
+# the installed system from here. Copying "/" itself walked into /proc, /sys
+# and -- once the target was mounted -- the target's own /proc and /dev, and
+# Calamares gave up when counting the files hit an entry that had vanished.
+[Unit]
+Description=Live root for the installer to copy
+ConditionKernelCommandLine=boot=b1nix-live
+DefaultDependencies=no
+Before=local-fs.target
+
+[Mount]
+What=/
+Where=/run/live/rootfs
+Options=bind,ro

@@ -50,7 +50,7 @@ The Alpine lane stays, so the musl smoke binaries stay too. What changes is
 the standard for keeping one:
 
 - **Delete a test whose subject is exercised harder by the distribution.**
-  If systemd, apt, Calamares or Plasma runs the same kernel path every boot and
+  If systemd, apt, the installer or the desktop runs the same kernel path every boot and
   a lane asserts on the result, a hand-written probe adds maintenance and no
   coverage.
 - **Keep a test that isolates a syscall or an error path.** A distribution

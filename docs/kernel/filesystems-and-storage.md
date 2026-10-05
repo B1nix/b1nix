@@ -47,8 +47,10 @@ isofs reads Rock Ridge and Joliet names and zisofs-compressed files, and is
 registered as both `iso9660` and `isofs`; every mount of it is read-only
 (`VFS_FS_RDONLY`), as a CD is on Linux. There is no Uniform CD-ROM layer, so
 `disk_to_cdi()` answers NULL and a multisession disc is read from its first
-session. Mount options (`-o norock`, `iocharset=`, ...) do not reach any
-imported filesystem yet: the bridge mounts with the defaults.
+session. Mount options reach the imported filesystems as Linux's do: a type
+that parses its own (`VFS_FS_OWN_OPTIONS`) gets the `mount(2)` data string or
+the `fsconfig` keys the VFS does not know, through `parse_param` for the
+new-style types, and `subvol=` mounts the named subtree.
 
 The bridge has two halves because the two VFS models cannot share a translation
 unit: `kernel/lkpi/fs_bridge.c` works in Linux's terms and `kernel/fs/lkpifs.c`
@@ -58,6 +60,14 @@ in b1nix's. Getting a root filesystem to hold its data taught these rules:
 - Namespace operations take the directory locks Linux would.
 - lkpi spinlocks save IRQ state at the outermost acquire.
 - `schedule()` really sleeps.
+- `folio_put` frees: the last reference returns the frame and the folio, and
+  attached private data holds a reference of its own. A background pass writes
+  dirty folios back, kicked by the reclaimer and by writers that find free
+  memory low, so a large copy is bounded by memory rather than by luck.
+- `bd_read_only` is the device's own flag, not the mode one open asked for:
+  an ro mount must not stop a later rw mount of the same filesystem.
+- A name the filesystem removes by itself (a btrfs subvolume deleted by
+  ioctl) is dropped from the VFS's cache after the ioctl.
 - Imported filesystems get 32-bit directory cookies, because bit 62 is the VFS
   cursor's phase bit.
 - Truncate zeroes the tail of the page containing the new end of file instead

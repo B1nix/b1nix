@@ -96,9 +96,9 @@ mountroot() {
 	err=$(mount -o remount,rw "${rootmnt}" 2>&1) ||
 		live_fail "could not remount the sprouted filesystem read-write: $err"
 
-	# The medium stays mounted for the installer, which copies from it.
-	mkdir -p "${rootmnt}/run/live/medium"
-	mount -o move "$medium" "${rootmnt}/run/live/medium" 2>/dev/null ||
-		mount --move "$medium" "${rootmnt}/run/live/medium" ||
-		live_fail "could not hand the medium to the live root"
+	# The medium stays mounted where it is, for the installer, which takes the
+	# kernel from it. /run/live/medium is in the initramfs' /run, which
+	# initramfs-tools moves onto the root's /run before switching to it; moving
+	# the medium into the root's /run instead put it under that tmpfs, where
+	# nothing could see it.
 }

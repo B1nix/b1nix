@@ -35,7 +35,7 @@ login:
 
 ## The installed system
 
-- [ ] Calamares installs onto a blank disk, unattended and interactively.
+- [ ] `b1nix-install` installs onto a blank disk, unattended and interactively.
 - [ ] The same install with no network produces a bootable console system, and
       `apt install b1nix-desktop` afterwards completes it.
 - [ ] The installed system boots, `systemctl is-system-running` matches the

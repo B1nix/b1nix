@@ -133,22 +133,26 @@ Detail in [../kernel/roadmap.md](../kernel/roadmap.md) under M127.
 
 ## Phase D: live ISO and installer
 
-- [ ] `planned` Netinstall ISO from the same debootstrap root: a graphical
-  installer environment, the base system carried for an offline install, the
-  desktop pulled over the network, the known-issues page shown before the first
-  step.
-- [ ] `planned` The size budget fixed as a number (target 900 MB–1.4 GB) and
-  asserted by the lane.
-- [ ] `planned` Calamares with our branding, the btrfs subvolume layout
-  (`@`, `@home`, `@snapshots`), ext4 offered, LUKS optional, and a
-  `shellprocess` module that installs Limine instead of Calamares' bootloader
-  module.
-- [ ] `planned` The apt snapshot hook and the documented rescue recipe
-  (boot the ISO, chroot, reinstall the previous kernel).
-- [ ] `planned` Lane `INSTALL-SMOKE`: unattended install onto a blank disk in
-  QEMU, then boot the installed disk to a login; a second run with the network
-  unplugged must still produce a bootable console system. Exercises Qt, udisks, parted,
-  loop devices, GPT writes, btrfs and fsync.
+- [x] `done` A console live ISO from the same debootstrap root (160 MB): it
+  boots under BIOS and UEFI, runs the session from compressed RAM, and carries
+  the base system it installs, so an install needs no network.
+- [x] `done` The size budget, 256 MB for the console medium, asserted by
+  `INSTALL-SMOKE`.
+- [x] `done` `b1nix-install`, a console installer in place of Calamares:
+  asks its questions or reads an answer file, lays out GPT with a BIOS boot
+  partition and a FAT `/boot`, btrfs with `@`, `@home`, `@snapshots` (ext4
+  offered), copies the live root and installs Limine for both firmwares.
+  LUKS is not offered until the kernel has dm-crypt
+  ([../kernel/abi-gaps.md](../kernel/abi-gaps.md)).
+- [ ] `partial` snapper set up on the btrfs root by the installer, its
+  snapshots in `@snapshots`, and the rescue recipe in [rescue.md](rescue.md).
+  Debian's apt hook comes with snapper, but no lane runs an upgrade on an
+  installed system yet to show the snapshots appear.
+- [x] `done` Lane `INSTALL-SMOKE`: two unattended installs side by side, BIOS
+  with the network and UEFI without, each booting the installed disk to a
+  login; about four minutes including the package and ISO builds.
+- [ ] `planned` The desktop over the network after the install: b1air
+  packaged in the overlay and `b1nix-desktop` pointing at it.
 
 ## Phase E: public release 1 — Гнилиці
 

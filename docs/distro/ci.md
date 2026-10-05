@@ -23,7 +23,7 @@ measured numbers go into this file once they exist.
   upgrade path, and it is worth setting up only once the manual runs become the
   bottleneck.
 
-Either way, `INSTALL-SMOKE` — booting an ISO, running Calamares, installing to
+Either way, `INSTALL-SMOKE` — booting an ISO, running the installer, installing to
 a virtual disk and booting the result — is the lane most likely to exceed a
 hosted job, and the first one to move locally.
 

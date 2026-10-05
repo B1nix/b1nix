@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
-# Finish an installed b1nix: run by Calamares (shellprocess@b1nix-target) after
-# the root has been copied, outside the target, with the target's root as $1.
+# Finish an installed b1nix: run by b1nix-install after the root has been
+# copied and configured, outside the target, with the target's root as $1.
 #
 #   1. the kernel from the live medium onto the ESP (mounted at <root>/boot),
 #      and an initramfs for it built inside the target
@@ -9,9 +9,6 @@
 #      installed system uses on every kernel upgrade), BOOTX64.EFI at the
 #      removable-media path and the BIOS stages in the BIOS boot partition
 #   3. snapper on a btrfs root, with its snapshots in the @snapshots subvolume
-#
-# Calamares' own bootloader module installs GRUB or systemd-boot; b1nix boots
-# with Limine, so this replaces it.
 set -eu
 
 ROOT="${1:-}"
@@ -66,9 +63,9 @@ cp "$limine_data/limine-bios.sys" "$ROOT/boot/limine-bios.sys"
 esp_dev=$(findmnt -n -o SOURCE --target "$ROOT/boot")
 disk=/dev/$(lsblk -n -o PKNAME "$esp_dev" | head -1)
 [ -b "$disk" ] || die "could not find the disk the ESP $esp_dev is on"
-# The BIOS stages go into the BIOS boot partition when there is one (Calamares
-# makes it on a machine that booted the medium through BIOS); a disk installed
-# from UEFI boots through BOOTX64.EFI alone.
+# The BIOS stages go into the BIOS boot partition b1nix-install always makes,
+# so the disk boots under BIOS as well as through BOOTX64.EFI under UEFI: the
+# live system cannot tell which firmware it was started by.
 bios_part=""
 for part in $(lsblk -n -l -o NAME "$disk" | tail -n +2); do
 	if [ "$(blkid -p -s PART_ENTRY_TYPE -o value "/dev/$part" 2>/dev/null)" = "$BIOS_BOOT_GUID" ]; then
@@ -76,11 +73,10 @@ for part in $(lsblk -n -l -o NAME "$disk" | tail -n +2); do
 		break
 	fi
 done
-if [ -n "$bios_part" ]; then
-	say "installing Limine's BIOS stages into $disk partition $bios_part"
-	chroot "$ROOT" limine bios-install "$disk" "$bios_part" ||
-		die "limine bios-install failed"
-fi
+[ -n "$bios_part" ] || die "no BIOS boot partition on $disk"
+say "installing Limine's BIOS stages into $disk partition $bios_part"
+chroot "$ROOT" limine bios-install "$disk" "$bios_part" ||
+	die "limine bios-install failed"
 sync
 
 # ── 3. snapper ──────────────────────────────────────────────────────────────
