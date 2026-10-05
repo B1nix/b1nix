@@ -1113,6 +1113,18 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 		return;
 	}
 
+	/* The no-fault user load (user_read_u32_nofault): resumed at its fixup
+	 * with -EFAULT, never serviced, because its caller holds a spinlock. */
+	if (is_abort && !from_el0) {
+		extern u64 user_nofault_fixup(u64 pc);
+		u64 resume = user_nofault_fixup(frame->elr);
+
+		if (resume) {
+			frame->elr = resume;
+			return;
+		}
+	}
+
 	if (is_abort) {
 		/* Translate ESR into the x86-shaped error_code the shared VM code
 		 * speaks: bit0 = page present (fault was a permission/access fault,

@@ -1787,6 +1787,13 @@ void kernel_main(usize arg0, usize arg1)
 		/* The nice/stride weighting, where the numbers live: the M46
 		 * userspace test can only observe the bias statistically. */
 		sched_nice_selftest();
+		/* The no-fault user load behind the futex re-check, and the fault
+		 * handlers' fixup for it (kernel/syscall/syscall.c). */
+		{
+			extern void user_nofault_selftest(void);
+
+			user_nofault_selftest();
+		}
 		/* netconsole is the klog ring over UDP — protocol, not hardware.
 		 * It only sat behind the x86_64 guard because it was written next
 		 * to the PAT/PCI tests above. */

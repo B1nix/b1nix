@@ -493,8 +493,14 @@ run_qemu() {
 			# The hibernation lane's resume device: a swap area of its own,
 			# made fresh for every run so no image outlives the run that wrote
 			# it.
+			#
+			# Every per-run disk here is cache=unsafe: they are scratch, and a
+			# guest FLUSH on one otherwise became a host fdatasync that a busy
+			# host held for tens of seconds -- an AHCI flush in the blk lane
+			# sat there until the guest watchdog called it a hang. The guest
+			# still issues each FLUSH and waits for its completion.
 			if [ -n "${SMOKE_HIB_IMG:-}" ] && [ -f "$SMOKE_HIB_IMG" ]; then
-				set -- "$@" -drive if=none,file="$SMOKE_HIB_IMG",format=raw,id=vhib \
+				set -- "$@" -drive if=none,file="$SMOKE_HIB_IMG",format=raw,cache=unsafe,id=vhib \
 					-device virtio-blk-pci,drive=vhib
 			fi
 
@@ -567,7 +573,7 @@ run_qemu() {
 			# because virt has no legacy PCI bus, and AHCI gets its own image
 			# because SATA_IMG is the root disk here.
 			set -- "$@" -append "$lane_cmdline" \
-				-drive if=none,file="$SATA_IMG",format=raw,id=vblk0 \
+				-drive if=none,file="$SATA_IMG",format=raw,cache=unsafe,id=vblk0 \
 				-device virtio-blk-device,drive=vblk0 \
 				-netdev user,id=net0,restrict=${B1NIX_NET_RESTRICT:-off} \
 				-device virtio-net-device,netdev=net0
@@ -593,7 +599,7 @@ run_qemu() {
 			if [ -z "${AHCI_IMG:-}" ] || [ ! -f "${AHCI_IMG:-}" ]; then
 				if [ -n "${SWAP_IMG:-}" ] && [ -f "${SWAP_IMG:-}" ]; then
 					set -- "$@" \
-						-drive if=none,file="$SWAP_IMG",format=raw,id=vswap0 \
+						-drive if=none,file="$SWAP_IMG",format=raw,cache=unsafe,id=vswap0 \
 						-device virtio-blk-device,drive=vswap0
 				fi
 			fi
@@ -628,18 +634,18 @@ run_qemu() {
 			if [ -n "${AHCI_IMG:-}" ] && [ -f "${AHCI_IMG:-}" ]; then
 				set -- "$@" \
 					-device ich9-ahci,id=ahci0 \
-					-drive if=none,file="$AHCI_IMG",format=raw,id=sata0 \
+					-drive if=none,file="$AHCI_IMG",format=raw,cache=unsafe,id=sata0 \
 					-device ide-hd,drive=sata0,bus=ahci0.0
 				boot_cd_bus=ahci0.5
 				if [ -n "${SWAP_IMG:-}" ] && [ -f "${SWAP_IMG:-}" ]; then
 					set -- "$@" \
-						-drive if=none,file="$SWAP_IMG",format=raw,id=sata1 \
+						-drive if=none,file="$SWAP_IMG",format=raw,cache=unsafe,id=sata1 \
 						-device ide-hd,drive=sata1,bus=ahci0.1
 				fi
 			fi
 			if [ -n "${NVME_IMG:-}" ] && [ -f "${NVME_IMG:-}" ]; then
 				set -- "$@" \
-					-drive if=none,file="$NVME_IMG",format=raw,id=nvm0 \
+					-drive if=none,file="$NVME_IMG",format=raw,cache=unsafe,id=nvm0 \
 					-device nvme,drive=nvm0,serial=b1nixnvme
 			fi
 			_prepare_hostshare
@@ -669,11 +675,11 @@ run_qemu() {
 			-device intel-hda,id=hda -device hda-duplex,bus=hda.0,audiodev=audio0 \
 			-device AC97,audiodev=audio0 \
 			-device ich9-ahci,id=ahci \
-				-drive file="$SATA_IMG",if=none,id=satadrive,format=raw,discard=unmap \
+				-drive file="$SATA_IMG",if=none,id=satadrive,format=raw,cache=unsafe,discard=unmap \
 				-device ide-hd,drive=satadrive,bus=ahci.0 \
-				-drive file="$SWAP_IMG",if=none,id=swapdrive,format=raw \
+				-drive file="$SWAP_IMG",if=none,id=swapdrive,format=raw,cache=unsafe \
 				-device ide-hd,drive=swapdrive,bus=ahci.1 \
-				-drive file="$NVME_IMG",if=none,id=nvmedrive,format=raw,discard=unmap \
+				-drive file="$NVME_IMG",if=none,id=nvmedrive,format=raw,cache=unsafe,discard=unmap \
 				-device nvme,serial=deadbeef,drive=nvmedrive \
 				-fsdev local,path="$PROJECT_DIR/smoke_run/hostshare",security_model=none,id=fsdev9p \
 				-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
@@ -3236,6 +3242,8 @@ check_output "$LOG" "M46-SMOKE: ok setpgid-eperm-pgrp" "setpgid into a nonexiste
 check_output "$LOG" "M46-SMOKE: ok getpgid" "getpgid(0) matches getpgrp()"
 check_output "$LOG" "M46-SMOKE: ok getpgid-esrch" "getpgid on a nonexistent pid returns ESRCH"
 check_output "$LOG" "M46-SMOKE: ok nice-roundtrip" "nice() and getpriority() round-trip"
+check_output "$LOG" "NOFAULT-SMOKE: ok read" "the no-fault user load reads a mapped word back exactly"
+check_output "$LOG" "NOFAULT-SMOKE: ok fixup" "a fault on the no-fault load resumes at its fixup with EFAULT instead of being serviced under a spinlock"
 check_output "$LOG" "M46-SCHED: ok stride-values" "the nice weighting is the stride it promises: -20 = 25, 0 = 50, 19 = 1000 (checked in-kernel, where the numbers are, not inferred from how often processes ran)"
 check_output "$LOG" "M46-SCHED: ok stride-clamped" "a nice value outside -20..19 clamps instead of dividing by zero or going negative"
 check_output "$LOG" "M46-SCHED: ok stride-monotonic" "a higher nice is never scheduled more often, at every step of the range"

@@ -1158,6 +1158,18 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
    * other fault's address. */
   u64 pf_cr2 = frame->vector == 14 ? read_cr2() : 0;
 
+  /* The no-fault user load (user_read_u32_nofault): resumed at its fixup with
+   * -EFAULT, never serviced, because its caller holds a spinlock. */
+  if (frame->vector == 14 && (frame->cs & 3) == 0) {
+    extern u64 user_nofault_fixup(u64 pc);
+    u64 resume = user_nofault_fixup(frame->rip);
+
+    if (resume) {
+      frame->rip = resume;
+      return;
+    }
+  }
+
   // Page fault handling for Demand Paging
   if (frame->vector == 14) {
     u64 fault_addr = pf_cr2;

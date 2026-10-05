@@ -13,6 +13,7 @@
  * nothing answers ENOKEY), the big_key/asymmetric/encrypted types, and
  * persistent keyrings beyond the user keyring they alias.
  */
+#include <b1nix/klog.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
@@ -594,16 +595,56 @@ static isize sys_request_key(u64 utype, u64 udesc, u64 ucallout, u64 dest) {
 #define KEYCTL_GET_PERSISTENT       22
 #define KEYCTL_CAPABILITIES         31
 
-static isize copy_text_out(const char *text, u64 ubuf, u64 buflen) {
+/* keyctl runs under g_key_lock, a spinlock, and a user copy may fault and
+ * sleep: none may happen under it. What an operation reads from the caller is
+ * copied in before the lock is taken, and what it hands back is written into a
+ * kernel buffer under the lock and copied out after it is released. */
+struct keyctl_io {
+  const char *str;   /* JOIN's keyring name, SEARCH's description */
+  const u8 *in;      /* UPDATE's payload */
+  usize in_len;
+  /* A failed copy-in is not returned at once: each is reported where the
+   * operation used to make its copy, so the order of errors is unchanged. */
+  int str_rc;
+  int in_rc;
+  int type_rc;       /* SEARCH's key type, resolved before the lock */
+  enum key_type type;
+  u8 *out;           /* the reply, staged under the lock */
+  usize out_cap;
+  usize out_len;
+  u64 out_user;      /* where it goes once the lock is released */
+};
+
+/* Large enough for every reply: a payload, a full keyring's serials, or a
+ * DESCRIBE line. */
+#define KEYCTL_OUT_MAX                                                         \
+  (KEY_PAYLOAD_MAX > KEYRING_MAX_LINKS * sizeof(i32)                           \
+       ? KEY_PAYLOAD_MAX                                                       \
+       : KEYRING_MAX_LINKS * sizeof(i32))
+
+static int keyctl_stage_out(struct keyctl_io *io, u64 ubuf, const void *src,
+                            usize n) {
+  /* The buffer is sized from the caller's length capped at KEYCTL_OUT_MAX,
+   * and every reply is no longer than either. */
+  KASSERT(n <= io->out_cap, "keyctl reply of %lu bytes, staging holds %lu",
+          (unsigned long)n, (unsigned long)io->out_cap);
+  memcpy(io->out, src, n);
+  io->out_len = n;
+  io->out_user = ubuf;
+  return 0;
+}
+
+static isize copy_text_out(struct keyctl_io *io, const char *text, u64 ubuf,
+                           u64 buflen) {
   usize n = strlen(text) + 1;
 
-  if (ubuf && buflen >= n &&
-      syscall_copyout((void *)(usize)ubuf, text, n))
-    return -EFAULT;
+  if (ubuf && buflen >= n)
+    keyctl_stage_out(io, ubuf, text, n);
   return (isize)n;
 }
 
-static isize keyctl_locked(u64 op, u64 a1, u64 a2, u64 a3, u64 a4) {
+static isize keyctl_locked(u64 op, u64 a1, u64 a2, u64 a3, u64 a4,
+                           struct keyctl_io *io) {
   isize err;
   struct key *k;
 
@@ -616,11 +657,9 @@ static isize keyctl_locked(u64 op, u64 a1, u64 a2, u64 a3, u64 a4) {
     return key_by_serial(s) ? s : -ENOKEY;
   }
   case KEYCTL_JOIN_SESSION_KEYRING: {
-    char name[256] = "_ses";
+    const char *name = io->str ? io->str : "_ses";
     usize row = cur_process_row();
 
-    if (a1 && syscall_copyinstr(name, sizeof(name), (const char *)(usize)a1) < 0)
-      return -EFAULT;
     if (key_tables() || row >= g_task_rows)
       return -ENOMEM;
     i32 s = new_keyring(name, cur_uid(), cur_gid());
@@ -640,17 +679,9 @@ static isize keyctl_locked(u64 op, u64 a1, u64 a2, u64 a3, u64 a4) {
       return -EOPNOTSUPP;
     if (a3 > KEY_PAYLOAD_MAX)
       return -EINVAL;
-    u8 tmp[256];
-    u8 *p = a3 <= sizeof(tmp) ? tmp : kmalloc((usize)a3);
-    if (!p)
-      return -ENOMEM;
-    int rc = a3 && syscall_copyin(p, (const void *)(usize)a2, (usize)a3) ? -EFAULT : 0;
-    if (!rc)
-      rc = set_payload(k, p, (u32)a3);
-    memset(p, 0, (usize)a3);
-    if (p != tmp)
-      kfree(p);
-    return rc;
+    if (io->in_rc)
+      return io->in_rc;
+    return set_payload(k, io->in ? io->in : (const u8 *)"", (u32)io->in_len);
   }
   case KEYCTL_REVOKE:
   case KEYCTL_INVALIDATE:
@@ -700,7 +731,7 @@ static isize keyctl_locked(u64 op, u64 a1, u64 a2, u64 a3, u64 a4) {
       return err;
     snprintf(text, sizeof(text), "%s;%u;%u;%08x;%s", type_name(k->type),
              k->uid, k->gid, k->perm, k->desc);
-    return copy_text_out(text, a2, a3);
+    return copy_text_out(io, text, a2, a3);
   }
   case KEYCTL_CLEAR:
     k = key_lookup((i32)a1, 0, KEY_NEED_WRITE, &err);
@@ -734,19 +765,19 @@ static isize keyctl_locked(u64 op, u64 a1, u64 a2, u64 a3, u64 a4) {
   }
   case KEYCTL_SEARCH: {
     enum key_type type;
-    char desc[256];
     struct key *kr = key_lookup((i32)a1, 0, KEY_NEED_SEARCH, &err);
 
     if (!kr)
       return err;
     if (kr->type != KT_KEYRING)
       return -ENOTDIR;
-    int rc = type_from_user(a2, &type);
+    int rc = io->type_rc;
     if (rc)
       return rc;
-    if (syscall_copyinstr(desc, sizeof(desc), (const char *)(usize)a3) < 0)
-      return -EFAULT;
-    k = key_search(kr->serial, (u8)type, desc, 0);
+    type = io->type;
+    if (io->str_rc)
+      return io->str_rc;
+    k = key_search(kr->serial, (u8)type, io->str, 0);
     if (!k)
       return -ENOKEY;
     if (a4) {
@@ -774,15 +805,13 @@ static isize keyctl_locked(u64 op, u64 a1, u64 a2, u64 a3, u64 a4) {
     if (k->type == KT_KEYRING) {
       u64 need = (u64)k->nlinks * sizeof(i32);
 
-      if (a2 && a3 >= need && need &&
-          syscall_copyout((void *)(usize)a2, k->links, (usize)need))
-        return -EFAULT;
+      if (a2 && a3 >= need && need)
+        keyctl_stage_out(io, a2, k->links, (usize)need);
       return (isize)need;
     }
-    if (a2 && a3 && k->plen &&
-        syscall_copyout((void *)(usize)a2, k->payload,
-                        a3 < k->plen ? (usize)a3 : k->plen))
-      return -EFAULT;
+    if (a2 && a3 && k->plen)
+      keyctl_stage_out(io, a2, k->payload,
+                       a3 < k->plen ? (usize)a3 : k->plen);
     return (isize)k->plen;
   case KEYCTL_SET_TIMEOUT:
     k = key_lookup((i32)a1, 0, KEY_NEED_SETATTR, &err);
@@ -795,7 +824,7 @@ static isize keyctl_locked(u64 op, u64 a1, u64 a2, u64 a3, u64 a4) {
     k = key_lookup((i32)a1, 0, KEY_NEED_VIEW, &err);
     if (!k)
       return err;
-    return copy_text_out("", a2, a3); /* no LSM labels keys */
+    return copy_text_out(io, "", a2, a3); /* no LSM labels keys */
   case KEYCTL_SET_REQKEY_KEYRING:
     /* The keyring request_key links into by default; only the default is
      * modelled, which this answers as the previous setting. */
@@ -825,8 +854,8 @@ static isize keyctl_locked(u64 op, u64 a1, u64 a2, u64 a3, u64 a4) {
                   0};
     usize n = a2 < sizeof(caps) ? (usize)a2 : sizeof(caps);
 
-    if (a1 && n && syscall_copyout((void *)(usize)a1, caps, n))
-      return -EFAULT;
+    if (a1 && n)
+      keyctl_stage_out(io, a1, caps, n);
     return sizeof(caps);
   }
   default:
@@ -835,11 +864,76 @@ static isize keyctl_locked(u64 op, u64 a1, u64 a2, u64 a3, u64 a4) {
 }
 
 static isize sys_keyctl(u64 op, u64 a1, u64 a2, u64 a3, u64 a4) {
+  struct keyctl_io io = {0};
+  char str[256];
+  u8 *in = 0;
+  u64 ubuf = 0, ulen = 0;
   u64 f;
 
+  /* Everything read from the caller, before the lock. */
+  switch (op) {
+  case KEYCTL_JOIN_SESSION_KEYRING:
+    if (a1) {
+      if (syscall_copyinstr(str, sizeof(str), (const char *)(usize)a1) < 0)
+        return -EFAULT;
+      io.str = str;
+    }
+    break;
+  case KEYCTL_SEARCH:
+    io.type_rc = type_from_user(a2, &io.type);
+    if (syscall_copyinstr(str, sizeof(str), (const char *)(usize)a3) < 0)
+      io.str_rc = -EFAULT;
+    io.str = str;
+    break;
+  case KEYCTL_UPDATE:
+    if (a3 && a3 <= KEY_PAYLOAD_MAX) {
+      in = kmalloc((usize)a3);
+      if (!in)
+        return -ENOMEM;
+      if (syscall_copyin(in, (const void *)(usize)a2, (usize)a3))
+        io.in_rc = -EFAULT;
+    }
+    io.in = in;
+    io.in_len = (usize)a3;
+    break;
+  case KEYCTL_DESCRIBE:
+  case KEYCTL_READ:
+  case KEYCTL_GET_SECURITY:
+    ubuf = a2;
+    ulen = a3;
+    break;
+  case KEYCTL_CAPABILITIES:
+    ubuf = a1;
+    ulen = a2;
+    break;
+  default:
+    break;
+  }
+  if (ubuf && ulen) {
+    io.out_cap = ulen < KEYCTL_OUT_MAX ? (usize)ulen : KEYCTL_OUT_MAX;
+    io.out = kmalloc(io.out_cap);
+    if (!io.out) {
+      kfree(in);
+      return -ENOMEM;
+    }
+  }
+
   spin_lock_irqsave(&g_key_lock, &f);
-  isize r = keyctl_locked(op, a1, a2, a3, a4);
+  isize r = keyctl_locked(op, a1, a2, a3, a4, &io);
   spin_unlock_irqrestore(&g_key_lock, f);
+
+  /* And everything handed back, after it. */
+  if (r >= 0 && io.out_len &&
+      syscall_copyout((void *)(usize)io.out_user, io.out, io.out_len))
+    r = -EFAULT;
+  if (in) {
+    memset(in, 0, io.in_len);
+    kfree(in);
+  }
+  if (io.out) {
+    memset(io.out, 0, io.out_cap);
+    kfree(io.out);
+  }
   return r;
 }
 

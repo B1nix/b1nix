@@ -493,18 +493,25 @@ int vfs_fifo_open(struct vfs_node *node, int flags) {
 
   /* Rendezvous: a blocking open waits for the opposite end. O_RDWR is its own
    * peer and never waits. */
+  /* The peer's count is re-read after this task is published as blocked.
+   * Checking it only before blocking lost the rendezvous: the peer, on another
+   * CPU, counted itself and woke the channel in the gap, found nobody blocked
+   * on it yet, and this end then slept with its peer already there -- a writer
+   * parked in open() beside a reader already waiting in read(). */
   if (!(flags & B1NIX_O_NONBLOCK) && acc != B1NIX_O_RDWR) {
-    while (want_read ? fifo->writer_opens == 0 : fifo->reader_opens == 0) {
+    volatile u32 *peer = want_read ? &fifo->writer_opens : &fifo->reader_opens;
+
+    while (__atomic_load_n(peer, __ATOMIC_ACQUIRE) == 0) {
       if (scheduler_signal_pending()) {
         fifo_detach(node->inode, fifo, want_read, want_write);
         return -ERESTARTSYS;
       }
-      interrupts_disable();
-      current_task->wait_chan = fifo;
-      scheduler_lease_clear_here(__func__);
-      current_task->state = TASK_BLOCKED;
-      scheduler_yield();
-      interrupts_enable();
+      scheduler_wait_prepare(fifo);
+      if (__atomic_load_n(peer, __ATOMIC_ACQUIRE) != 0) {
+        scheduler_wait_cancel();
+        break;
+      }
+      scheduler_wait_commit();
     }
   }
 

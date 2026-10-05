@@ -491,7 +491,7 @@ TARGET := x86_64-elf
 ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86_64/linker.ld
-ASM_SOURCES := kernel/arch/x86_64/s3_asm.S kernel/arch/x86_64/hib_asm.S kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S
+ASM_SOURCES := kernel/arch/x86_64/s3_asm.S kernel/arch/x86_64/hib_asm.S kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S kernel/arch/x86_64/user_nofault.S
 ARCH_SOURCES := kernel/arch/x86_64/s3.c kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_panel.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/smp_call.c kernel/virt/kvm_hooks.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c kernel/arch/x86_64/memtype.c kernel/arch/x86_64/pkeys.c
 else ifeq ($(ARCH),aarch64)
 TARGET := aarch64-unknown-elf
@@ -558,7 +558,7 @@ ARCH_LDFLAGS := -m aarch64elf
 KERNEL_BASE ?= 0x40080000
 ARCH_LDFLAGS += --defsym=KERNEL_LOAD_BASE=$(KERNEL_BASE)
 LINKER_SCRIPT := kernel/arch/aarch64/linker.ld
-ASM_SOURCES := kernel/arch/aarch64/boot.S kernel/arch/aarch64/context_switch.S kernel/arch/aarch64/isr.S kernel/arch/aarch64/fpu.S
+ASM_SOURCES := kernel/arch/aarch64/boot.S kernel/arch/aarch64/context_switch.S kernel/arch/aarch64/isr.S kernel/arch/aarch64/fpu.S kernel/arch/aarch64/user_nofault.S
 ARCH_SOURCES := kernel/arch/aarch64/arch.c kernel/arch/aarch64/platform.c kernel/arch/aarch64/bootinfo.c kernel/arch/aarch64/smp.c kernel/arch/aarch64/smp_call.c kernel/arch/aarch64/gicv3.c kernel/arch/aarch64/gicv3_its.c kernel/arch/aarch64/console.c kernel/arch/aarch64/fb_panel.c kernel/arch/aarch64/io.c kernel/arch/aarch64/interrupts.c kernel/arch/aarch64/paging.c kernel/arch/aarch64/serial.c kernel/arch/aarch64/signal.c kernel/arch/aarch64/coredump.c kernel/arch/aarch64/gdbstub.c kernel/arch/aarch64/memtype.c kernel/arch/aarch64/qcom_restart.c kernel/virt/kvm_hooks.c
 else
 $(error Unsupported ARCH=$(ARCH). Active builds support ARCH=x86_64 and ARCH=aarch64)

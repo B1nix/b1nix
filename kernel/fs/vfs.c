@@ -1177,22 +1177,22 @@ void icache_invalidate_fs(u32 fs_id) {
   icache_release();
 }
 
-/* Record who holds an inode's rwlock, for the watchdog's chan report. */
-static void vfs_inode_lock_note(struct vfs_inode *inode, const void *site) {
+/* rw_owner names the WRITER and nobody else: it is set by the task that took
+ * the write lock, after taking it, and cleared by that task before letting it
+ * go, so while the word is -1 it is either that writer or 0. Readers used to
+ * write their own names here too. A reader's name then outlived its read
+ * lock -- left behind for a writer that had just taken the lock -- and the
+ * recursion check and the unlock's owner check, which both trust this field,
+ * accused the wrong task. rw_site stays a diagnostic every holder writes. */
+static void vfs_inode_note_writer(struct vfs_inode *inode, const void *site) {
   struct task *t = current_task;
+
   __atomic_store_n(&inode->rw_owner, t ? (u64)t->id : 0, __ATOMIC_RELAXED);
   inode->rw_site = site;
 }
 
-/* Only the holder's own record is cleared. A reader runs this after its
- * decrement has already freed the lock, and by then a writer may have taken
- * it and written its own name here: an unconditional store wiped that, and
- * the writer's unlock then found the lock owned by nobody. */
-static void vfs_inode_lock_clear_note(struct vfs_inode *inode) {
-  struct task *t = current_task;
-  u64 me = t ? (u64)t->id : 0;
-
-  if (__atomic_compare_exchange_n(&inode->rw_owner, &me, 0, 0,
+static void vfs_inode_clear_writer(struct vfs_inode *inode, u64 owner) {
+  if (__atomic_compare_exchange_n(&inode->rw_owner, &owner, 0, 0,
                                   __ATOMIC_RELAXED, __ATOMIC_RELAXED))
     inode->rw_site = 0;
 }
@@ -1256,7 +1256,7 @@ static void vfs_inode_lock_read(struct vfs_inode *inode) {
    * caller on a different CPU than it slept on, so the release-CPU and
    * acquire-CPU may differ. Track via the global-singleton lockdep
    * entry (M28 #2 Variant A) instead of the per-CPU acquisition stack. */
-  vfs_inode_lock_note(inode, __builtin_return_address(0));
+  inode->rw_site = __builtin_return_address(0);
   LOCKDEP_ACQUIRE_GLOBAL(LOCKDEP_LVL_INODE);
 }
 
@@ -1268,7 +1268,6 @@ static void vfs_inode_unlock_read(struct vfs_inode *inode) {
   KASSERT(left >= 0, "inode %llu read-unlocked with lock word %d",
           (unsigned long long)inode->ino, left + 1);
   if (left == 0) {
-    vfs_inode_lock_clear_note(inode);
     if (__atomic_load_n(&inode->rw_waiters, __ATOMIC_SEQ_CST))
       scheduler_wake_all((void *)&inode->rw_lock);
   }
@@ -1400,7 +1399,7 @@ void vfs_release_inode_locks_of(u64 owner) {
     console_write_hex64((u64)(usize)inode->rw_site);
     console_write("; releasing it\n");
 
-    vfs_inode_lock_clear_note(inode);
+    vfs_inode_clear_writer(inode, owner);
     __atomic_store_n(&inode->rw_lock, 0, __ATOMIC_RELEASE);
     scheduler_wake_all((void *)&inode->rw_lock);
 
@@ -1409,7 +1408,7 @@ void vfs_release_inode_locks_of(u64 owner) {
   spin_unlock_irqrestore(&g_vfs_wlocks_lock, flags);
 }
 
-/* noinline, deliberately: vfs_inode_lock_note records
+/* noinline, deliberately: vfs_inode_note_writer records
  * __builtin_return_address(0) as the acquiring site, and that address is only
  * the caller's while this function has a frame of its own. Inlined, every
  * report named whoever called the caller. */
@@ -1470,7 +1469,7 @@ static void vfs_inode_lock_write(struct vfs_inode *inode) {
     scheduler_wait_commit();
     __atomic_sub_fetch(&inode->rw_waiters, 1, __ATOMIC_SEQ_CST);
   }
-  vfs_inode_lock_note(inode, __builtin_return_address(0));
+  vfs_inode_note_writer(inode, __builtin_return_address(0));
   /* Sleeping lock — see read-lock variant for why this uses _GLOBAL. */
   LOCKDEP_ACQUIRE_GLOBAL(LOCKDEP_LVL_INODE);
 }
@@ -1490,7 +1489,7 @@ static void vfs_inode_unlock_write(struct vfs_inode *inode) {
   }
   vfs_wlock_untrack(inode);
   LOCKDEP_RELEASE_GLOBAL(LOCKDEP_LVL_INODE);
-  vfs_inode_lock_clear_note(inode);
+  vfs_inode_clear_writer(inode, current_task ? (u64)current_task->id : 0);
   __atomic_store_n(&inode->rw_lock, 0, __ATOMIC_SEQ_CST);
   if (__atomic_load_n(&inode->rw_waiters, __ATOMIC_SEQ_CST))
     scheduler_wake_all((void *)&inode->rw_lock);

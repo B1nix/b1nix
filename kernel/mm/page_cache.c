@@ -1218,8 +1218,11 @@ static void writeback_page_locked(struct page_cache_entry *page) {
       page->inode->write_cb(&dummy, page->offset, virt_addr, size, 0);
       blk_clear_dirty_owner();
       lock_pc();
-      if (__atomic_sub_fetch(&page->refcount, 1, __ATOMIC_ACQ_REL) == 0 &&
-          (page->flags & PAGE_CACHE_ORPHAN)) {
+      int left = __atomic_sub_fetch(&page->refcount, 1, __ATOMIC_ACQ_REL);
+
+      KASSERT(left >= 0, "page-cache page %p refcount underflow after writeback",
+              (void *)page);
+      if (left == 0 && (page->flags & PAGE_CACHE_ORPHAN)) {
         /* Invalidated while we were writing: finish its teardown here. */
         pmm_free_frame(page->frame);
         if (page->inode && page->inode->cached_pages)

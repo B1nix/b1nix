@@ -97,6 +97,35 @@ static int futex_read_word(u64 uaddr, int *out) {
   return syscall_copyin(out, (const void *)(usize)uaddr, sizeof(int));
 }
 
+/* Take a bucket lock and read the word under it, Linux's
+ * get_futex_value_locked. Under the lock the read must not be serviced as a
+ * page fault (that can sleep), so it is the no-fault load; when the page is
+ * not there the lock is dropped, the page faulted in by an ordinary read, and
+ * the whole step retried. 0 holding the lock, or -EFAULT not holding it.
+ *
+ * A page that keeps vanishing between the fault-in and the locked read is
+ * reported as -EAGAIN after enough rounds: the caller's word is then plainly
+ * moving, which is what EAGAIN tells a waiter, and it loops in user space. */
+#define FUTEX_LOCKED_READ_TRIES 64
+static int futex_lock_and_read(struct futex_bucket *b, u64 *flags, u64 uaddr,
+                               int *cur) {
+  extern int user_read_u32_nofault(u64 uaddr, u32 * out);
+
+  for (int tries = 0; tries < FUTEX_LOCKED_READ_TRIES; tries++) {
+    u32 v;
+
+    spin_lock_irqsave(&b->lock, flags);
+    if (user_read_u32_nofault(uaddr, &v) == 0) {
+      *cur = (int)v;
+      return 0;
+    }
+    spin_unlock_irqrestore(&b->lock, *flags);
+    if (futex_read_word(uaddr, cur) != 0)
+      return -EFAULT;
+  }
+  return -EAGAIN;
+}
+
 /* The address space a futex belongs to — or, for one in shared memory, the
  * page itself.
  *
@@ -302,12 +331,9 @@ int scheduler_futex_waitv(struct scheduler_futex_vec *v, int n, u64 timeout_ms) 
       u64 flags;
 
       memset(w, 0, sizeof(*w));
-      spin_lock_irqsave(&b->lock, &flags);
-      if (futex_read_word(v[i].uaddr, &cur) != 0) {
-        spin_unlock_irqrestore(&b->lock, flags);
-        rc = -EFAULT;
+      rc = futex_lock_and_read(b, &flags, v[i].uaddr, &cur);
+      if (rc != 0)
         break;
-      }
       if (cur != v[i].val) {
         spin_unlock_irqrestore(&b->lock, flags);
         rc = -EAGAIN;
@@ -403,13 +429,11 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
     struct futex_bucket *b = &g_futex[h];
 
     u64 flags;
-    spin_lock_irqsave(&b->lock, &flags);
-
     /* Re-check value under the lock. */
-    if (futex_read_word(uaddr, &cur) != 0) {
-      spin_unlock_irqrestore(&b->lock, flags);
-      return -EFAULT;
-    }
+    int lrc = futex_lock_and_read(b, &flags, uaddr, &cur);
+
+    if (lrc != 0)
+      return lrc;
     if (cur != val) {
       spin_unlock_irqrestore(&b->lock, flags);
       return -EAGAIN;

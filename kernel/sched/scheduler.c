@@ -2027,10 +2027,19 @@ int sched_frozen_count(void) { return g_frozen_tasks; }
  */
 static volatile int g_park_request;
 static volatile int g_parked_cpus;
+/* Which CPUs answered, so a park that times out can name the ones that did
+ * not and what they were running. */
+static volatile u8 g_cpu_parked[MAX_CPUS];
 
 void sched_park_here_if_asked(void) {
   if (!__atomic_load_n(&g_park_request, __ATOMIC_ACQUIRE))
     return;
+  {
+    struct percpu *pc = get_percpu();
+
+    if (pc && pc->cpu_id < MAX_CPUS)
+      __atomic_store_n(&g_cpu_parked[pc->cpu_id], 1, __ATOMIC_RELEASE);
+  }
   __atomic_fetch_add(&g_parked_cpus, 1, __ATOMIC_RELEASE);
   for (;;) {
     interrupts_disable();
@@ -2057,13 +2066,33 @@ int sched_park_secondary_cpus(u64 timeout_ms) {
   if (want == 0)
     return 0; /* a machine with one CPU has nothing to park */
   __atomic_store_n(&g_parked_cpus, 0, __ATOMIC_RELEASE);
+  for (int c = 0; c < MAX_CPUS; c++)
+    __atomic_store_n(&g_cpu_parked[c], 0, __ATOMIC_RELAXED);
   __atomic_store_n(&g_park_request, 1, __ATOMIC_RELEASE);
   /* A CPU deep in a kernel thread reaches its idle loop when that thread
    * blocks; a kick shortens the wait for one that is merely running a task. */
   ipi_reschedule_all();
   while (__atomic_load_n(&g_parked_cpus, __ATOMIC_ACQUIRE) < want) {
     if (ktime_monotonic_ns() >= deadline) {
+      struct percpu *me = get_percpu();
+
       __atomic_store_n(&g_park_request, 0, __ATOMIC_RELEASE);
+      /* A CPU reaches the park only from its idle loop: name the task that
+       * kept each missing one out of it. */
+      for (int c = 0; c < g_max_cpus; c++) {
+        struct percpu *pc = get_percpu_n(c);
+        struct task *t = pc ? (struct task *)pc->cur_task : 0;
+
+        if (pc == me || __atomic_load_n(&g_cpu_parked[c], __ATOMIC_ACQUIRE))
+          continue;
+        console_write("sched: cpu ");
+        console_write_dec((u64)c);
+        console_write(" did not park; running pid ");
+        console_write_dec(t ? (u64)t->id : 0);
+        console_write(" (");
+        console_write(t && t->name ? t->name : "(none)");
+        console_write(")\n");
+      }
       return -1;
     }
     scheduler_sleep_ticks(1);
@@ -3168,7 +3197,7 @@ void scheduler_init(void) {
   g_task_rlimits[0][RLIMIT_NOFILE].rlim_max = 1024;
   /* M77: default core-dump soft cap of 1 MiB (boot task). */
   g_task_rlimits[0][RLIMIT_CORE].rlim_cur = 1024 * 1024;
-  current_task = boot;
+  set_current_task(boot);
   scheduler_started = 1;
 
   /* T3 (M28 #7): make the boot task the BSP's idle-fallback target so that
@@ -6278,7 +6307,7 @@ static int scheduler_yield_inner(void) {
     kvm_hook_sched_out(old_task, new_task);
 
   new_task->state = TASK_RUNNING;
-  current_task = new_task;
+  set_current_task(new_task);
 
   arch_set_kernel_stack(new_task->kernel_stack_ptr);
   paging_switch_address_space(new_task->pml4_phys);
@@ -6502,7 +6531,7 @@ static int scheduler_yield_inner(void) {
    * per-task architectural state again before any C code observes it. Without
    * this, the resumed stack runs with current_task, SP_EL1's published top,
    * TTBR0 and TLS still naming the task we switched to. */
-  current_task = old_task;
+  set_current_task(old_task);
   arch_set_kernel_stack(old_task->kernel_stack_ptr);
   paging_switch_address_space(old_task->pml4_phys);
   {

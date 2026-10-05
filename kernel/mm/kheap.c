@@ -1103,8 +1103,15 @@ static void klarge_free(void *ptr) {
   heap_acquire(&flags);
 
   if (h->magic != KLARGE_MAGIC) {
+    u64 seen = h->magic;
+
+    /* kfree routed it here by address: it is inside the large arena, so a
+     * header that is not live is a second free or a write over the header.
+     * Returning quietly let both pass. The lock goes first: the panic path
+     * may need the heap. */
     heap_release(flags);
-    return;
+    KASSERT(0, "kfree of large block %p with header magic 0x%llx: double free "
+               "or header overwritten", ptr, (unsigned long long)seen);
   }
   u64 base = (u64)(usize)h;
   usize npages = h->npages;

@@ -275,7 +275,78 @@ void free_kernel_array(char **k_array) {
 
 static int is_user_range_valid(const void *src, usize size, int write);
 
+/* A user copy can fault on a page that is not resident yet, and the fault
+ * handler takes sleeping locks and does I/O. With a spinlock held that is a
+ * sleep under a spinlock, so it is refused here, before the fault, instead of
+ * as a hang that depends on whether the page happened to be present
+ * (FreeBSD's vm_fault WITNESS check). */
+static inline void user_copy_assert_may_fault(void) {
+  KASSERT(!current_task || current_task->spin_held == 0,
+          "user copy with %d native spinlock(s) held", current_task->spin_held);
+}
+
+/* Read one aligned user word without letting a fault be serviced: 0, or
+ * -EFAULT when the page is not there (or the address is not a user one). For
+ * callers holding a spinlock, which then drop it, fault the page in with
+ * syscall_copyin and retry. */
+int user_read_u32_nofault(u64 uaddr, u32 *out) {
+  extern int arch_user_load_u32_nofault(const void *uaddr, u32 *out);
+
+  if (syscall_allows_kernel_pointers()) {
+    *out = *(volatile const u32 *)(usize)uaddr;
+    return 0;
+  }
+  if ((uaddr & 3) || uaddr + sizeof(u32) < uaddr ||
+      uaddr + sizeof(u32) > USER_SPACE_LIMIT)
+    return -EFAULT;
+  return arch_user_load_u32_nofault((const void *)(usize)uaddr, out);
+}
+
+/* The page-fault handlers ask this first for a fault taken in the kernel: a
+ * fault on the no-fault load is resumed at its fixup, not serviced. The
+ * fixup's address, or 0 when the faulting pc is not that load. */
+u64 user_nofault_fixup(u64 pc) {
+  extern char user_load_u32_nofault_insn[], user_load_u32_nofault_fixup[];
+
+  if (pc != (u64)(usize)user_load_u32_nofault_insn)
+    return 0;
+  return (u64)(usize)user_load_u32_nofault_fixup;
+}
+
+/* The no-fault load and its fixup, checked at boot. A word the kernel maps
+ * reads back exactly; an address no page table maps comes back -EFAULT
+ * through the fixup -- under a held spinlock, where a serviced fault would be
+ * the very sleep the mechanism exists to avoid. */
+void user_nofault_selftest(void) {
+  extern int arch_user_load_u32_nofault(const void *uaddr, u32 *out);
+  static volatile u32 word = 0x6b1e5eedu;
+  static spinlock_t held = SPINLOCK_INIT;
+  u32 got = 0;
+  int rc;
+  u64 flags;
+
+  rc = arch_user_load_u32_nofault((const void *)&word, &got);
+  if (rc == 0 && got == word)
+    console_write("NOFAULT-SMOKE: ok read\n");
+  else
+    console_write("NOFAULT-SMOKE: FAIL read\n");
+
+  got = 0;
+  spin_lock_irqsave(&held, &flags);
+  /* The top page of the user half: the kernel's own tables never map it
+   * (the bottom of the address space can be identity-mapped). */
+  rc = arch_user_load_u32_nofault(
+      (const void *)(usize)((USER_SPACE_LIMIT - PAGE_SIZE) & ~(u64)(PAGE_SIZE - 1)),
+      &got);
+  spin_unlock_irqrestore(&held, flags);
+  if (rc == -EFAULT && got == 0)
+    console_write("NOFAULT-SMOKE: ok fixup\n");
+  else
+    console_write("NOFAULT-SMOKE: FAIL fixup\n");
+}
+
 int syscall_copyin(void *dst, const void *user_src, usize size) {
+  user_copy_assert_may_fault();
   if (size == 0)
     return 0;
   if (!dst || !user_src)
@@ -377,6 +448,7 @@ static int user_range_prepare_write(void *user_dst, usize size) {
 }
 
 int syscall_copyout(void *user_dst, const void *src, usize size) {
+  user_copy_assert_may_fault();
   if (size == 0)
     return 0;
   if (!user_dst || !src)
@@ -410,6 +482,7 @@ int syscall_copyout(void *user_dst, const void *src, usize size) {
 }
 
 int syscall_copyinstr(char *dst, usize dst_size, const char *user_src) {
+  user_copy_assert_may_fault();
   if (!dst || dst_size == 0 || !user_src)
     return -EFAULT;
 

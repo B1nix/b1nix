@@ -562,8 +562,26 @@ int  scheduler_setrlimit_task(struct task *target, int resource,
 #ifdef __x86_64__
 #define percpu_this ((__seg_gs struct percpu *)0)
 #define current_task (percpu_this->cur_task)
+#define set_current_task(t) (percpu_this->cur_task = (t))
 #else
-#define current_task (get_percpu()->cur_task)
+/* Two steps here -- this CPU's block, then its current task -- and a task
+ * preempted between them and resumed on another CPU read the task running on
+ * the CPU it had left: an unlock then named the wrong owner and a lock count
+ * was read off a stranger. Interrupts are masked across both steps, which is
+ * what makes them one read; x86 needs nothing, its %gs load is one
+ * instruction. Not an lvalue: the scheduler's few stores use
+ * set_current_task(), with interrupts already off. */
+static inline struct task *aarch64_current_task(void) {
+  u64 daif;
+  struct task *t;
+
+  __asm__ volatile("mrs %0, daif; msr daifset, #2" : "=r"(daif) : : "memory");
+  t = get_percpu()->cur_task;
+  __asm__ volatile("msr daif, %0" : : "r"(daif) : "memory");
+  return t;
+}
+#define current_task (aarch64_current_task())
+#define set_current_task(t) (get_percpu()->cur_task = (t))
 #endif
 
 /* ── Scheduler ── */
