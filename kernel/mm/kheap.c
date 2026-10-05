@@ -1166,6 +1166,86 @@ static void klarge_free(void *ptr) {
   heap_release(flags);
 }
 
+/* Kernel stacks.
+ *
+ * On x86_64 a stack is a large-arena span laid out as [header page][guard
+ * page][stack]: the guard is left unmapped, so running off the bottom of the
+ * stack faults on the guard instead of writing over whatever was allocated
+ * below it -- which, from the general heap, was some other object, found
+ * corrupted only at the next context switch through one canary word, if at
+ * all. The fault cannot be handled on the stack that overflowed; #DF runs on
+ * its own IST stack and names the task (see the double-fault report).
+ *
+ * aarch64 takes an EL1 exception on the current SP with no stack of its own
+ * to fall back to, so a guard there would turn an overflow into an exception
+ * loop instead of a report; its stacks stay heap blocks with the canary. */
+void *kstack_alloc(usize size) {
+#if defined(__x86_64__)
+  void *p = klarge_alloc(size + 2 * PAGE_SIZE - KLARGE_HEADER_SIZE,
+                         (u64)(usize)__builtin_return_address(0));
+  u64 span, guard, frame;
+
+  if (!p)
+    return 0;
+  span = (u64)(usize)p - KLARGE_HEADER_SIZE;
+  KASSERT((span & (PAGE_SIZE - 1)) == 0, "large span %p is not page aligned",
+          (void *)(usize)span);
+  guard = span + PAGE_SIZE;
+  frame = vmm_virt_to_phys((void *)(usize)guard);
+  vmm_unmap_page(guard);
+  if (frame)
+    pmm_free_frame(frame);
+  return (void *)(usize)(guard + PAGE_SIZE);
+#else
+  return kmalloc(size);
+#endif
+}
+
+void kstack_free(void *stack) {
+  if (!stack)
+    return;
+#if defined(__x86_64__)
+  klarge_free((u8 *)stack - 2 * PAGE_SIZE + KLARGE_HEADER_SIZE);
+#else
+  kfree(stack);
+#endif
+}
+
+/* Whether `addr` falls in the guard page below the kernel stack at `stack`. */
+int kstack_is_guard_addr(const void *stack, u64 addr) {
+#if defined(__x86_64__)
+  u64 base = (u64)(usize)stack;
+
+  return stack && addr >= base - PAGE_SIZE && addr < base;
+#else
+  (void)stack;
+  (void)addr;
+  return 0;
+#endif
+}
+
+/* The guard under a task's kernel stack, checked once at boot: unmapped, with
+ * the whole stack above it mapped and writable. */
+void kstack_selftest(void) {
+#if defined(__x86_64__)
+  u8 *st = kstack_alloc(KERNEL_STACK_SIZE);
+  int ok;
+
+  if (!st) {
+    console_write("KSTACK-SMOKE: FAIL guard-armed (no stack)\n");
+    return;
+  }
+  ok = vmm_virt_to_phys(st - PAGE_SIZE) == 0;
+  for (usize off = 0; ok && off < KERNEL_STACK_SIZE; off += PAGE_SIZE)
+    ok = vmm_virt_to_phys(st + off) != 0;
+  if (ok)
+    memset(st, 0x5a, KERNEL_STACK_SIZE);
+  kstack_free(st);
+  console_write(ok ? "KSTACK-SMOKE: ok guard-armed\n"
+                   : "KSTACK-SMOKE: FAIL guard-armed\n");
+#endif
+}
+
 /*
  * Carve the unused tail of a reused free block back into a free block.
  *
@@ -1225,6 +1305,31 @@ static void kheap_split_block(struct kheap_block *blk, usize want) {
   free_lists[bkt] = tail;
 }
 
+/* A free block's payload is all KHEAP_JUNK_FREE (kfree fills it, and junks the
+ * headers coalescing absorbs into it). Anything else in it is a write through
+ * a pointer that was freed -- found here, when the block is handed out again,
+ * instead of as the next owner's corrupted object. The head and the tail are
+ * checked, not every byte of a block that may be a quarter of a megabyte. */
+#define KHEAP_JUNK_CHECK_HEAD 4096u
+#define KHEAP_JUNK_CHECK_TAIL 256u
+static void kheap_check_junk(const struct kheap_block *b) {
+  const u8 *p = (const u8 *)b + KHEAP_HEADER_SIZE;
+  usize n = b->size;
+  usize head = n < KHEAP_JUNK_CHECK_HEAD ? n : KHEAP_JUNK_CHECK_HEAD;
+  usize tail = n - head < KHEAP_JUNK_CHECK_TAIL ? n - head : KHEAP_JUNK_CHECK_TAIL;
+
+  for (usize i = 0; i < head; i++)
+    KASSERT(p[i] == KHEAP_JUNK_FREE,
+            "write after free: heap block %p byte %lu is 0x%02x, not junk "
+            "(block of %lu bytes)", (const void *)p, (unsigned long)i,
+            (unsigned)p[i], (unsigned long)n);
+  for (usize i = n - tail; i < n; i++)
+    KASSERT(p[i] == KHEAP_JUNK_FREE,
+            "write after free: heap block %p byte %lu is 0x%02x, not junk "
+            "(block of %lu bytes)", (const void *)p, (unsigned long)i,
+            (unsigned)p[i], (unsigned long)n);
+}
+
 static void *kmalloc_internal(usize size, u64 caller) {
   if (size == 0) {
     return 0;
@@ -1270,6 +1375,7 @@ static void *kmalloc_internal(usize size, u64 caller) {
                 (void *)cur, (unsigned long long)cur->magic,
                 (unsigned long)cur->size);
         if (cur->size >= size) {
+          kheap_check_junk(cur);
           *prev = cur->next;
           cur->next = 0;
           cur->magic = KHEAP_MAGIC;
@@ -1437,6 +1543,10 @@ void kfree(void *ptr) {
 #endif
   track_free((u64)(usize)ptr, block->size);
   block->magic = KHEAP_FREED_MAGIC;
+  /* Every free, not only the magazine's: a read through a stale pointer then
+   * sees 0xdededede rather than the old object, and kheap_check_junk finds a
+   * write when the block is reused. */
+  memset(ptr, KHEAP_JUNK_FREE, block->size);
 
   /* Coalesce with the physically-preceding block when it is also free. The
    * boundary tag prev_size locates the predecessor in O(1); merging undoes the
@@ -1455,6 +1565,8 @@ void kfree(void *ptr) {
       } else {
         heap.last_block = prev_phys;
       }
+      /* This block's header is now payload of the merged one. */
+      memset(block, KHEAP_JUNK_FREE, KHEAP_HEADER_SIZE);
       block = prev_phys;
     }
   }
@@ -1474,6 +1586,7 @@ void kfree(void *ptr) {
       } else {
         heap.last_block = block;
       }
+      memset(next_phys, KHEAP_JUNK_FREE, KHEAP_HEADER_SIZE);
     }
   }
 

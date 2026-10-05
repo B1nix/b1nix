@@ -2116,13 +2116,18 @@ fi
 # networking pointer going bad three subsystems away.
 for _bs_log in "$LOG" "$SYS_LOG" "$IOMMU_LOG" "$AMDVI_LOG"; do
 	[ -f "$_bs_log" ] || continue
-	if grep -aq "boot-stack overflow" "$_bs_log" 2>/dev/null; then
+	if grep -aq "boot-stack overflow\|kernel-stack overflow" "$_bs_log" 2>/dev/null; then
 		fail "no boot-stack overflow on any instance" \
 			"guard page hit in $(basename "$_bs_log")"
 		_bs_overflow=1
 	fi
 done
 [ -n "${_bs_overflow:-}" ] || pass "no boot-stack overflow on any instance"
+# Task kernel stacks have the same guard on x86_64 (kstack_alloc); the kernel
+# checks at boot that it is unmapped and the stack above it is not.
+if [ "$ARCH" = "x86_64" ]; then
+	check_output "$LOG" "KSTACK-SMOKE: ok guard-armed" "the page under a task's kernel stack is unmapped and the stack above it mapped, so an overflow faults instead of writing over the heap"
+fi
 # b1cc is cut from the build (B1NIX_NO_B1CC); its B1CC-*-SMOKE checks were
 # removed with it and come back when b1cc does (they are in git).
 fi

@@ -1274,6 +1274,15 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
       serial_write("#EXC boot-stack overflow: the boot CPU ran off the bottom "
                    "of its kernel stack (guard page)\n");
     }
+    /* And a task's: the page below every task kernel stack is unmapped too
+     * (kstack_alloc). */
+    if (current_task &&
+        (kstack_is_guard_addr(current_task->stack, read_cr2()) ||
+         kstack_is_guard_addr(current_task->stack, frame->rsp))) {
+      serial_write("#EXC kernel-stack overflow: pid ");
+      serial_emerg_hex((u64)current_task->id);
+      serial_write(" ran off the bottom of its kernel stack (guard page)\n");
+    }
   }
 
   /* SMP-FRAME: the things a ring-3 fault report is only true *because of*.

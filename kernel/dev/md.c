@@ -246,21 +246,37 @@ int md_autorun(void)
 	int started = 0;
 	u64 flags;
 
-	spin_lock_irqsave(&md_lock, &flags);
-
-	/* Pass one: collect members. */
+	/* Pass zero: read every candidate's superblock with no lock held. A read
+	 * is disk I/O that waits, and it used to run under md_lock -- a spinlock
+	 * with interrupts off, held across the wait. */
 	usize n = blk_count();
+	struct md_candidate {
+		struct block_device *dev;
+		struct md_superblock sb;
+	} *cand = n ? kmalloc(n * sizeof(*cand)) : 0;
+	usize ncand = 0;
+
+	if (n && !cand)
+		return 0;
 	for (usize i = 0; i < n; i++) {
 		struct block_device *dev = blk_at(i);
-		struct md_superblock sb;
 
 		if (!dev || !dev->name)
 			continue;
 		/* An array is not its own member: skip anything already assembled. */
 		if (dev->name[0] == 'm' && dev->name[1] == 'd')
 			continue;
-		if (md_read_sb(dev, &sb) != 0)
+		if (md_read_sb(dev, &cand[ncand].sb) != 0)
 			continue;
+		cand[ncand++].dev = dev;
+	}
+
+	spin_lock_irqsave(&md_lock, &flags);
+
+	/* Pass one: collect members. */
+	for (usize i = 0; i < ncand; i++) {
+		struct block_device *dev = cand[i].dev;
+		struct md_superblock sb = cand[i].sb;
 
 		struct md_array *a = md_find_or_create(sb.array_uuid, &sb);
 		if (!a || a->started)
@@ -319,6 +335,7 @@ int md_autorun(void)
 	}
 
 	spin_unlock_irqrestore(&md_lock, flags);
+	kfree(cand);
 	return started;
 }
 

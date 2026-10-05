@@ -1794,6 +1794,8 @@ void kernel_main(usize arg0, usize arg1)
 
 			user_nofault_selftest();
 		}
+		/* The guard page under task kernel stacks (kernel/mm/kheap.c). */
+		kstack_selftest();
 		/* netconsole is the klog ring over UDP — protocol, not hardware.
 		 * It only sat behind the x86_64 guard because it was written next
 		 * to the PAT/PCI tests above. */

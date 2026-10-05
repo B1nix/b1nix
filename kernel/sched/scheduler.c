@@ -3261,7 +3261,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
     return -1;
   }
 
-  void *stack = kmalloc(KERNEL_STACK_SIZE);
+  void *stack = kstack_alloc(KERNEL_STACK_SIZE);
   if (!stack) {
     free_task_slot(task);
     return -1;
@@ -3308,7 +3308,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   task->name = strdup(name);
   if (!task->name) {
     free_task_slot(task);
-    kfree(stack);
+    kstack_free(stack);
     return -1;
   }
   task->entry = entry;
@@ -3500,7 +3500,7 @@ void sched_ap_reap_worker(struct task *t) {
   if (!t)
     return;
   if (t->stack) {
-    kfree(t->stack);
+    kstack_free(t->stack);
     t->stack = 0;
   }
   if (t->name) {
@@ -3583,7 +3583,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
     paging_swap_in_all_swapped(parent->pml4_phys);
   }
 
-  void *child_stack = kmalloc(KERNEL_STACK_SIZE);
+  void *child_stack = kstack_alloc(KERNEL_STACK_SIZE);
   if (!child_stack) {
     return -1;
   }
@@ -3592,7 +3592,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
   struct task *child = find_unused_task(0);
   if (!child) {
     interrupts_enable();
-    kfree(child_stack);
+    kstack_free(child_stack);
     return -1;
   }
   /* find_unused_task assigned the id under g_tasks_lock; preserve it across the
@@ -3627,7 +3627,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
   child->name = parent->name ? strdup(parent->name) : 0;
   if (parent->name && !child->name) {
     free_task_slot(child);
-    kfree(child_stack);
+    kstack_free(child_stack);
     interrupts_enable();
     return -1;
   }
@@ -3827,7 +3827,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
       kfree((void *)child->name);
       child->name = 0;
     }
-    kfree(child_stack);
+    kstack_free(child_stack);
     child->stack = 0;
     interrupts_enable();
     free_task_slot(child);
@@ -3933,7 +3933,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
       kfree((void *)child->name);
       child->name = 0;
     }
-    kfree(child_stack);
+    kstack_free(child_stack);
     child->stack = 0;
     interrupts_enable();
     free_task_slot(child);
@@ -5099,9 +5099,10 @@ void scheduler_vfork_release(void) {
   if (!t)
     return;
   usize idx = task_index(t);
-  if (!g_task_vfork_pending[idx] || g_task_vfork_id[idx] != t->id)
+  if (!__atomic_load_n(&g_task_vfork_pending[idx], __ATOMIC_ACQUIRE) ||
+      g_task_vfork_id[idx] != t->id)
     return;
-  g_task_vfork_pending[idx] = 0;
+  __atomic_store_n(&g_task_vfork_pending[idx], 0, __ATOMIC_RELEASE);
   scheduler_wake_all(&g_task_vfork_pending[idx]);
 }
 
@@ -5172,7 +5173,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   }
 #endif
 
-  void *kstack = kmalloc(KERNEL_STACK_SIZE);
+  void *kstack = kstack_alloc(KERNEL_STACK_SIZE);
   if (!kstack) { kfree(cta); return -ENOMEM; }
 
   interrupts_disable();
@@ -5186,7 +5187,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
       console_write("sched: a thread was refused for want of a task slot"
                     " (clone -> EAGAIN)\n");
     }
-    kfree(kstack);
+    kstack_free(kstack);
     kfree(cta);
     return -EAGAIN;
   }
@@ -5350,7 +5351,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
     /* Without CLONE_VM we'd need a full address-space clone like fork.
      * That path is fork — clone-without-CLONE_VM is unsupported on b1nix. */
     free_task_slot(child);
-    kfree(kstack);
+    kstack_free(kstack);
     kfree(cta);
     return -EINVAL;
   }
@@ -5358,7 +5359,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
 clone_nomem:
     /* The COW copy of the address space could not be made. */
     free_task_slot(child);
-    kfree(kstack);
+    kstack_free(kstack);
     kfree(cta);
     return -ENOMEM;
   }
@@ -5499,6 +5500,19 @@ clone_nomem:
       syscall_copyout((void *)(usize)pidfd_addr, &pfd32, sizeof(pfd32));
     }
   }
+  /* CLONE_VFORK: the wait is armed BEFORE the child can run. Armed after it
+   * was made runnable, a child on another CPU could exec or exit first, find
+   * nothing pending to release, and leave the parent waiting for a release
+   * that had already happened -- /bin/timeout parked in clone with no child
+   * left in the table. */
+  usize c_slot = task_index(child);
+  usize c_id = child->id;
+
+  if (flags & B1NIX_CLONE_VFORK) {
+    __atomic_store_n(&g_task_vfork_id[c_slot], c_id, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_task_vfork_pending[c_slot], 1, __ATOMIC_RELEASE);
+  }
+
   interrupts_disable();
   /* M28 T4: see fork/kthread_create_impl — fresh task's kernel stack is set
    * up synchronously without going through arch_context_switch, so publish
@@ -5508,23 +5522,20 @@ clone_nomem:
   sched_rq_enqueue_current(child);
   interrupts_enable();
 
-  /* CLONE_VFORK: suspend here until the child execs or exits. */
+  /* Suspend here until the child execs or exits; the release is re-checked
+   * after this task is published as blocked, so it cannot fall in the gap. */
   if (flags & B1NIX_CLONE_VFORK) {
-    usize c_slot = task_index(child);
-    usize c_id = child->id;
-    g_task_vfork_id[c_slot] = c_id;
-    g_task_vfork_pending[c_slot] = 1;
-    while (g_task_vfork_pending[c_slot] && g_task_vfork_id[c_slot] == c_id) {
-      interrupts_disable();
-      if (!g_task_vfork_pending[c_slot] || g_task_vfork_id[c_slot] != c_id) {
-        interrupts_enable();
+    for (;;) {
+      if (!__atomic_load_n(&g_task_vfork_pending[c_slot], __ATOMIC_ACQUIRE) ||
+          __atomic_load_n(&g_task_vfork_id[c_slot], __ATOMIC_RELAXED) != c_id)
+        break;
+      scheduler_wait_prepare(&g_task_vfork_pending[c_slot]);
+      if (!__atomic_load_n(&g_task_vfork_pending[c_slot], __ATOMIC_ACQUIRE) ||
+          __atomic_load_n(&g_task_vfork_id[c_slot], __ATOMIC_RELAXED) != c_id) {
+        scheduler_wait_cancel();
         break;
       }
-      current_task->wait_chan = &g_task_vfork_pending[c_slot];
-      scheduler_lease_clear_here(__func__);
-      current_task->state = TASK_BLOCKED;
-      scheduler_yield();
-      interrupts_enable();
+      scheduler_wait_commit();
     }
   }
 
@@ -5642,7 +5653,7 @@ void scheduler_reap_dead_threads(void) {
         interrupts_disable();
       }
     }
-    if (t->stack) { kfree(t->stack); t->stack = 0; }
+    if (t->stack) { kstack_free(t->stack); t->stack = 0; }
     if (t->name) { kfree((void *)t->name); t->name = 0; }
     free_task_slot(t);
   }
@@ -5739,7 +5750,7 @@ void scheduler_reap_orphan_zombies(void) {
       kfree((void *)t->name);
       t->name = 0;
     }
-    if (t->stack) { kfree(t->stack); t->stack = 0; }
+    if (t->stack) { kstack_free(t->stack); t->stack = 0; }
     free_task_slot(t);
   }
   if (still_have)
@@ -9267,7 +9278,7 @@ static int scheduler_waitpid_inner(usize pid, int *status, int options) {
             }
             if (T(i) == current_task)
               panic("sched: freeing the kernel stack we are running on");
-            kfree(T(i)->stack);
+            kstack_free(T(i)->stack);
             interrupts_enable();
             free_task_slot(T(i));
             if (status) {
@@ -9530,7 +9541,7 @@ static int scheduler_waitid_inner(idtype_t idtype, usize id, siginfo_t *infop,
                 }
                 if (child == current_task)
                   panic("sched: freeing the kernel stack we are running on");
-                kfree(child->stack);
+                kstack_free(child->stack);
                 interrupts_enable();
                 free_task_slot(child);
 

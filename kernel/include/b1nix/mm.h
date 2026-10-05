@@ -338,6 +338,12 @@ void kheap_bounds(u64 *base, u64 *current, u64 *end);
 void *kmalloc(usize size);
 void *kzalloc(usize size);
 void kfree(void *ptr);
+/* Kernel stacks: a guard page below each where the arch can report hitting
+ * it (kernel/mm/kheap.c). Freed with kstack_free, never kfree. */
+void *kstack_alloc(usize size);
+void kstack_free(void *stack);
+int kstack_is_guard_addr(const void *stack, u64 addr);
+void kstack_selftest(void);
 usize kmalloc_usable_size(const void *ptr);
 
 void vmm_init(void);
