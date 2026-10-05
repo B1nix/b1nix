@@ -739,7 +739,7 @@ void cgroup_swap_uncharge(u16 id, u64 pages) {
  * the limit asked for; only a cgroup that cannot give anything back reaches
  * the kill below. With no swap device attached there is nowhere to put the
  * pages, the scan frees nothing, and the behaviour is exactly what it was. */
-static usize cg_reclaim(struct cgroup *cg, u64 over_pages) {
+static usize cg_reclaim(struct cgroup *cg, u64 over_pages, int force) {
   if (!swap_active() || !over_pages)
     return 0;
 
@@ -753,8 +753,13 @@ static usize cg_reclaim(struct cgroup *cg, u64 over_pages) {
    * cgroup owns are all in use, or swap is full. Either way the answer does
    * not change between two faults, and looking for it again costs a sweep of
    * the ring -- which is what made a cgroup with a full swap device stop the
-   * machine rather than merely stop itself. */
-  if (dry && now - dry < CG_MEM_ACTION_COOLDOWN_NS)
+   * machine rather than merely stop itself.
+   *
+   * Except for the kill path (`force`): a page refused a moment ago because
+   * the program had just touched it is often free to go now, and killing
+   * without looking turned a cgroup a few hundred pages over its limit, with
+   * megabytes it could have swapped, into a dead process. */
+  if (!force && dry && now - dry < CG_MEM_ACTION_COOLDOWN_NS)
     return 0;
 
   /* How much one crossing of the limit may reclaim. Linux reclaims in
@@ -853,7 +858,7 @@ static void cg_mem_relieve(struct cgroup *cg, u64 max_pages) {
 
     if (est <= max_pages)
       return;
-    if (cg_reclaim(cg, CG_RECLAIM_BATCH) == 0)
+    if (cg_reclaim(cg, CG_RECLAIM_BATCH, 0) == 0)
       return; /* nothing left to take: the kill path decides from here */
   }
 }
@@ -893,9 +898,11 @@ static usize cg_mem_over_limit(struct cgroup *cg, u64 max_pages) {
 
   psi_stall_begin(PSI_MEM);
   for (usize round = 0; round < CG_RECLAIM_ROUNDS && now > max_pages; round++) {
-    usize freed = cg_reclaim(cg, now - max_pages > CG_RECLAIM_BATCH
-                                     ? CG_RECLAIM_BATCH
-                                     : (usize)(now - max_pages));
+    usize freed = cg_reclaim(cg,
+                             now - max_pages > CG_RECLAIM_BATCH
+                                 ? CG_RECLAIM_BATCH
+                                 : (usize)(now - max_pages),
+                             1);
 
     if (!freed)
       break;
@@ -980,7 +987,7 @@ static void cg_mem_check_high(struct cgroup *cg) {
   /* Reclaiming for a limit is time the task spends waiting for memory, as on
    * Linux, where it runs under psi_memstall_enter(). */
   psi_stall_begin(PSI_MEM);
-  cg_reclaim(cg, now - high);
+  cg_reclaim(cg, now - high, 0);
   psi_stall_end(PSI_MEM);
 }
 
@@ -1140,17 +1147,36 @@ void cgroup_mem_charge_pages(u64 npages) {
    * task that went over the limit pays for the reclaim in its own fault. */
   cg_mem_relieve(over, over_max);
 
-  {
+  /* Still over, and the decision below ran a moment ago: wait for it to be
+   * due rather than go on past the limit. Letting the fault through made
+   * memory.max a suggestion -- a program that finished filling inside the
+   * cooldown stayed twice over its limit, with nothing left to bring it back,
+   * because nothing faults again. The wait is the throttle Linux's charge
+   * path imposes, bounded by the cooldown, and a SIGKILL ends it. */
+  for (;;) {
     int act;
+    u64 est;
 
     spin_lock_irqsave(&cg_lock, &flags);
     act = over->mem_oom_at_ns == 0 ||
           now - over->mem_oom_at_ns >= CG_MEM_ACTION_COOLDOWN_NS;
     if (act)
       over->mem_oom_at_ns = now;
+    est = over->mem_exact + over->mem_delta;
     spin_unlock_irqrestore(&cg_lock, flags);
-    if (!act)
+    if (act)
+      break;
+    if (est <= over_max)
       return;
+    if (__atomic_load_n(&cur->pending_signals, __ATOMIC_ACQUIRE) &
+        (1ULL << (SIGKILL - 1)))
+      return;
+    psi_stall_begin(PSI_MEM);
+    int gone = scheduler_sleep_ticks_state(1, 0) == SLEEP_GONE;
+    psi_stall_end(PSI_MEM);
+    if (gone)
+      return;
+    now = ktime_monotonic_ns();
   }
   /* The fault itself is never failed, not even when the task that just faulted
    * is the one chosen to die. Failing it turned a clean SIGKILL into an

@@ -5,6 +5,11 @@ Documentation=file:/usr/share/doc/b1nix-kernel/boot-counting
 # means the graphical target, and on anything else multi-user. Ordering after
 # both is correct -- a target that is not part of this boot is simply ignored.
 After=multi-user.target graphical.target
+# The state lives on the ESP. An fstab line for it with `nofail` is not
+# ordered before multi-user.target, and a /boot mounted after this unit had
+# started made the condition below false: the boot was never marked good, and
+# the next two would have fallen back to the previous kernel.
+RequiresMountsFor=/boot
 ConditionPathExists=/boot/b1nix
 
 [Service]

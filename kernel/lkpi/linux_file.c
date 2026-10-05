@@ -584,8 +584,11 @@ static int shmem_write_end(const struct kiocb *iocb,
                            unsigned len, unsigned copied, struct folio *folio,
                            void *fsdata)
 {
-	(void)iocb; (void)mapping; (void)pos; (void)len; (void)folio; (void)fsdata;
-	/* Nothing to mark: the page is the storage, not a cache of it. */
+	(void)iocb; (void)mapping; (void)pos; (void)len; (void)fsdata;
+	/* Nothing to mark: the page is the storage, not a cache of it. The
+	 * reference write_begin's lookup took goes back, as upstream's
+	 * write_end puts it. */
+	put_page(folio_page(folio, 0));
 	return (int)copied;
 }
 
@@ -706,6 +709,13 @@ struct folio *shmem_read_folio_gfp(struct address_space *mapping,
 	/* struct folio starts with its struct page — see <linux/mm.h> — so one
 	 * page is its own folio. */
 	ret = page_folio(&sh->pages[index]);
+	/* With a reference for the caller, as upstream's: the object keeps its
+	 * own. i915's put_pages drops what it was given here, and without this
+	 * that was the object's only reference -- the frame went back to the
+	 * allocator while the object still named it. The next get_pages handed
+	 * out a fresh zeroed page (black tiles in whatever the object held), and
+	 * anything still mapping the old frame wrote into someone else's memory. */
+	get_page(&sh->pages[index]);
 	g_shmem_folio_calls++;
 	g_shmem_folio_ns += lkpi_monotonic_ns() - t0;
 	return ret;
@@ -725,4 +735,45 @@ void shmem_truncate_range(struct inode *inode, loff_t start, loff_t end)
 	last = (end < 0) ? (sh->npages ? sh->npages - 1 : 0)
 	                 : (usize)(end >> PAGE_SHIFT);
 	shmem_drop_range(sh, first, last);
+}
+
+/*
+ * M101's check of the reference rule above, here because it needs the Linux
+ * types: a page whose caller's reference is dropped -- what i915's put_pages
+ * does to a live object -- is still the object's, frame and contents. Returns
+ * 0, or the step that failed.
+ */
+int lkpi_shmem_persist_selftest(void)
+{
+	struct file *f = shmem_file_setup("m101-persist", 2 * PAGE_SIZE, 0);
+	struct folio *a, *b;
+	u32 *p;
+	phys_addr_t phys;
+	int rc = 0;
+
+	if (IS_ERR_OR_NULL(f))
+		return 1;
+	a = shmem_read_folio_gfp(f->f_mapping, 0, GFP_KERNEL);
+	if (IS_ERR(a)) {
+		fput(f);
+		return 2;
+	}
+	p = folio_address(a);
+	p[0] = 0x51ab1e01;
+	p[PAGE_SIZE / 4 - 1] = 0x51ab1e02;
+	phys = page_to_phys(folio_page(a, 0));
+	put_page(folio_page(a, 0));
+	b = shmem_read_folio_gfp(f->f_mapping, 0, GFP_KERNEL);
+	if (IS_ERR(b)) {
+		rc = 3;
+	} else {
+		p = folio_address(b);
+		if (page_to_phys(folio_page(b, 0)) != phys)
+			rc = 4;
+		else if (p[0] != 0x51ab1e01 || p[PAGE_SIZE / 4 - 1] != 0x51ab1e02)
+			rc = 5;
+		put_page(folio_page(b, 0));
+	}
+	fput(f);
+	return rc;
 }

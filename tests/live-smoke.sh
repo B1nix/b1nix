@@ -19,7 +19,7 @@ BOOT_TIMEOUT="${BOOT_TIMEOUT:-300}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 # The size budget, in MiB: the plan's ceiling for a medium that carries the
 # base system and the installer, with the desktop pulled over the network.
-ISO_BUDGET_MIB="${ISO_BUDGET_MIB:-1400}"
+ISO_BUDGET_MIB="${ISO_BUDGET_MIB:-256}"
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 pass=0

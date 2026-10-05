@@ -21,6 +21,7 @@ ISO="$ROOT_DIR/build/x86_64/b1nix-install-smoke.iso"
 INSTALL_TIMEOUT="${INSTALL_TIMEOUT:-1800}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-300}"
 DISK_GIB="${DISK_GIB:-16}"
+STALL_SECS="${STALL_SECS:-120}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 # The size budget of the install medium: a console live system and the root it
 # installs, no desktop -- that comes from the network after the install.
@@ -71,8 +72,26 @@ run_qemu() { # tag firmware net(on|off) deadline pattern qemu-args...
 		-display none -serial file:"$serial" -no-reboot "$@" >>"$LOG" 2>&1 &
 	qpid=$!
 	t=0
+	quiet=0
+	last_size=0
 	while kill -0 "$qpid" 2>/dev/null && [ "$t" -lt "$deadline" ]; do
 		if [ -n "$pattern" ] && clean_log "$serial" | grep -aq "$pattern"; then
+			break
+		fi
+		# A guest whose console has said nothing for STALL_SECS is wedged
+		# (a firmware or loader hang shows up this way too): stop it and let
+		# the verdict below say what was missing, instead of waiting out the
+		# whole deadline.
+		size=$(stat -c %s "$serial" 2>/dev/null || echo 0)
+		if [ "$size" = "$last_size" ]; then
+			quiet=$((quiet + 5))
+		else
+			quiet=0
+			last_size=$size
+		fi
+		if [ "$quiet" -ge "$STALL_SECS" ]; then
+			echo "$tag: console silent for ${STALL_SECS}s -- stopped" >>"$LOG"
+			info "$tag: console silent for ${STALL_SECS}s -- stopped"
 			break
 		fi
 		sleep 5

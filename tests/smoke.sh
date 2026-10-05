@@ -3499,7 +3499,7 @@ else
 		_s3_name="${_s3_card% *}"
 		_s3_hz="${_s3_card#* }"
 		if [ -f "$_s3_wav" ] && command -v python3 >/dev/null 2>&1; then
-			_s3_audio="$(python3 "$PROJECT_DIR/tests/support/verify-tone-wav.py" "$_s3_wav" "$_s3_hz" 2>&1)"
+			_s3_audio="$(python3 "$PROJECT_DIR/tests/support/verify-tone-wav.py" "$_s3_wav" "$_s3_hz" 2>&1)" || true
 			case "$_s3_audio" in
 			"AUDIO-WAV: ok"*)
 				pass "the $_s3_name card played after the resume: the capture holds the $_s3_hz Hz tone the test wrote once the machine was back ($_s3_audio)"
@@ -4615,7 +4615,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 		# it at the frequency the guest said it was playing.
 		_audio_wav="${GFX_LOG%.log}-audio.wav"
 		if [ -f "$_audio_wav" ]; then
-			_audio_out="$(python3 "$PROJECT_DIR/tests/support/verify-tone-wav.py" "$_audio_wav" 440 2>&1)"
+			_audio_out="$(python3 "$PROJECT_DIR/tests/support/verify-tone-wav.py" "$_audio_wav" 440 2>&1)" || true
 			# A `case`, not a pipe into grep: `echo` in this script is a
 			# function that prefixes the instance name, which would put text
 			# in front of the anchor and never match.
@@ -4808,6 +4808,7 @@ check_output "$LOG" "M101-SMOKE: ok crc32c" "M101: CRC-32C gives the published c
 	# secondaries up over PSCI (kernel/arch/aarch64/smp.c).
 	check_output "$LOG" "M101-SMOKE: ok rcu-grace-period" "M101: synchronize_rcu does not return while a reader that started before it is still inside — proved by poisoning the object the moment it returns and having the reader, running on another CPU, report whether it ever saw the poison"
 	check_output "$LOG" "M101-SMOKE: ok pages" "M101: a shmem page array is genuinely scattered, and a vmap of it is verified through each page's own direct-map address — a different mapping of the same memory — in both directions, plus write-combining"
+	check_output "$LOG" "M101-SMOKE: ok gem-pages-persist" "M101: a GEM object's shmem page keeps its frame and contents when a driver drops the reference its lookup gave it (i915 put_pages on a live object)"
 	check_output "$LOG" "M101-SMOKE: ok device-pm" "M101: a kobject releases child-before-parent on the last put, and runtime PM suspends only on the last holder, refuses to claim a suspend the driver rejected, and leaves no usage reference behind on a failed resume"
 	check_output "$LOG" "M101-SMOKE: done" "M101 linuxkpi self-test suite completes"
 

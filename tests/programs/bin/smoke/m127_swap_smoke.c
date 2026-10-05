@@ -687,8 +687,10 @@ static void check_cgroup_reclaim(void) {
   }
   if (current > 24ll * 1024 * 1024) {
     failf("cgroup-reclaim",
-          "memory.current is %lld with a 12M limit: the limit did not hold",
-          current);
+          "memory.current is %lld with a 12M limit: the limit did not hold "
+          "(swap %lld, pgscan %lld, pgsteal %lld, oom %lld, oom_kill %lld)",
+          current, swap_cur, pgscan, pgsteal,
+          cg_kv("hog", "memory.events", "oom"), oom_kill);
     reap(pid);
     cg_destroy("hog");
     return;

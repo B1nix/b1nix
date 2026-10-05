@@ -1444,6 +1444,16 @@ static void test_device_pm(void)
 	m101_report("device-pm", ok, g_pm_suspends);
 }
 
+/* A GEM object's page outlives the reference a driver drops (linux_file.c). */
+extern int lkpi_shmem_persist_selftest(void);
+
+static void test_gem_pages_persist(void)
+{
+	int rc = lkpi_shmem_persist_selftest();
+
+	m101_report("gem-pages-persist", rc == 0, (u64)rc);
+}
+
 void lkpi_selftest_m101(void)
 {
 	if (!bootinfo_has_flag("b1nix.test=1"))
@@ -1464,6 +1474,7 @@ void lkpi_selftest_m101(void)
 	test_kthread_worker();
 	test_rcu_basic();
 	test_pages();
+	test_gem_pages_persist();
 	test_device_pm();
 	console_write("M101-SMOKE: done\n");
 }

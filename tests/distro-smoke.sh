@@ -158,12 +158,13 @@ for _m in boot:vfat tmp:tmpfs runlock:tmpfs; do
 	esac
 done
 
-# The package's modules reach the machine: IPv6 and the CD filesystem are
-# loadable modules, loaded from /lib/modules/<release> after the root mounts.
+# The package's modules reach the machine: IPv6 and NTFS are loadable
+# modules, loaded from /lib/modules/<release> after the root mounts. (The CD
+# filesystem used to be one too; the imported isofs is built in.)
 _mods=$(marker "$BOOT_LOG" "modules=")
 case "$_mods" in
-*ipv6*isofs* | *isofs*ipv6*) ok "kernel-modules-loaded" ;;
-*) bad "kernel-modules-loaded" "ipv6 and isofs are not in /proc/modules: '${_mods#*modules=}'" ;;
+*ipv6*ntfs* | *ntfs*ipv6*) ok "kernel-modules-loaded" ;;
+*) bad "kernel-modules-loaded" "ipv6 and ntfs are not in /proc/modules: '${_mods#*modules=}'" ;;
 esac
 
 case "$(marker "$BOOT_LOG" "shadow-owner=")" in

@@ -315,13 +315,15 @@ void *lkpi_bridge_lookup(void *dirp, const char *name)
 	return found;
 }
 
-/* Has the filesystem removed this name by itself? A dentry it deleted is
- * unhashed (we hold a reference, so it cannot simply turn negative). */
+/* Has the filesystem removed this name by itself? d_delete() here always
+ * makes the dentry negative. Not d_unhashed(): this dcache never hashes its
+ * dentries, so every one of them reads as unhashed -- asking that dropped
+ * every cached name under a directory after any ioctl on it. */
 int lkpi_bridge_gone(void *nodep)
 {
 	struct dentry *d = nodep;
 
-	return d && (d_unhashed(d) || !d->d_inode);
+	return d && !d->d_inode;
 }
 
 void lkpi_bridge_put(void *nodep)
