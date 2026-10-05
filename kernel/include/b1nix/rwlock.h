@@ -31,13 +31,29 @@
 
 typedef struct {
     volatile int state;
+    /* The writer's owner token (spin_owner_self) while state is -1, so a
+     * release by anyone else and a holder re-entering are caught. */
+    volatile int writer;
 } rwlock_t;
 
 #define RWLOCK_INIT { 0 }
 
 static inline void rw_init(rwlock_t *lock) {
     lock->state = 0;
+    lock->writer = 0;
 }
+
+/* Shared with spinlock.h (kernel/sched/lockdep.c). */
+#ifndef SPIN_OWNER_NOTASK
+#define SPIN_OWNER_NOTASK 0x7fffffff
+#endif
+int spin_owner_self(void);
+void spin_held_note(int delta);
+void spin_lock_recursive(volatile int *lock, u64 caller) __attribute__((noreturn));
+/* A read unlock with no reader, or a write unlock by a task that is not the
+ * writer (kernel/sched/lockdep.c). Does not return. */
+void rw_unlock_bad(rwlock_t *lock, int write, u64 caller) __attribute__((noreturn));
+
 
 /* While spinning we MUST drain TLB shootdown IPIs ourselves: callers reach
  * here via the _irqsave variants (vmm_lock is taken IRQs-off for the whole
@@ -50,6 +66,8 @@ static inline void rw_init(rwlock_t *lock) {
 void tlb_shootdown_poll(void);
 
 static inline void rw_read_lock(rwlock_t *lock) {
+    int self = spin_owner_self();
+
     for (;;) {
         int s = __atomic_load_n(&lock->state, __ATOMIC_ACQUIRE);
         if (s >= 0) {
@@ -58,31 +76,57 @@ static inline void rw_read_lock(rwlock_t *lock) {
                                             /*weak=*/0,
                                             __ATOMIC_ACQUIRE,
                                             __ATOMIC_RELAXED))
-                return;
+                break;
+            continue;
         }
+        /* A writer holds it. If that writer is this task, the wait never ends. */
+        if (__builtin_expect(lock->writer == self && self != SPIN_OWNER_NOTASK, 0))
+            spin_lock_recursive(&lock->state,
+                                (u64)(usize)__builtin_return_address(0));
         cpu_relax();
         tlb_shootdown_poll();
     }
+    spin_held_note(1);
 }
 
 static inline void rw_read_unlock(rwlock_t *lock) {
-    __atomic_sub_fetch(&lock->state, 1, __ATOMIC_RELEASE);
+    int left = __atomic_sub_fetch(&lock->state, 1, __ATOMIC_RELEASE);
+
+    if (__builtin_expect(left < 0, 0))
+        rw_unlock_bad(lock, 0, (u64)(usize)__builtin_return_address(0));
+    spin_held_note(-1);
 }
 
 static inline void rw_write_lock(rwlock_t *lock) {
+    int self = spin_owner_self();
+
     for (;;) {
         int expected = 0;
         if (__atomic_compare_exchange_n(&lock->state, &expected, -1,
                                         /*weak=*/0,
                                         __ATOMIC_ACQUIRE,
                                         __ATOMIC_RELAXED))
-            return;
+            break;
+        if (__builtin_expect(expected == -1 && lock->writer == self &&
+                                 self != SPIN_OWNER_NOTASK, 0))
+            spin_lock_recursive(&lock->state,
+                                (u64)(usize)__builtin_return_address(0));
         cpu_relax();
         tlb_shootdown_poll();
     }
+    lock->writer = self;
+    spin_held_note(1);
 }
 
 static inline void rw_write_unlock(rwlock_t *lock) {
+    int self = spin_owner_self();
+
+    if (__builtin_expect(lock->state != -1 ||
+                             (lock->writer != self && self != SPIN_OWNER_NOTASK &&
+                              lock->writer != SPIN_OWNER_NOTASK), 0))
+        rw_unlock_bad(lock, 1, (u64)(usize)__builtin_return_address(0));
+    lock->writer = 0;
+    spin_held_note(-1);
     __atomic_store_n(&lock->state, 0, __ATOMIC_RELEASE);
 }
 

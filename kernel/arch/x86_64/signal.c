@@ -242,6 +242,7 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
     return;
   if (frame->cs != 0x1B && frame->cs != 0x23)
     return;
+  sched_assert_user_return();
   if (task_has_saved_sigmask(current_task)) {
     current_task->blocked_signals = task_saved_sigmask(current_task);
     task_clear_saved_sigmask(current_task);

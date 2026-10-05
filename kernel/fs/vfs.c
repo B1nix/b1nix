@@ -1348,6 +1348,19 @@ static void vfs_wlock_track(struct vfs_inode *inode, u64 owner) {
   spin_unlock_irqrestore(&g_vfs_wlocks_lock, flags);
 }
 
+/* How many inode write locks a task holds now. Read without the table lock:
+ * only the owner itself adds or removes an entry naming it, so its own count
+ * cannot change under it. */
+int vfs_wlocks_held_by(u64 owner) {
+  int n = 0;
+
+  for (int i = 0; i < VFS_WLOCK_TRACK; i++)
+    if (__atomic_load_n(&g_vfs_wlocks[i].inode, __ATOMIC_RELAXED) &&
+        __atomic_load_n(&g_vfs_wlocks[i].owner, __ATOMIC_RELAXED) == owner)
+      n++;
+  return n;
+}
+
 static void vfs_wlock_untrack(struct vfs_inode *inode) {
   u64 flags;
   spin_lock_irqsave(&g_vfs_wlocks_lock, &flags);

@@ -10,8 +10,11 @@
 #include <b1nix/console.h>
 #include <b1nix/lapic.h>
 #include <b1nix/lockdep.h>
+#include <b1nix/rwlock.h>
 #include <b1nix/panic.h>
+#ifdef __x86_64__
 #include <b1nix/arch_x86_64.h>
+#endif
 #include <b1nix/klog.h>
 #include <b1nix/sched.h>
 #include <b1nix/types.h>
@@ -287,6 +290,106 @@ static void spin_owner_report(volatile int *lock) {
 	              " rebuild with LOCKDEP=1 to record plain spinlocks)");
 }
 
+
+/* The task running here, read so that preemption cannot split the read: on
+ * x86 one %gs-relative load; elsewhere with interrupts masked, or a task moved
+ * between reading its CPU's area and that area's current task would see the
+ * task that runs there now. */
+static struct task *spin_current(void) {
+#if defined(__x86_64__)
+    struct task *t;
+
+    __asm__ volatile("movq %%gs:%c1, %0"
+                     : "=r"(t)
+                     : "i"(__builtin_offsetof(struct percpu, cur_task)));
+    return t;
+#else
+    u64 flags = interrupts_save();
+    struct percpu *p = get_percpu();
+    struct task *t = p ? p->cur_task : 0;
+
+    interrupts_restore(flags);
+    return t;
+#endif
+}
+
+static int spin_token_of(const struct task *t) {
+    return t ? (int)((((usize)t >> 4) & 0x7fffffff) | 1) : SPIN_OWNER_NOTASK;
+}
+
+int spin_owner_self(void) {
+    return spin_token_of(spin_current());
+}
+
+void spin_held_note(int delta) {
+    struct task *t = spin_current();
+
+    if (!t)
+        return;
+    /* Only this task and interrupt handlers on its CPU change the count, and a
+     * handler's acquire and release are both done before it returns. */
+    t->spin_held += delta;
+    if (__builtin_expect(t->spin_held < 0, 0)) {
+        t->spin_held = 0;
+        panic("spinlock: task released more native spinlocks than it took");
+    }
+}
+
+void spin_unlock_foreign(volatile int *lock, int self, u64 caller) {
+    int held = *lock;
+
+    console_bust_lock();
+    console_write("\nSPINLOCK released by a task that does not hold it: lock=0x");
+    console_write_hex64((u64)(usize)lock);
+    console_write(" holder token=0x");
+    console_write_hex64((u64)(unsigned)held);
+    console_write(" releaser token=0x");
+    console_write_hex64((u64)(unsigned)self);
+    console_write(" cpu ");
+    console_write_dec((u64)percpu_read(cpu_id));
+    console_write(" from 0x");
+    console_write_hex64(caller);
+    ksym_print(caller);
+    console_write("\n");
+    {
+        extern void kheap_describe(u64 addr, const char *prefix);
+
+        kheap_describe((u64)(usize)lock, "  lock lives in ");
+    }
+    panic("spinlock: unlock by a task that does not hold the lock");
+}
+
+void spin_lock_recursive(volatile int *lock, u64 caller) {
+    console_bust_lock();
+    console_write("\nSPINLOCK recursion: the task spinning holds the lock itself, lock=0x");
+    console_write_hex64((u64)(usize)lock);
+    console_write(" cpu ");
+    console_write_dec((u64)percpu_read(cpu_id));
+    console_write(" from 0x");
+    console_write_hex64(caller);
+    ksym_print(caller);
+    console_write("\n");
+    panic("spinlock: recursive acquire");
+}
+
+void rw_unlock_bad(rwlock_t *lock, int write, u64 caller) {
+    console_bust_lock();
+    console_write(write ? "\nRWLOCK write-unlocked by a task that is not the writer: lock=0x"
+                        : "\nRWLOCK read-unlocked with no reader: lock=0x");
+    console_write_hex64((u64)(usize)lock);
+    console_write(" state=");
+    console_write_dec((u64)(unsigned)lock->state);
+    console_write(" writer token=0x");
+    console_write_hex64((u64)(unsigned)lock->writer);
+    console_write(" self token=0x");
+    console_write_hex64((u64)(unsigned)spin_owner_self());
+    console_write(" from 0x");
+    console_write_hex64(caller);
+    ksym_print(caller);
+    console_write("\n");
+    panic(write ? "rwlock: write unlock by a non-writer"
+                : "rwlock: read unlock underflow");
+}
 
 void spin_unlock_unheld(volatile int *lock, u64 caller) {
     console_bust_lock();

@@ -6,11 +6,12 @@
 #include <b1nix/types.h>
 #include <b1nix/lockdep.h>
 
-/* Spinlock: simple ticket lock / test-and-set lock
- * For UP (single-core) builds the lock is a no-op.
- * For SMP builds it uses a real xchg-based spinlock.
+/* Spinlock: a compare-and-swap lock whose word names its holder.
  *
- * The lock is "locked" when the value is 1, "unlocked" when 0.
+ * 0 is unlocked. A held lock carries the holder's owner token (see
+ * spin_owner_self), never a bare 1: an unlock by anyone but the holder, and a
+ * holder spinning on its own lock, are then caught at the moment they happen
+ * instead of as a hang or as corruption later on.
  */
 
 typedef volatile int spinlock_t;
@@ -48,6 +49,24 @@ void spin_lock_stuck(volatile int *lock, u64 caller) __attribute__((noreturn));
 /* Reports an unlock of a lock nobody holds -- a second unlock, or an unlock
  * on a path that never locked (kernel/sched/lockdep.c). Does not return. */
 void spin_unlock_unheld(volatile int *lock, u64 caller) __attribute__((noreturn));
+
+/* The calling task's owner token: never 0, SPIN_OWNER_NOTASK before this CPU
+ * runs a task. Derived from the task's address, so two tasks can only share a
+ * token by aliasing, which can hide a violation but never invent one. */
+#ifndef SPIN_OWNER_NOTASK
+#define SPIN_OWNER_NOTASK 0x7fffffff
+#endif
+int spin_owner_self(void);
+
+/* Count of native spinlocks the current task holds, kept for the checks that
+ * it holds none when it sleeps or returns to user mode. */
+void spin_held_note(int delta);
+
+/* A lock released by a task that does not hold it, and a task spinning on a
+ * lock it already holds (kernel/sched/lockdep.c). Neither returns. */
+void spin_unlock_foreign(volatile int *lock, int self, u64 caller)
+    __attribute__((noreturn));
+void spin_lock_recursive(volatile int *lock, u64 caller) __attribute__((noreturn));
 
 /* How long a contended acquire may take before it is called a lockup.
  *
@@ -89,10 +108,19 @@ static inline u64 spin_rdtsc(void) { return 0; }
 #endif
 
 static inline void spin_lock(spinlock_t *lock) {
-    /* Spin until we successfully exchange 1 (locked) with the old value.
-     * xchg is implicitly locked on x86 when used with a memory operand. */
+    int self = spin_owner_self();
     u64 deadline = 0;
-    while (spin_xchg(lock, 1) != 0) {
+
+    for (;;) {
+        int seen = 0;
+
+        /* Compare-and-swap, not exchange: an exchange writes the waiter's
+         * token over the holder's on every failed attempt. */
+        if (__atomic_compare_exchange_n(lock, &seen, self, 0, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED))
+            break;
+        if (__builtin_expect(seen == self && self != SPIN_OWNER_NOTASK, 0))
+            spin_lock_recursive(lock, (u64)(usize)__builtin_return_address(0));
         /* Pause to hint to the CPU that we're in a spin-wait loop.
          * Improves performance and power consumption on SMP. */
 #if defined(__x86_64__)
@@ -120,19 +148,31 @@ static inline void spin_lock(spinlock_t *lock) {
         else if (spin_rdtsc() > deadline)
             spin_lock_stuck(lock, (u64)(usize)__builtin_return_address(0));
     }
+    spin_held_note(1);
     /* Held now. Under LOCKDEP this records who to blame when another CPU spins
      * on it; in the default build it compiles to nothing. */
     LOCKDEP_NOTE_SPIN_ACQUIRE(lock, (u64)(usize)__builtin_return_address(0));
 }
 
 static inline void spin_unlock(spinlock_t *lock) {
+    int held = *lock;
+
     /* Writing 0 over a lock that is already 0 would hide a second unlock --
      * and the next one would then release somebody else's acquire. */
-    if (__builtin_expect(*lock == 0, 0))
+    if (__builtin_expect(held == 0, 0))
         spin_unlock_unheld(lock, (u64)(usize)__builtin_return_address(0));
+    {
+        int self = spin_owner_self();
+
+        if (__builtin_expect(held != self && held != SPIN_OWNER_NOTASK &&
+                                 self != SPIN_OWNER_NOTASK, 0))
+            spin_unlock_foreign(lock, self,
+                                (u64)(usize)__builtin_return_address(0));
+    }
     /* Drop the holder record before the lock itself, so no window exists in
      * which the lock is free but still attributed to this CPU. */
     LOCKDEP_NOTE_SPIN_RELEASE(lock);
+    spin_held_note(-1);
     /* Store 0 with a release barrier so all previous writes are visible
      * before the lock is released. A compiler-only barrier is insufficient
      * on AArch64: another CPU may observe the unlocked word before the
@@ -150,8 +190,12 @@ static inline void spin_unlock(spinlock_t *lock) {
  * -- the panic path, which needs the console but cannot afford to hang on a
  * CPU that died holding it. */
 static inline int spin_trylock(spinlock_t *lock) {
-    if (spin_xchg(lock, 1) != 0)
+    int seen = 0;
+
+    if (!__atomic_compare_exchange_n(lock, &seen, spin_owner_self(), 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
         return 0;
+    spin_held_note(1);
     LOCKDEP_NOTE_SPIN_ACQUIRE(lock, (u64)(usize)__builtin_return_address(0));
     return 1;
 }

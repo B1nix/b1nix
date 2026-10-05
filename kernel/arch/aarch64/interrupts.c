@@ -618,10 +618,15 @@ void aarch64_async_vector(u64 kind)
 void aarch64_irq_handler(struct interrupt_frame *frame)
 {
 	int from_el0 = (frame->spsr & 0xFULL) == 0;
+	struct task *in_irq_of = current_task;
 
 	if (from_el0)
 		sched_acct_enter_kernel();
+	if (in_irq_of)
+		in_irq_of->irq_nest++;
 	aarch64_irq_handler_inner(frame);
+	if (in_irq_of)
+		in_irq_of->irq_nest--;
 	if (from_el0)
 		sched_acct_leave_kernel();
 }

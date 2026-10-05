@@ -282,7 +282,11 @@ int lkpi_spin_trylock(struct lkpi_spinlock *l)
 	 * `pushfd` the assembler rejects. */
 	u64 f = interrupts_save();
 
-	if (__atomic_exchange_n(&l->raw, 1, __ATOMIC_ACQUIRE) != 0) {
+	/* Through the native trylock, which the release below pairs with: it
+	 * records this task as the holder and counts the lock as held. A bare
+	 * exchange wrote 1, which names nobody, and the release then found the
+	 * lock held by a stranger. */
+	if (!spin_trylock((spinlock_t *)&l->raw)) {
 		interrupts_restore(f);
 		return 0;
 	}
@@ -395,3 +399,30 @@ void lkpi_spin_unlock(struct lkpi_spinlock *l)
 	if (lkpi_irqs_enabled())
 		lkpi_note_irq_on();
 }
+
+/* <linux/lockdep.h>: whether the current task holds a linuxkpi spinlock. The
+ * holder is recorded by every acquire path above; a lock taken where there is
+ * no task is held by "nobody", and so is held by a caller with no task. */
+int lkpi_lockdep_spin_held(const void *p)
+{
+	const struct lkpi_spinlock *l = p;
+	u64 me = current_task ? (u64)current_task->id : LKPI_LOCK_NO_TASK;
+
+	return l && l->raw != 0 && l->owner_task == me;
+}
+
+void lkpi_lockdep_assert_failed(const void *l, const char *what,
+                                const char *file, int line)
+{
+	console_write("\nLOCKDEP: assertion that lock 0x");
+	console_write_hex64((u64)(usize)l);
+	console_write(" is ");
+	console_write(what);
+	console_write(" failed at ");
+	console_write(file);
+	console_write(":");
+	console_write_dec((u64)line);
+	console_write("\n");
+	panic("lockdep assertion failed");
+}
+

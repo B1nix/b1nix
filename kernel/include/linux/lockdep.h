@@ -9,7 +9,6 @@
  * compile away and the assertions report "not checked" instead of "checked and
  * fine" — the difference matters when reading a bug report. */
 struct lock_class_key { int unused; };
-#define lockdep_assert_held(l)       do { (void)(l); } while (0)
 #define lockdep_assert_none_held_once() do { } while (0)
 /* Lock-class annotations the ww_mutex headers emit. Nothing is recorded — see
  * the note above on why they are not claimed to have been checked. */
@@ -18,9 +17,7 @@ struct lock_class_key { int unused; };
 #define lock_release(l, i)                           do { } while (0)
 #define lockdep_init_map(l, n, k, s)                 do { } while (0)
 
-#define lockdep_assert_held_once(l)  do { (void)(l); } while (0)
-#define lockdep_assert_once(cond)    do { (void)(cond); } while (0)
-#define lockdep_assert_not_held(l)   do { (void)(l); } while (0)
+#define lockdep_assert_once(cond)    lockdep_assert(cond)
 #define might_lock(l) do { (void)(l); } while (0)
 #define might_sleep() do { } while (0)
 
@@ -35,12 +32,69 @@ struct pin_cookie { int unused; };
  * side effect is still evaluated exactly as often as it would be upstream
  * (never, in a kernel built without lockdep). */
 #ifndef lockdep_assert
-#define lockdep_assert(cond)          do { } while (0)
-#define lockdep_assert_held(l)        do { (void)(l); } while (0)
-#define lockdep_assert_not_held(l)    do { (void)(l); } while (0)
-#define lockdep_assert_held_once(l)   do { (void)(l); } while (0)
+#define lockdep_assert(cond)                                                  \
+	do {                                                                   \
+		if (!(cond))                                                   \
+			lkpi_lockdep_assert_failed(0, #cond, __FILE__, __LINE__); \
+	} while (0)
 #define lockdep_assert_none_held_once() do { } while (0)
 #endif
+
+
+/*
+ * Lock-held assertions, checked.
+ *
+ * The lock-order classes above are not modelled, but whether the CURRENT task
+ * holds a given lock is: linuxkpi spinlocks, mutexes and rwsems all record
+ * their holder. An assertion on one of those is therefore real, and a caller
+ * that reaches a "must hold X" path without X panics there. A lock type with
+ * no recorded holder answers "held" -- not checked, rather than refused -- so a
+ * correct caller is never aborted by a question this shim cannot answer.
+ */
+int lkpi_lockdep_spin_held(const void *l);
+int lkpi_lockdep_mutex_held(const void *m);
+int lkpi_lockdep_rwsem_held(const void *s, int mode); /* 0 any, 1 write, 2 read */
+void lkpi_lockdep_assert_failed(const void *l, const char *what,
+                                const char *file, int line)
+	__attribute__((noreturn));
+
+#define lkpi_lockdep_held_mode(l, mode)                                       \
+	_Generic((l),                                                          \
+		struct lkpi_spinlock *: lkpi_lockdep_spin_held((const void *)(l)),      \
+		const struct lkpi_spinlock *: lkpi_lockdep_spin_held((const void *)(l)),\
+		struct mutex *: lkpi_lockdep_mutex_held((const void *)(l)),             \
+		const struct mutex *: lkpi_lockdep_mutex_held((const void *)(l)),       \
+		struct rw_semaphore *: lkpi_lockdep_rwsem_held((const void *)(l), (mode)),\
+		const struct rw_semaphore *: lkpi_lockdep_rwsem_held((const void *)(l), (mode)),\
+		default: 1)
+
+#define lockdep_is_held(l)          lkpi_lockdep_held_mode((l), 0)
+#define lockdep_is_held_type(l, r)  lkpi_lockdep_held_mode((l), (r) == 0 ? 1 : (r) == 1 ? 2 : 0)
+#define lock_is_held(l)             1
+#define lock_is_held_type(l, r)     1
+
+#define lkpi_lockdep_assert_mode(l, mode, what)                               \
+	do {                                                                   \
+		if (!lkpi_lockdep_held_mode((l), (mode)))                      \
+			lkpi_lockdep_assert_failed((const void *)(l), (what),  \
+			                           __FILE__, __LINE__);        \
+	} while (0)
+
+#define lockdep_assert_held(l)       lkpi_lockdep_assert_mode((l), 0, "held")
+#define lockdep_assert_held_once(l)  lkpi_lockdep_assert_mode((l), 0, "held")
+#define lockdep_assert_held_write(l) lkpi_lockdep_assert_mode((l), 1, "held for write")
+#define lockdep_assert_held_read(l)  lkpi_lockdep_assert_mode((l), 2, "held for read")
+#define assert_spin_locked(l)        lkpi_lockdep_assert_mode((l), 0, "spin-locked")
+/* "Not held" cannot answer "not checked" safely for unknown types, so only the
+ * types with a recorded holder are tested. */
+#define lockdep_assert_not_held(l)                                            \
+	do {                                                                   \
+		if (_Generic((l), struct lkpi_spinlock *: 1, struct mutex *: 1, \
+		             struct rw_semaphore *: 1, default: 0) &&          \
+		    lkpi_lockdep_held_mode((l), 1))                            \
+			lkpi_lockdep_assert_failed((const void *)(l), "not held", \
+			                           __FILE__, __LINE__);        \
+	} while (0)
 
 
 /* Pinning marks a lock that must still be held when the caller returns from a
@@ -79,16 +133,11 @@ struct pin_cookie { int unused; };
 #define rwsem_release(l, i)            do { } while (0)
 #define lock_map_acquire(l)            do { } while (0)
 #define lock_map_release(l)            do { } while (0)
-#define lockdep_assert_held_write(l)   do { (void)(l); } while (0)
-#define lockdep_assert_held_read(l)    do { (void)(l); } while (0)
-#define lockdep_assert_not_held(l)     do { (void)(l); } while (0)
-#define lockdep_is_held(l)             1
 #define lockdep_is_held_type(l, r)     1
 
 /* Whether the caller holds a given lock. With no lockdep there is nothing to
  * consult, and the answer is the one that makes an assertion pass rather than
  * fail — a false negative here would abort a correct caller. */
-#define lock_is_held(l)      1
 #define lock_is_held_type(l, r) 1
 
 /* Dynamically allocated lock classes; nothing to register without lockdep. */

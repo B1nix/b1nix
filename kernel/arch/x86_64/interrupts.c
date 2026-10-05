@@ -938,9 +938,17 @@ void x86_irq_handler(struct interrupt_frame *frame) {
    * They only ever fire with the CPU already in ring 0, so skipping them costs
    * no accuracy. */
   int from_user = (frame->cs == 0x1B || frame->cs == 0x23);
+  /* Vectors below 32 are exceptions the task itself raised, which run in its
+   * own context; 32 and up are interrupts, which do not. */
+  struct task *in_irq_of = frame->vector >= 32 ? current_task : 0;
+
   if (from_user)
     sched_acct_enter_kernel();
+  if (in_irq_of)
+    in_irq_of->irq_nest++;
   x86_irq_handler_dispatch(frame);
+  if (in_irq_of)
+    in_irq_of->irq_nest--;
   if (from_user) {
     sched_acct_leave_kernel();
     interrupts_disable();

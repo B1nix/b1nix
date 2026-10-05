@@ -20,6 +20,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <lkpi/rwsem.h>
+#include <b1nix/klog.h>
 
 _Static_assert(sizeof(spinlock_t) == sizeof(int),
                "lkpi_rwsem's guard word must match b1nix's spinlock_t");
@@ -111,8 +112,10 @@ void lkpi_rwsem_up_read(struct lkpi_rwsem *s)
 	u64 flags;
 	int last = 0;
 	spin_lock_irqsave(&s->guard, &flags);
-	if (s->readers > 0)
-		s->readers--;
+	/* A release with no reader is a second up_read or one that never had a
+	 * down_read; clamping it hid which. */
+	KASSERT(s->readers > 0, "up_read of rwsem %p with no reader", (void *)s);
+	s->readers--;
 	/* Only the reader that emptied the semaphore can have unblocked a writer,
 	 * and only a writer that is waiting needs telling. */
 	last = (s->readers == 0) && s->writers_waiting != 0;
@@ -186,6 +189,9 @@ void lkpi_rwsem_up_write(struct lkpi_rwsem *s)
 	int waiters;
 
 	spin_lock_irqsave(&s->guard, &flags);
+	KASSERT(s->writer && s->owner == rwsem_current_id(),
+	        "up_write of rwsem %p by task %lu, write-held by %lu", (void *)s,
+	        (unsigned long)rwsem_current_id(), (unsigned long)s->owner);
 	s->writer = 0;
 	s->owner = 0;
 	waiters = s->writers_waiting != 0 || s->readers_waiting != 0;
@@ -282,3 +288,19 @@ void lkpi_sema_up(struct lkpi_semaphore *s)
 	spin_unlock_irqrestore(&s->guard, flags);
 	scheduler_wake_all(s);
 }
+
+/* <linux/lockdep.h>: struct rw_semaphore is a lkpi_rwsem. Readers are counted,
+ * not named, so "held for read" means some task reads it. */
+int lkpi_lockdep_rwsem_held(const void *p, int mode)
+{
+	const struct lkpi_rwsem *s = p;
+
+	if (!s)
+		return 0;
+	if (mode == 1)
+		return s->writer && s->owner == rwsem_current_id();
+	if (mode == 2)
+		return s->readers > 0;
+	return (s->writer && s->owner == rwsem_current_id()) || s->readers > 0;
+}
+

@@ -1075,3 +1075,9 @@ int lkpi_mutex_is_locked_by_current(struct lkpi_mutex *m)
 		return 0;
 	return m->locked && m->owner == lkpi_current_id();
 }
+
+/* <linux/lockdep.h>: struct mutex is a lkpi_mutex and nothing else. */
+int lkpi_lockdep_mutex_held(const void *m)
+{
+	return lkpi_mutex_is_locked_by_current((struct lkpi_mutex *)m);
+}

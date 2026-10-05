@@ -1645,3 +1645,11 @@ u64 lkpi_monotonic_ns(void)
 	 * for sixty seconds of silence. */
 	return lkpi_ticks() * 10000000ull;
 }
+
+int lkpi_in_hardirq(void)
+{
+	struct task *t = current_task;
+
+	return t && t->irq_nest > 0;
+}
+

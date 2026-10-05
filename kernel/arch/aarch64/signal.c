@@ -201,6 +201,7 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
    * == 0 means the interrupted context was EL0t (userspace). */
   if ((frame->spsr & 0xFULL) != 0)
     return;
+  sched_assert_user_return();
 
   interrupts_disable();
 

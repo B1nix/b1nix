@@ -6518,7 +6518,18 @@ static int scheduler_yield_inner(void) {
   return 1; /* we switched out and have since been resumed */
 }
 
+/* Sleeping gives the CPU up for an unbounded time, and a native spinlock held
+ * across it strands every CPU that wants it (FreeBSD's sleepq check, Linux's
+ * might_sleep). Checked at every way into a sleep. */
+static inline void sched_assert_may_sleep(const char *what) {
+  KASSERT(!current_task || current_task->spin_held == 0,
+          "%s with %d native spinlock(s) held", what, current_task->spin_held);
+  KASSERT(!current_task || current_task->irq_nest == 0,
+          "%s from an interrupt handler", what);
+}
+
 void scheduler_block_current(void) {
+  sched_assert_may_sleep(__func__);
   /* Preserve the caller's interrupt state, the way scheduler_yield does.
    *
    * This used to unmask unconditionally on the way out, so a caller that
@@ -6605,6 +6616,7 @@ void scheduler_wake_task(usize task_id) {
 }
 
 void scheduler_block_on(void *chan) {
+  sched_assert_may_sleep(__func__);
   /* Caller's interrupt state is preserved — see scheduler_block_current. */
   int restore_irqs = interrupts_enabled();
 
@@ -6649,6 +6661,7 @@ u64 scheduler_get_ticks(void) {
 }
 
 void scheduler_block_on_timeout(void *chan, u64 timeout_ticks) {
+  sched_assert_may_sleep(__func__);
   /* Caller's interrupt state is preserved — see scheduler_block_current. */
   int restore_irqs = interrupts_enabled();
 
@@ -6741,8 +6754,32 @@ void scheduler_dump_park_sites(void) {
   }
 }
 
+/* Every return to user mode: nothing the kernel took on this task's behalf may
+ * still be held (FreeBSD's userret checks). A lock carried out to user mode is
+ * held for as long as the program cares to run. */
+void sched_assert_user_return(void) {
+  struct task *t = current_task;
+  extern int lkpi_holding_spinlock(void);
+  extern int vfs_wlocks_held_by(u64 owner);
+
+  if (!t)
+    return;
+  KASSERT(t->spin_held == 0,
+          "return to user mode with %d native spinlock(s) held", t->spin_held);
+  KASSERT(g_task_preempt_depth[task_index(t)] == 0,
+          "return to user mode with preemption disabled (depth %d)",
+          (int)g_task_preempt_depth[task_index(t)]);
+  KASSERT(!lkpi_holding_spinlock(),
+          "return to user mode with %d lkpi spinlock(s) held",
+          lkpi_holding_spinlock());
+  KASSERT(!vfs_wlocks_held_by((u64)t->id),
+          "return to user mode holding %d inode write lock(s)",
+          vfs_wlocks_held_by((u64)t->id));
+}
+
 void scheduler_wait_prepare(void *chan) {
   int irq_was_on = interrupts_enabled();
+
 
   if (current_task && (usize)current_task->id < SCHED_MAX_TASKS)
     g_park_site[current_task->id] = __builtin_return_address(0);
@@ -6759,6 +6796,11 @@ void scheduler_wait_prepare(void *chan) {
 }
 
 void scheduler_wait_commit(void) {
+  /* Arming may happen under a lock -- prepare, unlock, commit is the pattern
+   * that closes the lost-wakeup window -- but the commit is the sleep, and it
+   * ends by enabling interrupts: nothing may be held across it. That rule was
+   * only a comment below. */
+  sched_assert_may_sleep(__func__);
   int switched = scheduler_yield();
 
   /*
@@ -6906,10 +6948,16 @@ void scheduler_wait_cancel(void) {
  * deadline guarantees forward progress if an interrupt is ever genuinely lost
  * (or the controller never raises one). timeout_ticks == 0 means no deadline. */
 void scheduler_wait_prepare_timeout(void *chan, u64 timeout_ticks) {
+  int irq_was_on = interrupts_enabled();
+
   interrupts_disable();
   if (current_task == 0)
     panic("scheduler_wait_prepare_timeout without running task");
   current_task->wait_chan = chan;
+  /* Recorded here as in scheduler_wait_prepare. Without it the commit read
+   * whatever the task's previous untimed wait had left, and could open
+   * interrupts for a caller that had them closed. */
+  current_task->wait_irq_was_on = irq_was_on;
   if (timeout_ticks) {
     current_task->wake_tick = scheduler_ticks + timeout_ticks;
     sched_note_deadline(current_task->wake_tick);
@@ -7029,6 +7077,7 @@ void scheduler_sleep_ticks(u64 ticks) {
  * one line in the log and a rebuild with printf to find it.
  */
 int scheduler_sleep_ticks_state(u64 ticks, int strict) {
+  sched_assert_may_sleep(__func__);
   interrupts_disable();
 
   if (current_task == 0) {
