@@ -1184,9 +1184,17 @@ static void vfs_inode_lock_note(struct vfs_inode *inode, const void *site) {
   inode->rw_site = site;
 }
 
+/* Only the holder's own record is cleared. A reader runs this after its
+ * decrement has already freed the lock, and by then a writer may have taken
+ * it and written its own name here: an unconditional store wiped that, and
+ * the writer's unlock then found the lock owned by nobody. */
 static void vfs_inode_lock_clear_note(struct vfs_inode *inode) {
-  __atomic_store_n(&inode->rw_owner, 0, __ATOMIC_RELAXED);
-  inode->rw_site = 0;
+  struct task *t = current_task;
+  u64 me = t ? (u64)t->id : 0;
+
+  if (__atomic_compare_exchange_n(&inode->rw_owner, &me, 0, 0,
+                                  __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+    inode->rw_site = 0;
 }
 
 __attribute__((noinline))

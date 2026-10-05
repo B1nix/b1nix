@@ -288,6 +288,24 @@ static void spin_owner_report(volatile int *lock) {
 }
 
 
+void spin_unlock_unheld(volatile int *lock, u64 caller) {
+    console_bust_lock();
+    console_write("\nSPINLOCK unlocked while not held on cpu ");
+    console_write_dec((u64)percpu_read(cpu_id));
+    console_write(": lock=0x");
+    console_write_hex64((u64)(usize)lock);
+    console_write(" from 0x");
+    console_write_hex64(caller);
+    ksym_print(caller);
+    console_write("\n");
+    {
+        extern void kheap_describe(u64 addr, const char *prefix);
+
+        kheap_describe((u64)(usize)lock, "  lock lives in ");
+    }
+    panic("spinlock: unlock of a lock that is not held");
+}
+
 void spin_lock_stuck(volatile int *lock, u64 caller) {
     console_bust_lock();
     console_write("\nSPINLOCK LOCKUP on cpu ");

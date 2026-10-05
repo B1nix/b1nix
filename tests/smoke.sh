@@ -1380,27 +1380,30 @@ with open('$_zdir/zbig.bin','wb') as f:
 				--compress zstd --rootdir "$_zdir" "$BTRFSZ_IMG" 2>/dev/null &&
 				btrfs inspect-internal dump-tree -t fs "$BTRFSZ_IMG" 2>/dev/null |
 				grep -q "compression 3"; then
-				EXTRA_BTRFSZ="-drive file=$BTRFSZ_IMG,if=none,id=btrfszdisk,format=raw -device $vblk_device,drive=btrfszdisk"
+				EXTRA_BTRFSZ="-drive file=$BTRFSZ_IMG,if=none,id=btrfszdisk,format=raw,cache=unsafe -device $vblk_device,drive=btrfszdisk"
 			else
 				# No image means no checks: the verdict below keys off it.
 				rm -f "$BTRFSZ_IMG"
 			fi
 			rm -rf "$_zdir"
 		fi
-		EXTRA_QEMU_ARGS="-drive file=$(disk_img usb blk),if=none,id=usbdisk,format=raw -device usb-storage,bus=xhci.0,drive=usbdisk \
-			-drive file=$(disk_img vblk blk),if=none,id=vblkdisk,format=raw,discard=unmap -device $vblk_device,drive=vblkdisk"
+		EXTRA_QEMU_ARGS="-drive file=$(disk_img usb blk),if=none,id=usbdisk,format=raw,cache=unsafe -device usb-storage,bus=xhci.0,drive=usbdisk \
+			-drive file=$(disk_img vblk blk),if=none,id=vblkdisk,format=raw,cache=unsafe,discard=unmap -device $vblk_device,drive=vblkdisk"
 		if [ "$BTRFS_READY" = 1 ]; then
 			EXTRA_QEMU_ARGS="$EXTRA_QEMU_ARGS \
-			-drive file=$BTRFS_IMG,if=none,id=btrfsdisk,format=raw -device $vblk_device,drive=btrfsdisk"
+			-drive file=$BTRFS_IMG,if=none,id=btrfsdisk,format=raw,cache=unsafe -device $vblk_device,drive=btrfsdisk"
 		fi
 		[ -n "$EXTRA_BTRFSZ" ] && EXTRA_QEMU_ARGS="$EXTRA_QEMU_ARGS $EXTRA_BTRFSZ"
 		# A raw disk for the kernel's block cache self-test, marked in its
 		# first sector, and larger than the cache so reads and writes evict.
+		# These disks are scratch: cache=unsafe keeps a guest FLUSH from
+		# becoming a host fdatasync, which on a busy host stalled one for
+		# forty seconds and wedged the lane. The guest still waits for it.
 		BCACHE_IMG=$(disk_img bcache blk)
 		rm -f "$BCACHE_IMG"; truncate -s 64M "$BCACHE_IMG"
 		command printf 'B1NIX-BCACHE-TEST' | dd of="$BCACHE_IMG" conv=notrunc 2>/dev/null
 		EXTRA_QEMU_ARGS="$EXTRA_QEMU_ARGS \
-			-drive file=$BCACHE_IMG,if=none,id=bcachedisk,format=raw -device $vblk_device,drive=bcachedisk"
+			-drive file=$BCACHE_IMG,if=none,id=bcachedisk,format=raw,cache=unsafe -device $vblk_device,drive=bcachedisk"
 		export BTRFS_READY
 		if [ -n "$_bios" ]; then
 			EXTRA_QEMU_ARGS="$EXTRA_QEMU_ARGS \

@@ -47,6 +47,10 @@ void device_initialize(struct device *dev)
 	dev->devres = 0;
 	lkpi_mutex_init(&dev->devres_lock);
 	lkpi_device_init(&dev->lk, name, 0);
+	/* dev->kobj is where imported code hangs its sysfs children, and every
+	 * child takes a reference on it: it needs a live count of its own. The
+	 * device's memory is its owner's to free, so it has no release. */
+	lkpi_kobject_init_and_add(&dev->kobj, name, 0, 0);
 }
 
 static void *devres_alloc(struct device *dev, usize size, gfp_t flags,

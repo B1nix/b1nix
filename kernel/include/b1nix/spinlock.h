@@ -45,6 +45,10 @@ void tlb_shootdown_poll(void);
  * Does not return. */
 void spin_lock_stuck(volatile int *lock, u64 caller) __attribute__((noreturn));
 
+/* Reports an unlock of a lock nobody holds -- a second unlock, or an unlock
+ * on a path that never locked (kernel/sched/lockdep.c). Does not return. */
+void spin_unlock_unheld(volatile int *lock, u64 caller) __attribute__((noreturn));
+
 /* How long a contended acquire may take before it is called a lockup.
  *
  * This used to count iterations, which is not a measure of time on a machine
@@ -122,6 +126,10 @@ static inline void spin_lock(spinlock_t *lock) {
 }
 
 static inline void spin_unlock(spinlock_t *lock) {
+    /* Writing 0 over a lock that is already 0 would hide a second unlock --
+     * and the next one would then release somebody else's acquire. */
+    if (__builtin_expect(*lock == 0, 0))
+        spin_unlock_unheld(lock, (u64)(usize)__builtin_return_address(0));
     /* Drop the holder record before the lock itself, so no window exists in
      * which the lock is free but still attributed to this CPU. */
     LOCKDEP_NOTE_SPIN_RELEASE(lock);

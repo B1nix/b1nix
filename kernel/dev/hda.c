@@ -892,6 +892,22 @@ static int hda_resume(void *ctx) {
 	while (__sync_lock_test_and_set(&hda_play_lock, 1))
 		scheduler_yield();
 	hda_controller_reset();
+	/* The codec announces itself in STATESTS when it is ready for verbs. The
+	 * fixed millisecond after reset is the earliest that can happen, not a
+	 * promise: a codec that came up later missed the configuration verbs
+	 * sent below, and the stream played into a converter nobody had set up
+	 * -- silence after some sleeps and not others. */
+	{
+		int up = 0;
+
+		for (int i = 0; i < 100 && !up; i++) {
+			up = (hda_r16(HDA_STATESTS) >> hda_codec_addr) & 1;
+			if (!up)
+				hda_delay_ms(1);
+		}
+		if (!up)
+			console_write("hda: codec did not come back after the resume\n");
+	}
 	if (hda_program_corb_rirb() < 0) {
 		__sync_lock_release(&hda_play_lock);
 		return -EIO;
@@ -979,12 +995,23 @@ static isize hda_dsp_write(struct vfs_node *node, u64 offset, const char *buffer
 		/* Bounded: the chunk is at most the buffer, which is well under a
 		 * second of audio. */
 		struct hda_wait w = hda_wait_start();
+		int played = 1;
 		while (!(hda_r8(sdo_off + HDA_SDO_STS) & HDA_SDO_STS_BCIS)) {
-			if (hda_wait_over(&w)) break;
+			if (hda_wait_over(&w)) {
+				played = 0;
+				break;
+			}
 			scheduler_yield();
 		}
 		hda_w32(sdo_off + HDA_SDO_CTL0, ctl0 & ~(HDA_SDO_CTL0_RUN | HDA_SDO_CTL0_SRST));
 		hda_w8(sdo_off + HDA_SDO_STS, HDA_SDO_STS_BCIS);
+		/* The stream never finished the chunk: the samples were not played,
+		 * and saying they were is the lie that made a silent card look like
+		 * a working one. */
+		if (!played) {
+			__sync_lock_release(&hda_play_lock);
+			return written ? (isize)written : -EIO;
+		}
 
 		written += chunk;
 		avail   -= chunk;

@@ -81,9 +81,10 @@ struct dev_pm_info {
 };
 
 struct device {
-	/* Imported code reaches for dev->kobj to hang sysfs entries off. It is the
-	 * kobject inside the embedded lkpi_device, exposed under the name Linux
-	 * uses so those references resolve to one object rather than two. */
+	/* Imported code reaches for dev->kobj to hang sysfs entries off. It is a
+	 * kobject of its own beside the one in the embedded lkpi_device;
+	 * device_initialize() starts both counts, and sysfs registration copies
+	 * the directory between them. */
 	struct kobject kobj;
 	struct dev_pm_info power;
 	const char *init_name;
