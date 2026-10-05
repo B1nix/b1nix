@@ -2983,6 +2983,58 @@ void vfs_detach_child(struct vfs_node *parent, struct vfs_node *child) {
   dcache_invalidate(parent, child->name);
 }
 
+/*
+ * Forget a name the filesystem has already removed by itself -- the way an
+ * unlink ends, without asking the filesystem first. btrfs deletes a subvolume
+ * through its own ioctl, never through rmdir, and the node cached under that
+ * name went on answering every lookup: `stat` found the deleted subvolume and
+ * `mkdir` of the same name failed with EEXIST.
+ */
+void vfs_forget_child(struct vfs_node *parent, const char *name) {
+  struct vfs_node *child = find_child(parent, name);
+
+  if (!child)
+    return;
+  child->deleted = 1;
+  if (child->inode) {
+    if (child->inode->nlink)
+      child->inode->nlink--;
+    icache_invalidate(child->inode->fs_id, child->inode->ino);
+  }
+  vfs_detach_child(parent, child);
+  vfs_node_put(child);
+  vfs_dir_changed(parent);
+}
+
+/* vfs_forget_child for every cached child `gone` says the filesystem no
+ * longer has. `gone` runs under the tree lock and must not sleep. */
+void vfs_prune_children(struct vfs_node *dir,
+                        int (*gone)(struct vfs_node *child)) {
+  char name[VFS_NAME_MAX];
+
+  if (!dir || !gone)
+    return;
+  /* Bounded: each pass removes the name it found, and a directory cannot
+   * hold more cached children than this in any real case. */
+  for (int pass = 0; pass < 4096; pass++) {
+    u64 flags;
+    int found = 0;
+
+    vfs_tree_read_acquire(&flags);
+    for (struct vfs_node *c = dir->first_child; c; c = c->next_sibling) {
+      if (!c->deleted && gone(c)) {
+        copy_path(name, sizeof(name), c->name);
+        found = 1;
+        break;
+      }
+    }
+    vfs_tree_read_release(flags);
+    if (!found)
+      return;
+    vfs_forget_child(dir, name);
+  }
+}
+
 isize vfs_readdir_children(struct vfs_node *dir, usize offset,
                            struct dirent *buf, usize max_entries) {
   if (!dir || !buf)
@@ -11183,7 +11235,7 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
       /* Real information rather than a constant: a loop device associated
        * through a read-only descriptor refuses writes, and blockdev --getro
        * should say so. */
-      int ro = bd->write_blocks ? 0 : 1;
+      int ro = blk_is_read_only(bd);
       return syscall_copyout(arg, &ro, sizeof(ro)) < 0 ? -EFAULT : 0;
     }
     default:

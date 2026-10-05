@@ -501,5 +501,31 @@ void btrfs_selftest(void) {
         }
     }
 
+    /* A read-only mount first, then a read-write one of the same filesystem:
+     * what an installed system does at boot, its initramfs mounting / read-only
+     * before fstab mounts /home. The device was marked read-only by the first
+     * open, and the second mount failed with EACCES. */
+    if (vfs_umount("/mnt/btrfs") == 0) {
+        int ok = 0;
+
+        vfs_mkdir("/mnt/btrfs-ro", 0755);
+        if (vfs_mount(dev_name, "/mnt/btrfs-ro", "btrfs", MS_RDONLY) == 0) {
+            if (vfs_mount(dev_name, "/mnt/btrfs", "btrfs", 0) == 0) {
+                int fd = vfs_open_flags("/mnt/btrfs/rw-after-ro.txt",
+                                        B1NIX_O_RDWR | B1NIX_O_CREAT);
+
+                if (fd >= 0) {
+                    ok = vfs_write(fd, "rw\n", 3) == 3 && vfs_fsync(fd) == 0;
+                    vfs_close(fd);
+                }
+            }
+            vfs_umount("/mnt/btrfs-ro");
+        }
+        console_write(ok ? "M119-BTRFS: ok ro-then-rw\n"
+                         : "M119-BTRFS: FAIL ro-then-rw\n");
+    } else {
+        console_write("M119-BTRFS: FAIL ro-then-rw (umount)\n");
+    }
+
     console_write("M119-BTRFS: done\n");
 }

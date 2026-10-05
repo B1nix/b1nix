@@ -39,6 +39,8 @@ void *lkpi_bridge_mount(const char *fstype, const char *source,
 void lkpi_bridge_unmount(void *root);
 
 void *lkpi_bridge_lookup(void *dir, const char *name);
+/* 1 when the filesystem has removed the name behind this handle itself. */
+int lkpi_bridge_gone(void *node);
 void lkpi_bridge_put(void *node);
 int lkpi_bridge_attr(void *node, struct lkpi_bridge_attr *out);
 /* chattr: store the FS_IOC_SETFLAGS bits through the filesystem. */

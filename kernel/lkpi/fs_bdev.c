@@ -37,6 +37,7 @@ struct b1nix_block_device;
 struct b1nix_block_device *lkpi_blk_get(const char *name);
 struct b1nix_block_device *lkpi_blk_from_devno(u64 rdev);
 u64 lkpi_blk_block_count(struct b1nix_block_device *dev);
+int lkpi_blk_read_only(struct b1nix_block_device *dev);
 unsigned int lkpi_blk_block_size(struct b1nix_block_device *dev);
 u32 lkpi_blk_devno(struct b1nix_block_device *dev);
 const char *lkpi_blk_name(struct b1nix_block_device *dev);
@@ -385,7 +386,13 @@ struct block_device *blkdev_get_by_path(const char *path, blk_mode_t mode,
 		bdev->bd_holder = holder;
 	}
 	bdev_refresh(bdev);
-	bdev->bd_read_only = (mode & BLK_OPEN_WRITE) ? 0 : 1;
+	/* Whether the DEVICE can be written, not how this open asked for it: as
+	 * in Linux, where bd_read_only is the disk's own flag. Taken from the
+	 * open mode, a read-only mount marked the device read-only for good --
+	 * btrfs counted no writable device, a second mount of the same
+	 * filesystem read-write failed with EACCES, and an installed system whose
+	 * initramfs mounts / read-only came up without /home. */
+	bdev->bd_read_only = lkpi_blk_read_only(dev);
 	atomic_inc(&bdev->bd_openers);
 	return bdev;
 }
@@ -408,6 +415,7 @@ struct block_device *blkdev_get_by_dev(dev_t dev, blk_mode_t mode, void *holder,
 		bdev->bd_holder = holder;
 	}
 	bdev_refresh(bdev);
+	bdev->bd_read_only = lkpi_blk_read_only(b1dev);
 	atomic_inc(&bdev->bd_openers);
 	return bdev;
 }

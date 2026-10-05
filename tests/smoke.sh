@@ -2545,6 +2545,7 @@ check_output "$LOG" "M26-SMOKE: start" "M26 smoke starts"
 check_output "$LOG" "M26-SMOKE: ok selfhost-status" "selfhost status syscall works"
 check_output "$LOG" "M26-SMOKE: ok toolchain-ready" "native toolchain (clang/binutils/make) is ported"
 check_output "$LOG" "M26-SMOKE: ok readdir" "libc opendir/readdir over SYS_GETDENTS works"
+check_output "$LOG" "M26-SMOKE: ok readdir-dots" "a directory on the btrfs root lists . and .. once each"
 # NOTE: in-guest full kernel self-build is not yet verified, so the marker is
 # "pending can-build-kernel" (not "ok"). Flip the kernel flag + this check to
 # "ok can-build-kernel" only once an in-guest kernel.elf actually builds.
@@ -4144,7 +4145,7 @@ check_output "$LOG" "M109-SMOKE: ok veth-carries-frame" "a frame sent on one end
 check_output "$LOG" "M109-SMOKE: ok net-namespace" "unshare(CLONE_NEWNET) leaves a task with no interfaces at all - not the NIC, not a veth pair created before the unshare"
 check_output "$LOG" "M109-SMOKE: ok veth-crosses-namespace" "one veth end moved into another network namespace vanishes from this one, and a frame sent here is received there"
 check_output "$LOG" "M109-SMOKE: ok unlink-enoent" "unlink of a name that exists on neither the filesystem nor the VFS still fails ENOENT, while an in-memory device node on an on-disk directory really is removed"
-check_output "$LOG" "M109-UEVENT: ok sysfs-dev-tree" "/sys/dev/block/<maj:min> is a link named for the device (what lsblk resolves), and its dev and uevent agree with the block node in /dev"
+check_output "$LOG" "M109-UEVENT: ok sysfs-dev-tree" "/sys/dev/block/<maj:min> is a link named for the device (what lsblk resolves), its dev and uevent agree with the block node in /dev, and a partition says where it starts"
 check_output "$LOG" "M109-UEVENT: ok sysfs-subsystem-link" "each device directory carries a subsystem symlink whose basename names the subsystem udev matches on"
 check_output "$LOG" "M109-UEVENT: ok uevent-trigger" "writing add to a device's sysfs uevent file re-announces it on the netlink group, DEVTYPE included (device coldplug: what udevadm trigger and mdev -s do)"
 check_output "$LOG" "M109-UEVENT: ok uevent-trigger-tty" "the same coldplug write works on a device that is not a disk: /sys/class/tty/tty1/uevent takes an add and re-announces the terminal (it was read-only, so udevadm trigger reached no tty at all)"
@@ -4523,6 +4524,7 @@ if command -v mkfs.btrfs >/dev/null 2>&1; then
 	check_output "$BLK_LOG" "M119-BTRFS: ok rename" "btrfs: rename moves the entries and leaves nothing at the old name"
 	check_output "$BLK_LOG" "M119-BTRFS: ok truncate" "btrfs: truncate shortens a file and frees the extents past its new end"
 	check_output "$BLK_LOG" "M119-BTRFS: ok unlink-rmdir" "btrfs: a non-empty directory refuses to go, and unlink then rmdir remove both"
+	check_output "$BLK_LOG" "M119-BTRFS: ok ro-then-rw" "btrfs: a read-write mount beside a read-only one of the same filesystem writes (what an installed system's /home does at boot)"
 	check_output "$BLK_LOG" "M119-BTRFS: done" "btrfs read and write checks complete"
 	# The judge that was not written here. btrfs check walks the extent tree,
 	# the checksum tree and the back-references and says whether the

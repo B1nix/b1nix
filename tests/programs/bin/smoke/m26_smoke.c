@@ -68,13 +68,17 @@ int main(void) {
       marker("M26-SMOKE: fail readdir-opendir\n");
       return 1;
     }
-    int found_self = 0, n = 0;
+    int found_self = 0, n = 0, dot = 0, dotdot = 0;
     struct dirent *e;
     while ((e = readdir(d)) != 0) {
       n++;
       if (strcmp(e->d_name, "m26-smoke") == 0 ||
           strcmp(e->d_name, "m26_smoke") == 0)
         found_self = 1;
+      if (strcmp(e->d_name, ".") == 0)
+        dot++;
+      if (strcmp(e->d_name, "..") == 0)
+        dotdot++;
     }
     closedir(d);
     if (n > 0 && found_self) {
@@ -83,6 +87,12 @@ int main(void) {
       marker("M26-SMOKE: fail readdir\n");
       return 1;
     }
+    /* "." and ".." once each, as on Linux -- on the root filesystem (btrfs)
+     * they used to be missing altogether. */
+    if (dot == 1 && dotdot == 1)
+      marker("M26-SMOKE: ok readdir-dots\n");
+    else
+      marker("M26-SMOKE: fail readdir-dots\n");
   }
 
   marker("M26-SMOKE: done\n");

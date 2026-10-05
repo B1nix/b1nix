@@ -668,6 +668,12 @@ u64 lkpi_blk_block_count(struct block_device *dev)
 	return dev ? dev->block_count : 0;
 }
 
+/* The same answer BLKROGET gives: a device that cannot be written. */
+int lkpi_blk_read_only(struct block_device *dev)
+{
+	return blk_is_read_only(dev);
+}
+
 unsigned int lkpi_blk_block_size(struct block_device *dev)
 {
 	return dev ? (unsigned int)dev->block_size : 0;

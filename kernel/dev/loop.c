@@ -82,6 +82,11 @@ static int loop_read_blocks(struct block_device *dev, u64 lba, u32 count, void *
 /* M107: loop devices are writable. Without this a loop-mounted image was
  * read-only in a way nothing reported — writes reached the block cache and
  * were silently dropped at flush time because the device had no write path. */
+int loop_is_read_only(struct block_device *dev) {
+    struct loop_device *loop = dev ? (struct loop_device *)dev->priv : 0;
+    return loop && loop->readonly;
+}
+
 static int loop_write_blocks(struct block_device *dev, u64 lba, u32 count,
                              const void *buffer) {
     struct loop_device *loop = (struct loop_device *)dev->priv;

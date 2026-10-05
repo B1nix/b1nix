@@ -630,6 +630,23 @@ static void test_sysfs_dev_tree(void) {
       return;
     }
 
+    /* A partition says where it starts, in 512-byte sectors: libblkid
+     * matches start and size against the parent's table to find the
+     * partition's own entry (its type, name and UUID). */
+    snprintf(path, sizeof(path), "/sys/dev/block/%s/partition", ent->d_name);
+    if (read_file(path, buf, sizeof(buf)) > 0) {
+      char *end;
+      snprintf(path, sizeof(path), "/sys/dev/block/%s/start", ent->d_name);
+      if (read_file(path, buf, sizeof(buf)) <= 0 ||
+          (strtoull(buf, &end, 10), end == buf)) {
+        char why[128];
+        snprintf(why, sizeof(why), "partition %s has no start", ent->d_name);
+        closedir(d);
+        failm("sysfs-dev-tree", why);
+        return;
+      }
+    }
+
     snprintf(path, sizeof(path), "/sys/dev/block/%s/uevent", ent->d_name);
     if (read_file(path, buf, sizeof(buf)) <= 0) {
       closedir(d);

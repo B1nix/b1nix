@@ -559,8 +559,21 @@ static void sysfs_block_publish(usize index, struct block_device *d) {
     if (bd) {
       sysfs_mkstr(bd, "dev", "%s\n", majmin);
       sysfs_mk_live_size(bd, (int)index);
+      /* Both kinds carry these; a partition's start is in 512-byte sectors,
+       * whatever the disk's block size. libblkid finds a partition's own
+       * table entry (PART_ENTRY_TYPE, _NAME, _UUID) by matching start and
+       * size against the parent's table: without start, `blkid -p` on a
+       * partition answered nothing, and the installer could not tell which
+       * partition was the BIOS boot one. */
+      sysfs_mkstr(bd, "alignment_offset", "0\n");
+      sysfs_mkstr(bd, "discard_alignment", "0\n");
       if (part) {
+        u64 start = blk_partition_start(d);
+        usize pbs = (parent && parent->block_size) ? parent->block_size : 512;
         sysfs_mkstr(bd, "partition", "%d\n", partno);
+        sysfs_mkstr(bd, "start", "%llu\n",
+                    (unsigned long long)(start * pbs / 512));
+        sysfs_mkstr(bd, "ro", "0\n");
       } else {
         sysfs_mkstr(bd, "removable", "%d\n", blk_is_removable(d));
         sysfs_mkstr(bd, "ro", "0\n");

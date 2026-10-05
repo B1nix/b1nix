@@ -267,6 +267,12 @@ int blk_rescan_partitions(struct block_device *dev);
  * The name is "" for an MBR partition and NULL for a device that is not a
  * partition. */
 u64 blk_partition_start(struct block_device *dev);
+/* Can the device not be written? A partition answers for its disk; a loop
+ * device attached read-only says so. What BLKROGET and the imported
+ * filesystems' bdev_read_only() report. */
+int blk_is_read_only(struct block_device *dev);
+/* kernel/dev/loop.c: the loop device was attached read-only. */
+int loop_is_read_only(struct block_device *dev);
 const char *blk_partition_label(struct block_device *dev);
 
 /* Create a /dev/<name> node for every registered block device (read/write

@@ -664,6 +664,14 @@ int blk_is_partition(struct block_device *dev) {
   return dev && dev->read_blocks == partition_read;
 }
 
+int blk_is_read_only(struct block_device *dev) {
+  if (blk_is_partition(dev) && blk_partition_parent(dev))
+    dev = blk_partition_parent(dev);
+  if (!dev || !dev->write_blocks)
+    return 1;
+  return dev->bus == BLK_BUS_LOOP && loop_is_read_only(dev);
+}
+
 u64 blk_partition_start(struct block_device *dev) {
   if (!blk_is_partition(dev))
     return 0;

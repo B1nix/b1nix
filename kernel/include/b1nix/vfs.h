@@ -661,6 +661,10 @@ int vfs_attach_child_unique(struct vfs_node *parent, struct vfs_node *child);
  * whose tree changes at runtime (a module removing its /sys/module entry).
  * The caller still owns its reference on the child. */
 void vfs_detach_child(struct vfs_node *parent, struct vfs_node *child);
+/* Drop a cached child whose name the filesystem removed on its own. */
+void vfs_forget_child(struct vfs_node *parent, const char *name);
+void vfs_prune_children(struct vfs_node *dir,
+                        int (*gone)(struct vfs_node *child));
 /* Device number of the filesystem a node belongs to, resolved through its
  * ancestors when the node itself predates the mount stamp. */
 u32 vfs_node_dev(struct vfs_node *node);

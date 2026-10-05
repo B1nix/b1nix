@@ -315,6 +315,15 @@ void *lkpi_bridge_lookup(void *dirp, const char *name)
 	return found;
 }
 
+/* Has the filesystem removed this name by itself? A dentry it deleted is
+ * unhashed (we hold a reference, so it cannot simply turn negative). */
+int lkpi_bridge_gone(void *nodep)
+{
+	struct dentry *d = nodep;
+
+	return d && (d_unhashed(d) || !d->d_inode);
+}
+
 void lkpi_bridge_put(void *nodep)
 {
 	if (nodep)

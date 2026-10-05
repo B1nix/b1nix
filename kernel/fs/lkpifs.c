@@ -544,11 +544,10 @@ static int lkpifs_emit(void *arg, const char *name, int len,
 
 	if (f->count >= f->max)
 		return 0;   /* stop: no room, and the cursor stays where it is */
-	/* "." and ".." are the VFS's own business; a filesystem that reported
-	 * them would have them listed twice. */
-	if ((n == 1 && name[0] == '.') ||
-	    (n == 2 && name[0] == '.' && name[1] == '.'))
-		return 1;
+	/* "." and ".." are listed as the filesystem reports them, with their
+	 * inode numbers: the VFS adds them only to directories it keeps in
+	 * memory, and dropping them here left every directory on btrfs or ext4
+	 * without them -- `ls -a` showed neither. */
 	if (n > sizeof(f->buf[0].name) - 1)
 		n = sizeof(f->buf[0].name) - 1;
 	memcpy(f->buf[f->count].name, name, n);
@@ -922,14 +921,28 @@ static int lkpifs_fitrim(struct vfs_node *node, u64 start, u64 len, u64 minlen,
 	return rc;
 }
 
+static int lkpifs_child_gone(struct vfs_node *child)
+{
+	struct lkpifs_node *info = node_info(child);
+
+	return info && info->handle && lkpi_bridge_gone(info->handle);
+}
+
 static int lkpifs_ioctl(struct vfs_node *node, u64 request, void *arg)
 {
 	void *handle = node_handle(node);
+	int ret;
 
 	if (!handle)
 		return -EINVAL;
-	return (int)lkpi_bridge_ioctl(handle, (unsigned int)request,
-	                              (unsigned long)(usize)arg);
+	ret = (int)lkpi_bridge_ioctl(handle, (unsigned int)request,
+	                             (unsigned long)(usize)arg);
+	/* An ioctl can remove names of the directory it was made on -- btrfs
+	 * deletes a subvolume that way -- and the nodes cached under them would
+	 * go on resolving. */
+	if (ret >= 0 && node->inode && node->inode->type == VFS_DIRECTORY)
+		vfs_prune_children(node, lkpifs_child_gone);
+	return ret;
 }
 
 static int lkpifs_statfs(struct vfs_node *node, struct b1nix_statfs *st)
