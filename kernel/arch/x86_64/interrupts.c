@@ -1324,7 +1324,7 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
       current_task && current_task->pml4_phys) {
     u64 pte = paging_user_pte(current_task->pml4_phys,
                               frame->rip & ~(u64)(PAGE_SIZE - 1));
-    char b[320];
+    char b[400];
     char va[64], pa[64];
     unsigned char op[16];
     extern int syscall_copyin(void *dst, const void *user_src,
@@ -1346,6 +1346,20 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     snprintf(b, sizeof(b), "SMP-CODE rip=%p pte=%p va=[%s] phys=[%s]%s\n",
              (void *)(usize)frame->rip, (void *)(usize)pte, va, pa,
              (va[0] && pa[0] && strcmp(va, pa)) ? " MISMATCH" : "");
+    serial_write(b);
+    /* The registers go to the serial line too: once userspace owns the
+     * console, the full dump below never reaches it, and a #GP names no
+     * address -- the bad pointer is in one of these. */
+    snprintf(b, sizeof(b),
+             "SMP-REGS rax=%lx rbx=%lx rcx=%lx rdx=%lx rsi=%lx rdi=%lx "
+             "rbp=%lx rsp=%lx r8=%lx r9=%lx r12=%lx r13=%lx r14=%lx\n",
+             (unsigned long)frame->rax, (unsigned long)frame->rbx,
+             (unsigned long)frame->rcx, (unsigned long)frame->rdx,
+             (unsigned long)frame->rsi, (unsigned long)frame->rdi,
+             (unsigned long)frame->rbp, (unsigned long)frame->rsp,
+             (unsigned long)frame->r8, (unsigned long)frame->r9,
+             (unsigned long)frame->r12, (unsigned long)frame->r13,
+             (unsigned long)frame->r14);
     serial_write(b);
 
     /* When the two disagree, say WHICH flush repairs it -- that is the whole

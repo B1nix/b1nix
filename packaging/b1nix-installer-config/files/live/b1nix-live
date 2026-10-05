@@ -68,11 +68,8 @@ mountroot() {
 		live_fail "no device labelled $label appeared"
 	fi
 
-	# The CD filesystem is a loadable module, and the kernel only loads its
-	# boot modules once a root is mounted -- which is what this is doing.
-	grep -q '^isofs ' /proc/modules 2>/dev/null ||
-		insmod "/usr/lib/modules/$(uname -r)/isofs.ko" ||
-		live_fail "could not load isofs.ko"
+	# iso9660 is built into the kernel (the imported Linux isofs), so there is
+	# no module to load first.
 	mount -t iso9660 -o ro "$dev" "$medium" ||
 		live_fail "could not mount $dev as iso9660"
 	if [ ! -f "$medium/live/root.img" ]; then
@@ -96,8 +93,8 @@ mountroot() {
 		live_fail "could not mount the seed image $loop"
 	btrfs device add -f /dev/zram0 "${rootmnt}" ||
 		live_fail "could not add zram0 to the seed filesystem"
-	mount -o remount,rw,compress=zstd:1 "${rootmnt}" ||
-		live_fail "could not remount the sprouted filesystem read-write"
+	err=$(mount -o remount,rw "${rootmnt}" 2>&1) ||
+		live_fail "could not remount the sprouted filesystem read-write: $err"
 
 	# The medium stays mounted for the installer, which copies from it.
 	mkdir -p "${rootmnt}/run/live/medium"

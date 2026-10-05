@@ -73,3 +73,9 @@ int vfs_inotify_watching(void);
 void vfs_inotify_notify_move(struct vfs_node *old_dir, const char *old_name,
                              struct vfs_node *new_dir, const char *new_name,
                              int is_dir);
+
+/* /proc/sys/fs/inotify/max_user_instances, max_user_watches and
+ * max_queued_events. set returns 0 or a negative errno. */
+enum { INOTIFY_LIMIT_INSTANCES, INOTIFY_LIMIT_WATCHES, INOTIFY_LIMIT_QUEUED };
+int inotify_limit_get(int which);
+int inotify_limit_set(int which, int value);

@@ -1853,8 +1853,15 @@ static isize sys_fchdir(int fd) {
   if (h->node->inode->type != VFS_DIRECTORY)
     return -ENOTDIR;
 
+  /* The directory's name as the descriptor knows it, through the mount it
+   * was opened by: a bind of "/" has the root's nodes, and naming those
+   * nodes put the caller in the real root. systemd enters a service's new
+   * root this way -- fchdir() and then pivot_root(".", ".") -- and was
+   * pivoting "/" onto itself. */
   char resolved[VFS_MAX_PATH];
-  int err = vfs_get_node_path(h->node, resolved, VFS_MAX_PATH);
+  int err = vfs_fd_abspath(fd, resolved, VFS_MAX_PATH);
+  if (err < 0)
+    err = vfs_get_node_path(h->node, resolved, VFS_MAX_PATH);
   if (err < 0)
     return err;
 

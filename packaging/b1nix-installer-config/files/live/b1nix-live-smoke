@@ -11,8 +11,7 @@ while [ $i -lt 60 ]; do
 	sleep 5
 done
 say "uname=$(uname -r)"
-say "firmware=$([ -d /sys/firmware/efi ] && echo uefi || echo bios)"
-say "root=$(findmnt -n -o FSTYPE,SOURCE / 2>&1 | tr -s ' ')"
+say "root=$(stat -f -c %T / 2>&1)"
 say "medium=$(findmnt -n -o FSTYPE /run/live/medium 2>&1)"
 if echo b1nix >/var/tmp/live-write-test && [ "$(cat /var/tmp/live-write-test)" = b1nix ]; then
 	say "root-writable=yes"

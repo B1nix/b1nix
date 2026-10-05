@@ -345,9 +345,30 @@ static void test_uevent_trigger_tty(int nlfd) {
     return;
   }
 
+  /* The device lives where Linux puts a VT, and the class entry links to it:
+   * udev learns the subsystem from the `subsystem` link in the device's own
+   * directory, and without one it filed every terminal under "subsystem". */
+  char link[128];
+  ssize_t ln = readlink("/sys/class/tty/tty1", link, sizeof(link) - 1);
+  if (ln <= 0) {
+    failm("uevent-trigger-tty", "/sys/class/tty/tty1 is not a link into /sys/devices");
+    return;
+  }
+  link[ln] = '\0';
+  if (strcmp(link, "../../devices/virtual/tty/tty1") != 0) {
+    note("link='%s'", link);
+    failm("uevent-trigger-tty", "/sys/class/tty/tty1 does not point at the VT's device directory");
+    return;
+  }
+  ln = readlink("/sys/class/tty/tty1/subsystem", link, sizeof(link) - 1);
+  if (ln <= 0 || (link[ln] = '\0', strcmp(strrchr(link, '/') ? strrchr(link, '/') + 1 : link, "tty") != 0)) {
+    failm("uevent-trigger-tty", "the terminal's subsystem link does not name the tty class");
+    return;
+  }
+
   struct uev e;
-  if (uev_wait(nlfd, "add@/class/tty/tty1", &e) != 0) {
-    failm("uevent-trigger-tty", "no add@/class/tty/tty1 arrived on the socket");
+  if (uev_wait(nlfd, "add@/devices/virtual/tty/tty1", &e) != 0) {
+    failm("uevent-trigger-tty", "no add@/devices/virtual/tty/tty1 arrived on the socket");
     return;
   }
   if (strcmp(e.action, "add") != 0 || strcmp(e.subsystem, "tty") != 0 ||

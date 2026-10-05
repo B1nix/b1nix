@@ -747,6 +747,8 @@ void vfs_set_currently_mounting_root(struct vfs_node *root);
  * on /dev give a populated /dev rather than an empty directory. */
 void vfs_populate_dev(void);
 isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries);
+/* Ids and parent ids of the same entries, in the same order. */
+isize vfs_mounts_topology(u32 *ids, u32 *parents, usize max_entries);
 isize vfs_mounts_info(struct vfs_mount_info *out, usize max_entries);
 /* The mount id of the mount a path lives on — the first field of that mount's
  * /proc/<pid>/mountinfo row. 0 when no mount matches. */
@@ -1358,6 +1360,11 @@ struct vfs_handle {
    * /proc/self/exe is on a read-only mount. */
   u32 mnt_flags;
   u8 mnt_flags_set;
+  /* The mount the file was opened through (its creation sequence; 0 when not
+   * known). A node reached through a bind is the same node as in the tree it
+   * came from, so only this says which of its names the descriptor has --
+   * what openat(fd, ...) and statx(fd, ...) resolve relative to. */
+  u64 mnt_seq;
 };
 
 /* Internal handle management for subsystems */

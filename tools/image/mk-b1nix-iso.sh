@@ -84,6 +84,10 @@ fi
 if [ "$REUSE_ROOT" = 0 ]; then
 # ── 1. the root tree ────────────────────────────────────────────────────────
 log "assembling the $SUITE live root"
+# From scratch every time the root is rebuilt: a tree kept from the last build
+# keeps whatever that build wrote by hand, and a file left in /etc by an older
+# version of this script quietly overrides the package that replaced it.
+CHROOT_BASE="$ROOTFS_BASE" sh "$CHROOT" clean || die "could not remove the old live root"
 CHROOT_BASE="$ROOTFS_BASE" BUILD_DEPS="$SYSTEM_PKGS $LIVE_PKGS" sh "$CHROOT" create ||
 	die "could not build the root tree"
 

@@ -724,6 +724,7 @@ KERNEL_SOURCES += \
 	kernel/dev/mixer.c \
 	kernel/dev/pty.c \
  	kernel/dev/serial_tty.c \
+ 	kernel/dev/tty_sysfs.c \
  	kernel/dev/virtio_gpu.c \
  	kernel/dev/virtio_input.c \
  	kernel/dev/virtio_console.c \
@@ -815,6 +816,7 @@ KERNEL_SOURCES += \
 	kernel/dev/ps2_kbd.c \
 	kernel/dev/pty.c \
 	kernel/dev/serial_tty.c \
+	kernel/dev/tty_sysfs.c \
 	kernel/dev/kmsg.c \
 	kernel/dev/vt.c \
 	kernel/dev/rtc_dev.c \

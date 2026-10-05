@@ -394,6 +394,8 @@ void vfs_dump_mounts(void) {
 }
 
 
+static struct vfs_node *root_node;
+
 static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   if (!node)
     return 0;
@@ -410,9 +412,11 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   u64 flags;
   vfs_tree_read_acquire(&flags);
   struct vfs_node *curr = node;
+  struct vfs_node *top = node;
   struct vfs_mount_entry *res = 0;
   u32 walk_ns = vfs_current_mnt_ns(); /* once per walk, see mount_visible_in */
   while (curr) {
+    top = curr;
     /* The deepest ancestor that is some mount's root wins; among the entries
      * rooted at THAT node, the one mounted last does (see ::seq). */
     for (int i = 0; i < (int)mount_hwm; i++) {
@@ -424,6 +428,13 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
       goto out;
     curr = curr->parent;
   }
+  /* A node attached to nothing -- a memfd, an O_TMPFILE-style anonymous file
+   * -- is on no mount at all, and no mount's flags apply to it. Judging it by
+   * the root mount's made every memfd read-only inside a service whose root
+   * systemd had remounted read-only: dbus-broker could not size the memfd it
+   * logs through and exited. */
+  if (top != root_node)
+    goto out;
   /* Nothing in the chain is a mount root: fall back to the root mount, first
    * match as before. "Newest wins" answers "which mount is stacked on this
    * node"; it is not a rule about a node that is on no mount at all, and
@@ -439,6 +450,16 @@ out:
   vfs_tree_read_release(flags);
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   return res;
+}
+
+/* Is the file behind a descriptor on a read-only mount? The mount it was
+ * opened through says, as Linux's file->f_path.mnt does: its nodes may also
+ * be reachable through a writable bind, or through none at all. */
+static int vfs_handle_mount_ro(struct vfs_handle *h) {
+  if (h->mnt_flags_set)
+    return (h->mnt_flags & MS_RDONLY) != 0;
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(h->node);
+  return mnt && (mnt->flags & MS_RDONLY);
 }
 
 /* A mount root's ->parent is NULL: the names above it live on the node it was
@@ -3053,6 +3074,7 @@ struct vfs_handle *alloc_raw_handle(enum vfs_handle_kind kind) {
   h->refcount = 1;
   h->kind = kind;
   h->open_path = 0;
+  h->mnt_seq = 0;
   return h;
 }
 
@@ -4112,7 +4134,16 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
     return -ENOMEM;
   vfs_resolve_path(path, resolved);
 
-  if (strcmp(resolved, "/dev/tty") == 0) {
+  /* The terminals and the DRM cards below are opened by their drivers, which
+   * build a handle of their own. An O_PATH descriptor names the node and
+   * opens nothing, so it never reaches them -- it goes through the ordinary
+   * lookup like any other file. Handed to the serial driver, it came back as
+   * a handle with no node behind it: fstat answered EBADF, and udev, which
+   * sets a device node's owner and mode through an O_PATH descriptor, failed
+   * on /dev/ttyS0 and left it without its systemd tag. */
+  const int open_path_only = (flags & B1NIX_O_PATH) ? 1 : 0;
+
+  if (!open_path_only && strcmp(resolved, "/dev/tty") == 0) {
     int type = 0;
     int index = 0;
     scheduler_get_ctty(&type, &index);
@@ -4221,6 +4252,7 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
            * how liburing's across-fork saw an empty file after writing four
            * lines into it. */
           nh->offset = 0;
+          nh->mnt_seq = h->mnt_seq;
           if (h->open_path) {
             usize pl = strlen(h->open_path);
             char *op = kmalloc(pl + 1);
@@ -4257,8 +4289,8 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   /* M32b pseudo-terminals: /dev/ptmx allocates a fresh master; /dev/pts/<N>
    * binds to that pair's slave. These are dynamic handles, not VFS nodes, so
    * intercept the open before the path lookup. */
-  if (strcmp(resolved, "/dev/ptmx") == 0 ||
-      strcmp(resolved, "/dev/pts/ptmx") == 0) {
+  if (!open_path_only && (strcmp(resolved, "/dev/ptmx") == 0 ||
+                          strcmp(resolved, "/dev/pts/ptmx") == 0)) {
     struct vfs_node *ptmx_node = vfs_find_node(resolved);
     if (!IS_ERR(ptmx_node)) {
       int access_mask = 0;
@@ -4281,7 +4313,7 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   /* M39 serial ttys: /dev/ttySn opens bind to the per-port tty (dynamic
    * handles like ptys, with their own line discipline + session state). */
   {
-    int sidx = serial_tty_path_index(resolved);
+    int sidx = open_path_only ? -1 : serial_tty_path_index(resolved);
     if (sidx >= 0) {
       struct vfs_node *snode = vfs_find_node(resolved);
       if (!IS_ERR(snode)) {
@@ -4306,7 +4338,7 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   /* Both DRM nodes take the same route: check the node's permissions, then let
    * the owning driver build the handle. They differ only in which driver that
    * is — card0 is b1nix's own device, card1 the imported core's. */
-  if (drm_imported_card_present(resolved)) {
+  if (!open_path_only && drm_imported_card_present(resolved)) {
     struct vfs_node *card = vfs_find_node(resolved);
     if (!IS_ERR(card)) {
       int access_mask = 0;
@@ -4325,7 +4357,7 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
     kfree(resolved);
     return fd;
   }
-  if (strcmp(resolved, "/dev/dri/card0") == 0) {
+  if (!open_path_only && strcmp(resolved, "/dev/dri/card0") == 0) {
     struct vfs_node *card = vfs_find_node(resolved);
     if (!IS_ERR(card)) {
       int access_mask = 0;
@@ -4369,7 +4401,7 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
       return fd;
     }
   }
-  if (strncmp(resolved, "/dev/pts/", 9) == 0) {
+  if (!open_path_only && strncmp(resolved, "/dev/pts/", 9) == 0) {
     const char *num = resolved + 9;
     if (*num >= '0' && *num <= '9') {
       int idx = 0;
@@ -4405,7 +4437,7 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   /* A pty slave reached under another name -- bound over /dev/console by a
    * container manager, which is how systemd-nspawn gives the container its
    * terminal -- is the same terminal as /dev/pts/<n>. */
-  if (!IS_ERR(node) && node->inode->fs_id == DEVPTS_FSID &&
+  if (!open_path_only && !IS_ERR(node) && node->inode->fs_id == DEVPTS_FSID &&
       node->inode->type == VFS_DEVICE && (node->inode->rdev >> 8) == 136) {
     int access_mask = 0;
     if (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))
@@ -4615,6 +4647,7 @@ make_handle:;
   handle_note_open(h);
   h->mnt_flags = open_mnt.flags;
   h->mnt_flags_set = (u8)open_mnt.known;
+  h->mnt_seq = open_mnt.seq;
   /* The name this descriptor was opened under (see vfs_handle::open_path).
    * `resolved` is already absolute and lexically normalised. */
   {
@@ -5185,8 +5218,7 @@ isize vfs_pwrite_h(struct vfs_handle *h, const char *buf, usize size,
     return -EBADF;
   if (h->kind != VFS_HANDLE_NODE || !h->node)
     return -ESPIPE;
-  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(h->node);
-  if (mnt && (mnt->flags & MS_RDONLY))
+  if (vfs_handle_mount_ro(h))
     return -EROFS;
   if (write_past_fsize_limit(h, offset, size))
     return -EFBIG;
@@ -5285,8 +5317,7 @@ isize vfs_handle_write(struct vfs_handle *h, const void *buf, usize size) {
        /* /proc and /sys files are regular files to userspace, and a
         * read-only bind of /proc/sys (ProtectKernelTunables=) must refuse */
        (h->node->inode->flags & VFS_NODE_PSEUDO_REG))) {
-    struct vfs_mount_entry *mnt = vfs_get_mount_for_node(h->node);
-    if (mnt && (mnt->flags & MS_RDONLY))
+    if (vfs_handle_mount_ro(h))
       return -EROFS;
   }
 
@@ -6848,6 +6879,20 @@ int vfs_rmdir(const char *path) {
   return res;
 }
 
+/* The node behind a descriptor the serial driver opened. Its handle is the
+ * driver's own, but the file is still /dev/ttySn: fstat reports that node,
+ * and fchown/fchmod change it -- which is how agetty and login make a serial
+ * line belong to the user logging in on it. Returns a reference, or NULL. */
+static struct vfs_node *vfs_serial_handle_node(const struct vfs_handle *h) {
+  const char *name = serial_tty_handle_name(h);
+  if (!name)
+    return 0;
+  char path[24];
+  snprintf(path, sizeof(path), "/dev/%s", name);
+  struct vfs_node *n = vfs_find_node(path);
+  return IS_ERR(n) ? 0 : n;
+}
+
 int vfs_fstat(int fd, struct b1nix_stat *st) {
   /* Pseudo-terminal slave/master fds have no backing vfs_node, but fstat() must
    * still work on them — musl's ttyname_r() fstat()s the slave and matches its
@@ -6949,6 +6994,15 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
     return 0;
   }
 
+  if (ph && ph->kind == VFS_HANDLE_SERIAL_TTY) {
+    struct vfs_node *sn = vfs_serial_handle_node(ph);
+    if (!sn)
+      return -EBADF;
+    int rc = vfs_stat_node(sn, st);
+    vfs_node_put(sn);
+    return rc;
+  }
+
   struct vfs_node *node = vfs_find_node_by_fd(fd);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
@@ -6979,12 +7033,95 @@ int vfs_fd_ns(int fd, int *kind, u32 *id) {
  * joins the relative component. Built by walking node->parent under the VFS tree
  * read lock (a concurrent rmdir could otherwise free an ancestor mid-walk).
  * Returns the path length on success, or a negative errno. */
+/* The path of `node` as seen through the mount created as `seq`: the mount's
+ * place, then the names from its root down to the node (Linux d_path, which
+ * follows the descriptor's own vfsmount). -1 when the mount is gone or the
+ * node is not inside it, and the caller names the node by its tree instead. */
+static int vfs_path_in_mount(struct vfs_node *node, u64 seq, char *buf,
+                             usize size) {
+  char target[VFS_MAX_PATH];
+  struct vfs_node *mroot = 0;
+
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  for (usize i = 0; i < mount_hwm; i++)
+    if (mount_visible(i) && mounts[i].seq == seq && mounts[i].root_node) {
+      mroot = mounts[i].root_node;
+      copy_path(target, sizeof(target), mounts[i].target);
+      break;
+    }
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  if (!mroot || mount_is_detached(target))
+    return -1;
+
+  const char *parts[64];
+  int n = 0;
+  u64 flags;
+  vfs_tree_read_acquire(&flags);
+  struct vfs_node *c = node;
+  for (int steps = 0; c && c != mroot && n < 64 && steps < 256; steps++) {
+    parts[n++] = c->name;
+    c = c->parent;
+  }
+  if (c != mroot) {
+    vfs_tree_read_release(flags);
+    return -1;
+  }
+  usize pos = strlen(target);
+  if (pos + 1 > size) {
+    vfs_tree_read_release(flags);
+    return -1;
+  }
+  memcpy(buf, target, pos);
+  if (pos == 1 && n > 0)
+    pos = 0; /* "/" + "a" is "/a", not "//a" */
+  for (int i = n - 1; i >= 0; i--) {
+    usize pl = parts[i] ? strlen(parts[i]) : 0;
+    if (pos + 1 + pl + 1 > size) {
+      vfs_tree_read_release(flags);
+      return -1;
+    }
+    buf[pos++] = '/';
+    memcpy(buf + pos, parts[i], pl);
+    pos += pl;
+  }
+  buf[pos] = '\0';
+  vfs_tree_read_release(flags);
+  return (int)pos;
+}
+
 int vfs_fd_abspath(int fd, char *buf, usize size) {
   if (!buf || size < 2)
     return -EINVAL;
   struct vfs_node *node = vfs_find_node_by_fd(fd);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
+
+  /* Through the mount the descriptor was opened by, when that is known and
+   * the caller is not chrooted (whose names start at its own root): a
+   * directory opened as /run/systemd/mount-rootfs/sys/fs is that, and not
+   * the /sys/fs its nodes also hang under -- systemd builds a service's
+   * namespace one openat(dirfd, ...) at a time, and every answer came from
+   * the host's mounts instead of the tree it was building. */
+  {
+    struct vfs_handle *fh = get_handle(fd);
+    if (fh && fh->kind == VFS_HANDLE_NODE && fh->mnt_seq &&
+        !scheduler_get_root_node()) {
+      int rc = vfs_path_in_mount(node, fh->mnt_seq, buf, size);
+      if (rc >= 0) {
+        /* Taken only when it names the node: a mount's recorded place can
+         * be out of date (a pivot, a mount made through a descriptor that
+         * could not be named), and then the node's own path is the better
+         * answer. */
+        struct vfs_node *chk = vfs_find_node_no_follow(buf);
+        int same = !IS_ERR(chk) && chk == node;
+        if (!IS_ERR(chk))
+          vfs_node_put(chk);
+        if (same)
+          return rc;
+      }
+    }
+  }
 
   /* Collect the basename of each ancestor (deepest first), stopping at the root
    * (parent == NULL), then emit them root-first as "/a/b/c". */
@@ -7205,6 +7342,8 @@ void vfs_set_currently_mounting_root(struct vfs_node *root) {
   }
 }
 
+static struct vfs_node *vfs_find_mount_place(const char *path, u64 *mnt);
+
 int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags) {
   if (!target || target[0] == '\0' || !fstype)
@@ -7224,7 +7363,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   }
 
   u64 parent_mnt = 0;
-  struct vfs_node *target_node = vfs_find_node_mnt(target, &parent_mnt);
+  struct vfs_node *target_node = vfs_find_mount_place(target, &parent_mnt);
   if (IS_ERR(target_node))
     return (int)PTR_ERR(target_node);
   if (target_node->inode->type != VFS_DIRECTORY) {
@@ -7527,6 +7666,38 @@ int vfs_remount(const char *target, u64 flags) {
   return found ? 0 : -EINVAL;
 }
 
+/* The node a mount operation names, and the mount it lies in.
+ *
+ * systemd names every place it mounts by descriptor: it opens the directory
+ * O_PATH and passes /proc/self/fd/<n> to mount(2). The walk crosses that
+ * link straight to the node the descriptor holds, and so does not know which
+ * mount the node was reached through -- a node of a recursive bind is the
+ * same node as in the tree it came from. A mount made there was attached to
+ * no mount at all, matched every walk that reached the node, and being the
+ * newest it won: the private /sys systemd builds for a PrivateNetwork=
+ * service, moved onto /run/systemd/mount-rootfs/sys, covered the host's
+ * /sys, and the sandbox then found no /sys/fs/cgroup to bind back. The
+ * descriptor remembers the name it was opened under; walking that name again
+ * finds the mount, and is taken only when it leads to the same node. */
+static struct vfs_node *vfs_find_mount_place(const char *path, u64 *mnt) {
+  struct vfs_node *n = vfs_find_node_mnt(path, mnt);
+  if (IS_ERR(n) || *mnt || !path || strncmp(path, "/proc/", 6) != 0)
+    return n;
+  char link[VFS_MAX_PATH];
+  isize len = vfs_readlink(path, link, sizeof(link) - 1);
+  if (len <= 0 || link[0] != '/')
+    return n;
+  link[len] = '\0';
+  u64 again = 0;
+  struct vfs_node *n2 = vfs_find_node_mnt(link, &again);
+  if (!IS_ERR(n2)) {
+    if (n2 == n)
+      *mnt = again;
+    vfs_node_put(n2);
+  }
+  return n;
+}
+
 /* The name to record for a mount point.
  *
  * Not the node's own path: a node reached through a bind mount has a name in
@@ -7644,6 +7815,42 @@ static void vfs_bind_copy_submounts(const char *src, u64 src_mnt, int bind) {
         if (!parent)
           continue; /* not below the source after all */
       }
+    } else {
+      /* The original's parent is not recorded -- the mounts the kernel and
+       * the initramfs made before the root was switched are like that. The
+       * copy's parent must still be known: one left at 0 hangs off every
+       * mount at that node, and being the newer it was what a walk through
+       * the ORIGINAL tree found. systemd's private /sys for PrivateNetwork=
+       * copied /sys/fs/cgroup this way, and the host's /sys/fs/cgroup then
+       * resolved into the copy -- whose submounts the sandbox then unmounted,
+       * so polkit's memory.pressure no longer existed. The original is
+       * attached to the deepest mount above it, so the copy goes on the
+       * copy of that mount: the deepest one made since the bind whose target
+       * holds this one, or the bind itself. */
+      usize best_len = strlen(dst);
+      parent = bind_seq;
+      char want[VFS_MAX_PATH];
+      const char *t = mounts[next].target + (slen == 1 ? 0 : slen);
+      if (dst[0] == '/' && dst[1] == '\0')
+        copy_path(want, sizeof(want), t);
+      else
+        snprintf(want, sizeof(want), "%s%s", dst, t);
+      for (usize k = 0; k < mount_hwm; k++) {
+        if (!mount_visible_in(k, ns) || mounts[k].seq <= bind_seq ||
+            !mounts[k].copied_from)
+          continue;
+        /* A mount stacked on another at the same path is attached to the
+         * one below it, so a copy at the same target counts too: the newest
+         * such copy is the layer under this one. */
+        usize kl = strlen(mounts[k].target);
+        if (strcmp(mounts[k].target, want) != 0 &&
+            !path_is_under(want, mounts[k].target))
+          continue;
+        if (kl > best_len || (kl == best_len && mounts[k].seq > parent)) {
+          best_len = kl;
+          parent = mounts[k].seq;
+        }
+      }
     }
 
     char target[VFS_MAX_PATH];
@@ -7689,10 +7896,10 @@ int vfs_bind_mount(const char *source, const char *target, u64 flags) {
   if (!source || !source[0])
     return -EINVAL;
   u64 src_mnt = 0, parent_mnt = 0;
-  struct vfs_node *src = vfs_find_node_mnt(source, &src_mnt);
+  struct vfs_node *src = vfs_find_mount_place(source, &src_mnt);
   if (IS_ERR(src))
     return (int)PTR_ERR(src);
-  struct vfs_node *tgt = vfs_find_node_mnt(target, &parent_mnt);
+  struct vfs_node *tgt = vfs_find_mount_place(target, &parent_mnt);
   if (IS_ERR(tgt)) {
     vfs_node_put(src);
     return (int)PTR_ERR(tgt);
@@ -7939,11 +8146,11 @@ static int vfs_move_mount_impl(const char *source, const char *target) {
   }
 
   u64 src_mnt = 0;
-  struct vfs_node *src_node = vfs_find_node_mnt(src, &src_mnt);
+  struct vfs_node *src_node = vfs_find_mount_place(src, &src_mnt);
   if (IS_ERR(src_node))
     return (int)PTR_ERR(src_node);
   u64 dst_mnt = 0;
-  struct vfs_node *dst_node = vfs_find_node_mnt(dst, &dst_mnt);
+  struct vfs_node *dst_node = vfs_find_mount_place(dst, &dst_mnt);
   if (IS_ERR(dst_node)) {
     vfs_node_put(src_node);
     return (int)PTR_ERR(dst_node);
@@ -7953,6 +8160,15 @@ static int vfs_move_mount_impl(const char *source, const char *target) {
     vfs_node_put(src_node);
     return -ENOTDIR;
   }
+
+  /* The place as the mount table spells it, as mount(2) records one: a
+   * destination named by descriptor (/proc/self/fd/<n>, which is how systemd
+   * moves every private /proc and /sys into a unit's tree) was recorded as
+   * that string, and a mount at "/proc/self/fd/4" is at no place a path can
+   * name -- every path through it came out in the host's spelling. */
+  char dst_rec[VFS_MAX_PATH];
+  mount_record_target(dst, dst_node, dst_rec, sizeof(dst_rec));
+  path_strip_trailing_slash(dst_rec);
 
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
@@ -7986,14 +8202,19 @@ static int vfs_move_mount_impl(const char *source, const char *target) {
    * crosses into it changes — this entry's mountpoint, and the recorded target
    * of every mount nested inside it, whose own mountpoint nodes travel with
    * the subtree and so need no fixing. */
+  /* By the names the table uses, which a descriptor-spelled source or
+   * destination is not. */
+  char src_rec[VFS_MAX_PATH];
+  copy_path(src_rec, sizeof(src_rec), mounts[midx].target);
   for (usize i = 0; i < mount_hwm; i++) {
     if (!mounts[i].used || (int)i == midx)
       continue;
-    retarget_under(mounts[i].target, sizeof(mounts[i].target), src, dst);
+    retarget_under(mounts[i].target, sizeof(mounts[i].target), src_rec,
+                   dst_rec);
   }
   mounts[midx].mount_point = dst_node; /* takes over the lookup reference */
   mounts[midx].parent_seq = dst_mnt;
-  copy_path(mounts[midx].target, sizeof(mounts[midx].target), dst);
+  copy_path(mounts[midx].target, sizeof(mounts[midx].target), dst_rec);
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
 
   /* A working directory is a directory, not a path, so a process standing
@@ -8004,7 +8225,7 @@ static int vfs_move_mount_impl(const char *source, const char *target) {
   for (usize i = 0; i < scheduler_task_slots(); i++) {
     struct task *t = scheduler_task_slot(i);
     if (t)
-      retarget_under(t->cwd, sizeof(t->cwd), src, dst);
+      retarget_under(t->cwd, sizeof(t->cwd), src_rec, dst_rec);
   }
 
   /* Cached name→node answers still point through the old mountpoint. */
@@ -8013,9 +8234,9 @@ static int vfs_move_mount_impl(const char *source, const char *target) {
   vfs_node_put(old_mp);
   vfs_node_put(src_node);
   /* The real root has arrived at "/": what waited for it can start. */
-  if (strcmp(dst, "/") == 0)
+  if (strcmp(dst_rec, "/") == 0)
     module_boot_root_arrived();
-  mount_table_trace(dst);
+  mount_table_trace(dst_rec);
   return 0;
 }
 
@@ -8106,8 +8327,18 @@ static int vfs_umount_one(const char *canon, int detach, u32 group,
 
   /* Basic busy check: if root_node has other refs than our mount entry.
    * Acquire-load: pairs with the atomic refcount updates so a ref taken
-   * on another CPU just before umount is observed. */
-  if (!detach &&
+   * on another CPU just before umount is observed.
+   *
+   * Only for the last mount of the filesystem. Node references are not
+   * per mount: a copy made by a recursive bind or a new namespace shares its
+   * nodes with the original, and every descriptor open through the original
+   * counted against the copy -- systemd sandboxing a service unmounts the
+   * copies of /sys/fs/cgroup and /sys/kernel/tracing in the service's
+   * namespace and was told they were busy, because PID 1 holds cgroup files
+   * open on the host. While another entry keeps the filesystem mounted,
+   * removing this one tears nothing down, and Linux, which counts per mount,
+   * finds such a copy idle. */
+  if (!detach && mount_fs_refs(mounts[i].root_node) <= 1 &&
       __atomic_load_n(&mounts[i].root_node->refcount, __ATOMIC_ACQUIRE) >
           (int)mount_root_refs(mounts[i].root_node)) {
     __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
@@ -8821,6 +9052,50 @@ isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries) {
   return (isize)count;
 }
 
+static isize mount_parent_slot(usize i, u32 ns);
+
+/* The mount a slot hangs off, for mountinfo's second field: the recorded
+ * parent when there is one; else the mount it is stacked on (same target,
+ * created just before it); else the mount its target lies under. */
+static isize mount_topology_parent(usize i, u32 ns) {
+  if (mounts[i].parent_seq)
+    for (usize j = 0; j < mount_hwm; j++)
+      if (mount_visible_in(j, ns) && mounts[j].seq == mounts[i].parent_seq)
+        return (isize)j;
+  isize below = -1;
+  for (usize j = 0; j < mount_hwm; j++)
+    if (j != i && mount_visible_in(j, ns) && mounts[j].seq < mounts[i].seq &&
+        !strcmp(mounts[j].target, mounts[i].target) &&
+        (below < 0 || mounts[j].seq > mounts[below].seq))
+      below = (isize)j;
+  if (below >= 0)
+    return below;
+  return mount_parent_slot(i, ns);
+}
+
+/* The ids and parent ids of the entries vfs_mounts() lists, in its order.
+ * Ids are the mounts' creation sequence: stable for as long as the mount
+ * exists, never reused, and what statx(STATX_MNT_ID) and name_to_handle_at
+ * report for a path on it. They were list positions, which shift every time
+ * an earlier mount goes away -- so an id read from mountinfo and one taken
+ * from a descriptor a moment later could disagree, and systemd, which checks
+ * the two against each other, skipped the mount. */
+isize vfs_mounts_topology(u32 *ids, u32 *parents, usize max_entries) {
+  u32 ns = vfs_current_mnt_ns();
+  usize count = 0;
+  for (usize i = 0; i < mount_hwm; i++) {
+    if (!mount_visible(i) || mount_is_detached(mounts[i].target))
+      continue;
+    if (count < max_entries) {
+      isize p = mount_topology_parent(i, ns);
+      ids[count] = (u32)mounts[i].seq;
+      parents[count] = (u32)mounts[p < 0 ? (isize)i : p].seq;
+    }
+    count++;
+  }
+  return (isize)count;
+}
+
 /* The mount id of the mount a path lives on: the number /proc/<pid>/mountinfo
  * prints in its first field for that mount, which is the only thing a mount id
  * means to userspace.
@@ -8833,20 +9108,15 @@ isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries) {
  * running) DISABLES its device monitor for the rest of the boot. No .device
  * unit can activate after that, whatever udev goes on to do.
  *
- * The id is the mount's position in the visible list, +1, exactly as
- * r_mountinfo numbers the rows it prints. The mount a path lives on is the
+ * The id is the mount's creation sequence, exactly as r_mountinfo numbers
+ * the rows it prints. The mount a path lives on is the
  * visible mount whose target is the longest prefix of it, latest wins.
  * Returns 0 when nothing matches, which cannot happen once / is mounted. */
 /* The visible-list position (+1) of mount `seq`, 0 when it is not visible. */
 static int mount_id_of_seq(u64 seq) {
-  usize index = 0;
-  for (usize i = 0; seq && i < mount_hwm; i++) {
-    if (!mount_visible(i))
-      continue;
-    index++;
-    if (mounts[i].seq == seq)
-      return (int)index;
-  }
+  for (usize i = 0; seq && i < mount_hwm; i++)
+    if (mount_visible(i) && mounts[i].seq == seq)
+      return (int)seq;
   return 0;
 }
 
@@ -8872,11 +9142,9 @@ int vfs_mount_id_for_path(const char *path) {
 
   int best_id = 0;
   usize best_len = 0;
-  usize index = 0;
   for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i))
       continue;
-    index++;
     const char *tgt = mounts[i].target;
     usize tlen = strlen(tgt);
     if (tlen == 0)
@@ -8889,7 +9157,7 @@ int vfs_mount_id_for_path(const char *path) {
       continue;
     if (tlen >= best_len) {
       best_len = tlen;
-      best_id = (int)index;
+      best_id = (int)mounts[i].seq;
     }
   }
   return best_id;
@@ -9002,27 +9270,19 @@ static int mount_is_descendant(usize i, usize ancestor, u32 ns) {
 u64 vfs_mount_unique_id_for_path(const char *path) {
   int old = vfs_mount_id_for_path(path);
   u32 ns = vfs_current_mnt_ns();
-  usize index = 0;
 
   if (old <= 0)
     return 0;
-  for (usize i = 0; i < mount_hwm; i++) {
-    if (!mount_visible_in(i, ns))
-      continue;
-    if ((int)++index == old)
+  for (usize i = 0; i < mount_hwm; i++)
+    if (mount_visible_in(i, ns) && mounts[i].seq == (u64)old)
       return mount_unique_id(i);
-  }
   return 0;
 }
 
-/* The 1-based position mountinfo prints for slot i. */
+/* The id mountinfo prints for slot i: its creation sequence. */
 static u32 mount_old_id(usize slot, u32 ns) {
-  u32 index = 0;
-
-  for (usize i = 0; i <= slot && i < mount_hwm; i++)
-    if (mount_visible_in(i, ns))
-      index++;
-  return index;
+  (void)ns;
+  return (u32)mounts[slot].seq;
 }
 
 #define LSMT_ROOT 0xffffffffffffffffULL
@@ -9738,8 +9998,7 @@ int vfs_ftruncate(int fd, u64 length) {
   struct vfs_node *node = h->node;
   struct vfs_inode *inode = node->inode;
 
-  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(node);
-  if (mnt && (mnt->flags & MS_RDONLY))
+  if (vfs_handle_mount_ro(h))
     return -EROFS;
 
   if ((h->flags & 3) == B1NIX_O_RDONLY)
@@ -11020,10 +11279,34 @@ out:
   return res;
 }
 
+static int vfs_chmod_node(struct vfs_node *node, u16 mode) {
+  const struct cred *cred = get_current_cred();
+  if (!cred)
+    return -EACCES;
+
+  if (!cred_inode_owner_or_capable(cred, node->inode->uid, node->inode->gid))
+    return -EPERM;
+
+  node->inode->mode = (node->inode->mode & ~07777) |
+                      vfs_chmod_bits(cred, node->inode, mode);
+  vfs_update_times(node->inode, VFS_CTIME);
+  if (node->inode->setattr_cb)
+    return node->inode->setattr_cb(node);
+  return 0;
+}
+
 int vfs_fchmod(int fd, u16 mode) {
   struct vfs_handle *handle = get_handle(fd);
   if (!handle || !handle->used)
     return -EBADF;
+  if (handle->kind == VFS_HANDLE_SERIAL_TTY) {
+    struct vfs_node *sn = vfs_serial_handle_node(handle);
+    if (!sn)
+      return -EBADF;
+    int rc = vfs_chmod_node(sn, mode);
+    vfs_node_put(sn);
+    return rc;
+  }
   if (handle->kind != VFS_HANDLE_NODE || !handle->node) {
     /* An O_PATH descriptor refers to nothing that can change (EBADF on
      * Linux); every other nodeless object has its own inode. Its owner is
@@ -11036,20 +11319,7 @@ int vfs_fchmod(int fd, u16 mode) {
     return 0;
   }
 
-  const struct cred *cred = get_current_cred();
-  if (!cred)
-    return -EACCES;
-
-  if (!cred_inode_owner_or_capable(cred, handle->node->inode->uid,
-                                   handle->node->inode->gid))
-    return -EPERM;
-
-  handle->node->inode->mode = (handle->node->inode->mode & ~07777) |
-                              vfs_chmod_bits(cred, handle->node->inode, mode);
-  vfs_update_times(handle->node->inode, VFS_CTIME);
-  if (handle->node->inode->setattr_cb)
-    return handle->node->inode->setattr_cb(handle->node);
-  return 0;
+  return vfs_chmod_node(handle->node, mode);
 }
 
 /* Shared body of chown/lchown: `nofollow` selects whether a trailing symlink is
@@ -11354,24 +11624,35 @@ out:
   return ret;
 }
 
-int vfs_fchown(int fd, u32 uid, u32 gid) {
-  struct vfs_handle *handle = get_handle(fd);
-  if (!handle || !handle->used)
-    return -EBADF;
-  if (handle->kind != VFS_HANDLE_NODE || !handle->node)
-    return -EINVAL;
-
+static int vfs_fchown_node(struct vfs_node *node, u32 uid, u32 gid) {
   const struct cred *cred = get_current_cred();
   if (!cred)
     return -EACCES;
 
-  int rc = vfs_chown_inode(cred, handle->node->inode, uid, gid);
+  int rc = vfs_chown_inode(cred, node->inode, uid, gid);
   if (rc != 0)
     return rc;
-  handle->node->inode->ctime = vfs_get_unix_time();
-  if (handle->node->inode->setattr_cb)
-    return handle->node->inode->setattr_cb(handle->node);
+  node->inode->ctime = vfs_get_unix_time();
+  if (node->inode->setattr_cb)
+    return node->inode->setattr_cb(node);
   return 0;
+}
+
+int vfs_fchown(int fd, u32 uid, u32 gid) {
+  struct vfs_handle *handle = get_handle(fd);
+  if (!handle || !handle->used)
+    return -EBADF;
+  if (handle->kind == VFS_HANDLE_SERIAL_TTY) {
+    struct vfs_node *sn = vfs_serial_handle_node(handle);
+    if (!sn)
+      return -EBADF;
+    int rc = vfs_fchown_node(sn, uid, gid);
+    vfs_node_put(sn);
+    return rc;
+  }
+  if (handle->kind != VFS_HANDLE_NODE || !handle->node)
+    return -EINVAL;
+  return vfs_fchown_node(handle->node, uid, gid);
 }
 
 int vfs_fstatfs(int fd, struct b1nix_statfs *st) {

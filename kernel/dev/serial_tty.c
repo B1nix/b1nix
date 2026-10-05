@@ -29,6 +29,7 @@
 #include <b1nix/spinlock.h>
 #include <b1nix/syscall.h>
 #include <b1nix/sysfs_attr.h>
+#include <b1nix/tty_sysfs.h>
 #include <b1nix/uevent.h>
 #include <b1nix/virtio_console.h>
 #include <stdio.h>
@@ -682,6 +683,14 @@ int serial_tty_open(int idx, int flags) {
   return fd;
 }
 
+/* The /dev name of the port a handle is open on, or NULL if it is not a
+ * serial tty handle. */
+const char *serial_tty_handle_name(const struct vfs_handle *h) {
+  if (!h || h->kind != VFS_HANDLE_SERIAL_TTY || !h->private_data)
+    return 0;
+  return ((const struct serial_tty *)h->private_data)->name;
+}
+
 /* Map a /dev path to a serial tty index; -1 if it is not one of ours. */
 int serial_tty_path_index(const char *resolved_path) {
   for (int i = 0; i < STTY_COUNT; i++) {
@@ -776,7 +785,7 @@ void serial_tty_register_nodes(void) {
 
 static u64 stty_rdev(const struct serial_tty *t);
 
-/* ── /sys/class/tty/ttySN, so udev and systemd can see the port ──────────
+/* ── /sys/devices/.../tty/ttySN, so udev and systemd can see the port ────
  *
  * A device node alone is not a device: systemd builds `dev-ttyS0.device` from
  * what udev reports, udev reports what it finds in /sys, and nothing here
@@ -784,50 +793,19 @@ static u64 stty_rdev(const struct serial_tty *t);
  * serial getty -- then waited its ninety seconds and failed, on a machine
  * where /dev/ttyS0 worked perfectly.
  *
- * The VTs next door already do this (vt_sysfs_publish); this is the same three
- * files for the serial side, including a writable `uevent` so that a coldplug
- * replay (`udevadm trigger`) re-announces the port to a manager that started
- * after the kernel did. */
-static isize stty_sysfs_dev_show(void *ctx, char *buf, usize cap) {
-  u64 rdev = (u64)(usize)ctx;
-
-  return (isize)snprintf(buf, cap, "%u:%u\n", (unsigned)(rdev >> 8),
-                         (unsigned)(rdev & 0xff));
-}
-
-static isize stty_sysfs_uevent_show(void *ctx, char *buf, usize cap) {
-  const struct serial_tty *t = ctx;
-  u64 rdev = stty_rdev(t);
-
-  return (isize)snprintf(buf, cap, "MAJOR=%u\nMINOR=%u\nDEVNAME=%s\n",
-                         (unsigned)(rdev >> 8), (unsigned)(rdev & 0xff),
-                         t->name);
-}
-
-static isize stty_sysfs_uevent_store(void *ctx, const char *buf, usize len) {
-  const struct serial_tty *t = ctx;
-  u64 rdev = stty_rdev(t);
-  char devpath[40];
-
-  snprintf(devpath, sizeof(devpath), "/class/tty/%s", t->name);
-  /* A tty carries no DEVTYPE on Linux either. */
-  return uevent_store_write(buf, len, devpath, "tty", 0, t->name,
-                            (int)(rdev >> 8), (int)(rdev & 0xff));
-}
-
+ * The layout is tty_sysfs_publish()'s, shared with the VTs; the ports hang off
+ * the platform device their driver is on Linux. */
+#if defined(__x86_64__)
+#define STTY_SYSFS_PARENT "platform/serial8250"
+#else
+#define STTY_SYSFS_PARENT "platform/pl011"
+#endif
 static void stty_sysfs_publish(struct serial_tty *t) {
-  struct sysfs_dir *cls = sysfs_reg_dir(sysfs_reg_dir(0, "class"), "tty");
-  struct sysfs_dir *d;
+  u64 rdev = stty_rdev(t);
 
-  if (!cls)
-    return;
-  d = sysfs_reg_dir(cls, t->name);
-  if (!d)
-    return;
-  (void)sysfs_reg_attr(d, "dev", 0444, stty_sysfs_dev_show, 0,
-                       (void *)(usize)stty_rdev(t), 0);
-  (void)sysfs_reg_attr(d, "uevent", 0644, stty_sysfs_uevent_show,
-                       stty_sysfs_uevent_store, t, 0);
+  /* virtio-console has no hardware of its own behind it on Linux either. */
+  (void)tty_sysfs_publish(t->hvc ? "virtual" : STTY_SYSFS_PARENT, t->name,
+                          (int)(rdev >> 8), (int)(rdev & 0xff));
 }
 
 /* The device number a port really has, with Linux's numbering: the UARTs are

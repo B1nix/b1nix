@@ -559,6 +559,8 @@ int unix_shutdown(struct vfs_socket_state *s, int how_wr, int how_rd);
 /* SO_PEERCRED — credentials of the peer socket's creator. -ENOTCONN if the
  * socket has no peer. */
 int unix_peer_cred(struct vfs_socket_state *s, struct b1nix_ucred *out);
+/* The peer's supplementary groups at connect time; count, or -errno. */
+int unix_peer_groups(struct vfs_socket_state *s, u32 *out, int max);
 usize unix_bytes_available(struct vfs_socket_state *s);
 
 #endif

@@ -50,13 +50,24 @@ int main(int argc, char **argv) {
   }
 
   /* 3. Write file from guest */
+  /* Written, read back through a second descriptor, and -- by the harness,
+   * from the host's side of the share -- compared with what was sent. */
   int out_fd = open("/mnt/9p/guest_output.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
   if (out_fd >= 0) {
     const char *msg = "Written by b1nix via VirtIO-9P!\n";
-    write(out_fd, msg, strlen(msg));
-    fsync(out_fd);
+    ssize_t wn = write(out_fd, msg, strlen(msg));
     close(out_fd);
-    marker("M110-9P: ok write-guest-file\n");
+    char back[64];
+    ssize_t rn = -1;
+    int in_fd = open("/mnt/9p/guest_output.txt", O_RDONLY);
+    if (in_fd >= 0) {
+      rn = read(in_fd, back, sizeof(back));
+      close(in_fd);
+    }
+    if (wn == (ssize_t)strlen(msg) && rn == wn && memcmp(back, msg, (size_t)wn) == 0)
+      marker("M110-9P: ok write-guest-file\n");
+    else
+      marker("M110-9P: fail write-guest-file\n");
   } else {
     marker("M110-9P: fail write-guest-file\n");
   }

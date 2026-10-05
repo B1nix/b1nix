@@ -47,16 +47,16 @@ ovmf() { # code|vars
 # q35: its ICH9 AHCI carries the CD drive, which is where a person's machine
 # has it too. The guest powers off when its checks are done.
 boot_iso() { # firmware serial-log
-	fw=""
+	fwargs=""
 	if [ "$1" = uefi ]; then
 		code=$(ovmf code) && vars=$(ovmf vars) || return 1
 		cp -f "$vars" "$2.vars.fd"
-		fw="-drive if=pflash,format=raw,readonly=on,file=$code -drive if=pflash,format=raw,file=$2.vars.fd"
+		fwargs="-drive if=pflash,format=raw,readonly=on,file=$code -drive if=pflash,format=raw,file=$2.vars.fd"
 	fi
 	accel=""
 	[ ! -w /dev/kvm ] || accel="-accel kvm -cpu host,+invtsc"
 	# shellcheck disable=SC2086
-	timeout "$BOOT_TIMEOUT" qemu-system-x86_64 -machine q35 $accel $fw -m 2048 -smp 2 \
+	timeout "$BOOT_TIMEOUT" qemu-system-x86_64 -machine q35 $accel $fwargs -m 2048 -smp 2 \
 		-cdrom "$ISO" -display none -serial file:"$2" -no-reboot >>"$LOG" 2>&1 || true
 }
 
@@ -95,10 +95,15 @@ for fw in bios uefi; do
 		clean_log "$blog" | grep -a "b1nix-live:" | head -3 | sed 's/^/    /'
 		continue
 	fi
-	case "$(marker "$blog" "firmware=")" in
-	*"firmware=$fw") ok "$fw-firmware" ;;
-	*) bad "$fw-firmware" "the session says it booted '$(marker "$blog" "firmware=" | sed 's/.*=//')'" ;;
-	esac
+	# Which path Limine took, from its own banner: the kernel has no
+	# /sys/firmware/efi to ask (docs/kernel/abi-gaps.md).
+	want=BIOS
+	[ "$fw" = bios ] || want=UEFI
+	if clean_log "$blog" | grep -aq "Limine .*(x86-64, $want)"; then
+		ok "$fw-firmware"
+	else
+		bad "$fw-firmware" "Limine's banner does not say $want"
+	fi
 	case "$(marker "$blog" "root=")" in
 	*"root=btrfs"*) ok "$fw-root-is-the-seed" ;;
 	*) bad "$fw-root-is-the-seed" "/ is '$(marker "$blog" "root=" | sed 's/.*root=//')', not the btrfs seed" ;;

@@ -25,6 +25,13 @@ static u32 p9_alloc_fid(void) {
   return __sync_fetch_and_add(&g_p9_next_fid, 1);
 }
 
+/* Every p9_proto_* call below holds the device across the whole exchange --
+ * marshalling into req_buf, the transfer, and parsing resp_buf -- through the
+ * wrapper generated beside it. The lock used to cover the transfer alone, so
+ * two writers (a cp and an xwd onto one share) built their requests in one
+ * buffer at once: the host saw garbage, the files stayed empty, and the next
+ * exchange waited for ever. */
+
 /* Marshalling helpers */
 static void p9_buf_init(struct p9_buffer *buf, void *data, usize cap) {
   buf->data = (u8 *)data;
@@ -146,7 +153,7 @@ static int p9_get_str(struct p9_buffer *buf, char *out, usize max_len) {
 
 /* 9P Protocol Actions */
 
-static int p9_proto_version(struct virtio_9p_dev *p9dev) {
+static int p9_proto_version_locked(struct virtio_9p_dev *p9dev) {
   struct p9_buffer req, resp;
   p9_buf_init(&req, p9dev->req_buf, p9dev->msize);
 
@@ -180,7 +187,14 @@ static int p9_proto_version(struct virtio_9p_dev *p9dev) {
   return 0;
 }
 
-static int p9_proto_attach(struct virtio_9p_dev *p9dev, u32 root_fid,
+static int p9_proto_version(struct virtio_9p_dev *p9dev) {
+  virtio_9p_lock(p9dev);
+  int ret = p9_proto_version_locked(p9dev);
+  virtio_9p_unlock(p9dev);
+  return ret;
+}
+
+static int p9_proto_attach_locked(struct virtio_9p_dev *p9dev, u32 root_fid,
                            struct p9_qid *root_qid) {
   struct p9_buffer req, resp;
   p9_buf_init(&req, p9dev->req_buf, p9dev->msize);
@@ -210,7 +224,15 @@ static int p9_proto_attach(struct virtio_9p_dev *p9dev, u32 root_fid,
   return p9_get_qid(&resp, root_qid);
 }
 
-static int p9_proto_walk(struct virtio_9p_dev *p9dev, u32 fid, u32 new_fid,
+static int p9_proto_attach(struct virtio_9p_dev *p9dev, u32 root_fid,
+                           struct p9_qid *root_qid) {
+  virtio_9p_lock(p9dev);
+  int ret = p9_proto_attach_locked(p9dev, root_fid, root_qid);
+  virtio_9p_unlock(p9dev);
+  return ret;
+}
+
+static int p9_proto_walk_locked(struct virtio_9p_dev *p9dev, u32 fid, u32 new_fid,
                          const char *name, struct p9_qid *out_qid) {
   struct p9_buffer req, resp;
   p9_buf_init(&req, p9dev->req_buf, p9dev->msize);
@@ -251,7 +273,15 @@ static int p9_proto_walk(struct virtio_9p_dev *p9dev, u32 fid, u32 new_fid,
   return 0;
 }
 
-static int p9_proto_clunk(struct virtio_9p_dev *p9dev, u32 fid) {
+static int p9_proto_walk(struct virtio_9p_dev *p9dev, u32 fid, u32 new_fid,
+                         const char *name, struct p9_qid *out_qid) {
+  virtio_9p_lock(p9dev);
+  int ret = p9_proto_walk_locked(p9dev, fid, new_fid, name, out_qid);
+  virtio_9p_unlock(p9dev);
+  return ret;
+}
+
+static int p9_proto_clunk_locked(struct virtio_9p_dev *p9dev, u32 fid) {
   struct p9_buffer req;
   p9_buf_init(&req, p9dev->req_buf, p9dev->msize);
 
@@ -264,7 +294,14 @@ static int p9_proto_clunk(struct virtio_9p_dev *p9dev, u32 fid) {
   return virtio_9p_transact(p9dev, req.offset, p9dev->msize, &actual_resp);
 }
 
-static int p9_proto_fsync(struct virtio_9p_dev *p9dev, u32 fid) {
+static int p9_proto_clunk(struct virtio_9p_dev *p9dev, u32 fid) {
+  virtio_9p_lock(p9dev);
+  int ret = p9_proto_clunk_locked(p9dev, fid);
+  virtio_9p_unlock(p9dev);
+  return ret;
+}
+
+static int p9_proto_fsync_locked(struct virtio_9p_dev *p9dev, u32 fid) {
   struct p9_buffer req, resp;
   p9_buf_init(&req, p9dev->req_buf, p9dev->msize);
 
@@ -287,7 +324,14 @@ static int p9_proto_fsync(struct virtio_9p_dev *p9dev, u32 fid) {
   return 0;
 }
 
-static int p9_proto_getattr(struct virtio_9p_dev *p9dev, u32 fid, u64 mask,
+static int p9_proto_fsync(struct virtio_9p_dev *p9dev, u32 fid) {
+  virtio_9p_lock(p9dev);
+  int ret = p9_proto_fsync_locked(p9dev, fid);
+  virtio_9p_unlock(p9dev);
+  return ret;
+}
+
+static int p9_proto_getattr_locked(struct virtio_9p_dev *p9dev, u32 fid, u64 mask,
                             struct p9_rgetattr *out) {
   struct p9_buffer req, resp;
   p9_buf_init(&req, p9dev->req_buf, p9dev->msize);
@@ -331,7 +375,15 @@ static int p9_proto_getattr(struct virtio_9p_dev *p9dev, u32 fid, u64 mask,
   return 0;
 }
 
-static int p9_proto_setattr(struct virtio_9p_dev *p9dev, u32 fid, u32 valid,
+static int p9_proto_getattr(struct virtio_9p_dev *p9dev, u32 fid, u64 mask,
+                            struct p9_rgetattr *out) {
+  virtio_9p_lock(p9dev);
+  int ret = p9_proto_getattr_locked(p9dev, fid, mask, out);
+  virtio_9p_unlock(p9dev);
+  return ret;
+}
+
+static int p9_proto_setattr_locked(struct virtio_9p_dev *p9dev, u32 fid, u32 valid,
                             u32 mode, u32 uid, u32 gid, u64 size,
                             u64 atime_sec, u64 atime_nsec,
                             u64 mtime_sec, u64 mtime_nsec) {
@@ -356,7 +408,17 @@ static int p9_proto_setattr(struct virtio_9p_dev *p9dev, u32 fid, u32 valid,
   return virtio_9p_transact(p9dev, req.offset, p9dev->msize, &actual_resp);
 }
 
-static int p9_proto_lopen(struct virtio_9p_dev *p9dev, u32 fid, u32 flags) {
+static int p9_proto_setattr(struct virtio_9p_dev *p9dev, u32 fid, u32 valid,
+                            u32 mode, u32 uid, u32 gid, u64 size,
+                            u64 atime_sec, u64 atime_nsec,
+                            u64 mtime_sec, u64 mtime_nsec) {
+  virtio_9p_lock(p9dev);
+  int ret = p9_proto_setattr_locked(p9dev, fid, valid, mode, uid, gid, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec);
+  virtio_9p_unlock(p9dev);
+  return ret;
+}
+
+static int p9_proto_lopen_locked(struct virtio_9p_dev *p9dev, u32 fid, u32 flags) {
   struct p9_buffer req, resp;
   p9_buf_init(&req, p9dev->req_buf, p9dev->msize);
 
@@ -382,7 +444,14 @@ static int p9_proto_lopen(struct virtio_9p_dev *p9dev, u32 fid, u32 flags) {
   return 0;
 }
 
-static int p9_proto_lcreate(struct virtio_9p_dev *p9dev, u32 fid,
+static int p9_proto_lopen(struct virtio_9p_dev *p9dev, u32 fid, u32 flags) {
+  virtio_9p_lock(p9dev);
+  int ret = p9_proto_lopen_locked(p9dev, fid, flags);
+  virtio_9p_unlock(p9dev);
+  return ret;
+}
+
+static int p9_proto_lcreate_locked(struct virtio_9p_dev *p9dev, u32 fid,
                             const char *name, u32 flags, u32 mode, u32 gid,
                             struct p9_qid *out_qid) {
   struct p9_buffer req, resp;
@@ -416,7 +485,16 @@ static int p9_proto_lcreate(struct virtio_9p_dev *p9dev, u32 fid,
   return 0;
 }
 
-static int p9_proto_mkdir(struct virtio_9p_dev *p9dev, u32 fid,
+static int p9_proto_lcreate(struct virtio_9p_dev *p9dev, u32 fid,
+                            const char *name, u32 flags, u32 mode, u32 gid,
+                            struct p9_qid *out_qid) {
+  virtio_9p_lock(p9dev);
+  int ret = p9_proto_lcreate_locked(p9dev, fid, name, flags, mode, gid, out_qid);
+  virtio_9p_unlock(p9dev);
+  return ret;
+}
+
+static int p9_proto_mkdir_locked(struct virtio_9p_dev *p9dev, u32 fid,
                           const char *name, u32 mode, u32 gid,
                           struct p9_qid *out_qid) {
   struct p9_buffer req, resp;
@@ -449,7 +527,16 @@ static int p9_proto_mkdir(struct virtio_9p_dev *p9dev, u32 fid,
   return 0;
 }
 
-static int p9_proto_unlinkat(struct virtio_9p_dev *p9dev, u32 dir_fid,
+static int p9_proto_mkdir(struct virtio_9p_dev *p9dev, u32 fid,
+                          const char *name, u32 mode, u32 gid,
+                          struct p9_qid *out_qid) {
+  virtio_9p_lock(p9dev);
+  int ret = p9_proto_mkdir_locked(p9dev, fid, name, mode, gid, out_qid);
+  virtio_9p_unlock(p9dev);
+  return ret;
+}
+
+static int p9_proto_unlinkat_locked(struct virtio_9p_dev *p9dev, u32 dir_fid,
                              const char *name, u32 flags) {
   struct p9_buffer req;
   p9_buf_init(&req, p9dev->req_buf, p9dev->msize);
@@ -465,7 +552,15 @@ static int p9_proto_unlinkat(struct virtio_9p_dev *p9dev, u32 dir_fid,
   return virtio_9p_transact(p9dev, req.offset, p9dev->msize, &actual_resp);
 }
 
-static isize p9_proto_read(struct virtio_9p_dev *p9dev, u32 fid, u64 offset,
+static int p9_proto_unlinkat(struct virtio_9p_dev *p9dev, u32 dir_fid,
+                             const char *name, u32 flags) {
+  virtio_9p_lock(p9dev);
+  int ret = p9_proto_unlinkat_locked(p9dev, dir_fid, name, flags);
+  virtio_9p_unlock(p9dev);
+  return ret;
+}
+
+static isize p9_proto_read_locked(struct virtio_9p_dev *p9dev, u32 fid, u64 offset,
                            char *buffer, usize size) {
   struct p9_buffer req, resp;
   p9_buf_init(&req, p9dev->req_buf, p9dev->msize);
@@ -504,7 +599,15 @@ static isize p9_proto_read(struct virtio_9p_dev *p9dev, u32 fid, u64 offset,
   return (isize)count;
 }
 
-static isize p9_proto_write(struct virtio_9p_dev *p9dev, u32 fid, u64 offset,
+static isize p9_proto_read(struct virtio_9p_dev *p9dev, u32 fid, u64 offset,
+                           char *buffer, usize size) {
+  virtio_9p_lock(p9dev);
+  isize ret = p9_proto_read_locked(p9dev, fid, offset, buffer, size);
+  virtio_9p_unlock(p9dev);
+  return ret;
+}
+
+static isize p9_proto_write_locked(struct virtio_9p_dev *p9dev, u32 fid, u64 offset,
                             const char *buffer, usize size) {
   struct p9_buffer req, resp;
   p9_buf_init(&req, p9dev->req_buf, p9dev->msize);
@@ -538,6 +641,14 @@ static isize p9_proto_write(struct virtio_9p_dev *p9dev, u32 fid, u64 offset,
   return (isize)written;
 }
 
+static isize p9_proto_write(struct virtio_9p_dev *p9dev, u32 fid, u64 offset,
+                            const char *buffer, usize size) {
+  virtio_9p_lock(p9dev);
+  isize ret = p9_proto_write_locked(p9dev, fid, offset, buffer, size);
+  virtio_9p_unlock(p9dev);
+  return ret;
+}
+
 /* VFS Callbacks */
 
 static int p9_vfs_lookup(struct vfs_node *dir, const char *name);
@@ -558,6 +669,15 @@ static int p9_vfs_statfs(struct vfs_node *node, struct b1nix_statfs *st);
 static void p9_vfs_release(struct vfs_node *node);
 static int p9_vfs_fsync(struct vfs_node *node);
 
+/* Writes go to the host as they are made, as Linux's 9p does by default
+ * (cache=none): the files belong to the host, which reads them while the guest
+ * runs. Left to the page cache they were never written at all -- nothing
+ * flushes a 9p page -- and every file a guest wrote to a share stayed empty. */
+static int p9_vfs_write_through(struct vfs_node *node) {
+  (void)node;
+  return 1;
+}
+
 static void p9_setup_node_ops(struct vfs_node *node, struct virtio_9p_dev *p9dev,
                               u32 fid, struct p9_qid *qid, u32 mode, u64 size) {
   struct p9_inode_info *info = kzalloc(sizeof(struct p9_inode_info));
@@ -573,6 +693,7 @@ static void p9_setup_node_ops(struct vfs_node *node, struct virtio_9p_dev *p9dev
   node->inode->size = (usize)size;
   node->inode->read_cb = p9_vfs_read;
   node->inode->write_cb = p9_vfs_write;
+  node->inode->write_through_cb = p9_vfs_write_through;
   node->inode->readdir_cb = p9_vfs_readdir;
   node->inode->lookup_cb = p9_vfs_lookup;
   node->inode->create_cb = p9_vfs_create;
@@ -791,6 +912,41 @@ static isize p9_vfs_readdir(struct vfs_node *dir, usize offset,
   return (isize)entries_read;
 }
 
+/* Give a name the server has just created its node in the tree.
+ *
+ * The VFS links a node for the name before it calls create_cb or mkdir_cb,
+ * and hands THAT node to the caller; the filesystem's part is to fill it in.
+ * This used to build and attach a second node of the same name instead, so
+ * open(O_CREAT) returned the VFS's bare node -- no fid, no write-through --
+ * and everything written to a new file on a share went into a page cache
+ * nothing flushed: the server's file stayed empty. A node already filled in
+ * keeps its fid and this one is dropped; with no node for the name (a caller
+ * outside the VFS's create path), one is made. */
+static int p9_bind_new_child(struct vfs_node *dir, const char *name,
+                             enum vfs_node_type type,
+                             struct virtio_9p_dev *p9dev, u32 fid,
+                             struct p9_qid *qid, u32 mode) {
+  struct vfs_node *child = find_child(dir, name);
+  if (child) {
+    if (child->inode && !child->inode->data)
+      p9_setup_node_ops(child, p9dev, fid, qid, mode, 0);
+    else
+      p9_proto_clunk(p9dev, fid);
+    vfs_node_put(child);
+    return 0;
+  }
+  child = vfs_create_node(type);
+  if (!child) {
+    p9_proto_clunk(p9dev, fid);
+    return -ENOMEM;
+  }
+  strncpy(child->name, name, VFS_NAME_MAX - 1);
+  child->name[VFS_NAME_MAX - 1] = '\0';
+  p9_setup_node_ops(child, p9dev, fid, qid, mode, 0);
+  vfs_attach_child(dir, child);
+  return 0;
+}
+
 static int p9_vfs_create(struct vfs_node *dir, const char *name,
                          const char *full_path, u32 mode) {
   (void)full_path;
@@ -815,17 +971,7 @@ static int p9_vfs_create(struct vfs_node *dir, const char *name,
     return err;
   }
 
-  struct vfs_node *child = vfs_create_node(VFS_FILE);
-  if (!child) {
-    p9_proto_clunk(p9dev, new_fid);
-    return -ENOMEM;
-  }
-
-  strncpy(child->name, name, VFS_NAME_MAX - 1);
-  child->name[VFS_NAME_MAX - 1] = '\0';
-  p9_setup_node_ops(child, p9dev, new_fid, &qid, mode, 0);
-  vfs_attach_child(dir, child);
-  return 0;
+  return p9_bind_new_child(dir, name, VFS_FILE, p9dev, new_fid, &qid, mode);
 }
 
 static int p9_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
@@ -845,17 +991,8 @@ static int p9_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
   if (err < 0)
     return err;
 
-  struct vfs_node *child = vfs_create_node(VFS_DIRECTORY);
-  if (!child) {
-    p9_proto_clunk(p9dev, new_fid);
-    return -ENOMEM;
-  }
-
-  strncpy(child->name, name, VFS_NAME_MAX - 1);
-  child->name[VFS_NAME_MAX - 1] = '\0';
-  p9_setup_node_ops(child, p9dev, new_fid, &qid, mode | B1NIX_S_IFDIR, 0);
-  vfs_attach_child(dir, child);
-  return 0;
+  return p9_bind_new_child(dir, name, VFS_DIRECTORY, p9dev, new_fid, &qid,
+                           mode | B1NIX_S_IFDIR);
 }
 
 static int p9_vfs_unlink(struct vfs_node *dir, const char *name) {

@@ -458,22 +458,31 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
   if (!argv_ptrs || !envp_ptrs)
     goto out;
 
-  for (int i = image->argc - 1; i >= 0; i--) {
-    argv_ptrs[i] = user_stack_push_string(stack, &sp, image->argv[i]);
-    if (argv_ptrs[i] == 0) goto out;
+  /* The strings in Linux's order, from the top down: a zero word, the
+   * AT_EXECFN path, the environment, then the arguments -- so argv[0] is the
+   * lowest and the last environment string ends where the block does.
+   * Programs measure that block: setproctitle() in util-linux (login) and
+   * others clears from argv[0] to the end of the last environment string,
+   * and with the arguments above the environment that length came out
+   * negative -- a memset of (size_t)-1 off the top of the stack. */
+  if (sp < sizeof(usize)) goto out;
+  sp -= sizeof(usize);
+  memset(stack + sp, 0, sizeof(usize));
+  /* M92: the AT_EXECFN string goes in before the 16-byte alignment so its
+   * variable length doesn't break the alignment for the auxv pairs; the auxv
+   * entry pushes only the pointer and type. */
+  usize execfn_va = 0;
+  if (image->path) {
+    execfn_va = user_stack_push_string(stack, &sp, image->path);
+    if (execfn_va == 0) goto out;
   }
   for (int i = envc - 1; i >= 0; i--) {
     envp_ptrs[i] = user_stack_push_string(stack, &sp, image->envp[i]);
     if (envp_ptrs[i] == 0) goto out;
   }
-
-  /* M92: Push the AT_EXECFN string data BEFORE the 16-byte alignment so its
-   * variable-length payload doesn't break the alignment for the auxv pairs.
-   * Record its user VA; the auxv entry pushes only the pointer and type. */
-  usize execfn_va = 0;
-  if (image->path) {
-    execfn_va = user_stack_push_string(stack, &sp, image->path);
-    if (execfn_va == 0) goto out;
+  for (int i = image->argc - 1; i >= 0; i--) {
+    argv_ptrs[i] = user_stack_push_string(stack, &sp, image->argv[i]);
+    if (argv_ptrs[i] == 0) goto out;
   }
 
   sp &= ~(usize)0xf;

@@ -18,14 +18,14 @@
 static struct virtio_9p_dev g_p9_devs[MAX_VIRTIO_9P_DEVS];
 static int g_p9_dev_count = 0;
 
-static void p9_lock(struct virtio_9p_dev *p9dev) {
+void virtio_9p_lock(struct virtio_9p_dev *p9dev) {
   while (__sync_lock_test_and_set(&p9dev->busy, 1)) {
     scheduler_yield();
   }
   scheduler_kcrit_enter();
 }
 
-static void p9_unlock(struct virtio_9p_dev *p9dev) {
+void virtio_9p_unlock(struct virtio_9p_dev *p9dev) {
   __sync_lock_release(&p9dev->busy);
   scheduler_kcrit_leave();
 }
@@ -48,8 +48,6 @@ int virtio_9p_transact(struct virtio_9p_dev *p9dev, usize req_len,
       max_resp_len < sizeof(struct p9_header)) {
     return -EINVAL;
   }
-
-  p9_lock(p9dev);
 
   /* Update request header size */
   *(u32 *)p9dev->req_buf = (u32)req_len;
@@ -80,7 +78,6 @@ int virtio_9p_transact(struct virtio_9p_dev *p9dev, usize req_len,
   while (vq->last_used_idx == vq->used->idx) {
     if (--timeout == 0) {
       k_warn("virtio-9p", "timeout waiting for response");
-      p9_unlock(p9dev);
       return -EIO;
     }
     cpu_relax();
@@ -96,18 +93,15 @@ int virtio_9p_transact(struct virtio_9p_dev *p9dev, usize req_len,
   }
 
   if (bytes_written < sizeof(struct p9_header)) {
-    p9_unlock(p9dev);
     return -EIO;
   }
 
   u8 resp_type = p9dev->resp_buf[4];
   if (resp_type == P9_RLERROR) {
     u32 ecode = *(u32 *)(p9dev->resp_buf + 7);
-    p9_unlock(p9dev);
     return -(int)ecode;
   }
 
-  p9_unlock(p9dev);
   return 0;
 }
 

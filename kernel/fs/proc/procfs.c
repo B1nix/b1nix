@@ -31,6 +31,7 @@
 #include <b1nix/psi.h>
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
+#include <b1nix/inotify.h>
 #include <b1nix/kmsg.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
@@ -1032,6 +1033,53 @@ static int r_sys_threads_max(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/sys/fs/inotify: the per-user limits inotify charges against. */
+static int r_sys_inotify(int which, struct sbuf *s) {
+  sb_addf(s, "%d\n", inotify_limit_get(which));
+  return 0;
+}
+
+static int w_sys_inotify(int which, const char *buf, usize len) {
+  const struct cred *cred = scheduler_get_current_cred();
+  if (!cred || !cred_has_cap_effective(cred, CAP_SYS_ADMIN))
+    return -EPERM;
+  usize i = 0;
+  while (i < len && (buf[i] == ' ' || buf[i] == '\t'))
+    i++;
+  if (i >= len || buf[i] < '0' || buf[i] > '9')
+    return -EINVAL;
+  u64 v = 0;
+  while (i < len && buf[i] >= '0' && buf[i] <= '9') {
+    v = v * 10 + (u64)(buf[i] - '0');
+    if (v > 0x7fffffff)
+      return -EINVAL;
+    i++;
+  }
+  int rc = inotify_limit_set(which, (int)v);
+  return rc < 0 ? rc : (int)len;
+}
+
+static int r_sys_inotify_instances(usize pid, struct sbuf *s) {
+  (void)pid;
+  return r_sys_inotify(INOTIFY_LIMIT_INSTANCES, s);
+}
+static int r_sys_inotify_watches(usize pid, struct sbuf *s) {
+  (void)pid;
+  return r_sys_inotify(INOTIFY_LIMIT_WATCHES, s);
+}
+static int r_sys_inotify_queued(usize pid, struct sbuf *s) {
+  (void)pid;
+  return r_sys_inotify(INOTIFY_LIMIT_QUEUED, s);
+}
+static int w_sys_inotify_instances(usize pid, const char *buf, usize len) {
+  (void)pid;
+  return w_sys_inotify(INOTIFY_LIMIT_INSTANCES, buf, len);
+}
+static int w_sys_inotify_watches(usize pid, const char *buf, usize len) {
+  (void)pid;
+  return w_sys_inotify(INOTIFY_LIMIT_WATCHES, buf, len);
+}
+
 static int r_sys_file_max(usize pid, struct sbuf *s) {
   (void)pid;
   /* The per-task descriptor ceiling is RLIMIT_NOFILE; the kernel imposes no
@@ -1512,11 +1560,20 @@ static int r_mountinfo(usize pid, struct sbuf *s) {
 
   if (!ents)
     return 0;
+  u32 *ids = kmalloc(cap * sizeof(u32) * 2);
+  if (!ids) {
+    kfree(ents);
+    return 0;
+  }
+  u32 *parents = ids + cap;
   isize n = vfs_mounts(ents, cap);
+  isize nt = vfs_mounts_topology(ids, parents, cap);
   for (isize i = 0; i < n; i++) {
     const char *src = ents[i].source[0] ? ents[i].source : "none";
     const char *tgt = ents[i].target[0] ? ents[i].target : "/";
     const char *fstype = ents[i].fstype[0] ? ents[i].fstype : "none";
+    long id = i < nt ? (long)ids[i] : (long)(i + 1);
+    long parent = i < nt ? (long)parents[i] : 1;
     char ob[32];
     const char *opts = mount_opts(ents[i].flags, ob, sizeof(ob));
     int maj = 0, min = (int)i;
@@ -1532,9 +1589,10 @@ static int r_mountinfo(usize pid, struct sbuf *s) {
         break;
       }
     }
-    sb_addf(s, "%ld 1 %d:%d / %s %s - %s %s %s\n", (long)(i + 1), maj, min,
+    sb_addf(s, "%ld %ld %d:%d / %s %s - %s %s %s\n", id, parent, maj, min,
             tgt, opts, fstype, src, opts);
   }
+  kfree(ids);
   kfree(ents);
   return 0;
 }
@@ -4623,8 +4681,18 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
         procfs_mkchild(userd, nsmax[i].name, VFS_DEVICE, nsmax[i].render, 0);
     }
     struct vfs_node *fsd = procfs_mkchild(sysd, "fs", VFS_DIRECTORY, 0, 0);
-    if (fsd)
+    if (fsd) {
       procfs_mkchild(fsd, "file-max", VFS_DEVICE, r_sys_file_max, 0);
+      struct vfs_node *ind = procfs_mkchild(fsd, "inotify", VFS_DIRECTORY, 0, 0);
+      if (ind) {
+        procfs_mkchild_writable(ind, "max_user_instances",
+                                r_sys_inotify_instances, w_sys_inotify_instances);
+        procfs_mkchild_writable(ind, "max_user_watches", r_sys_inotify_watches,
+                                w_sys_inotify_watches);
+        procfs_mkchild(ind, "max_queued_events", VFS_DEVICE,
+                       r_sys_inotify_queued, 0);
+      }
+    }
     procfs_sysctl_publish(sysd);
     struct vfs_node *snet = procfs_mkchild(sysd, "net", VFS_DIRECTORY, 0, 0);
     struct vfs_node *ipv4 =

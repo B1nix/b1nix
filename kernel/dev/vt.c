@@ -23,6 +23,7 @@
 
 #include <b1nix/termios_abi.h>
 #include <b1nix/vt.h>
+#include <b1nix/tty_sysfs.h>
 #include <b1nix/console.h>
 #include <b1nix/fb.h>
 #include <b1nix/bootinfo.h>
@@ -1257,73 +1258,28 @@ static isize vt_sysfs_active_show(void *ctx, char *buf, usize cap)
 	return (isize)snprintf(buf, cap, "tty%d\n", vt_active());
 }
 
-/* Every VT publishes the device number it really has, so a lookup by devnum
- * finds it. Major 4 is the Linux console major, and it is what our own nodes
- * carry; the minor is the VT number, as on Linux. */
-static isize vt_sysfs_dev_show(void *ctx, char *buf, usize cap)
-{
-	return (isize)snprintf(buf, cap, "4:%d\n", (int)(usize)ctx);
-}
-
-static isize vt_sysfs_uevent_show(void *ctx, char *buf, usize cap)
-{
-	int minor = (int)(usize)ctx;
-
-	if (minor == 0)
-		return (isize)snprintf(buf, cap,
-			"MAJOR=4\nMINOR=0\nDEVNAME=tty0\n");
-	return (isize)snprintf(buf, cap,
-		"MAJOR=4\nMINOR=%d\nDEVNAME=tty%d\n", minor, minor);
-}
-
-/* Writing "add" to a device's `uevent` file re-announces it, and that is how
- * every coldplug replay works: `udevadm trigger` walks /sys and writes to each
- * one. These files were read-only, so the replay reached every VT with
- * "Failed to write 'add' to '/sys/class/tty/ttyN/uevent': Permission denied"
- * and no tty was ever announced to a manager that started after the kernel
- * did. */
-static isize vt_sysfs_uevent_store(void *ctx, const char *buf, usize len)
-{
-	int minor = (int)(usize)ctx;
-	char name[8];
-	char devpath[32];
-
-	snprintf(name, sizeof(name), "tty%d", minor);
-	snprintf(devpath, sizeof(devpath), "/class/tty/%s", name);
-	/* A tty carries no DEVTYPE on Linux either. */
-	return uevent_store_write(buf, len, devpath, "tty", 0, name, 4, minor);
-}
-
 static void vt_sysfs_publish(void)
 {
-	struct sysfs_dir *cls = sysfs_reg_dir(sysfs_reg_dir(0, "class"), "tty");
 	struct sysfs_dir *d;
 	char name[8];
 
-	if (!cls)
-		return;
-
 	/* tty0 is not a console of its own: it is the name for "whichever is
-	 * current", which is why the active file lives here and nowhere else. */
-	d = sysfs_reg_dir(cls, "tty0");
-	if (d) {
+	 * current", which is why the active file lives here and nowhere else.
+	 * Major 4 is the Linux console major, and it is what our own nodes
+	 * carry; the minor is the VT number, as on Linux. */
+	d = tty_sysfs_publish("virtual", "tty0", 4, 0);
+	if (d)
 		(void)sysfs_reg_attr(d, "active", 0444, vt_sysfs_active_show, 0, 0, 0);
-		(void)sysfs_reg_attr(d, "dev", 0444, vt_sysfs_dev_show, 0,
-				     (void *)(usize)0, 0);
-		(void)sysfs_reg_attr(d, "uevent", 0644, vt_sysfs_uevent_show,
-				     vt_sysfs_uevent_store, (void *)(usize)0, 0);
-	}
-
 	for (int i = 1; i <= VT_COUNT; i++) {
 		snprintf(name, sizeof(name), "tty%d", i);
-		d = sysfs_reg_dir(cls, name);
-		if (!d)
-			continue;
-		(void)sysfs_reg_attr(d, "dev", 0444, vt_sysfs_dev_show, 0,
-				     (void *)(usize)i, 0);
-		(void)sysfs_reg_attr(d, "uevent", 0644, vt_sysfs_uevent_show,
-				     vt_sysfs_uevent_store, (void *)(usize)i, 0);
+		(void)tty_sysfs_publish("virtual", name, 4, i);
 	}
+	/* The terminals that are names rather than devices -- the controlling
+	 * terminal, the console, the pty multiplexer -- are virtual ttys on
+	 * Linux too, and the console carries the list a getty generator reads. */
+	(void)tty_sysfs_publish("virtual", "tty", 5, 0);
+	tty_sysfs_publish_console();
+	(void)tty_sysfs_publish("virtual", "ptmx", 5, 2);
 }
 
 void vt_init(void) {

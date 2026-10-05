@@ -794,6 +794,13 @@ static void sysfs_char_publish(struct vfs_node *devnode, const char *name) {
    * that link, and logind's TakeDevice for the mouse answered ENODEV. */
   if (major == 13)
     return;
+  /* And so do the terminals (4: VTs and serial ports, 5: tty, console and
+   * ptmx, 229: hvc): links into /sys/devices/.../tty/<name>, whose
+   * `subsystem` link is what makes udev see a tty at all -- see
+   * kernel/dev/tty_sysfs.c. This walk runs before those links are attached
+   * to a fresh mount, so a directory made here would take their place. */
+  if (major == 4 || major == 5 || major == 229)
+    return;
 
   char majmin[24];
   snprintf(majmin, sizeof(majmin), "%u:%u", (unsigned)major, (unsigned)minor);
@@ -2225,11 +2232,7 @@ static int sysfs_statfs(struct vfs_node *node, struct b1nix_statfs *st) {
   return 0;
 }
 
-static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
-                                       void *data) {
-  (void)source;
-  (void)flags;
-  (void)data;
+static struct vfs_node *sysfs_build_tree(void) {
   struct vfs_node *root = vfs_create_node(VFS_DIRECTORY);
   if (!root)
     return ERR_PTR(-ENOMEM);
@@ -2470,6 +2473,34 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
    * materialise as they happen. */
   sysfs_reg_attach_root(root);
   return root;
+}
+
+/* Every mount of sysfs is the same tree, as on Linux, where sysfs is one
+ * kernfs whatever it is mounted on.
+ *
+ * Each mount used to build a tree of its own, and the registry of driver
+ * directories -- /sys/class/tty, /sys/bus/pci, the DRM class -- can live in
+ * only one, so it moved to the newest: a sandbox mounting sysfs for itself
+ * (systemd does for every PrivateNetwork= service) took those directories
+ * out of the host's /sys for good. A second tree also had nodes of its own,
+ * so the mounts on the first one -- /sys/fs/cgroup -- were not at the same
+ * place in it, and systemd, rebuilding a service's /sys, could not tell what
+ * to bind back. The tree is built once and every mount shares it; the
+ * reference kept here keeps it alive between mounts. */
+static struct vfs_node *g_sysfs_tree;
+
+static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
+                                       void *data) {
+  (void)source;
+  (void)flags;
+  (void)data;
+  if (!g_sysfs_tree) {
+    struct vfs_node *root = sysfs_build_tree();
+    if (IS_ERR(root) || !root)
+      return root;
+    g_sysfs_tree = root;
+  }
+  return vfs_node_get(g_sysfs_tree);
 }
 
 void sysfs_init(void) {

@@ -11,6 +11,8 @@ void serial_tty_init(void);           /* after serial_init(); probes ports */
 void serial_tty_register_nodes(void); /* create /dev/ttySn VFS nodes */
 int serial_tty_open(int idx, int flags); /* returns fd or -errno */
 int serial_tty_path_index(const char *resolved_path); /* -1 if not a ttySn */
+struct vfs_handle;
+const char *serial_tty_handle_name(const struct vfs_handle *h); /* NULL if not one */
 int serial_tty_present(int idx);
 int serial_tty_claimed(int idx); /* open handles exist: tty owns its UART RX */
 void serial_tty_tick(void);

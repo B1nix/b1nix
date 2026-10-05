@@ -20,8 +20,15 @@
 #include <b1nix/vfs.h>
 #include <string.h>
 
-#define INOTIFY_MAX_INSTANCES 16
-#define INOTIFY_MAX_WATCHES 32
+/* The limits are per user, as on Linux, and start at Linux's defaults; they
+ * are /proc/sys/fs/inotify/max_user_{instances,watches}. They used to be a
+ * fixed 16 instances for the whole machine and 32 watches per instance, and
+ * systemd alone needs more than that: PID 1 watches cgroup.events and
+ * memory.events for every unit it starts, and from about the sixteenth unit
+ * on every one of them failed with ENOSPC -- "Failed to add control inotify
+ * watch descriptor" -- so it never learned when that unit's cgroup emptied. */
+static int g_max_user_instances = 128;
+static int g_max_user_watches = 8192;
 #define INOTIFY_QUEUE 64
 #define INOTIFY_NAME_MAX 255
 
@@ -40,15 +47,20 @@ struct inotify_event_rec {
 };
 
 struct inotify_instance {
-  struct inotify_watch watches[INOTIFY_MAX_WATCHES];
+  struct inotify_instance *next; /* registry list, under g_reg_lock */
+  u32 uid;                       /* the user the limits are charged to */
+  struct inotify_watch *watches; /* nwatch_cap slots; wd 0 = free */
+  int nwatch_cap;
+  int nwatch;                    /* slots in use */
   struct inotify_event_rec ev[INOTIFY_QUEUE];
   int head, tail, count; /* event ring */
   int next_wd;
   spinlock_t lock;
 };
 
-/* Registry of live instances so vfs_inotify_notify can find watchers. */
-static struct inotify_instance *g_instances[INOTIFY_MAX_INSTANCES];
+/* Registry of live instances so vfs_inotify_notify can find watchers. Lock
+ * order: g_reg_lock, then an instance's lock. */
+static struct inotify_instance *g_instances;
 static spinlock_t g_reg_lock = SPINLOCK_INIT;
 static int g_inotify_active; /* count of live instances — hot-path gate */
 
@@ -153,21 +165,7 @@ static void inotify_release(struct vfs_handle *h) {
     return;
   h->private_data = 0;
   /* Unregister and drop watch node refs. */
-  u64 flags;
-  spin_lock_irqsave(&g_reg_lock, &flags);
-  for (int i = 0; i < INOTIFY_MAX_INSTANCES; i++) {
-    if (g_instances[i] == in) {
-      g_instances[i] = 0;
-      __atomic_fetch_sub(&g_inotify_active, 1, __ATOMIC_RELEASE);
-      break;
-    }
-  }
-  spin_unlock_irqrestore(&g_reg_lock, flags);
-  for (int i = 0; i < INOTIFY_MAX_WATCHES; i++) {
-    if (in->watches[i].wd && in->watches[i].node)
-      vfs_node_put(in->watches[i].node);
-  }
-  kfree(in);
+  inotify_release_by_ptr(in);
 }
 
 /* FIONREAD: the bytes read(2) would return right now, as Linux answers it.
@@ -210,19 +208,23 @@ int vfs_inotify_init1(int flags) {
     return -ENOMEM;
   in->lock = SPINLOCK_INIT;
   in->next_wd = 1;
+  const struct cred *cred = scheduler_get_current_cred();
+  in->uid = cred ? cred->uid : 0;
 
-  /* Register. */
+  /* Register, within the user's instance limit (EMFILE, as on Linux). */
   u64 rf;
   spin_lock_irqsave(&g_reg_lock, &rf);
-  int slot = -1;
-  for (int i = 0; i < INOTIFY_MAX_INSTANCES; i++)
-    if (!g_instances[i]) { slot = i; break; }
-  if (slot < 0) {
+  int mine = 0;
+  for (struct inotify_instance *o = g_instances; o; o = o->next)
+    if (o->uid == in->uid)
+      mine++;
+  if (mine >= g_max_user_instances) {
     spin_unlock_irqrestore(&g_reg_lock, rf);
     kfree(in);
-    return -ENFILE;
+    return -EMFILE;
   }
-  g_instances[slot] = in;
+  in->next = g_instances;
+  g_instances = in;
   __atomic_fetch_add(&g_inotify_active, 1, __ATOMIC_RELEASE);
   spin_unlock_irqrestore(&g_reg_lock, rf);
 
@@ -246,17 +248,23 @@ int vfs_inotify_init1(int flags) {
   return fd;
 }
 
-/* Helper used only on the alloc_raw_handle failure path (no handle to release). */
+/* Unregister an instance, drop its watches' node references and free it. */
 static void inotify_release_by_ptr(struct inotify_instance *in) {
   u64 flags;
   spin_lock_irqsave(&g_reg_lock, &flags);
-  for (int i = 0; i < INOTIFY_MAX_INSTANCES; i++)
-    if (g_instances[i] == in) {
-      g_instances[i] = 0;
+  for (struct inotify_instance **pp = &g_instances; *pp; pp = &(*pp)->next) {
+    if (*pp == in) {
+      *pp = in->next;
       __atomic_fetch_sub(&g_inotify_active, 1, __ATOMIC_RELEASE);
       break;
     }
+  }
   spin_unlock_irqrestore(&g_reg_lock, flags);
+  for (int i = 0; i < in->nwatch_cap; i++) {
+    if (in->watches[i].wd && in->watches[i].node)
+      vfs_node_put(in->watches[i].node);
+  }
+  kfree(in->watches);
   kfree(in);
 }
 
@@ -288,37 +296,76 @@ int vfs_inotify_add_watch(int fd, const char *user_path, u32 mask) {
   if (!node)
     return -ENOENT;
 
-  u64 flags;
-  spin_lock_irqsave(&in->lock, &flags);
-  /* Existing watch on this node? Update the mask. */
-  for (int i = 0; i < INOTIFY_MAX_WATCHES; i++) {
-    if (in->watches[i].wd && in->watches[i].node == node) {
-      /* IN_MASK_ADD ORs into the existing mask instead of replacing it. The
-       * modifier bit itself is not an event and must not be stored. */
-      in->watches[i].mask =
-          (mask & IN_MASK_ADD)
-              ? (in->watches[i].mask | (mask & IN_ALL_EVENTS))
-              : (mask & IN_ALL_EVENTS);
-      int wd = in->watches[i].wd;
-      spin_unlock_irqrestore(&in->lock, flags);
-      vfs_node_put(node); /* already hold a ref in the existing watch */
-      return wd;
+  u64 rf, flags;
+  for (;;) {
+    spin_lock_irqsave(&g_reg_lock, &rf);
+    spin_lock_irqsave(&in->lock, &flags);
+    /* Existing watch on this node? Update the mask. */
+    for (int i = 0; i < in->nwatch_cap; i++) {
+      if (in->watches[i].wd && in->watches[i].node == node) {
+        /* IN_MASK_ADD ORs into the existing mask instead of replacing it. The
+         * modifier bit itself is not an event and must not be stored. */
+        in->watches[i].mask =
+            (mask & IN_MASK_ADD)
+                ? (in->watches[i].mask | (mask & IN_ALL_EVENTS))
+                : (mask & IN_ALL_EVENTS);
+        int wd = in->watches[i].wd;
+        spin_unlock_irqrestore(&in->lock, flags);
+        spin_unlock_irqrestore(&g_reg_lock, rf);
+        vfs_node_put(node); /* already hold a ref in the existing watch */
+        return wd;
+      }
     }
-  }
-  /* New watch. */
-  for (int i = 0; i < INOTIFY_MAX_WATCHES; i++) {
-    if (in->watches[i].wd == 0) {
-      in->watches[i].wd = in->next_wd++;
-      in->watches[i].node = node; /* keep the ref */
-      in->watches[i].mask = mask & IN_ALL_EVENTS;
-      int wd = in->watches[i].wd;
+    /* A new watch is charged to the instance's user, across all of that
+     * user's instances. */
+    int used = 0;
+    for (struct inotify_instance *o = g_instances; o; o = o->next)
+      if (o->uid == in->uid)
+        used += o->nwatch;
+    if (used >= g_max_user_watches) {
       spin_unlock_irqrestore(&in->lock, flags);
-      return wd;
+      spin_unlock_irqrestore(&g_reg_lock, rf);
+      vfs_node_put(node);
+      return -ENOSPC;
     }
+    for (int i = 0; i < in->nwatch_cap; i++) {
+      if (in->watches[i].wd == 0) {
+        in->watches[i].wd = in->next_wd++;
+        in->watches[i].node = node; /* keep the ref */
+        in->watches[i].mask = mask & IN_ALL_EVENTS;
+        in->nwatch++;
+        int wd = in->watches[i].wd;
+        spin_unlock_irqrestore(&in->lock, flags);
+        spin_unlock_irqrestore(&g_reg_lock, rf);
+        return wd;
+      }
+    }
+    /* The table is full: grow it. Not under the locks -- an allocation may
+     * reclaim, and nothing that reclaim can reach may be held -- so the size
+     * is noted, the table built, and the whole search run again. */
+    int cap = in->nwatch_cap;
+    spin_unlock_irqrestore(&in->lock, flags);
+    spin_unlock_irqrestore(&g_reg_lock, rf);
+    int ncap = cap ? cap * 2 : 16;
+    struct inotify_watch *nw = kzalloc(sizeof(*nw) * (usize)ncap);
+    if (!nw) {
+      vfs_node_put(node);
+      return -ENOMEM;
+    }
+    struct inotify_watch *old = 0;
+    spin_lock_irqsave(&in->lock, &flags);
+    if (in->nwatch_cap == cap) {
+      if (cap)
+        memcpy(nw, in->watches, sizeof(*nw) * (usize)cap);
+      old = in->watches;
+      in->watches = nw;
+      in->nwatch_cap = ncap;
+      nw = 0;
+    }
+    spin_unlock_irqrestore(&in->lock, flags);
+    kfree(old);
+    kfree(nw); /* someone else grew it first */
   }
-  spin_unlock_irqrestore(&in->lock, flags);
-  vfs_node_put(node);
-  return -ENOSPC;
 }
 
 int vfs_inotify_rm_watch(int fd, int wd) {
@@ -331,12 +378,13 @@ int vfs_inotify_rm_watch(int fd, int wd) {
   u64 flags;
   struct vfs_node *to_put = 0;
   spin_lock_irqsave(&in->lock, &flags);
-  for (int i = 0; i < INOTIFY_MAX_WATCHES; i++) {
+  for (int i = 0; i < in->nwatch_cap; i++) {
     if (in->watches[i].wd == wd) {
       to_put = in->watches[i].node;
       in->watches[i].wd = 0;
       in->watches[i].node = 0;
       in->watches[i].mask = 0;
+      in->nwatch--;
       /* IN_IGNORED tells userspace the watch was removed. */
       inotify_enqueue(in, wd, IN_IGNORED, 0);
       spin_unlock_irqrestore(&in->lock, flags);
@@ -388,13 +436,10 @@ static void inotify_notify_cookie(struct vfs_node *node, u32 mask,
   int woke = 0;
   u64 rf;
   spin_lock_irqsave(&g_reg_lock, &rf);
-  for (int i = 0; i < INOTIFY_MAX_INSTANCES; i++) {
-    struct inotify_instance *in = g_instances[i];
-    if (!in)
-      continue;
+  for (struct inotify_instance *in = g_instances; in; in = in->next) {
     u64 lf;
     spin_lock_irqsave(&in->lock, &lf);
-    for (int w = 0; w < INOTIFY_MAX_WATCHES; w++) {
+    for (int w = 0; w < in->nwatch_cap; w++) {
       if (in->watches[w].wd && in->watches[w].node == node &&
           (in->watches[w].mask & mask)) {
         /* Report the matched event bits plus the IN_ISDIR qualifier, which
@@ -412,4 +457,31 @@ static void inotify_notify_cookie(struct vfs_node *node, u32 mask,
    * g_reg_lock. */
   if (woke)
     scheduler_wake_all(vfs_poll_chan);
+}
+
+/* /proc/sys/fs/inotify. */
+int inotify_limit_get(int which) {
+  switch (which) {
+  case INOTIFY_LIMIT_INSTANCES:
+    return g_max_user_instances;
+  case INOTIFY_LIMIT_WATCHES:
+    return g_max_user_watches;
+  default:
+    return INOTIFY_QUEUE;
+  }
+}
+
+int inotify_limit_set(int which, int value) {
+  if (value < 1)
+    return -EINVAL;
+  switch (which) {
+  case INOTIFY_LIMIT_INSTANCES:
+    g_max_user_instances = value;
+    return 0;
+  case INOTIFY_LIMIT_WATCHES:
+    g_max_user_watches = value;
+    return 0;
+  default:
+    return -EINVAL; /* the event ring is a fixed size */
+  }
 }

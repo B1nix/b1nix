@@ -3096,27 +3096,22 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
     if (s->domain != B1NIX_AF_UNIX)
       return -ENOPROTOOPT;
 
-    struct b1nix_ucred pc;
-    int rc = unix_peer_cred(s, &pc);
+    /* Captured when the connection was made, as SO_PEERCRED is: looking the
+     * peer task up live answered ESRCH once a client had exited, and
+     * dbus-broker drops the connection on that. */
+    u32 groups[MAX_GROUPS];
+    int count = unix_peer_groups(s, groups, MAX_GROUPS);
 
-    if (rc < 0)
-      return rc;
-
-    struct task *peer = pc.pid > 0 ? scheduler_task_by_pid((usize)pc.pid) : 0;
-    const struct cred *pcred = peer ? peer->cred : 0;
-
-    if (!pcred)
-      return -ESRCH;
-
-    usize count = (usize)(pcred->ngroups > 0 ? pcred->ngroups : 0);
-    usize need = count * sizeof(u32);
+    if (count < 0)
+      return count;
+    usize need = (usize)count * sizeof(u32);
 
     if (*optlen < need) {
       *optlen = need;
       return -ERANGE;
     }
-    for (usize i = 0; i < count; i++)
-      ((u32 *)optval)[i] = current_from_kgid(pcred->groups[i]);
+    for (int i = 0; i < count; i++)
+      ((u32 *)optval)[i] = current_from_kgid(groups[i]);
     *optlen = need;
     return 0;
   }

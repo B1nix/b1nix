@@ -70,6 +70,11 @@ fi
 SMOKE_PROGRESS_MODE=full
 
 mkdir -p "$PROJECT_DIR/smoke_run"
+# When this run began: a file the guest writes to the 9p share counts only if
+# it was written after this. Several lanes share the directory, so none of them
+# may delete what another's guest has already written.
+SMOKE_RUN_STAMP="$PROJECT_DIR/smoke_run/.smoke-start-$$"
+: >"$SMOKE_RUN_STAMP"
 
 # The supplementary ACPI table the power-management lane boots with.
 #
@@ -2308,6 +2313,16 @@ check_output "$LOG" "M110-9P: start" "M110 VirtIO-9P smoke starts"
 check_output "$LOG" "M110-9P: ok mount" "VirtIO-9P mount successful"
 check_output "$LOG" "M110-9P: ok read-host-file" "VirtIO-9P read file from host verified"
 check_output "$LOG" "M110-9P: ok write-guest-file" "VirtIO-9P write file from guest verified"
+# The guest's own read-back can be served from its page cache; the host's copy
+# is the one that says the data crossed the transport.
+_gout="$PROJECT_DIR/smoke_run/hostshare/guest_output.txt"
+if [ "$_gout" -nt "$SMOKE_RUN_STAMP" ] &&
+	[ "$(cat "$_gout" 2>/dev/null)" = "Written by b1nix via VirtIO-9P!" ]; then
+	pass "VirtIO-9P guest write reached the host's file"
+else
+	fail "VirtIO-9P guest write reached the host's file" "smoke_run/hostshare/guest_output.txt is missing, stale or differs"
+fi
+rm -f "$SMOKE_RUN_STAMP"
 check_output "$LOG" "M110-9P: ok readdir" "VirtIO-9P directory traversal verified"
 check_output "$LOG" "M110-9P: ok read-big" "a file larger than any 9p message reads whole, in chunks of the caller's choosing -- what apt does with a package index on a 9p share"
 check_output "$LOG" "M110-9P: done" "VirtIO-9P smoke complete"
@@ -4192,7 +4207,10 @@ check_output "$INIT_LOG" "M108-SMOKE: ok init-shell" "the BusyBox-init boot reac
 check_output "$INIT_LOG" "M108-SMOKE: ok init-reaps-orphan" "BusyBox init reaps an orphaned grandchild re-parented to PID 1"
 check_output "$INIT_LOG" "M108-SMOKE: ok init-respawns-getty" "killing the inittab getty makes PID 1 respawn it as a new process"
 # ── An empty optical drive on the q35 machine's own ICH9 ──
-check_iommu "$IOMMU_LOG" "did not answer a packet command" "an ATAPI port with no disc in it is given up on instead of waited for"
+# The drive answers its packet commands (CHECK CONDITION, NOT READY) since the
+# AHCI port recovers from a task-file error, so it is probed rather than timed
+# out: "ready (packet device)" is printed only after IDENTIFY PACKET answered.
+check_iommu "$IOMMU_LOG" "ahci: port 3 ready (packet device)" "an ATAPI port with no disc in it answers its packet commands instead of being waited for"
 check_iommu "$IOMMU_LOG" "packet device reports no medium" "and it is left alone rather than published as a disk that answers nothing"
 check_iommu "$IOMMU_LOG" "ahci: cd-rom registered" "the drive that DOES hold a disc is still found, after the empty one was passed over"
 # ── M100b: VT-d DMA remapping ──

@@ -257,6 +257,24 @@ static int fsctx_apply_option(struct fsctx_state *ctx, const char *key,
     if (strcmp(key, accepted_hints[i]) == 0)
       return 0;
 
+  /* 9p's own. Every 9p line in an fstab -- and util-linux, which hands each
+   * one to fsconfig -- names the transport and the protocol, so refusing them
+   * refused `mount -t 9p -o trans=virtio,version=9p2000.L` outright. This
+   * kernel speaks 9P2000.L over virtio and nothing else: those two values are
+   * the truth, any other is EINVAL as from a kernel built without it. The
+   * tuning ones are accepted and left to the defaults. */
+  if (strcmp(ctx->fstype, "9p") == 0) {
+    if (strcmp(key, "trans") == 0)
+      return value && strcmp(value, "virtio") == 0 ? 0 : -EINVAL;
+    if (strcmp(key, "version") == 0)
+      return value && strcmp(value, "9p2000.L") == 0 ? 0 : -EINVAL;
+    static const char *const p9_hints[] = {"msize", "cache", "access",
+                                           "posixacl", "noextend"};
+    for (usize i = 0; i < sizeof(p9_hints) / sizeof(p9_hints[0]); i++)
+      if (strcmp(key, p9_hints[i]) == 0)
+        return 0;
+  }
+
   return -EINVAL; /* no such parameter */
 }
 

@@ -185,7 +185,12 @@ struct p9_buffer {
 
 void virtio_9p_init(void);
 struct virtio_9p_dev *virtio_9p_find_by_tag(const char *tag);
+/* One request in req_buf, its reply in resp_buf: the caller holds the device
+ * from building the request until it has read the reply, because both buffers
+ * are the device's only ones (virtio_9p_lock). */
 int virtio_9p_transact(struct virtio_9p_dev *p9dev, usize req_len, usize max_resp_len, usize *actual_resp_len);
+void virtio_9p_lock(struct virtio_9p_dev *p9dev);
+void virtio_9p_unlock(struct virtio_9p_dev *p9dev);
 
 void p9_fs_init(void);
 

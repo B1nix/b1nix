@@ -101,6 +101,10 @@ struct unix_socket_data {
    * handler uses it to decide whether the process on the other end of its
    * socket is one it is responsible for. */
   struct b1nix_ucred owner;
+  /* ... and the creator's supplementary groups, captured with them: what
+   * SO_PEERGROUPS reports, from the same moment as SO_PEERCRED. */
+  u32 owner_groups[MAX_GROUPS];
+  int owner_ngroups;
   struct unix_socket_data *peer;
   /* The peer's credentials as they were when the connection was made.
    *
@@ -110,6 +114,8 @@ struct unix_socket_data {
    * that had already been served exited, which a server asking who it just
    * served hits routinely. */
   struct b1nix_ucred peer_cred;
+  u32 peer_groups[MAX_GROUPS];
+  int peer_ngroups;
   int has_peer_cred;
   /* This socket has been connected at least once. It distinguishes "the peer
    * hung up" (POLLHUP) from "never connected", which a listening socket is
@@ -207,6 +213,16 @@ static void unix_data_put(struct unix_socket_data *u) {
   }
 }
 
+static void unix_copy_groups(u32 *dst, int *dn, const u32 *src, int n) {
+  if (n < 0)
+    n = 0;
+  if (n > MAX_GROUPS)
+    n = MAX_GROUPS;
+  for (int i = 0; i < n; i++)
+    dst[i] = src[i];
+  *dn = n;
+}
+
 int unix_init_state(struct vfs_socket_state *s) {
   struct unix_socket_data *u = kzalloc(sizeof(struct unix_socket_data));
   if (!u) return -ENOMEM;
@@ -217,6 +233,11 @@ int unix_init_state(struct vfs_socket_state *s) {
     const struct cred *c = scheduler_get_current_cred();
     u->owner.uid = c ? c->uid : 0;
     u->owner.gid = c ? c->gid : 0;
+    u->owner_ngroups = c && c->ngroups > 0 ? c->ngroups : 0;
+    if (u->owner_ngroups > MAX_GROUPS)
+      u->owner_ngroups = MAX_GROUPS;
+    for (int i = 0; i < u->owner_ngroups; i++)
+      u->owner_groups[i] = c->groups[i];
   }
   u->rb_size = unix_rb_size();
   u->rb_buffer = kmalloc(u->rb_size);
@@ -359,8 +380,12 @@ void unix_link_pair(struct vfs_socket_state *a, struct vfs_socket_state *b) {
   ua->had_peer = 1;
   ub->had_peer = 1;
   ua->peer_cred = ub->owner;
+  unix_copy_groups(ua->peer_groups, &ua->peer_ngroups, ub->owner_groups,
+                   ub->owner_ngroups);
   ua->has_peer_cred = 1;
   ub->peer_cred = ua->owner;
+  unix_copy_groups(ub->peer_groups, &ub->peer_ngroups, ua->owner_groups,
+                   ua->owner_ngroups);
   ub->has_peer_cred = 1;
 }
 
@@ -505,6 +530,32 @@ usize unix_bytes_available(struct vfs_socket_state *s) {
     n = u->msg_len[u->msg_head];
   unix_unlock(u);
   return n;
+}
+
+/* SO_PEERGROUPS: the peer's supplementary groups (kernel ids) as they were
+ * when the connection was made; returns how many, up to `max`, or -errno. */
+int unix_peer_groups(struct vfs_socket_state *s, u32 *out, int max) {
+  struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
+  if (!u || !out)
+    return -EINVAL;
+  unix_lock(u);
+  const u32 *g = 0;
+  int n = 0;
+  if (u->has_peer_cred) {
+    g = u->peer_groups;
+    n = u->peer_ngroups;
+  } else if (u->peer) {
+    g = u->peer->owner_groups;
+    n = u->peer->owner_ngroups;
+  } else {
+    unix_unlock(u);
+    return -ENOTCONN;
+  }
+  int total = n;
+  for (int i = 0; i < n && i < max; i++)
+    out[i] = g[i];
+  unix_unlock(u);
+  return total;
 }
 
 int unix_peer_cred(struct vfs_socket_state *s, struct b1nix_ucred *out) {
@@ -766,6 +817,8 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
      * the endpoint inherits it from the listening socket rather than from the
      * process that happens to be connecting. */
     srv->owner = peer_u->owner;
+    unix_copy_groups(srv->owner_groups, &srv->owner_ngroups,
+                     peer_u->owner_groups, peer_u->owner_ngroups);
     srv->refcount = 1; /* the backlog slot's reference */
 
     /* Linked before it is published. accept() takes whatever is in the backlog
@@ -781,8 +834,12 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
     u->had_peer = 1;
     srv->had_peer = 1;
     u->peer_cred = srv->owner;
+    unix_copy_groups(u->peer_groups, &u->peer_ngroups, srv->owner_groups,
+                     srv->owner_ngroups);
     u->has_peer_cred = 1;
     srv->peer_cred = u->owner;
+    unix_copy_groups(srv->peer_groups, &srv->peer_ngroups, u->owner_groups,
+                     u->owner_ngroups);
     srv->has_peer_cred = 1;
     s->connected = 1;
     unix_unlock(u);
