@@ -69,6 +69,10 @@ struct vc_queue {
 	u8 *buf;
 	u16 free[VC_QDEPTH]; /* transmit: descriptors not in the device's hands */
 	u16 nfree;
+	/* transmit: descriptors that ARE in the device's hands. A completion for
+	 * one that is not -- a duplicate, a stray id -- would put a page on the
+	 * free list twice, and two writers would fill it while the device reads. */
+	u8 inflight[VC_QDEPTH];
 };
 
 static volatile struct vc_common_cfg *vc_cfg;
@@ -227,8 +231,15 @@ static void vc_pump(void)
 	while (q->vq.last_used_idx != q->vq.used->idx) {
 		u16 id = (u16)q->vq.used->ring[q->vq.last_used_idx % q->vq.queue_size].id;
 
-		if (id < q->vq.queue_size && q->nfree < VC_QDEPTH)
+		if (id < q->vq.queue_size && id < VC_QDEPTH && q->inflight[id] &&
+		    q->nfree < VC_QDEPTH) {
+			q->inflight[id] = 0;
 			q->free[q->nfree++] = id;
+		} else {
+			console_write("virtio-console: completion for descriptor ");
+			console_write_dec(id);
+			console_write(", which the device was not given\n");
+		}
 		q->vq.last_used_idx++;
 	}
 	while (q->nfree && vc_used_bytes()) {
@@ -246,6 +257,7 @@ static void vc_pump(void)
 			vc_head = (vc_head + run) % VC_RING_SIZE;
 		}
 		q->vq.desc[id].len = (u32)n;
+		q->inflight[id] = 1;
 		q->vq.avail->ring[q->avail_idx % q->vq.queue_size] = id;
 		q->avail_idx++;
 		q->vq.avail->idx = q->avail_idx;
@@ -376,6 +388,7 @@ static void vc_rebind_queue(u16 index, struct vc_queue *q, int device_writes)
 	q->vq.last_used_idx = 0;
 	q->vq.used->idx = 0;
 	q->nfree = 0;
+	memset(q->inflight, 0, sizeof(q->inflight));
 	for (u16 i = 0; i < qsize; i++) {
 		q->vq.desc[i].len = PAGE_SIZE;
 		if (device_writes)

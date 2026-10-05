@@ -504,11 +504,15 @@ static int hda_program_corb_rirb(void);
 static int hda_setup_corb_rirb(void) {
 	/* Allocate CORB: 256 entries × 4 bytes = 1 KiB, 128-byte aligned */
 	hda_corb_phys = pmm_alloc_frames(1);
+	if (!hda_corb_phys)
+		return -1;
 	hda_corb = (u32 *)(usize)(hda_corb_phys + vmm_direct_map_base());
 	memset((void *)hda_corb, 0, PAGE_SIZE);
 
 	/* Allocate RIRB: 256 entries × 8 bytes (only low 32 used) = 2 KiB */
 	hda_rirb_phys = pmm_alloc_frames(1);
+	if (!hda_rirb_phys)
+		return -1;
 	hda_rirb = (u32 *)(usize)(hda_rirb_phys + vmm_direct_map_base());
 	memset((void *)hda_rirb, 0, PAGE_SIZE);
 	return hda_program_corb_rirb();

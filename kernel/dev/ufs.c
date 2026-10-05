@@ -1179,6 +1179,8 @@ static void ufs_log_flush(void)
 	last_pos = pos;
 	static u8 buf[0x40000];
 
+	if (size > sizeof(buf))
+		size = sizeof(buf);
 	memcpy(buf, zone, size);
 	/* Through the cache like any write, then pushed out now: the point is
 	 * that it is on the flash before the power goes. */

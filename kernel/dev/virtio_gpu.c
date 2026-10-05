@@ -607,11 +607,49 @@ static int virtio_gpu_submit_pair(struct virtio_device *dev, struct virtqueue *v
     return 0;
 }
 
+/*
+ * The control queue has one request page and one response page, shared by
+ * every command, so commands are made one at a time. Ioctls reached here
+ * under different locks or none, and two of them overwrote each other's
+ * request -- or each other's answer -- in flight.
+ *
+ * A command that times out still belongs to the device: its pages are not
+ * reused, and nothing else is sent, until the device reports it done.
+ * Carrying on used to post the next command over it and count the late
+ * completion as that command's answer.
+ */
+static volatile int gpu_ctrl_busy;
+static int gpu_ctrl_stuck;
+static u16 gpu_ctrl_stuck_target;
+
+static void gpu_ctrl_lock(void)
+{
+    while (__atomic_test_and_set(&gpu_ctrl_busy, __ATOMIC_ACQUIRE)) {
+        if (scheduler_can_block())
+            scheduler_yield();
+        else
+            cpu_relax();
+    }
+}
+
+static void gpu_ctrl_unlock(void)
+{
+    __atomic_clear(&gpu_ctrl_busy, __ATOMIC_RELEASE);
+}
+
 static int virtio_gpu_send_cmd(const void *req, usize req_len, void *resp, usize resp_len)
 {
     if (!gpu_control_req_dma || !gpu_control_resp_dma ||
         req_len > VGPU_CTRL_REQ_PAGES * PAGE_SIZE || resp_len > PAGE_SIZE)
         return -1;
+    gpu_ctrl_lock();
+    if (gpu_ctrl_stuck) {
+        if ((u16)(controlq.used->idx - gpu_ctrl_stuck_target) >= 0x8000) {
+            gpu_ctrl_unlock();
+            return -1; /* the earlier command is still the device's */
+        }
+        gpu_ctrl_stuck = 0;
+    }
     memcpy(gpu_control_req_dma, req, req_len);
     memset(gpu_control_resp_dma, 0, resp_len);
     u16 target_used;
@@ -619,11 +657,17 @@ static int virtio_gpu_send_cmd(const void *req, usize req_len, void *resp, usize
                                gpu_control_req_dma, req_len,
                                gpu_control_resp_dma, resp_len,
                                &target_used) < 0) {
+        gpu_ctrl_unlock();
         return -1;
     }
-    if (virtio_gpu_wait_used(&controlq, target_used) < 0)
+    if (virtio_gpu_wait_used(&controlq, target_used) < 0) {
+        gpu_ctrl_stuck = 1;
+        gpu_ctrl_stuck_target = target_used;
+        gpu_ctrl_unlock();
         return -1;
+    }
     memcpy(resp, gpu_control_resp_dma, resp_len);
+    gpu_ctrl_unlock();
     return 0;
 }
 

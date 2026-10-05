@@ -103,7 +103,19 @@ int virtio_9p_transact(struct virtio_9p_dev *p9dev, usize req_len,
   struct vring_used_elem *elem =
       &vq->used->ring[vq->last_used_idx % vq->queue_size];
   u32 bytes_written = elem->len;
+  u32 used_id = elem->id;
   vq->last_used_idx++;
+
+  /* One request is in flight, so the answer names its chain; and the device
+   * cannot have written more than the buffer it was given. A length past it
+   * made the reply parser read beyond the response frames and hand that
+   * kernel memory to whoever asked. */
+  if (used_id != desc0 || bytes_written > max_resp_len) {
+    k_err("virtio-9p", "bad completion: id %u (expected %u), %u bytes into "
+          "a %lu-byte buffer", (unsigned)used_id, (unsigned)desc0,
+          (unsigned)bytes_written, (unsigned long)max_resp_len);
+    return -EIO;
+  }
 
   if (actual_resp_len) {
     *actual_resp_len = bytes_written;

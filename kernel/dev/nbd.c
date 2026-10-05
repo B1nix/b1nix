@@ -54,6 +54,12 @@ struct nbd_device {
 	struct block_device dev;
 	struct tcp_conn *conn;
 	struct vfs_handle *sock;
+	/* The socket a request in flight uses, with a reference of its own:
+	 * NBD_CLEAR_SOCK drops `sock` while a request may still be reading. */
+	struct vfs_handle *io_sock;
+	/* One request on the stream at a time. Two interleaved their requests
+	 * and their replies, and a READ's payload landed in the other's buffer. */
+	volatile int req_busy;
 	u64 handle_seq;
 	spinlock_t lock;
 	int used;
@@ -88,15 +94,15 @@ static u32 be32(u32 v)
  * partial answer, it is a wrong one. */
 static int nbd_io_recv(struct nbd_device *nd, void *buf, usize len)
 {
-	if (nd->sock)
-		return (int)vfs_handle_read(nd->sock, buf, len);
+	if (nd->io_sock)
+		return (int)vfs_handle_read(nd->io_sock, buf, len);
 	return tcp_recv(nd->conn, buf, len, 0);
 }
 
 static int nbd_io_send(struct nbd_device *nd, const void *buf, usize len)
 {
-	if (nd->sock)
-		return (int)vfs_handle_write(nd->sock, buf, len);
+	if (nd->io_sock)
+		return (int)vfs_handle_write(nd->io_sock, buf, len);
 	return tcp_send(nd->conn, buf, len);
 }
 
@@ -105,7 +111,7 @@ static int nbd_io_closed(struct nbd_device *nd)
 	/* A handed-over socket reports its own end of stream through a read
 	 * returning 0, which the caller sees; only our own connection has a
 	 * separate "is it closed" question to ask. */
-	return nd->sock ? 0 : tcp_is_closed(nd->conn);
+	return nd->io_sock ? 0 : tcp_is_closed(nd->conn);
 }
 
 static int nbd_recv_all(struct nbd_device *nd, void *buf, usize len)
@@ -150,8 +156,37 @@ static int nbd_send_all(struct nbd_device *nd, const void *buf, usize len)
 	return 0;
 }
 
+static int nbd_exchange(struct nbd_device *nd, u32 type, u64 handle, u64 offset,
+			u32 len, void *rbuf, const void *wbuf);
+
 static int nbd_request(struct nbd_device *nd, u32 type, u64 offset, u32 len,
 		       void *rbuf, const void *wbuf)
+{
+	u64 flags;
+	int rc;
+
+	while (__atomic_test_and_set(&nd->req_busy, __ATOMIC_ACQUIRE))
+		scheduler_yield();
+	spin_lock_irqsave(&nd->lock, &flags);
+	u64 handle = ++nd->handle_seq;
+	nd->io_sock = nd->sock;
+	if (nd->io_sock)
+		vfs_handle_retain(nd->io_sock);
+	spin_unlock_irqrestore(&nd->lock, flags);
+	if (!nd->io_sock && !nd->conn) {
+		__atomic_clear(&nd->req_busy, __ATOMIC_RELEASE);
+		return -1;
+	}
+	rc = nbd_exchange(nd, type, handle, offset, len, rbuf, wbuf);
+	if (nd->io_sock)
+		vfs_handle_release(nd->io_sock);
+	nd->io_sock = 0;
+	__atomic_clear(&nd->req_busy, __ATOMIC_RELEASE);
+	return rc;
+}
+
+static int nbd_exchange(struct nbd_device *nd, u32 type, u64 handle, u64 offset,
+			u32 len, void *rbuf, const void *wbuf)
 {
 	struct {
 		u32 magic;
@@ -165,12 +200,6 @@ static int nbd_request(struct nbd_device *nd, u32 type, u64 offset, u32 len,
 		u32 error;
 		u64 handle;
 	} __attribute__((packed)) rep;
-	u64 flags;
-	int rc = -1;
-
-	spin_lock_irqsave(&nd->lock, &flags);
-	u64 handle = ++nd->handle_seq;
-	spin_unlock_irqrestore(&nd->lock, flags);
 
 	req.magic = be32(NBD_REQUEST_MAGIC);
 	req.type = be32(type);
@@ -195,8 +224,7 @@ static int nbd_request(struct nbd_device *nd, u32 type, u64 offset, u32 len,
 		return -1;
 	if (type == NBD_CMD_READ && nbd_recv_all(nd, rbuf, len) != 0)
 		return -1;
-	rc = 0;
-	return rc;
+	return 0;
 }
 
 static int nbd_read_blocks(struct block_device *dev, u64 lba, u32 count,
@@ -340,7 +368,11 @@ int nbd_set_socket(struct nbd_device *nd, struct vfs_handle *sock)
 
 int nbd_set_geometry(struct nbd_device *nd, u32 block_size, u64 blocks)
 {
-	if (!nd || block_size < 512 || blocks == 0)
+	/* A power of two the block cache can hold in a page, and not under a
+	 * device that is serving: requests are sized from it, and a size that
+	 * changes mid-flight or is not a power of two makes their lengths wrong. */
+	if (!nd || block_size < 512 || block_size > 4096 ||
+	    (block_size & (block_size - 1)) || blocks == 0 || nd->serving)
 		return -EINVAL;
 	nd->dev.block_size = block_size;
 	nd->dev.block_count = blocks;

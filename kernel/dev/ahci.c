@@ -880,10 +880,42 @@ static int ahci_wait_ci_clear_bounded(volatile struct ahci_port *p,
   return 0;
 }
 
-/* Stop a port that will not answer, so nothing later waits on it. */
+/* Wait up to `ms` for every bit of `mask` in PxCMD to drop. */
+static int ahci_cmd_bits_clear(volatile struct ahci_port *p, u32 mask, u64 ms) {
+  u64 deadline = ktime_monotonic_ns() + ms * 1000000ull;
+
+  while ((p->cmd & mask) && ktime_monotonic_ns() < deadline)
+    cpu_relax();
+  return (p->cmd & mask) == 0;
+}
+
+/* Stop a port that will not answer, so nothing later waits on it.
+ *
+ * Stopped means the engine has stopped, not that ST was cleared: the command
+ * that timed out still points the HBA at its caller's buffer, and the caller
+ * frees that buffer as soon as this returns. AHCI gives CR 500 ms to drop
+ * after ST is cleared; past that, a COMRESET takes the device off the link,
+ * after which nothing on the port can be moving data. */
 static void ahci_port_disable(struct ahci_port_state *port,
                               volatile struct ahci_port *p, const char *why) {
   p->cmd &= ~AHCI_PxCMD_ST;
+  if (!ahci_cmd_bits_clear(p, AHCI_PxCMD_CR, 500)) {
+    p->sctl = (p->sctl & ~0xFu) | 1u; /* DET=1: COMRESET */
+    {                                 /* hold it for at least a millisecond */
+      u64 until = ktime_monotonic_ns() + 2000000ull;
+
+      while (ktime_monotonic_ns() < until)
+        cpu_relax();
+    }
+    p->sctl &= ~0xFu;
+    if (!ahci_cmd_bits_clear(p, AHCI_PxCMD_CR, 500)) {
+      console_write("ahci: port ");
+      console_write_dec(port->port_num);
+      console_write(": command engine did not stop even after COMRESET\n");
+    }
+  }
+  p->cmd &= ~AHCI_PxCMD_FRE;
+  ahci_cmd_bits_clear(p, AHCI_PxCMD_FR, 500);
   p->ie = 0;
   p->is = p->is;
   port->present = 0;

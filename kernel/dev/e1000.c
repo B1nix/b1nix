@@ -376,10 +376,19 @@ static int e1000_xmit(const u8 hdr[14], const void *payload, usize plen)
 		scheduler_yield();
 
 	u16 i = tx_cur;
-	/* Wait for this descriptor to drain (bounded). */
+	/* Wait for this descriptor to drain (bounded). Past the bound the NIC
+	 * still owns it -- overwriting it corrupted the frame being sent and let
+	 * the tail run past the head -- so the packet is dropped instead. */
+	int drained = 0;
 	for (int spins = 0; spins < 500000; spins++) {
-		if (tx_ring[i].status & TXD_STAT_DD)
+		if (tx_ring[i].status & TXD_STAT_DD) {
+			drained = 1;
 			break;
+		}
+	}
+	if (!drained) {
+		__atomic_clear(&e1000_tx_lock, __ATOMIC_RELEASE);
+		return -1;
 	}
 
 	u8 *buf = tx_buf_virt + (usize)i * E1000_BUF_SZ;
@@ -424,7 +433,10 @@ static void e1000_poll(struct netdev *nd)
 	while (rx_ring[rx_cur].status & RXD_STAT_DD) {
 		u16 len = rx_ring[rx_cur].length;
 		u8 *buf = rx_buf_virt + (usize)rx_cur * E1000_BUF_SZ;
-		if ((rx_ring[rx_cur].status & RXD_STAT_EOP) && len > 0)
+		/* The length is the device's word; past the buffer it describes
+		 * memory that is not this frame. */
+		if ((rx_ring[rx_cur].status & RXD_STAT_EOP) && len > 0 &&
+		    len <= E1000_BUF_SZ)
 			ethernet_receive(buf, len);
 		rx_ring[rx_cur].status = 0;
 		u16 old = rx_cur;

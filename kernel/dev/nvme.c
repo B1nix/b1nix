@@ -642,6 +642,10 @@ static int nvme_io_transfer(struct nvme_device *nd, u64 lba, u32 count, void *bu
         } else {
             int num_pages = (offset + bytes_to_transfer + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE;
             prp_list_phys = pmm_alloc_frames(1);
+            /* Without a page for the list the controller would be pointed at
+             * physical page 0. */
+            if (!prp_list_phys)
+                return -1;
             u64 *prp_list = (u64 *)(usize)(prp_list_phys + vmm_direct_map_base());
             memset(prp_list, 0, NVME_PAGE_SIZE);
             for (int i = 1; i < num_pages; i++) {
@@ -1099,6 +1103,17 @@ void nvme_init(void)
     u16 lbads = ns->lbaf[flbas].ds;
     
     nvme.namespace_size = ns->nsze;
+    /* Every request reaches the controller in the block layer's 512-byte
+     * units, unscaled. On a namespace formatted otherwise (4Kn) each command
+     * would move eight times the bytes its buffer covers. Until requests are
+     * scaled, such a namespace is refused rather than corrupted; lbads past
+     * 12 would also be an undefined shift. */
+    if (lbads != 9) {
+        k_err("nvme", "namespace 1 has %u-byte blocks (lbads %u); only 512 is "
+              "supported, not registering it",
+              lbads < 32 ? 1u << lbads : 0u, (unsigned)lbads);
+        return;
+    }
     nvme.block_size = 1 << lbads;
     
     console_write("nvme: nsze=");

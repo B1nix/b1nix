@@ -442,7 +442,12 @@ static int evt_wait_transfer(int target_slot, int target_dci, struct trb *out, i
 					return 1;
 				}
 				if ((int)slot == kbd_slot && (int)dci == kbd_ep_dci) {
+					/* Handled, and so not stashed: a stashed keyboard event
+					 * was popped and handled again on every later wait, each
+					 * time re-queueing an interrupt TRB, until the ring
+					 * overran TRBs the controller still owned. */
 					usb_handle_transfer_event(&e);
+					continue;
 				}
 				/* Stash unexpected transfer events so they are not lost.
 				 * On real hardware, the controller may deliver events for
@@ -949,7 +954,9 @@ static void usb_probe_port(u32 port, u32 speed)
 	console_write("xhci: enable slot...\n");
 	int slot = -1;
 	int cmd_res = cmd_exec(0, 0, (TRB_ENABLE_SLOT << TRB_TYPE_SHIFT), &slot);
-	if (cmd_res != CC_SUCCESS || slot <= 0) {
+	/* The slot id indexes the DCBAA and the doorbells: past MaxSlotsEn it
+	 * would write another device's context entry. */
+	if (cmd_res != CC_SUCCESS || slot <= 0 || (u32)slot > xhci_max_slots) {
 		console_write("xhci: enable slot failed res=");
 		console_write_dec(cmd_res);
 		console_write(" slot=");
@@ -1043,7 +1050,8 @@ static void usb_probe_port(u32 port, u32 speed)
 			}
 			udelay(300000);
 			slot = -1;
-			if (cmd_exec(0, 0, (TRB_ENABLE_SLOT << TRB_TYPE_SHIFT), &slot) != CC_SUCCESS || slot <= 0) {
+			if (cmd_exec(0, 0, (TRB_ENABLE_SLOT << TRB_TYPE_SHIFT), &slot) != CC_SUCCESS || slot <= 0 ||
+			    (u32)slot > xhci_max_slots) {
 				console_write("xhci: fallback enable slot failed\n");
 				return;
 			}

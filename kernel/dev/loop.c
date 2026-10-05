@@ -8,6 +8,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/posix.h>
+#include <b1nix/spinlock.h>
 #include <lkpi/env.h>
 #include <stdio.h>
 #include <string.h>
@@ -24,35 +25,113 @@ struct loop_device {
     /* Re-entrancy guard: a write to the backing file goes through ext4, which
      * may evict a dirty block cache entry, and the entry it picks can belong to
      * this very loop device. Coming back in here would try to take the backing
-     * inode's (non-recursive) lock a second time on the same thread. */
-    int in_io;
+     * inode's (non-recursive) lock a second time on the same thread.
+     *
+     * Kept per task, not per device. A device-wide flag also refused the I/O
+     * of every OTHER task while one was inside, and the block layer took the
+     * -EAGAIN for a read error: two tasks reading one loop device at once
+     * could fail each other's reads. */
+#define LOOP_IO_SLOTS 16
+    struct task *io_tasks[LOOP_IO_SLOTS];
+    /* Guards io_tasks and backing_node. An I/O takes its own reference on the
+     * backing node under it, so LOOP_CLR_FD dropping the device's reference
+     * cannot free the node under a read in progress. */
+    spinlock_t io_lock;
 };
 
+/* Enter an I/O on this device: the backing node, referenced, or NULL with
+ * *err set (-EAGAIN for a re-entry by the same task, -EIO with no backing). */
+static struct vfs_node *loop_io_begin(struct loop_device *loop, int *err) {
+    struct task *me = current_task;
+
+    for (;;) {
+        u64 flags;
+        int free_slot = -1;
+
+        spin_lock_irqsave(&loop->io_lock, &flags);
+        struct vfs_node *node = loop->backing_node;
+        if (!node || !node->inode) {
+            spin_unlock_irqrestore(&loop->io_lock, flags);
+            *err = -EIO;
+            return 0;
+        }
+        for (int i = 0; i < LOOP_IO_SLOTS; i++) {
+            if (me && loop->io_tasks[i] == me) {
+                spin_unlock_irqrestore(&loop->io_lock, flags);
+                *err = -EAGAIN;
+                return 0;
+            }
+            if (!loop->io_tasks[i] && free_slot < 0)
+                free_slot = i;
+        }
+        if (free_slot >= 0) {
+            loop->io_tasks[free_slot] = me;
+            vfs_node_get(node);
+            spin_unlock_irqrestore(&loop->io_lock, flags);
+            return node;
+        }
+        spin_unlock_irqrestore(&loop->io_lock, flags);
+        scheduler_yield(); /* every slot busy: wait for one */
+    }
+}
+
+static void loop_io_end(struct loop_device *loop, struct vfs_node *node) {
+    struct task *me = current_task;
+    u64 flags;
+
+    spin_lock_irqsave(&loop->io_lock, &flags);
+    for (int i = 0; i < LOOP_IO_SLOTS; i++) {
+        if (loop->io_tasks[i] == me) {
+            loop->io_tasks[i] = 0;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&loop->io_lock, flags);
+    vfs_node_put(node);
+}
+
+/* Swap the backing node under the I/O lock; the caller drops the old one. */
+static struct vfs_node *loop_set_backing(struct loop_device *loop,
+                                         struct vfs_node *node) {
+    u64 flags;
+
+    spin_lock_irqsave(&loop->io_lock, &flags);
+    struct vfs_node *old = loop->backing_node;
+    loop->backing_node = node;
+    spin_unlock_irqrestore(&loop->io_lock, flags);
+    return old;
+}
+
 /* Byte extent of the mapping inside the backing file. */
-static u64 loop_limit(const struct loop_device *loop) {
-    u64 file_size = loop->backing_node->inode->size;
+static u64 loop_limit_of(const struct loop_device *loop,
+                         const struct vfs_node *node) {
+    u64 file_size = node->inode->size;
     u64 end = file_size;
     if (loop->sizelimit && loop->offset + loop->sizelimit < end)
         end = loop->offset + loop->sizelimit;
     return end;
 }
 
+static u64 loop_limit(const struct loop_device *loop) {
+    return loop_limit_of(loop, loop->backing_node);
+}
+
 static int loop_read_blocks(struct block_device *dev, u64 lba, u32 count, void *buffer) {
     struct loop_device *loop = (struct loop_device *)dev->priv;
-    if (!loop || !loop->backing_node || !loop->backing_node->inode) {
+    int err = 0;
+    if (!loop)
         return -1;
-    }
-
-    struct vfs_node *node = loop->backing_node;
-    if (loop->in_io)
-        return -EAGAIN;
+    struct vfs_node *node = loop_io_begin(loop, &err);
+    if (!node)
+        return err == -EAGAIN ? -EAGAIN : -1;
 
     u64 offset = loop->offset + lba * 512;
     usize size = (usize)count * 512;
-    u64 limit = loop_limit(loop);
+    u64 limit = loop_limit_of(loop, node);
 
     if (offset >= limit) {
         memset(buffer, 0, size);
+        loop_io_end(loop, node);
         return 0;
     }
 
@@ -63,11 +142,10 @@ static int loop_read_blocks(struct block_device *dev, u64 lba, u32 count, void *
     /* Read the backing file the way read(2) does — through its page cache.
      * Going straight to inode->read_cb would return whatever is on disk while
      * the file's own cached pages held newer data. */
-    loop->in_io = 1;
     void *fs_ctx = lkpi_fs_context_leave();
     isize read_bytes = vfs_node_pread(node, buffer, size, offset);
     lkpi_fs_context_restore(fs_ctx);
-    loop->in_io = 0;
+    loop_io_end(loop, node);
     if (read_bytes < 0) {
         return (int)read_bytes;
     }
@@ -90,19 +168,22 @@ int loop_is_read_only(struct block_device *dev) {
 static int loop_write_blocks(struct block_device *dev, u64 lba, u32 count,
                              const void *buffer) {
     struct loop_device *loop = (struct loop_device *)dev->priv;
-    if (!loop || !loop->backing_node || !loop->backing_node->inode)
+    int err = 0;
+    if (!loop)
         return -EIO;
     if (loop->readonly)
         return -EROFS;
-    struct vfs_node *node = loop->backing_node;
-    if (loop->in_io)
-        return -EAGAIN;
+    struct vfs_node *node = loop_io_begin(loop, &err);
+    if (!node)
+        return err;
 
     u64 offset = loop->offset + lba * 512;
     usize size = (usize)count * 512;
-    u64 limit = loop_limit(loop);
-    if (offset >= limit)
+    u64 limit = loop_limit_of(loop, node);
+    if (offset >= limit) {
+        loop_io_end(loop, node);
         return -ENOSPC;
+    }
     if (offset + size > limit)
         size = (usize)(limit - offset);
 
@@ -110,11 +191,10 @@ static int loop_write_blocks(struct block_device *dev, u64 lba, u32 count,
      * landed on disk but left the file's cached pages stale, so reading the
      * backing file back returned the pre-write bytes (and a later writeback of
      * those clean-looking pages could undo the loop write entirely). */
-    loop->in_io = 1;
     void *fs_ctx = lkpi_fs_context_leave();
     isize written = vfs_node_pwrite(node, (const char *)buffer, size, offset);
     lkpi_fs_context_restore(fs_ctx);
-    loop->in_io = 0;
+    loop_io_end(loop, node);
     if (written < 0)
         return (int)written;
     return (usize)written == size ? 0 : -EIO;
@@ -252,7 +332,12 @@ static int loop_set_fd(int idx, struct loop_device *lo, int backing_fd) {
   /* Pin the backing node: the setup process's fd will be closed (and the
    * file may be unlinked) while the loop device lives on. Without this ref
    * loop_read_blocks would dereference a freed node (UAF). */
-  lo->backing_node = vfs_node_get(h->node);
+  {
+    struct vfs_node *was = loop_set_backing(lo, vfs_node_get(h->node));
+
+    if (was)
+      vfs_node_put(was);
+  }
   lo->offset = 0;
   lo->sizelimit = 0;
   lo->flags = 0;
@@ -312,7 +397,7 @@ static void loop_slot_reset(int i) {
   g_loops[i].bdev.read_blocks = loop_read_blocks;
   g_loops[i].bdev.write_blocks = loop_write_blocks;
   g_loops[i].bdev.flush = loop_flush;
-  g_loops[i].in_io = 0;
+  g_loops[i].io_lock = (spinlock_t)SPINLOCK_INIT;
   g_loops[i].bdev.priv = &g_loops[i];
 }
 
@@ -384,12 +469,17 @@ struct block_device *loop_register_file(const char *path) {
   }
 
   struct loop_device *lo = &g_loops[idx];
-  lo->backing_node = node; /* the reference from vfs_find_node is ours to keep */
+  /* the reference from vfs_find_node is ours to keep */
+  {
+    struct vfs_node *was = loop_set_backing(lo, node);
+
+    if (was)
+      vfs_node_put(was);
+  }
   lo->readonly = 1;        /* boot images are attached read-only */
   lo->offset = 0;
   lo->sizelimit = 0;
   lo->flags = 0;
-  lo->in_io = 0;
   strncpy(lo->file_name, path, sizeof(lo->file_name) - 1);
   lo->file_name[sizeof(lo->file_name) - 1] = '\0';
   lo->bdev.block_count = (node->inode->size + 511) / 512;
@@ -477,7 +567,7 @@ int loop_ioctl(struct vfs_node *node, u64 request, void *arg) {
       blk_cache_flush(&lo->bdev);
       loop_flush(&lo->bdev);
     }
-    lo->backing_node = 0;
+    (void)loop_set_backing(lo, 0); /* `old` is dropped below */
     lo->bdev.block_count = 0;
     lo->offset = 0;
     lo->sizelimit = 0;

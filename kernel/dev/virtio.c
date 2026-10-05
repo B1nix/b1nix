@@ -121,8 +121,10 @@ int virtq_init(struct virtio_device *dev, u16 queue_idx, struct virtqueue *vq)
 	outw((u16)(dev->port_base + VIRTIO_PCI_QUEUE_SEL), queue_idx);
 
 	u16 qsize = inw((u16)(dev->port_base + VIRTIO_PCI_QUEUE_SIZE));
-	if (qsize == 0) {
-		console_write("virtq: queue size is 0\n");
+	/* The ring indices wrap at 2^16 and are reduced modulo the size: only a
+	 * power of two keeps the two in step. */
+	if (qsize == 0 || (qsize & (qsize - 1))) {
+		console_write("virtq: queue size is 0 or not a power of two\n");
 		return 0;
 	}
 

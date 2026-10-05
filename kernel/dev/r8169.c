@@ -301,7 +301,10 @@ static void r8169_poll(struct netdev *nd)
 		u32 o1 = rx_ring[rx_cur].opts1;
 		u32 len = o1 & DESC_LEN_MASK;
 		/* FS+LS => a complete single-buffer frame; strip the 4-byte CRC. */
-		if ((o1 & DESC_FS) && (o1 & DESC_LS) && len > 4) {
+		/* len comes from the device: a frame longer than the buffer it
+		 * was given is not a frame. */
+		if ((o1 & DESC_FS) && (o1 & DESC_LS) && len > 4 &&
+		    len <= R8169_BUF_SZ) {
 			u8 *buf = rx_buf_virt + (usize)rx_cur * R8169_BUF_SZ;
 			ethernet_receive(buf, len - 4);
 		}
