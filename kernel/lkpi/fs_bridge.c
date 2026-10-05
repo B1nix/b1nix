@@ -102,8 +102,58 @@ static void bridge_close(struct file *f)
  * whatever the real reason was. */
 int lkpi_bridge_last_mount_error;
 
+/*
+ * Feed a comma-separated option string to a new-interface context, one
+ * parameter at a time, as vfs_parse_fs_string does upstream: "key" is a flag,
+ * "key=value" a string. A parameter the filesystem does not know is an error
+ * (-ENOPARAM becomes -EINVAL, "Unknown parameter" on Linux).
+ */
+static int lkpi_bridge_parse_opts(struct fs_context *fc, const char *opts)
+{
+	char *copy, *cur, *opt;
+	int err = 0;
+
+	if (!opts || !*opts)
+		return 0;
+	if (!fc->ops || !fc->ops->parse_param)
+		return -EINVAL;
+	copy = kstrdup(opts, GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+	cur = copy;
+	while (!err && (opt = strsep(&cur, ",")) != NULL) {
+		struct fs_parameter param;
+		char *eq;
+
+		if (!*opt)
+			continue;
+		memset(&param, 0, sizeof(param));
+		eq = strchr(opt, '=');
+		if (eq) {
+			*eq = '\0';
+			param.type = fs_value_is_string;
+			param.string = kstrdup(eq + 1, GFP_KERNEL);
+			if (!param.string) {
+				err = -ENOMEM;
+				break;
+			}
+			param.size = strlen(param.string);
+		} else {
+			param.type = fs_value_is_flag;
+		}
+		param.key = opt;
+		param.dirfd = -1;
+		err = fc->ops->parse_param(fc, &param);
+		if (err == -ENOPARAM)
+			err = -EINVAL;
+		kfree(param.string); /* NULL if the filesystem kept it */
+	}
+	kfree(copy);
+	return err;
+}
+
 void *lkpi_bridge_mount(const char *fstype, const char *source,
-                        unsigned long flags)
+                        unsigned long flags, const char *opts)
 {
 	struct file_system_type *type = get_fs_type(fstype);
 	struct dentry *root;
@@ -111,14 +161,17 @@ void *lkpi_bridge_mount(const char *fstype, const char *source,
 	if (!type)
 		return NULL;
 	if (type->mount) {
-		/* The old interface, which btrfs still uses in 6.6. */
-		root = type->mount(type, (int)flags, source, NULL);
+		/* The old interface, which btrfs still uses in 6.6: the options go
+		 * in as the data string, on a copy the filesystem may cut up. */
+		char *data = (opts && *opts) ? kstrdup(opts, GFP_KERNEL) : NULL;
+
+		root = type->mount(type, (int)flags, source, data);
+		kfree(data);
 	} else if (type->init_fs_context) {
 		/*
 		 * The new one, which ext4 uses: the filesystem builds a context,
-		 * the context's get_tree produces the superblock, and the root is
-		 * left in fc.root. There are no mount options to feed in here — a
-		 * parameter would go through ->parse_param before get_tree.
+		 * each option goes through ->parse_param, the context's get_tree
+		 * produces the superblock, and the root is left in fc.root.
 		 */
 		struct fs_context fc;
 		int err;
@@ -132,6 +185,8 @@ void *lkpi_bridge_mount(const char *fstype, const char *source,
 		fc.source = source ? kstrdup(source, GFP_KERNEL) : NULL;
 		fc.user_ns = &init_user_ns;
 		err = type->init_fs_context(&fc);
+		if (!err)
+			err = lkpi_bridge_parse_opts(&fc, opts);
 		if (!err && fc.ops && fc.ops->get_tree)
 			err = fc.ops->get_tree(&fc);
 		else if (!err)
@@ -844,7 +899,8 @@ int lkpi_bridge_chmod(void *nodep, unsigned int mode)
 
 int lkpi_bridge_setattr(void *nodep, unsigned int mode, unsigned int uid,
                         unsigned int gid, unsigned long long atime,
-                        unsigned long long mtime)
+                        unsigned int atime_nsec, unsigned long long mtime,
+                        unsigned int mtime_nsec)
 {
 	struct dentry *d = nodep;
 	struct inode *inode;
@@ -874,13 +930,17 @@ int lkpi_bridge_setattr(void *nodep, unsigned int mode, unsigned int uid,
 		attr.ia_gid = KGIDT_INIT(gid);
 		attr.ia_vfsgid = attr.ia_gid;
 	}
-	if ((unsigned long long)inode->i_atime.tv_sec != atime) {
+	if ((unsigned long long)inode->i_atime.tv_sec != atime ||
+	    (unsigned int)inode->i_atime.tv_nsec != atime_nsec) {
 		attr.ia_valid |= ATTR_ATIME | ATTR_ATIME_SET;
 		attr.ia_atime.tv_sec = (time64_t)atime;
+		attr.ia_atime.tv_nsec = (long)atime_nsec;
 	}
-	if ((unsigned long long)inode->i_mtime.tv_sec != mtime) {
+	if ((unsigned long long)inode->i_mtime.tv_sec != mtime ||
+	    (unsigned int)inode->i_mtime.tv_nsec != mtime_nsec) {
 		attr.ia_valid |= ATTR_MTIME | ATTR_MTIME_SET;
 		attr.ia_mtime.tv_sec = (time64_t)mtime;
+		attr.ia_mtime.tv_nsec = (long)mtime_nsec;
 	}
 	if (!attr.ia_valid)
 		return 0;

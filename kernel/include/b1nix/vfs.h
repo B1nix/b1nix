@@ -538,12 +538,21 @@ struct vfs_node {
  * the filesystem. On Linux a CD mounts read-only by the same rule, enforced
  * there by the drive's read-only block device and mount(8)'s retry. */
 #define VFS_FS_RDONLY 0x8
+/* The filesystem parses its own mount options -- the imported Linux ones,
+ * whose options (btrfs's compress=, ext4's data=) mean nothing to the VFS.
+ * mount(2)'s data string and every fsconfig key the VFS does not know reach
+ * the type's mount_opts callback instead of being refused or dropped. */
+#define VFS_FS_OWN_OPTIONS 0x10
 
 struct module;
 
 struct vfs_fs {
   const char *name;
   struct vfs_node *(*mount)(const char *source, u64 flags, void *data);
+  /* For VFS_FS_OWN_OPTIONS: the same, with the options the VFS did not
+   * consume as one comma-separated string (NULL or "" for none). */
+  struct vfs_node *(*mount_opts)(const char *source, u64 flags, void *data,
+                                 const char *opts);
   int (*umount)(struct vfs_node *root_node);
   u32 flags;
   /* Module this type came from, filled in by vfs_register_fs from the address
@@ -568,7 +577,10 @@ struct vfs_fs {
  * them — which is also why nothing in path resolution had to learn about them.
  *
  * The id these return is an index into that table, valid until released. */
-int vfs_detached_create(const char *fstype, const char *source, u64 flags);
+int vfs_detached_create(const char *fstype, const char *source, u64 flags,
+                        const char *opts);
+/* Does `fstype` take mount options of its own (VFS_FS_OWN_OPTIONS)? */
+int vfs_fs_takes_options(const char *fstype);
 /* Where that mount currently lives — a private path nothing else names. The
  * descriptor layer opens it, so a mount descriptor is an ordinary directory
  * descriptor and openat(mfd, ".") works. */
@@ -723,6 +735,9 @@ int vfs_fd_abspath(int fd, char *buf, usize size);
 int vfs_fd_ns(int fd, int *kind, u32 *id);
 int vfs_fsync(int fd);
 int vfs_fsync_h(struct vfs_handle *h);
+/* vfs_mount with the filesystem's own options (VFS_FS_OWN_OPTIONS). */
+int vfs_mount_opts(const char *source, const char *target, const char *fstype,
+                   u64 flags, const char *opts);
 int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags);
 int vfs_umount(const char *target);
@@ -972,6 +987,12 @@ extern void *vfs_poll_chan;
 int vfs_chmod(const char *path, u16 mode);
 int vfs_fchmod(int fd, u16 mode);
 int vfs_utime(const char *path, u64 atime, u64 mtime);
+/* utimensat(2): times = {atime s, atime ns, mtime s, mtime ns}; a field whose
+ * VFS_UTIME_OMIT_* bit is set keeps its value; `nofollow` sets a symlink's own
+ * times. */
+#define VFS_UTIME_OMIT_ATIME 1u
+#define VFS_UTIME_OMIT_MTIME 2u
+int vfs_utimens(const char *path, int nofollow, const u64 times[4], u32 omit);
 int vfs_chown(const char *path, u32 uid, u32 gid);
 /* lchown(2): the symlink itself is the target, not what it points at. */
 int vfs_lchown(const char *path, u32 uid, u32 gid);
@@ -1042,6 +1063,11 @@ struct vfs_file_ops {
   isize (*pread_user)(struct vfs_handle *h, void *user_buf, usize len, u64 off);
   isize (*write)(struct vfs_handle *h, const char *buf, usize len);
   int (*poll)(struct vfs_handle *h, struct b1nix_pollfd *pfd);
+  /* A counter that moves on every wakeup of the file, for edge-triggered
+   * epoll: Linux reports an EPOLLET watch again whenever the file is woken
+   * -- more data arriving on a socket that was already readable included --
+   * not only when its readiness set changes. Optional. */
+  u32 (*poll_gen)(struct vfs_handle *h);
   isize (*lseek)(struct vfs_handle *h, isize offset, int whence);
   int (*close)(struct vfs_handle *h);
   void (*release)(struct vfs_handle *h);
@@ -1129,6 +1155,10 @@ struct vfs_pipe {
 #define SOCK_DGRAM_SLOT_MAX 2048
 
 struct vfs_socket_state {
+  /* Bumped on every wakeup of this socket (data or a connection arriving,
+   * room freed, a peer gone): what an EPOLLET watch reports on, see
+   * vfs_file_ops::poll_gen. */
+  u32 poll_gen;
   /* The network namespace the socket was created in. A socket keeps it for
    * life — as on Linux, joining another namespace re-points what a task
    * creates NEXT, never what it already holds open. Delivery compares it

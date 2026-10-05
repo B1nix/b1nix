@@ -388,11 +388,14 @@ int vfs_pidfd_open(usize pid, int flags) {
   if (pid == 0)
     return -EINVAL;
 
+  /* A zombie still has its pid -- Linux opens a descriptor on one, which
+   * then polls readable at once -- and that is not a corner case: the parent
+   * of a CLONE_VFORK child gets its descriptor only after the child has
+   * exec'd or exited. Only a process already reaped is gone. */
   struct task *t = scheduler_task_by_pid(pid);
   if (!t)
     return -ESRCH;
-  if (t->state == TASK_DEAD || t->state == TASK_REAPING ||
-      t->state == TASK_UNUSED)
+  if (t->state == TASK_REAPING || t->state == TASK_UNUSED)
     return -ESRCH;
   /* Linux: a pid that names a thread rather than a thread group leader is
    * EINVAL without PIDFD_THREAD. */
@@ -1154,7 +1157,14 @@ struct epoll_watch {
   u32 events;       /* requested event mask (incl. EPOLLET / EPOLLONESHOT) */
   u64 data;         /* opaque user data echoed back in epoll_wait */
   u32 last_revents; /* edge-triggered state: events seen on the last scan */
+  u32 last_gen;     /* ... and the file's wakeup counter then (poll_gen) */
 };
+
+/* The file's wakeup counter, for files that keep one (vfs_file_ops::poll_gen);
+ * 0 for the rest, whose edges are their readiness changes alone. */
+static u32 epoll_file_gen(struct vfs_handle *th) {
+  return th && th->ops && th->ops->poll_gen ? th->ops->poll_gen(th) : 0;
+}
 
 /* Retired tables, kept until the epoll fd is closed.
  *
@@ -1276,7 +1286,8 @@ static int epoll_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
      * readable and libmount watches it EPOLLET -- while the wait on it returned
      * nothing, so systemd's mount monitor fired on every turn of its loop,
      * sd-event rate-limited it, and systemd held back every mount job. */
-    if (matched && (w->events & B1NIX_EPOLLET) && matched == w->last_revents)
+    if (matched && (w->events & B1NIX_EPOLLET) && matched == w->last_revents &&
+        epoll_file_gen(th) == w->last_gen)
       matched = 0;
     if (matched) {
       pfd->revents = B1NIX_POLLIN;
@@ -1572,14 +1583,19 @@ int vfs_epoll_wait(int epfd, struct b1nix_epoll_event *events, int maxevents,
         continue;
       }
 
-      /* Edge-triggered: only report when the readiness set changed from the
-       * last scan (rising edge). Level-triggered reports on every scan. */
+      /* Edge-triggered: report when the readiness set changed since the last
+       * report, or when the file was woken since -- Linux queues an EPOLLET
+       * event on every wakeup, so a socket that was already readable and has
+       * just received more is reported again. Level-triggered reports on every
+       * scan. */
+      u32 gen = epoll_file_gen(th);
       if (w->events & B1NIX_EPOLLET) {
-        if (matched == w->last_revents) {
+        if (matched == w->last_revents && gen == w->last_gen) {
           continue;
         }
       }
       w->last_revents = matched;
+      w->last_gen = gen;
 
       events[nready].events = matched;
       events[nready].data.u64 = w->data;

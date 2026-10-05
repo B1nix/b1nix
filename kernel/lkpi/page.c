@@ -82,6 +82,12 @@ static u64 lkpi_alloc_aligned_frames(u32 order)
 	return aligned;
 }
 
+/* A page allocated on its own (lkpi_alloc_page): its struct is a heap block of
+ * its own, which the last reference may free with the frame. A page inside an
+ * array -- an alloc_pages run, a GEM object's page vector -- has a struct its
+ * owner frees. */
+#define LKPI_PAGE_SINGLE      (1u << 30)
+
 struct page *alloc_pages(u32 gfp, u32 order)
 {
 	(void)gfp; /* see the note in <lkpi/page.h> */
@@ -124,7 +130,7 @@ struct page *lkpi_alloc_page(void)
 	}
 	page->phys = phys;
 	page->count = 1;
-	page->order = 0;
+	page->order = LKPI_PAGE_SINGLE;
 	lkpi_page_register(page);
 	return page;
 }
@@ -230,6 +236,18 @@ int put_page(struct page *page)
 		return 1;
 	}
 	return 0;
+}
+
+void lkpi_put_page_free(struct page *page)
+{
+	if (!page)
+		return;
+	if (!(page->order & LKPI_PAGE_SINGLE)) {
+		put_page(page);
+		return;
+	}
+	if (__atomic_fetch_sub(&page->count, 1, __ATOMIC_ACQ_REL) == 1)
+		__free_page(page);
 }
 
 /* ── shmem-style page arrays ────────────────────────────────────── */

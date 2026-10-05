@@ -923,6 +923,15 @@ static usize next_task_id = 2;
 
 static int g_task_vfork_pending[TASK_SLOTS];
 static usize g_task_vfork_id[TASK_SLOTS];
+/* CLONE_PIDFD on the thread-style clone path: where the caller wants the
+ * child's pidfd written, set by the syscall for the duration of one
+ * scheduler_clone_thread (scheduler_clone_set_pidfd). */
+static u64 g_task_clone_pidfd[TASK_SLOTS];
+
+void scheduler_clone_set_pidfd(u64 user_addr) {
+  if (current_task)
+    g_task_clone_pidfd[task_index(current_task)] = user_addr;
+}
 
 /* Pid 1 is reserved for the next user process. Only kthread_create_user may
  * take it: a filesystem worker started while init's path is being looked up
@@ -5438,6 +5447,20 @@ clone_nomem:
                      (flags & B1NIX_CLONE_VFORK)  ? PTRACE_EVENT_VFORK
                      : (flags & B1NIX_CLONE_THREAD) ? PTRACE_EVENT_CLONE
                                                     : PTRACE_EVENT_CLONE);
+  /* CLONE_PIDFD: the descriptor exists before the child can run, as in
+   * Linux's copy_process. Made after the parent resumed from a CLONE_VFORK
+   * it could find the child already gone -- exited and reaped while the
+   * parent was suspended -- and the caller got no descriptor at all. */
+  {
+    usize ps = task_index(parent);
+    u64 pidfd_addr = g_task_clone_pidfd[ps];
+    if (pidfd_addr) {
+      g_task_clone_pidfd[ps] = 0;
+      int pfd = vfs_pidfd_open((usize)child->id, 0);
+      i32 pfd32 = pfd < 0 ? -1 : (i32)pfd;
+      syscall_copyout((void *)(usize)pidfd_addr, &pfd32, sizeof(pfd32));
+    }
+  }
   interrupts_disable();
   /* M28 T4: see fork/kthread_create_impl — fresh task's kernel stack is set
    * up synchronously without going through arch_context_switch, so publish

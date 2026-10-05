@@ -307,6 +307,23 @@ say "shadow-owner=$(stat -c %U:%G /etc/shadow 2>&1)"
 say "modules=$(awk '{print $1}' /proc/modules 2>/dev/null | sort | tr '\n' ' ')"
 # The policy calls Debian units use, answered by the kernel rather than guessed.
 say "sched-idle=$(chrt --idle 0 true 2>&1 | head -1; echo rc=$?)"
+# A unit's sandbox has to take: ProtectSystem=strict makes /usr read-only for
+# the service and only for it. systemd used to decide the unit's new root was
+# already the root and skip switching to it, so every sandbox on this kernel
+# was silently absent -- the write below succeeded.
+rm -f /usr/.b1nix-sandbox-probe
+if systemd-run --wait -q -p ProtectSystem=strict \
+	sh -c 'touch /usr/.b1nix-sandbox-probe' 2>/dev/null; then
+	say "sandbox=FAIL the write to /usr went through"
+elif [ -e /usr/.b1nix-sandbox-probe ]; then
+	say "sandbox=FAIL the file exists"
+elif systemd-run --wait -q -p ProtectSystem=strict sh -c 'touch /dev/shm/.b1nix-sandbox-probe' 2>/dev/null; then
+	say "sandbox=ok"
+	rm -f /dev/shm/.b1nix-sandbox-probe
+else
+	say "sandbox=FAIL the sandboxed unit could not run at all"
+fi
+rm -f /usr/.b1nix-sandbox-probe
 
 say "done"
 systemctl poweroff --no-block 2>/dev/null || { sync; echo o >/proc/sysrq-trigger; }

@@ -396,6 +396,22 @@ void vfs_dump_mounts(void) {
 
 static struct vfs_node *root_node;
 
+/* The mount the calling task's last path walk ended in (its seq; 0 when not
+ * known). A node is the root of every mount of its filesystem -- "/" and a
+ * bind of "/" share one -- so the node alone cannot say which mount a path
+ * operation is in; the walk that found it can. Every path operation walks to
+ * its parent just before it checks the mount, so this is that walk's answer:
+ * without it `mount -o bind,ro / /mnt` made every write to "/" EROFS. */
+static u64 g_walk_last_seq[SCHED_MAX_TASKS];
+
+static void vfs_note_walk_mount(u64 seq) {
+  if (!current_task)
+    return;
+  usize i = scheduler_task_index(current_task);
+  if (i < SCHED_MAX_TASKS)
+    g_walk_last_seq[i] = seq;
+}
+
 static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   if (!node)
     return 0;
@@ -415,6 +431,23 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   struct vfs_node *top = node;
   struct vfs_mount_entry *res = 0;
   u32 walk_ns = vfs_current_mnt_ns(); /* once per walk, see mount_visible_in */
+  /* The mount the last walk went through, when the node is inside it. */
+  if (current_task) {
+    usize ti = scheduler_task_index(current_task);
+    u64 seq = ti < SCHED_MAX_TASKS ? g_walk_last_seq[ti] : 0;
+    for (usize i = 0; seq && i < mount_hwm; i++) {
+      if (!mount_visible_in(i, walk_ns) || mounts[i].seq != seq)
+        continue;
+      struct vfs_node *mr = mounts[i].root_node;
+      for (struct vfs_node *c = node; c && mr; c = c->parent) {
+        if (c == mr) {
+          res = &mounts[i];
+          goto out;
+        }
+      }
+      break;
+    }
+  }
   while (curr) {
     top = curr;
     /* The deepest ancestor that is some mount's root wins; among the entries
@@ -2303,6 +2336,7 @@ restart_traversal:
       kfree(curr_path);
       kfree(parent_path);
       vfs_inode_unlock_read(current->inode);
+      vfs_note_walk_mount(cur_mnt);
       if (mnt_out) {
         mnt_out->seq = cur_mnt;
         mnt_out->known = 0;
@@ -7346,6 +7380,20 @@ static struct vfs_node *vfs_find_mount_place(const char *path, u64 *mnt);
 
 int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags) {
+  return vfs_mount_opts(source, target, fstype, flags, 0);
+}
+
+int vfs_fs_takes_options(const char *fstype) {
+  if (!fstype)
+    return 0;
+  for (struct vfs_fs *fs = filesystems; fs; fs = fs->next)
+    if (strcmp(fs->name, fstype) == 0)
+      return (fs->flags & VFS_FS_OWN_OPTIONS) && fs->mount_opts;
+  return 0;
+}
+
+int vfs_mount_opts(const char *source, const char *target, const char *fstype,
+                   u64 flags, const char *opts) {
   if (!target || target[0] == '\0' || !fstype)
     return -EINVAL;
   if (!vfs_may_mount())
@@ -7466,7 +7514,12 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   const char *dev_source = source;
   if (dev_source && strncmp(dev_source, "/dev/", 5) == 0)
     dev_source += 5;
-  struct vfs_node *root_node = fs->mount(dev_source, flags, (void *)target);
+  /* The type's own options, for a type that parses them; for the others
+   * mount(2)'s data string is ignored, as it always has been. */
+  struct vfs_node *root_node =
+      (fs->mount_opts && (fs->flags & VFS_FS_OWN_OPTIONS))
+          ? fs->mount_opts(dev_source, flags, (void *)target, opts)
+          : fs->mount(dev_source, flags, (void *)target);
   g_mounting_fs_id = 0;
   currently_mounting = NULL;
 
@@ -8354,16 +8407,22 @@ static int vfs_umount_one(const char *canon, int detach, u32 group,
    * tasks in that namespace. */
   int last_ref = (mount_fs_refs(root) <= 1);
 
-  /* Call filesystem umount callback if available (e.g. JBD RECOVER flag) */
+  /* The filesystem's own umount callback (e.g. JBD RECOVER flag), found
+   * now and called once the table lock is dropped. It is the filesystem's
+   * whole teardown -- an imported btrfs writes back, closes its devices and
+   * frees large buffers, which sends TLB shootdowns -- and this lock is a
+   * spin-yield one that every path lookup's mount check takes: a CPU
+   * spinning for it could not answer the shootdown, and the umount of a
+   * freshly made btrfs panicked the machine ("tlb_shootdown timeout") while
+   * dbus-broker waited for the lock to size a memfd. The entry is retired
+   * first, so nothing can find the mount while it is being torn down. */
+  int (*fs_umount)(struct vfs_node *) = 0;
   if (last_ref && mounts[i].fstype[0]) {
-    struct vfs_fs *fs = filesystems;
-    while (fs) {
+    for (struct vfs_fs *fs = filesystems; fs; fs = fs->next) {
       if (strcmp(fs->name, mounts[i].fstype) == 0) {
-        if (fs->umount && root)
-          fs->umount(root);
+        fs_umount = fs->umount;
         break;
       }
-      fs = fs->next;
     }
   }
 
@@ -8371,6 +8430,8 @@ static int vfs_umount_one(const char *canon, int detach, u32 group,
   mounts[i].used = 0;
   mounts[i].owner = 0;
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  if (fs_umount && root)
+    fs_umount(root);
   module_put(owner);
 
   if (last_ref && root && root->inode && root->inode->blk_dev) {
@@ -8933,6 +8994,7 @@ void vfs_mnt_ns_destroy(u32 ns) {
     struct vfs_node *roots[MNT_RELEASE_BATCH];
     struct vfs_node *mps[MNT_RELEASE_BATCH];
     struct module *owners[MNT_RELEASE_BATCH];
+    int (*umounts[MNT_RELEASE_BATCH])(struct vfs_node *);
     usize n = 0;
 
     while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
@@ -8944,12 +9006,14 @@ void vfs_mnt_ns_destroy(u32 ns) {
       /* Last entry anywhere for this filesystem: let it shut down properly, the
        * same way vfs_umount() does. A filesystem another namespace still mounts
        * is left alone. */
+      /* The filesystem's teardown runs after the lock is dropped, as in
+       * vfs_umount_one: it can write back and send TLB shootdowns. */
+      umounts[n] = 0;
       if (mount_root_refs(mounts[i].root_node) <= 1 && mounts[i].fstype[0]) {
         for (struct vfs_fs *fs = filesystems; fs; fs = fs->next) {
           if (strcmp(fs->name, mounts[i].fstype) != 0)
             continue;
-          if (fs->umount && mounts[i].root_node)
-            fs->umount(mounts[i].root_node);
+          umounts[n] = fs->umount;
           break;
         }
       }
@@ -8969,6 +9033,8 @@ void vfs_mnt_ns_destroy(u32 ns) {
       return; /* nothing left in this namespace */
 
     for (usize i = 0; i < n; i++) {
+      if (umounts[i] && roots[i])
+        umounts[i](roots[i]);
       module_put(owners[i]);
       vfs_node_put(roots[i]);
       vfs_node_put(mps[i]);
@@ -8986,6 +9052,7 @@ static void vfs_mounts_drop_under(const char *path) {
     struct vfs_node *roots[MNT_RELEASE_BATCH];
     struct vfs_node *mps[MNT_RELEASE_BATCH];
     struct module *owners[MNT_RELEASE_BATCH];
+    int (*umounts[MNT_RELEASE_BATCH])(struct vfs_node *);
     usize n = 0;
 
     while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
@@ -8994,12 +9061,14 @@ static void vfs_mounts_drop_under(const char *path) {
     for (usize i = 0; i < mount_hwm && n < MNT_RELEASE_BATCH; i++) {
       if (!mounts[i].used || !path_is_under(mounts[i].target, path))
         continue;
+      /* The filesystem's teardown runs after the lock is dropped, as in
+       * vfs_umount_one: it can write back and send TLB shootdowns. */
+      umounts[n] = 0;
       if (mount_root_refs(mounts[i].root_node) <= 1 && mounts[i].fstype[0]) {
         for (struct vfs_fs *fs = filesystems; fs; fs = fs->next) {
           if (strcmp(fs->name, mounts[i].fstype) != 0)
             continue;
-          if (fs->umount && mounts[i].root_node)
-            fs->umount(mounts[i].root_node);
+          umounts[n] = fs->umount;
           break;
         }
       }
@@ -9019,6 +9088,8 @@ static void vfs_mounts_drop_under(const char *path) {
       return;
 
     for (usize i = 0; i < n; i++) {
+      if (umounts[i] && roots[i])
+        umounts[i](roots[i]);
       module_put(owners[i]);
       vfs_node_put(roots[i]);
       vfs_node_put(mps[i]);
@@ -10994,7 +11065,13 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
       return rc;
   }
 
-  if (!arg)
+  /* Two block ioctls take no argument: BLKRRPART and BLKFLSBUF. Refusing a
+   * null one before reaching them made every partitioner's "re-read the
+   * table" fail with EINVAL, and the partitions it had just written never
+   * appeared -- sfdisk said "Re-reading the partition table failed". */
+  int blk_noarg = node->inode->blk_dev && ((request >> 8) & 0xFF) == 0x12 &&
+                  ((request & 0xFF) == 0x5F || (request & 0xFF) == 0x61);
+  if (!arg && !blk_noarg)
     return -EINVAL;
 
   /* HDIO_GETGEO: mkfs.vfat and fdisk want a CHS geometry for the boot sector.
@@ -11040,6 +11117,20 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
     case 0x72: /* BLKGETSIZE64: size in bytes (u64) */
       return syscall_copyout(arg, &bytes, sizeof(bytes)) < 0 ? -EFAULT : 0;
     case 0x5F: /* BLKRRPART: reread partition table */
+      /* Not under a mounted partition: dropping it would pull the device
+       * out from under the filesystem. Linux answers EBUSY, and the
+       * partitioners fall back to telling the kernel one partition at a
+       * time. */
+      for (usize i = 0; i < blk_count(); i++) {
+        struct block_device *p = blk_at(i);
+        char dn[48];
+        if (!p || !p->name || !blk_is_partition(p) ||
+            blk_partition_parent(p) != bd)
+          continue;
+        snprintf(dn, sizeof(dn), "/dev/%s", p->name);
+        if (vfs_device_is_mounted(p->name) || vfs_device_is_mounted(dn))
+          return -EBUSY;
+      }
       return blk_rescan_partitions(bd) == 0 ? 0 : -EIO;
     case 0x61: /* BLKFLSBUF: flush buffers — accept */
       return 0;
@@ -11243,8 +11334,9 @@ out:
   return res;
 }
 
-int vfs_utime(const char *path, u64 atime, u64 mtime) {
-  struct vfs_node *node = vfs_find_node(path);
+int vfs_utimens(const char *path, int nofollow, const u64 times[4], u32 omit) {
+  struct vfs_node *node =
+      nofollow ? vfs_find_node_no_follow(path) : vfs_find_node(path);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
 
@@ -11261,22 +11353,30 @@ int vfs_utime(const char *path, u64 atime, u64 mtime) {
     goto out;
   }
 
-  /* utimes(2) names whole seconds; the sub-second halves it does not name are
-   * zeroed rather than left over from the last write. */
-  node->inode->atime = atime;
-  node->inode->atime_nsec = 0;
-  node->inode->mtime = mtime;
-  node->inode->mtime_nsec = 0;
+  if (!(omit & VFS_UTIME_OMIT_ATIME)) {
+    node->inode->atime = times[0];
+    node->inode->atime_nsec = (u32)times[1];
+  }
+  if (!(omit & VFS_UTIME_OMIT_MTIME)) {
+    node->inode->mtime = times[2];
+    node->inode->mtime_nsec = (u32)times[3];
+  }
   vfs_update_times(node->inode, VFS_CTIME);
   vfs_inotify_notify(node, IN_ATTRIB, 0); /* M107 */
-  if (node->inode->setattr_cb) {
+  if (node->inode->setattr_cb)
     res = node->inode->setattr_cb(node);
-    goto out;
-  }
 
 out:
   vfs_node_put(node);
   return res;
+}
+
+/* utime(2) names whole seconds; the sub-second halves it does not name are
+ * zeroed rather than left over from the last write. */
+int vfs_utime(const char *path, u64 atime, u64 mtime) {
+  const u64 times[4] = {atime, 0, mtime, 0};
+
+  return vfs_utimens(path, 0, times, 0);
 }
 
 static int vfs_chmod_node(struct vfs_node *node, u16 mode) {
@@ -11847,7 +11947,8 @@ static void detached_free_slot(int id) {
     (void)vfs_unlink(path);
 }
 
-int vfs_detached_create(const char *fstype, const char *source, u64 flags) {
+int vfs_detached_create(const char *fstype, const char *source, u64 flags,
+                        const char *opts) {
   if (!fstype || !fstype[0])
     return -EINVAL;
 
@@ -11856,7 +11957,7 @@ int vfs_detached_create(const char *fstype, const char *source, u64 flags) {
   if (id < 0)
     return id;
 
-  int rc = vfs_mount(source, path, fstype, flags);
+  int rc = vfs_mount_opts(source, path, fstype, flags, opts);
   if (rc < 0) {
     detached_free_slot(id);
     return rc;

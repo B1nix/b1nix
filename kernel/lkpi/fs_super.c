@@ -23,11 +23,13 @@
 #include <linux/fs.h>
 #include <linux/string.h>
 #include <linux/fs_context.h>
+#include <linux/namei.h>
 #include <linux/slab.h>
 #include <linux/blkdev.h>
 #include <linux/backing-dev.h>
 #include <linux/writeback.h>
 #include <linux/pagemap.h>
+#include <linux/workqueue.h>
 #include <lkpi/env.h>
 
 /* ── the registry ───────────────────────────────────────────────── */
@@ -37,6 +39,7 @@ static struct file_system_type *file_systems;
  * it, and the memory reclaimer walks it from kswapd. */
 static DEFINE_MUTEX(sb_instances_lock);
 unsigned long lkpi_fs_reclaim(unsigned long want);
+void lkpi_kick_writeback(void);
 /* b1nix's frame allocator: who to ask for file pages when its own cache is
  * empty. */
 extern void pmm_set_fs_reclaim(unsigned long (*fn)(unsigned long));
@@ -477,7 +480,102 @@ unsigned long lkpi_fs_reclaim(unsigned long want)
 		}
 	}
 	mutex_unlock(&sb_instances_lock);
+	/* Whatever is left is dirty or in use. Dirty folios become reclaimable
+	 * only once written, and nothing else writes them until a sync: start
+	 * that now so the next pass finds them clean. */
+	if (dropped < want)
+		lkpi_kick_writeback();
 	return dropped;
+}
+
+/* ── background writeback ───────────────────────────────────────── */
+
+/*
+ * Upstream's flusher threads, reduced to one pass over every mounted
+ * superblock's cached inodes, writing each mapping's dirty folios through its
+ * own writepages. Without it, data written to an imported filesystem stayed
+ * dirty until a sync, the reclaimer above could not drop any of it, and a
+ * large copy -- an installer unpacking a root filesystem -- ran the machine
+ * out of memory.
+ */
+static void lkpi_writeback_fn(struct work_struct *work);
+static DECLARE_WORK(lkpi_writeback_work, lkpi_writeback_fn);
+
+/* Superblocks one pass takes at a time. */
+#define WRITEBACK_BATCH 16
+
+/* Write back every cached mapping of one superblock, whose s_umount the
+ * caller holds for read. */
+static void writeback_sb(struct super_block *sb)
+{
+	struct inode *inode, *held = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&sb->s_inode_list_lock, flags);
+	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+		struct inode *got;
+
+		if (!inode->i_mapping || !inode->i_mapping->nrpages)
+			continue;
+		got = igrab(inode);
+		if (!got)
+			continue;
+		spin_unlock_irqrestore(&sb->s_inode_list_lock, flags);
+		if (held)
+			iput(held);
+		held = got;
+		filemap_fdatawrite(got->i_mapping);
+		spin_lock_irqsave(&sb->s_inode_list_lock, flags);
+	}
+	spin_unlock_irqrestore(&sb->s_inode_list_lock, flags);
+	if (held)
+		iput(held);
+}
+
+/*
+ * The instance list's mutex is held only to pick the superblocks, each pinned
+ * by a read hold on its s_umount (an unmount needs it for write); the I/O runs
+ * without it, so the reclaimer, which takes the same mutex, is never stuck
+ * behind a pass.
+ */
+static void lkpi_writeback_fn(struct work_struct *work)
+{
+	struct super_block *batch[WRITEBACK_BATCH];
+	struct file_system_type *type;
+	int n = 0, i;
+
+	(void)work;
+	mutex_lock(&sb_instances_lock);
+	for (type = file_systems; type && n < WRITEBACK_BATCH; type = type->next) {
+		struct super_block *sb;
+
+		hlist_for_each_entry(sb, &type->fs_supers, s_instances) {
+			if (n == WRITEBACK_BATCH)
+				break;
+			if (!(sb->s_flags & SB_ACTIVE) || sb_rdonly(sb) ||
+			    !down_read_trylock(&sb->s_umount))
+				continue;
+			batch[n++] = sb;
+		}
+	}
+	mutex_unlock(&sb_instances_lock);
+	for (i = 0; i < n; i++) {
+		writeback_sb(batch[i]);
+		up_read(&batch[i]->s_umount);
+	}
+}
+
+/* Start a pass, unless one is already queued. */
+void lkpi_kick_writeback(void)
+{
+	queue_work(system_unbound_wq, &lkpi_writeback_work);
+}
+
+/* Wait for the pass in flight, if any: the throttle a writer takes when it is
+ * dirtying memory faster than the pass cleans it. */
+void lkpi_wait_writeback(void)
+{
+	flush_work(&lkpi_writeback_work);
 }
 
 void deactivate_locked_super(struct super_block *sb)
@@ -1077,18 +1175,61 @@ struct dentry *mount_subtree(struct vfsmount *mnt, const char *path)
 	root = mnt->mnt_root;
 
 	/*
-	 * An empty path, or "/", means the filesystem's own root — which is what
-	 * a plain `mount /dev/sda /mnt` asks for, and the only case reachable
-	 * until a path walk exists here. A named subvolume needs the lookup that
-	 * b1nix's VFS performs above this layer, so it is refused rather than
-	 * silently returning the wrong root.
+	 * A named subtree -- a btrfs subvolume, `subvol=/@` -- is walked to one
+	 * component at a time inside the filesystem, with the same lookup the
+	 * bridge uses for every name. It used to be refused with EOPNOTSUPP, so
+	 * no subvolume could be mounted: the installer's @, @home and @snapshots
+	 * all failed, and an installed system with rootflags=subvol=@ could not
+	 * have mounted its root.
 	 */
 	if (path && path[0] && strcmp(path, "/") != 0) {
-		/* Name the path: "the mount failed" alone does not say that what was
-		 * asked for was a subvolume rather than the filesystem's root. */
-		lkpi_printk("lkpi-fs: mount_subtree cannot walk to '%s'\n", path);
-		kern_unmount(mnt);
-		return ERR_PTR(-EOPNOTSUPP);
+		char *copy = kstrdup(path, GFP_KERNEL);
+		char *cur, *comp;
+		struct dentry *d;
+
+		if (!copy) {
+			kern_unmount(mnt);
+			return ERR_PTR(-ENOMEM);
+		}
+		d = dget(root);
+		cur = copy;
+		while ((comp = strsep(&cur, "/")) != NULL) {
+			struct dentry *next;
+
+			if (!*comp || strcmp(comp, ".") == 0)
+				continue;
+			if (strcmp(comp, "..") == 0 || !d->d_inode ||
+			    !S_ISDIR(d->d_inode->i_mode)) {
+				dput(d);
+				d = ERR_PTR(-ENOTDIR);
+				break;
+			}
+			next = lookup_one_len(comp, d, (int)strlen(comp));
+			dput(d);
+			if (IS_ERR(next)) {
+				d = next;
+				break;
+			}
+			if (!next->d_inode) {
+				dput(next);
+				d = ERR_PTR(-ENOENT);
+				break;
+			}
+			d = next;
+		}
+		kfree(copy);
+		if (IS_ERR(d)) {
+			lkpi_printk("lkpi-fs: mount_subtree: no '%s' (%ld)\n", path,
+			            PTR_ERR(d));
+			kern_unmount(mnt);
+			return d;
+		}
+		/* The walked dentry has its own reference; the mount's on its root
+		 * goes, its hold on the superblock passes to the caller with the
+		 * dentry -- what the root case below hands over too. */
+		dput(root);
+		kfree(mnt);
+		return d;
 	}
 
 	/* The dentry outlives the vfsmount, so it takes its own reference before

@@ -1313,6 +1313,7 @@ void kernel_main(usize arg0, usize arg1)
 		    rdinit_present()) {
 			g_initramfs_root = 1;
 			boot_summary_set_root("initramfs");
+			ramdisk_release();
 			vfs_repopulate_after_root_mount();
 			rc = 0;
 		}

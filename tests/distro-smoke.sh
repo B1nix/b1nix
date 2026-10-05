@@ -171,6 +171,10 @@ case "$(marker "$BOOT_LOG" "shadow-owner=")" in
 *) bad "file-ownership" "/etc/shadow is '$(marker "$BOOT_LOG" "shadow-owner=" | sed 's/.*=//')', not root:shadow" ;;
 esac
 
+case "$(marker "$BOOT_LOG" "sandbox=")" in
+*sandbox=ok) ok "unit-sandbox" ;;
+*) bad "unit-sandbox" "ProtectSystem=strict did not keep a unit off /usr: $(marker "$BOOT_LOG" "sandbox=" | sed 's/.*sandbox=//')" ;;
+esac
 case "$(marker "$BOOT_LOG" "strace-pid1=")" in
 *strace-pid1=ok) ok "strace-pid1" ;;
 *) bad "strace-pid1" "tracing PID 1 left it stopped, or strace never ran" ;;

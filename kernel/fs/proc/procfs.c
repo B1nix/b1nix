@@ -1584,8 +1584,9 @@ static int r_mountinfo(usize pid, struct sbuf *s) {
     for (usize b = 0; b < bn; b++) {
       struct block_device *d = blk_at(b);
       if (d && d->name && strcmp(d->name, devname) == 0) {
-        maj = 8;
-        min = (int)b;
+        u32 dn = blk_devno(d);
+        maj = (int)(dn >> 8);
+        min = (int)(dn & 0xFF);
         break;
       }
     }
@@ -4448,8 +4449,47 @@ static int r_partitions(usize pid, struct sbuf *s) {
     if (!d || !d->name)
       continue;
     u64 kblocks = ((u64)d->block_size * d->block_count) / 1024;
-    sb_addf(s, "%4d %7lu %10lu %s\n", 8, (unsigned long)i,
-            (unsigned long)kblocks, d->name);
+    u32 dn = blk_devno(d);
+    sb_addf(s, "%4u %7u %10lu %s\n", (unsigned)(dn >> 8),
+            (unsigned)(dn & 0xFF), (unsigned long)kblocks, d->name);
+  }
+  return 0;
+}
+
+/* /proc/devices: the majors in use, by driver name. Readers look a dynamic
+ * major up by name here -- libparted finds virtio disks by "virtblk", udev and
+ * mdadm look for "md" -- so the names are Linux's. The block majors are the
+ * ones blk_devno() hands out; a driver with no device registered is left out,
+ * as Linux leaves out a module that is not loaded. */
+static int r_devices(usize pid, struct sbuf *s) {
+  (void)pid;
+  static const struct {
+    unsigned major;
+    const char *name;
+  } chr[] = {{1, "mem"}, {4, "/dev/vc/0"}, {4, "tty"}, {4, "ttyS"},
+             {5, "/dev/tty"}, {5, "/dev/console"}, {5, "/dev/ptmx"},
+             {10, "misc"}, {13, "input"}, {136, "pts"}, {226, "drm"},
+             {229, "hvc"}};
+  static const struct {
+    unsigned major;
+    const char *name;
+  } blkm[] = {{1, "ramdisk"}, {7, "loop"}, {8, "sd"}, {9, "md"},
+              {11, "sr"}, {43, "nbd"}, {179, "mmc"},
+              {BLK_ZRAM_MAJOR, "zram"}, {BLK_VIRTBLK_MAJOR, "virtblk"},
+              {BLK_EXT_MAJOR, "blkext"}};
+  sb_puts(s, "Character devices:\n");
+  for (usize i = 0; i < sizeof(chr) / sizeof(chr[0]); i++)
+    sb_addf(s, "%3u %s\n", chr[i].major, chr[i].name);
+  sb_puts(s, "\nBlock devices:\n");
+  usize n = blk_count();
+  for (usize k = 0; k < sizeof(blkm) / sizeof(blkm[0]); k++) {
+    int used = 0;
+    for (usize i = 0; i < n && !used; i++) {
+      struct block_device *d = blk_at(i);
+      used = d && d->name && (blk_devno(d) >> 8) == blkm[k].major;
+    }
+    if (used)
+      sb_addf(s, "%3u %s\n", blkm[k].major, blkm[k].name);
   }
   return 0;
 }
@@ -4613,6 +4653,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "last_kmsg", VFS_DEVICE, r_last_kmsg, 0);
 #endif
   procfs_mkchild(root, "partitions", VFS_DEVICE, r_partitions, 0);
+  procfs_mkchild(root, "devices", VFS_DEVICE, r_devices, 0);
   procfs_mkchild(root, "mtd", VFS_DEVICE, r_mtd, 0);
   procfs_mkchild(root, "diskstats", VFS_DEVICE, r_diskstats, 0);
   procfs_mkchild(root, "swaps", VFS_DEVICE, r_swaps, 0);

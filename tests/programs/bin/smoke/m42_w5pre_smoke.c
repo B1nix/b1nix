@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
@@ -244,6 +245,41 @@ int main(int argc, char **argv) {
     }
     close(dir_fd);
     ok("fchdir");
+
+    /* getcwd(2) as Linux answers it: the length including the NUL, and
+     * ERANGE -- not a truncated path -- for a buffer too small. */
+    {
+        char small[4];
+        long n = syscall(SYS_getcwd, cwd, sizeof(cwd));
+        errno = 0;
+        char *r = getcwd(small, sizeof(small));
+        if (n != (long)strlen("/tmp") + 1 || r != NULL || errno != ERANGE) {
+            fail("getcwd-erange");
+            return 1;
+        }
+        ok("getcwd-erange");
+    }
+
+    /* utimensat(AT_SYMLINK_NOFOLLOW) sets the link's own times, to the
+     * nanosecond, and works on a link whose target does not exist -- what
+     * rsync -a and cp -a do for every symlink they copy. */
+    {
+        const char *link = "/tmp/m42-utime-link";
+        struct timespec ts[2] = {{1000, 123456789}, {2000, 987654321}};
+        struct stat st;
+
+        unlink(link);
+        if (symlink("/tmp/m42-utime-missing", link) != 0 ||
+            utimensat(AT_FDCWD, link, ts, AT_SYMLINK_NOFOLLOW) != 0 ||
+            lstat(link, &st) != 0 || st.st_mtim.tv_sec != 2000 ||
+            st.st_mtim.tv_nsec != 987654321 || st.st_atim.tv_sec != 1000 ||
+            st.st_atim.tv_nsec != 123456789) {
+            fail("utimensat-nofollow");
+            return 1;
+        }
+        unlink(link);
+        ok("utimensat-nofollow");
+    }
 
     /* 4. fnmatch() */
     if (fnmatch("a*b", "axxxb", 0) != 0 ||

@@ -1726,8 +1726,14 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   return 0;
 }
 
+static u32 socket_poll_gen(struct vfs_handle *h) {
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  return s ? __atomic_load_n(&s->poll_gen, __ATOMIC_ACQUIRE) : 0;
+}
+
 const struct vfs_file_ops socket_file_ops = {
   .read = socket_read, .write = socket_write, .poll = socket_poll,
+  .poll_gen = socket_poll_gen,
   .release = socket_release, .ioctl = socket_ioctl
 };
 

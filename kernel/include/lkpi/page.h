@@ -217,6 +217,9 @@ struct page *lkpi_page_from_virt(const void *addr);
 void get_page(struct page *page);
 /* Returns 1 if this put freed the frame. */
 int put_page(struct page *page);
+/* The same for a page nothing keeps a pointer to once its last reference is
+ * gone -- a cached file folio: the struct page goes with the frame. */
+void lkpi_put_page_free(struct page *page);
 
 /*
  * A shmem-style backing store: `count` pages, allocated individually so they are

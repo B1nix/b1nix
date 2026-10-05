@@ -354,7 +354,8 @@ static int lkpifs_remount(struct vfs_node *root, u64 flags)
 }
 
 static struct vfs_node *lkpifs_mount_type(const char *linux_name,
-                                          const char *source, u64 flags)
+                                          const char *source, u64 flags,
+                                          const char *opts)
 {
 	void *root_handle;
 	struct vfs_node *root;
@@ -368,7 +369,7 @@ static struct vfs_node *lkpifs_mount_type(const char *linux_name,
 	 * deliberately not forwarded.
 	 */
 	root_handle = lkpi_bridge_mount(linux_name, source,
-	                                (flags & MS_RDONLY) ? 1ul : 0ul);
+	                                (flags & MS_RDONLY) ? 1ul : 0ul, opts);
 	if (!root_handle) {
 		extern int lkpi_bridge_last_mount_error;
 		extern int lkpi_mount_stage;
@@ -902,7 +903,8 @@ static int lkpifs_setattr(struct vfs_node *node)
 	page_cache_flush_inode(node->inode);
 	return lkpi_bridge_setattr(handle, node->inode->mode, node->inode->uid,
 	                           node->inode->gid, node->inode->atime,
-	                           node->inode->mtime);
+	                           node->inode->atime_nsec, node->inode->mtime,
+	                           node->inode->mtime_nsec);
 }
 
 static int lkpifs_fitrim(struct vfs_node *node, u64 start, u64 len, u64 minlen,
@@ -1068,15 +1070,30 @@ static struct vfs_node *lkpifs_mount_btrfs(const char *source, u64 flags,
                                            void *data)
 {
 	(void)data;
-	return lkpifs_mount_type("btrfs", source, flags);
+	return lkpifs_mount_type("btrfs", source, flags, 0);
 }
+
+/* The same mounts with the filesystem's own options (VFS_FS_OWN_OPTIONS):
+ * whatever the VFS did not consume -- btrfs's compress=, ext4's data=, vfat's
+ * umask= -- handed to the imported driver to parse, and refused by it if it
+ * does not know them. */
+#define LKPIFS_MOUNT_OPTS(fn, lname)                                           \
+	static struct vfs_node *fn(const char *source, u64 flags, void *data,  \
+	                           const char *opts)                           \
+	{                                                                      \
+		(void)data;                                                    \
+		return lkpifs_mount_type(lname, source, flags, opts);          \
+	}
+LKPIFS_MOUNT_OPTS(lkpifs_mount_btrfs_opts, "btrfs")
 
 /* Registered as "btrfs", not as a second opinion beside one: this is the
  * filesystem b1nix mounts when something says btrfs. */
 static struct vfs_fs lkpifs_btrfs = {
 	.name = "btrfs",
 	.mount = lkpifs_mount_btrfs,
+	.mount_opts = lkpifs_mount_btrfs_opts,
 	.umount = lkpifs_umount,
+	.flags = VFS_FS_OWN_OPTIONS,
 };
 
 #if B1NIX_FS_IMPORT_EXT4
@@ -1084,44 +1101,57 @@ static struct vfs_node *lkpifs_mount_ext4(const char *source, u64 flags,
                                           void *data)
 {
 	(void)data;
-	return lkpifs_mount_type("ext4", source, flags);
+	return lkpifs_mount_type("ext4", source, flags, 0);
 }
 
 /* ext4 is also b1nix's ext3 and ext2, as it is Linux's: one driver reads all
  * three formats, registered under each name so a mount shows the one asked. */
+LKPIFS_MOUNT_OPTS(lkpifs_mount_ext4_opts, "ext4")
 static struct vfs_fs lkpifs_ext_types[] = {
-	{ .name = "ext4", .mount = lkpifs_mount_ext4, .umount = lkpifs_umount },
-	{ .name = "ext3", .mount = lkpifs_mount_ext4, .umount = lkpifs_umount },
-	{ .name = "ext2", .mount = lkpifs_mount_ext4, .umount = lkpifs_umount },
+	{ .name = "ext4", .mount = lkpifs_mount_ext4,
+	  .mount_opts = lkpifs_mount_ext4_opts, .umount = lkpifs_umount,
+	  .flags = VFS_FS_OWN_OPTIONS },
+	{ .name = "ext3", .mount = lkpifs_mount_ext4,
+	  .mount_opts = lkpifs_mount_ext4_opts, .umount = lkpifs_umount,
+	  .flags = VFS_FS_OWN_OPTIONS },
+	{ .name = "ext2", .mount = lkpifs_mount_ext4,
+	  .mount_opts = lkpifs_mount_ext4_opts, .umount = lkpifs_umount,
+	  .flags = VFS_FS_OWN_OPTIONS },
 };
 
 static struct vfs_node *lkpifs_mount_vfat(const char *source, u64 flags,
                                           void *data)
 {
 	(void)data;
-	return lkpifs_mount_type("vfat", source, flags);
+	return lkpifs_mount_type("vfat", source, flags, 0);
 }
 
 static struct vfs_node *lkpifs_mount_msdos(const char *source, u64 flags,
                                            void *data)
 {
 	(void)data;
-	return lkpifs_mount_type("msdos", source, flags);
+	return lkpifs_mount_type("msdos", source, flags, 0);
 }
 
 /* FAT is built with ext4 because it stands on the same buffer heads. "vfat"
  * is what every fstab and every EFI system partition says; "msdos" is the same
  * driver with 8.3 names only, as on Linux. */
+LKPIFS_MOUNT_OPTS(lkpifs_mount_vfat_opts, "vfat")
+LKPIFS_MOUNT_OPTS(lkpifs_mount_msdos_opts, "msdos")
 static struct vfs_fs lkpifs_fat_types[] = {
-	{ .name = "vfat", .mount = lkpifs_mount_vfat, .umount = lkpifs_umount },
-	{ .name = "msdos", .mount = lkpifs_mount_msdos, .umount = lkpifs_umount },
+	{ .name = "vfat", .mount = lkpifs_mount_vfat,
+	  .mount_opts = lkpifs_mount_vfat_opts, .umount = lkpifs_umount,
+	  .flags = VFS_FS_OWN_OPTIONS },
+	{ .name = "msdos", .mount = lkpifs_mount_msdos,
+	  .mount_opts = lkpifs_mount_msdos_opts, .umount = lkpifs_umount,
+	  .flags = VFS_FS_OWN_OPTIONS },
 };
 
 static struct vfs_node *lkpifs_mount_iso9660(const char *source, u64 flags,
                                              void *data)
 {
 	(void)data;
-	return lkpifs_mount_type("iso9660", source, flags);
+	return lkpifs_mount_type("iso9660", source, flags, 0);
 }
 
 /* isofs is built with FAT, on the same buffer heads. "iso9660" is the type
@@ -1131,11 +1161,14 @@ static struct vfs_node *lkpifs_mount_iso9660(const char *source, u64 flags,
  * VFS_FS_RDONLY because Linux's isofs refuses a read-write superblock
  * (EACCES), and a CD mounted without -o ro is read-only on Linux rather than
  * an error: the drive's block device is read-only and mount(8) retries. */
+LKPIFS_MOUNT_OPTS(lkpifs_mount_iso9660_opts, "iso9660")
 static struct vfs_fs lkpifs_iso_types[] = {
-	{ .name = "iso9660", .mount = lkpifs_mount_iso9660, .umount = lkpifs_umount,
-	  .flags = VFS_FS_RDONLY },
-	{ .name = "isofs", .mount = lkpifs_mount_iso9660, .umount = lkpifs_umount,
-	  .flags = VFS_FS_RDONLY },
+	{ .name = "iso9660", .mount = lkpifs_mount_iso9660,
+	  .mount_opts = lkpifs_mount_iso9660_opts, .umount = lkpifs_umount,
+	  .flags = VFS_FS_RDONLY | VFS_FS_OWN_OPTIONS },
+	{ .name = "isofs", .mount = lkpifs_mount_iso9660,
+	  .mount_opts = lkpifs_mount_iso9660_opts, .umount = lkpifs_umount,
+	  .flags = VFS_FS_RDONLY | VFS_FS_OWN_OPTIONS },
 };
 #endif
 

@@ -1616,9 +1616,12 @@ static isize sys_utime(const char *user_path, u64 atime, u64 mtime) {
 #define LX_UTIME_NOW 0x3fffffffL
 #define LX_UTIME_OMIT 0x3ffffffeL
 static isize sys_linux_utimensat(int dirfd, const char *user_path,
-                                 u64 times_ptr, int is_nsec) {
+                                 u64 times_ptr, int is_nsec, int flags) {
   char kpath[VFS_MAX_PATH];
   char resolved[VFS_MAX_PATH];
+
+  if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
+    return -EINVAL;
 
   /*
    * The path-less form IS futimens(3).
@@ -1656,31 +1659,33 @@ static isize sys_linux_utimensat(int dirfd, const char *user_path,
       return -EBADF;
   }
 
+  /* {atime s, atime sub-second, mtime s, mtime sub-second}: nanoseconds for
+   * utimensat, microseconds for utimes and futimesat. */
   u64 now = vfs_get_unix_time();
-  u64 atime = now, mtime = now;
+  u64 times[4] = {now, 0, now, 0};
+  u32 omit = 0;
   if (times_ptr) {
-    u64 tv[4]; /* [0]=a.sec [1]=a.frac [2]=m.sec [3]=m.frac */
-    if (syscall_copyin(tv, (void *)(usize)times_ptr, sizeof(tv)) < 0)
+    if (syscall_copyin(times, (void *)(usize)times_ptr, sizeof(times)) < 0)
       return -EFAULT;
-    atime = tv[0];
-    mtime = tv[2];
-    if (is_nsec) {
-      if (tv[1] == LX_UTIME_NOW)
-        atime = now;
-      if (tv[3] == LX_UTIME_NOW)
-        mtime = now;
-      if (tv[1] == LX_UTIME_OMIT || tv[3] == LX_UTIME_OMIT) {
-        struct b1nix_stat st;
-        if (vfs_stat(resolved, &st) == 0) {
-          if (tv[1] == LX_UTIME_OMIT)
-            atime = st.st_atim.tv_sec;
-          if (tv[3] == LX_UTIME_OMIT)
-            mtime = st.st_mtim.tv_sec;
-        }
+    for (int i = 1; i < 4; i += 2) {
+      if (is_nsec && times[i] == LX_UTIME_NOW) {
+        times[i - 1] = now;
+        times[i] = 0;
+      } else if (is_nsec && times[i] == LX_UTIME_OMIT) {
+        omit |= i == 1 ? VFS_UTIME_OMIT_ATIME : VFS_UTIME_OMIT_MTIME;
+      } else if (times[i] >= (is_nsec ? 1000000000ULL : 1000000ULL)) {
+        return -EINVAL;
+      } else if (!is_nsec) {
+        times[i] *= 1000;
       }
     }
+    if (omit == (VFS_UTIME_OMIT_ATIME | VFS_UTIME_OMIT_MTIME))
+      return 0;
   }
-  return vfs_utime(resolved, atime, mtime);
+  /* AT_SYMLINK_NOFOLLOW: the link's own times -- what rsync and cp -a set on
+   * every symlink they copy, and following it instead failed on each link
+   * whose target did not exist yet. */
+  return vfs_utimens(resolved, (flags & AT_SYMLINK_NOFOLLOW) != 0, times, omit);
 }
 
 static isize sys_chown(const char *user_path, u32 uid, u32 gid) {
@@ -2503,7 +2508,8 @@ out:
 }
 
 static isize sys_mount(const char *user_src, const char *user_target,
-                       const char *user_type, u64 flags) {
+                       const char *user_type, u64 flags,
+                       const char *user_data) {
   char *ksrc = kmalloc(VFS_MAX_PATH);
   if (!ksrc)
     return -ENOMEM;
@@ -2593,7 +2599,21 @@ static isize sys_mount(const char *user_src, const char *user_target,
     return -EFAULT;
   }
 
-  int res = vfs_mount(ksrc, ktarget, ktype, flags);
+  /* The data string: the filesystem's own options, for a type that parses
+   * them (VFS_FS_OWN_OPTIONS); others ignore it, as they always have. */
+  char *kdata = 0;
+  if (user_data && vfs_fs_takes_options(ktype)) {
+    kdata = kmalloc(PAGE_SIZE);
+    if (!kdata || strncpy_from_user(kdata, user_data, PAGE_SIZE) < 0) {
+      kfree(kdata);
+      kfree(ksrc);
+      kfree(ktarget);
+      kfree(ktype);
+      return kdata ? -EFAULT : -ENOMEM;
+    }
+  }
+  int res = vfs_mount_opts(ksrc, ktarget, ktype, flags, kdata);
+  kfree(kdata);
   /* Which mounts an init system actually asks for, and what it got. A mount
    * that fails non-fatally (systemd tries three variants of cgroup2 before
    * falling back) is invisible from the guest side. */
@@ -7362,10 +7382,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * struct timespec[2], flags). */
       if (number == LINUX_NR_UTIMES)
         return (u64)sys_linux_utimensat(AT_FDCWD, (const char *)(usize)arg0,
-                                        arg1, 0);
+                                        arg1, 0, 0);
       if (number == LINUX_NR_UTIMENSAT)
         return (u64)sys_linux_utimensat((int)arg0, (const char *)(usize)arg1,
-                                        arg2, 1);
+                                        arg2, 1, (int)arg3);
       /* tkill(tid, sig) / tgkill(tgid, tid, sig): b1nix tids are task ids, so
        * the tid targets a thread directly. tgkill also verifies the thread
        * group, so a tid recycled into another process is rejected rather than
@@ -8905,7 +8925,26 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           return ns_pid_out((u64)kid);
         }
 
-        u64 b1nix_flags = flags;
+        /* CLONE_PIDFD with a stack of the caller's: Qt's QProcess starts every
+         * child this way (forkfd's system_vforkfd: CLONE_VM|CLONE_VFORK|
+         * CLONE_PIDFD on a stack in its own frame) and then waits for it
+         * through the descriptor. Only the fork-style path above honoured
+         * the flag; here it was ignored, Qt polled whatever its variable
+         * held, and every QProcess::waitForFinished ran to its timeout --
+         * Calamares sat thirty seconds on `locale -a`, then on the next
+         * command, and never drew a window. */
+        const int want_pidfd = (flags & LX_CLONE_PIDFD) != 0;
+        if (want_pidfd) {
+          if (!parent_tid ||
+              (flags & (B1NIX_CLONE_THREAD | LX_CLONE_DETACHED |
+                        B1NIX_CLONE_PARENT_SETTID)))
+            return (u64)-EINVAL;
+          i32 probe = -1;
+          if (syscall_copyout((void *)(usize)parent_tid, &probe,
+                              sizeof(probe)) < 0)
+            return (u64)-EFAULT;
+        }
+        u64 b1nix_flags = flags & ~LX_CLONE_PIDFD;
         /* M92: musl's __clone stores the start_routine pointer in r9 before
          * calling syscall. The child expects to resume at the parent's RIP
          * (right after the syscall instruction in musl __clone), with rax=0
@@ -8929,20 +8968,26 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
          * EFAULT and BusyBox init could not spawn anything ("can't fork"). */
         if (user_stack == 0 && parent_sp)
           user_stack = parent_sp;
+        isize tkid;
+        /* The descriptor is made inside the clone, before the child runs. */
+        if (want_pidfd)
+          scheduler_clone_set_pidfd(parent_tid);
 #if defined(__aarch64__)
         u64 user_lr = frame ? frame->x30 : 0;
-        return (u64)scheduler_clone_thread(b1nix_flags, child_entry,
-                                           user_stack, 0, tls_val, child_tid,
-                                           parent_tid, child_tid, start_func,
-                                           user_lr, frame);
+        tkid = scheduler_clone_thread(b1nix_flags, child_entry, user_stack, 0,
+                                      tls_val, child_tid,
+                                      want_pidfd ? 0 : parent_tid, child_tid,
+                                      start_func, user_lr, frame);
 #else
         struct clone_user_regs uregs;
         clone_regs_from_frame(&uregs, frame);
-        return (u64)scheduler_clone_thread(b1nix_flags, child_entry,
-                                           user_stack, 0, tls_val, child_tid,
-                                           parent_tid, child_tid, start_func,
-                                           frame ? &uregs : 0);
+        tkid = scheduler_clone_thread(b1nix_flags, child_entry, user_stack, 0,
+                                      tls_val, child_tid,
+                                      want_pidfd ? 0 : parent_tid, child_tid,
+                                      start_func, frame ? &uregs : 0);
 #endif
+        scheduler_clone_set_pidfd(0); /* consumed, or the clone failed */
+        return (u64)tkid;
       }
       /* Futex with extended ops for musl (WAIT_BITSET, WAKE_BITSET, REQUEUE,
        * CMP_REQUEUE, PRIVATE_FLAG). The dispatcher routes futex through
@@ -9851,7 +9896,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * on aarch64 that same number is LX_prlimit64, already handled above). */
       if (number == 261)
         return (u64)sys_linux_utimensat((int)arg0, (const char *)(usize)arg1,
-                                        arg2, 0);
+                                        arg2, 0, 0);
 #endif
 
       /* io_destroy/io_cancel: b1nix keeps one AIO context per task and
@@ -11642,17 +11687,15 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     const char *cwd = scheduler_get_cwd();
     if (!arg0 || arg1 == 0)
       return (u64)-EFAULT;
+    /* Linux's answer: the length INCLUDING the terminating NUL, and ERANGE
+     * for a buffer that cannot hold it all. A truncated path is a different
+     * directory, and handing one back as success is worse than failing. */
     usize len = strlen(cwd);
-    if (len >= arg1)
-      len = arg1 - 1;
-    char tmp[VFS_MAX_PATH];
-    if (len >= sizeof(tmp))
-      len = sizeof(tmp) - 1;
-    memcpy(tmp, cwd, len);
-    tmp[len] = '\0';
-    if (syscall_copyout((void *)(usize)arg0, tmp, len + 1) != 0)
+    if (len + 1 > arg1)
+      return (u64)-ERANGE;
+    if (syscall_copyout((void *)(usize)arg0, cwd, len + 1) != 0)
       return (u64)-EFAULT;
-    return (u64)len;
+    return (u64)(len + 1);
   }
   case SYS_CHDIR:
     return (u64)sys_chdir((const char *)(usize)arg0);
@@ -11771,7 +11814,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   }
   case SYS_MOUNT:
     return (u64)sys_mount((const char *)(usize)arg0, (const char *)(usize)arg1,
-                          (const char *)(usize)arg2, arg3);
+                          (const char *)(usize)arg2, arg3,
+                          (const char *)(usize)arg4);
   case SYS_UMOUNT:
     return (u64)sys_umount((const char *)(usize)arg0, (int)arg1);
 

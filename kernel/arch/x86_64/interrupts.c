@@ -2215,11 +2215,20 @@ static int fp_is_safe(u64 fp) {
     if (hb && fp >= hb && fp + 16 <= hc)
       return 1;
   }
-  if (fp >= KERNEL_VMA)
-    return 1;
+  /* The kernel image itself (the boot stack lives in it) -- and nothing past
+   * its end: "at or above KERNEL_VMA" also admitted 0xffffffffffffffc0, which
+   * a frame pointer of a task that died of memory exhaustion held, and the
+   * dump of that fault faulted again and panicked the machine. */
+  if (fp >= KERNEL_VMA) {
+    extern char __kernel_end[];
+    return fp + 16 <= (u64)(usize)__kernel_end;
+  }
   /* Higher-half direct map. */
   return fp + 16 <= 0xffff800100000000ULL;
 }
+
+/* For the other unwinders (klog's panic backtrace). */
+int arch_frame_pointer_safe(u64 fp) { return fp_is_safe(fp); }
 
 void arch_backtrace(u64 rbp, u64 rip) {
   int frames = 0;

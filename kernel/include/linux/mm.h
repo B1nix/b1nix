@@ -305,8 +305,14 @@ static inline void set_page_private(struct page *page, unsigned long v)
 { page->private = v; }
 static inline void *folio_get_private(struct folio *folio)
 { return folio->private; }
+void folio_get(struct folio *folio);
+void folio_put(struct folio *folio);
+/* Attached private data holds a reference on the folio, as upstream's does:
+ * btrfs attaches an extent buffer and then drops its own allocation
+ * reference, leaving the attachment the folio's only owner. */
 static inline void folio_attach_private(struct folio *folio, void *data)
 {
+	folio_get(folio);
 	folio->private = data;
 	folio_set_private(folio);
 }
@@ -314,8 +320,11 @@ static inline void *folio_detach_private(struct folio *folio)
 {
 	void *data = folio_get_private(folio);
 
-	folio->private = NULL;
+	if (!folio_test_private(folio))
+		return NULL;
 	folio_clear_private(folio);
+	folio->private = NULL;
+	folio_put(folio);
 	return data;
 }
 
@@ -385,7 +394,8 @@ static inline unsigned long folio_pfn(struct folio *f)
 
 static inline struct page *folio_file_page(struct folio *f, unsigned long index)
 { (void)index; return folio_page(f, 0); }
-static inline void folio_put(struct folio *f) { (void)f; }
+/* folio_put drops a reference; the last one frees the frame and the folio
+ * itself (kernel/lkpi/fs_support.c). */
 static inline void *folio_address(struct folio *f) { return page_address(folio_page(f, 0)); }
 
 /*

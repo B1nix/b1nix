@@ -394,9 +394,11 @@ static void blk_announce(struct block_device *dev, usize index,
    * systemd-udevd looks for FIRST: a device whose message omits it is one
    * whose whole-disk question has no answer, and the worker drops the event
    * before a single rule runs. */
+  u32 devno = blk_devno(dev);
+  (void)index;
   uevent_post(action, devpath, "block",
               blk_is_partition(dev) ? "partition" : "disk", dev->name,
-              BLK_SYSFS_MAJOR, (int)index);
+              (int)(devno >> 8), (int)(devno & 0xFF));
 }
 
 static void blk_register_internal(struct block_device *dev,
@@ -856,19 +858,103 @@ usize blk_count(void) { return blk_device_count; }
  * (major << 8 | minor) that /proc/<pid>/maps and stat's st_dev use: the minor
  * is the device's registration index, which is stable for a boot. Returns 0
  * for a device that is not registered (no such dev_t exists). */
+/* Linux's block majors.
+ *
+ * Every block device used to be major 8 with its registry index as the minor.
+ * Tools tell devices apart by the major: libparted decides a disk is SCSI
+ * from major 8 and minor % 16 == 0, asks it for SCSI_IOCTL_GET_IDLUN, gets
+ * nothing from a virtio disk and drops it -- Calamares then found no disk big
+ * enough to install to -- and lsblk hides RAM disks by major 1 and unused
+ * loop devices by major 7. The numbers below are Linux's: the static majors
+ * from devices.txt, 254 for virtblk and 251 for zram where Linux picks one at
+ * load time (they are listed in /proc/devices so a reader can find them), and
+ * the extended major 259 for everything else. */
+static int blk_name_digits(const char *s) {
+  int n = 0;
+  if (*s < '0' || *s > '9')
+    return -1;
+  for (; *s >= '0' && *s <= '9'; s++)
+    n = n * 10 + (*s - '0');
+  return *s ? -1 : n;
+}
+
+/* "a".."z", "aa".. as sd/vd name their disks: 0-based. */
+static int blk_name_letters(const char *s) {
+  int n = 0;
+  if (*s < 'a' || *s > 'z')
+    return -1;
+  for (; *s >= 'a' && *s <= 'z'; s++)
+    n = n * 26 + (*s - 'a' + 1);
+  return *s ? -1 : n - 1;
+}
+
+/* Major and first minor of a whole device, and how many minors it owns (its
+ * partitions take the ones after it). 0 for a device numbered in blkext. */
+static u32 blk_whole_devno(const char *name, u32 *span) {
+  int i;
+  *span = 1;
+  if (!strncmp(name, "sd", 2) && (i = blk_name_letters(name + 2)) >= 0 &&
+      i < 16) {
+    *span = 16;
+    return (8u << 8) | (u32)(i * 16);
+  }
+  if (!strncmp(name, "vd", 2) && (i = blk_name_letters(name + 2)) >= 0 &&
+      i < 16) {
+    *span = 16;
+    return (BLK_VIRTBLK_MAJOR << 8) | (u32)(i * 16);
+  }
+  if (!strncmp(name, "sr", 2) && (i = blk_name_digits(name + 2)) >= 0 && i < 256)
+    return (11u << 8) | (u32)i;
+  if (!strncmp(name, "loop", 4) && (i = blk_name_digits(name + 4)) >= 0 &&
+      i < 256)
+    return (7u << 8) | (u32)i;
+  if (!strncmp(name, "md", 2) && (i = blk_name_digits(name + 2)) >= 0 && i < 256)
+    return (9u << 8) | (u32)i;
+  if (!strncmp(name, "nbd", 3) && (i = blk_name_digits(name + 3)) >= 0 &&
+      i < 16) {
+    *span = 16;
+    return (43u << 8) | (u32)(i * 16);
+  }
+  if (!strncmp(name, "ram", 3) && (i = blk_name_digits(name + 3)) >= 0 &&
+      i < 256)
+    return (1u << 8) | (u32)i;
+  if (!strncmp(name, "zram", 4) && (i = blk_name_digits(name + 4)) >= 0 &&
+      i < 256)
+    return (BLK_ZRAM_MAJOR << 8) | (u32)i;
+  if (!strncmp(name, "mmcblk", 6) && (i = blk_name_digits(name + 6)) >= 0 &&
+      i < 32) {
+    *span = 8;
+    return (179u << 8) | (u32)(i * 8);
+  }
+  *span = 0;
+  return 0;
+}
+
 u32 blk_devno(struct block_device *dev) {
   if (!dev || !dev->name)
     return 0;
   for (usize i = 0; i < blk_device_count; i++) {
     /* The one numbering userspace sees everywhere else: the device node's
-     * st_rdev, /sys/dev/block, the uevent's MAJOR/MINOR (see
-     * blk_wire_dev_node). A mount's st_dev used to be numbered per device
-     * type instead -- loop 7, virtio 254 -- so the directory of a filesystem
-     * on /dev/loop0 named a different device than /dev/loop0 itself, and
-     * every tool that finds a mount by comparing the two (quota-tools, for
-     * one) found nothing. */
-    if (blk_devices[i] == dev)
-      return (BLK_SYSFS_MAJOR << 8) | (u32)(i & 0xFF);
+     * st_rdev, /sys/dev/block, the uevent's MAJOR/MINOR, /proc/partitions
+     * and a mount's st_dev -- every tool that finds a mount by comparing a
+     * file's st_dev with a node's st_rdev depends on the two agreeing. */
+    if (blk_devices[i] != dev)
+      continue;
+    u32 span;
+    if (blk_is_partition(dev)) {
+      struct block_device *parent = blk_partition_parent(dev);
+      int no = blk_partition_number(dev);
+      u32 pdev = parent && parent->name ? blk_whole_devno(parent->name, &span) : 0;
+      if (pdev && span > 1 && no > 0 && (u32)no < span)
+        return pdev + (u32)no;
+    } else {
+      u32 d = blk_whole_devno(dev->name, &span);
+      if (d)
+        return d;
+    }
+    /* The extended major, numbered by registry slot: unique, and the slot
+     * of a device does not change while it is registered. */
+    return (BLK_EXT_MAJOR << 8) | (u32)(i & 0xFF);
   }
   return 0;
 }
@@ -3241,23 +3327,26 @@ static void blk_wire_dev_node(struct vfs_node *node, struct block_device *dev,
    * it st_rdev was 0 on every block node, so a tool that identifies a device
    * by its number rather than its path — mdev deciding whether the node it
    * finds is the one the event named — had nothing to compare. */
-  node->inode->rdev = ((u64)BLK_SYSFS_MAJOR << 8) | (u64)index;
+  (void)index;
+  node->inode->rdev = (u64)blk_devno(dev);
 }
 
 struct block_device *blk_from_devno(u64 rdev) {
-  if ((rdev >> 8) != BLK_SYSFS_MAJOR)
+  if (!rdev)
     return 0;
-  return blk_at((usize)(rdev & 0xFF));
+  for (usize i = 0; i < blk_device_count; i++)
+    if (blk_devices[i] && blk_devno(blk_devices[i]) == (u32)rdev)
+      return blk_devices[i];
+  return 0;
 }
 
 int blk_bind_dev_node(struct vfs_node *node, u64 rdev) {
   if (!node || !node->inode)
     return -EINVAL;
-  usize index = (usize)(rdev & 0xFF);
   struct block_device *dev = blk_from_devno(rdev);
   if (!dev)
     return -ENODEV;
-  blk_wire_dev_node(node, dev, index);
+  blk_wire_dev_node(node, dev, 0);
   return 0;
 }
 

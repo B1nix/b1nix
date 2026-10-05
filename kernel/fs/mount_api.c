@@ -103,6 +103,10 @@ struct fsctx_state {
    * path it was picked at. CMD_RECONFIGURE then remounts that mount. */
   int picked;
   char pick_path[VFS_MAX_PATH];
+  /* The options the VFS does not know, for a type that parses its own
+   * (VFS_FS_OWN_OPTIONS): "key" or "key=value", comma-separated, the way
+   * Linux's legacy context gathers them for a filesystem's mount(). */
+  char data[512];
 };
 
 /* What fsmount and open_tree hand back.
@@ -256,6 +260,22 @@ static int fsctx_apply_option(struct fsctx_state *ctx, const char *key,
   for (usize i = 0; i < sizeof(accepted_hints) / sizeof(accepted_hints[0]); i++)
     if (strcmp(key, accepted_hints[i]) == 0)
       return 0;
+
+  /* The filesystem's own: handed to it whole when the superblock is made,
+   * and refused there if it does not know them -- as Linux does for a
+   * filesystem on the legacy interface (btrfs) and through ->parse_param for
+   * one on the new (ext4). The installer mounts the root with
+   * `-o compress=zstd:1`, which used to fail right here. */
+  if (vfs_fs_takes_options(ctx->fstype)) {
+    usize at = strlen(ctx->data);
+    usize need = strlen(key) + (value ? 1 + strlen(value) : 0) + (at ? 1 : 0);
+    if (at + need + 1 > sizeof(ctx->data) || strchr(key, ',') ||
+        (value && strchr(value, ',')))
+      return -EINVAL;
+    snprintf(ctx->data + at, sizeof(ctx->data) - at, "%s%s%s%s",
+             at ? "," : "", key, value ? "=" : "", value ? value : "");
+    return 0;
+  }
 
   /* 9p's own. Every 9p line in an fstab -- and util-linux, which hands each
    * one to fsconfig -- names the transport and the protocol, so refusing them
@@ -436,7 +456,7 @@ int vfs_fsconfig(int fd, u32 cmd, const char *key, const char *value,
       return -EBUSY; /* already created */
     {
       int id = vfs_detached_create(ctx->fstype, ctx->source[0] ? ctx->source : 0,
-                                   ctx->flags);
+                                   ctx->flags, ctx->data);
       mount_api_trace("fsconfig-create", cmd, ctx->fstype, id);
       if (id < 0)
         return id;

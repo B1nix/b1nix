@@ -19,6 +19,7 @@
  */
 
 #include <b1nix/blk.h>
+#include <b1nix/bootinfo.h>
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
@@ -61,6 +62,13 @@ struct nbd_device {
 };
 
 static struct nbd_device g_nbd[NBD_MAX_DEVICES];
+
+/* How many devices to publish: Linux's nbds_max, which for a built-in driver
+ * is `nbd.nbds_max=` on the command line. A distribution that does not load
+ * nbd (Debian's is a module nothing loads) has none, and a partitioner never
+ * sees four empty "disks" ahead of the real one; 0 is how a b1nix system asks
+ * for that. */
+static int g_nbds_max = NBD_MAX_DEVICES;
 
 static u64 be64(u64 v)
 {
@@ -213,7 +221,7 @@ int nbd_attach(struct ipv4_addr server, u16 port)
 {
 	struct nbd_device *nd = 0;
 
-	for (int i = 0; i < NBD_MAX_DEVICES; i++) {
+	for (int i = 0; i < g_nbds_max; i++) {
 		if (!g_nbd[i].used) {
 			nd = &g_nbd[i];
 			break;
@@ -308,7 +316,7 @@ int nbd_detach(const char *name)
  */
 struct nbd_device *nbd_device_at(unsigned index)
 {
-	if (index >= NBD_MAX_DEVICES)
+	if (index >= (unsigned)g_nbds_max)
 		return 0;
 	return &g_nbd[index];
 }
@@ -407,7 +415,16 @@ u64 nbd_block_count(struct nbd_device *nd)
  */
 void nbd_init(void)
 {
-	for (int i = 0; i < NBD_MAX_DEVICES; i++) {
+	char v[8];
+
+	if (bootinfo_get_kv("nbd.nbds_max", v, sizeof(v))) {
+		int n = 0;
+
+		for (const char *p = v; *p >= '0' && *p <= '9'; p++)
+			n = n * 10 + (*p - '0');
+		g_nbds_max = n < NBD_MAX_DEVICES ? n : NBD_MAX_DEVICES;
+	}
+	for (int i = 0; i < g_nbds_max; i++) {
 		struct nbd_device *nd = &g_nbd[i];
 
 		memset(nd, 0, sizeof(*nd));

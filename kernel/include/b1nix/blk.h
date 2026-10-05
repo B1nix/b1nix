@@ -200,6 +200,11 @@ void blk_register(struct block_device *dev);
  * a node userspace mknod()s from what /sys told it resolves back to the right
  * device. */
 #define BLK_SYSFS_MAJOR 8
+/* Majors Linux assigns at load time; fixed here, and listed in /proc/devices
+ * under the names Linux uses so a reader can look them up. */
+#define BLK_VIRTBLK_MAJOR 254u
+#define BLK_ZRAM_MAJOR 251u
+#define BLK_EXT_MAJOR 259u
 
 /* Remove a device from the registry (LOOP_CTL_REMOVE today). Raises the
  * `remove` uevent, empties the slot WITHOUT renumbering anything above it, and
@@ -219,8 +224,8 @@ u32 blk_generation(void);
  * /sys is mounted. */
 void sysfs_block_changed(void);
 
-/* The device a (major << 8 | minor) pair names, or NULL. Only BLK_SYSFS_MAJOR
- * is a block major here. */
+/* The device a (major << 8 | minor) pair names, or NULL: the inverse of
+ * blk_devno(). */
 struct block_device *blk_from_devno(u64 rdev);
 
 /* Make `node` behave as the block device `rdev` names: cached block I/O

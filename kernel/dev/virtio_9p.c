@@ -74,14 +74,31 @@ int virtio_9p_transact(struct virtio_9p_dev *p9dev, usize req_len,
 
   virtq_kick(&p9dev->dev, vq);
 
-  u32 timeout = 50000000;
-  while (vq->last_used_idx == vq->used->idx) {
-    if (--timeout == 0) {
-      k_warn("virtio-9p", "timeout waiting for response");
-      return -EIO;
+  /* Wait for the answer however long the host takes, as Linux's 9p client
+   * does. This used to give up after about a second of spinning -- while
+   * the device still owned the descriptors and both buffers -- so the next
+   * request was posted over the one in flight, the late answer was read as
+   * the reply to the wrong request, and from then on every exchange on the
+   * share timed out. A 4 MiB write into a share on a busy host takes longer
+   * than that. A short spin covers the usual quick answer; after it the CPU
+   * is yielded, and a slow host is reported without being abandoned. */
+  u64 spins = 0;
+  u64 waited_from = 0;
+  while (*(volatile u16 *)&vq->used->idx == vq->last_used_idx) {
+    if (++spins < 20000) {
+      cpu_relax();
+      continue;
     }
-    cpu_relax();
+    u64 now = scheduler_get_uptime_ticks();
+    if (!waited_from)
+      waited_from = now;
+    else if (now - waited_from >= 10ULL * SCHED_TICKS_PER_SEC) {
+      k_warn("virtio-9p", "the host has not answered for 10 s; still waiting");
+      waited_from = now;
+    }
+    scheduler_yield();
   }
+  __sync_synchronize(); /* the answer is read only after its index */
 
   struct vring_used_elem *elem =
       &vq->used->ring[vq->last_used_idx % vq->queue_size];

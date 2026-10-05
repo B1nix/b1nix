@@ -213,6 +213,18 @@ static void unix_data_put(struct unix_socket_data *u) {
   }
 }
 
+/* Wake whoever waits on a socket, and tell an edge-triggered epoll watch on
+ * it that something happened (vfs_socket_state::poll_gen). The X server
+ * watches its clients EPOLLET; a client that wrote a second request while the
+ * first was still unread produced no new edge, and xwd waited for a reply to
+ * a request the server never learned about. */
+static void unix_wake(struct vfs_socket_state *s) {
+  if (!s)
+    return;
+  __atomic_add_fetch(&s->poll_gen, 1, __ATOMIC_RELEASE);
+  scheduler_wake_all(s);
+}
+
 static void unix_copy_groups(u32 *dst, int *dn, const u32 *src, int n) {
   if (n < 0)
     n = 0;
@@ -440,11 +452,11 @@ void unix_free_state(struct vfs_socket_state *s) {
     }
     unix_unlock(peer);
     if (linked) {
-      if (peer->socket) scheduler_wake_all(peer->socket);
+      if (peer->socket) unix_wake(peer->socket);
       /* Also wake anyone blocked in unix_send_control waiting for space in OUR
        * ring buffer (they park on our own socket, the buffer-owner) so they see
        * the hangup and return ENOTCONN instead of sleeping forever. */
-      if (u->socket) scheduler_wake_all(u->socket);
+      if (u->socket) unix_wake(u->socket);
       scheduler_wake_all(vfs_poll_chan);
       unix_data_put(u);    /* drop the peer's reference on us */
     }
@@ -472,7 +484,7 @@ void unix_free_state(struct vfs_socket_state *s) {
       }
       unix_unlock(cli);
       if (linked) {
-        if (cli->socket) scheduler_wake_all(cli->socket);
+        if (cli->socket) unix_wake(cli->socket);
         scheduler_wake_all(vfs_poll_chan);
         unix_data_put(srv); /* the client's reference on the endpoint */
       }
@@ -864,7 +876,7 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
     unix_unlock(peer_u);
 
     /* Wake up peer for accept() */
-    scheduler_wake_all(peer_s);
+    unix_wake(peer_s);
     scheduler_wake_all(vfs_poll_chan);
 
     /* Connected, blocking or not: nothing is pending, so there is nothing to
@@ -931,7 +943,7 @@ int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s,
       new_s->connected = (srv->peer != 0);
 
       if (srv->peer && srv->peer->socket)
-        scheduler_wake_all(srv->peer->socket);
+        unix_wake(srv->peer->socket);
 
       return 0;
     }
@@ -1298,7 +1310,7 @@ retry:;
 
   struct vfs_socket_state *peer_sock = peer_u->socket;
   unix_unlock(peer_u);
-  if (peer_sock) scheduler_wake_all(peer_sock);
+  if (peer_sock) unix_wake(peer_sock);
   scheduler_wake_all(vfs_poll_chan);
   unix_data_put(peer_u);
   return (isize)to_copy;
@@ -1405,7 +1417,7 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
       unix_unlock(u);
       
       /* Wake up anyone waiting to send more data */
-      scheduler_wake_all(u->socket);
+      unix_wake(u->socket);
       scheduler_wake_all(vfs_poll_chan);
       
       return (isize)to_copy;
@@ -1539,7 +1551,7 @@ int unix_shutdown(struct vfs_socket_state *s, int how_wr, int how_rd) {
     return 0;
   __atomic_store_n(&peer->peer_wr_shut, 1, __ATOMIC_RELEASE);
   if (peer->socket)
-    scheduler_wake_all(peer->socket);
+    unix_wake(peer->socket);
   scheduler_wake_all(vfs_poll_chan);
   unix_data_put(peer);
   return 0;

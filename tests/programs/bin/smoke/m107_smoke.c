@@ -66,6 +66,8 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sched.h>
+#include <signal.h>
 #include <sys/epoll.h>
 #include <sys/mount.h>
 #include <stdio.h>
@@ -2416,6 +2418,104 @@ static void test_mountinfo_poll_not_stolen(void) {
   (void)syscall(SYS_umount2, target, 0);
 }
 
+/* ── wakeup semantics a desktop depends on ─────────────────────────────── */
+
+/* EPOLLET reports a socket again when more arrives, even though it never
+ * stopped being readable: Linux queues an edge-triggered event on every
+ * wakeup. The X server watches its clients this way; reporting only readiness
+ * changes left a second request unread and its client waiting forever. */
+static void test_epoll_et_rearm(void) {
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    fail("epoll-et-rearm-socketpair", -1);
+    return;
+  }
+  int ep = epoll_create1(0);
+  struct epoll_event ev = {.events = EPOLLIN | EPOLLET, .data.u32 = 7}, out[2];
+  epoll_ctl(ep, EPOLL_CTL_ADD, sv[0], &ev);
+  write(sv[1], "a", 1);
+  int n1 = epoll_wait(ep, out, 2, 1000);
+  int n2 = epoll_wait(ep, out, 2, 0); /* nothing new: no event */
+  write(sv[1], "b", 1);               /* still readable, but new data */
+  int n3 = epoll_wait(ep, out, 2, 1000);
+  char b[4];
+  ssize_t r = read(sv[0], b, sizeof(b));
+  close(ep);
+  close(sv[0]);
+  close(sv[1]);
+  if (n1 == 1 && n2 == 0 && n3 == 1 && r == 2)
+    ok("epoll-et-rearm");
+  else
+    fail("epoll-et-rearm", (long)n1 * 100 + n2 * 10 + n3);
+}
+
+/* Qt's QProcess starts children with clone(CLONE_VM|CLONE_VFORK|CLONE_PIDFD)
+ * on a stack of its own and waits for them through the descriptor. The
+ * descriptor must arrive -- after a vfork the child may already be a zombie
+ * -- and must poll readable and wait. */
+#ifndef CLONE_PIDFD
+#define CLONE_PIDFD 0x00001000
+#endif
+#ifndef P_PIDFD
+#define P_PIDFD 3
+#endif
+static char g_vfork_stack[16384] __attribute__((aligned(16)));
+static int vfork_child(void *arg) {
+  (void)arg;
+  _exit(9);
+}
+static void test_clone_vfork_pidfd(void) {
+  int pidfd = -1;
+  int pid = clone(vfork_child, g_vfork_stack + sizeof(g_vfork_stack),
+                  CLONE_VM | CLONE_VFORK | CLONE_PIDFD | SIGCHLD, 0, &pidfd);
+  if (pid <= 0 || pidfd < 0) {
+    fail("clone-vfork-pidfd", pid <= 0 ? pid : pidfd);
+    return;
+  }
+  struct pollfd pf = {.fd = pidfd, .events = POLLIN};
+  int pr = poll(&pf, 1, 2000);
+  siginfo_t si;
+  memset(&si, 0, sizeof(si));
+  long w = syscall(SYS_waitid, P_PIDFD, pidfd, &si, WEXITED, NULL);
+  close(pidfd);
+  if (pr == 1 && (pf.revents & POLLIN) && w == 0 && si.si_pid == pid &&
+      si.si_status == 9)
+    ok("clone-vfork-pidfd");
+  else
+    fail("clone-vfork-pidfd", pr * 10 + (int)w);
+}
+
+/* More watches than one instance used to hold (32), and the limit itself
+ * where systemd and every file manager read it. */
+static void test_inotify_many_watches(void) {
+  char lim[32] = {0};
+  int lf = open("/proc/sys/fs/inotify/max_user_watches", O_RDONLY);
+  ssize_t ln = lf >= 0 ? read(lf, lim, sizeof(lim) - 1) : -1;
+  if (lf >= 0)
+    close(lf);
+  int ifd = inotify_init1(IN_NONBLOCK);
+  int made = 0;
+  char path[64];
+  mkdir("/tmp/m107-inw", 0755);
+  for (int i = 0; i < 100; i++) {
+    snprintf(path, sizeof(path), "/tmp/m107-inw/%d", i);
+    mkdir(path, 0755);
+    if (ifd >= 0 && inotify_add_watch(ifd, path, IN_CREATE) > 0)
+      made++;
+  }
+  if (ifd >= 0)
+    close(ifd);
+  for (int i = 0; i < 100; i++) {
+    snprintf(path, sizeof(path), "/tmp/m107-inw/%d", i);
+    rmdir(path);
+  }
+  rmdir("/tmp/m107-inw");
+  if (ln > 0 && atol(lim) >= 8192 && made == 100)
+    ok("inotify-many-watches");
+  else
+    fail("inotify-many-watches", made);
+}
+
 int main(void) {
   marker("M107-SMOKE: start");
 
@@ -2448,6 +2548,10 @@ int main(void) {
   test_inotify_move();
   test_inotify_attrib();
   test_inotify_selfdel();
+  test_inotify_many_watches();
+
+  test_epoll_et_rearm();
+  test_clone_vfork_pidfd();
 
   test_rtc_read();
   test_rtc_alarm();

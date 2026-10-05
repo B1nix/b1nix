@@ -652,6 +652,9 @@ struct clone_user_regs {
   u64 r8, r9, r10, r11, r12, r13, r14, r15;
 };
 
+/* CLONE_PIDFD for the next scheduler_clone_thread by this task: the user
+ * address the child's pidfd is written to before the child runs (0 clears). */
+void scheduler_clone_set_pidfd(u64 user_addr);
 #if defined(__aarch64__)
 /* user_lr: the caller's link register at the clone(2) syscall. AArch64 has no
  * return address on the stack, so a vfork child — which resumes at the parent's

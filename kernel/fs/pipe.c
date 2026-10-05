@@ -27,11 +27,19 @@ static spinlock_t pipe_pool_lock = SPINLOCK_INIT;
 static volatile int g_pipe_buffers_held;
 #define PIPE_BUFFER_CACHE 64
 
+static u32 pipe_poll_gen(struct vfs_handle *h) {
+  return h && h->private_data
+             ? __atomic_load_n(&((struct vfs_pipe *)h->private_data)->event_gen,
+                               __ATOMIC_ACQUIRE)
+             : 0;
+}
+
+/* The file's wakeup counter (vfs_file_ops::poll_gen), for any file that keeps
+ * one: pipes and FIFOs count the data written into them, sockets every
+ * wakeup. */
 u32 vfs_handle_event_gen(struct vfs_handle *h) {
-  if (h && (h->kind == VFS_HANDLE_PIPE_READ || h->kind == VFS_HANDLE_PIPE_WRITE) &&
-      h->private_data)
-    return __atomic_load_n(&((struct vfs_pipe *)h->private_data)->event_gen,
-                           __ATOMIC_ACQUIRE);
+  if (h && h->ops && h->ops->poll_gen)
+    return h->ops->poll_gen(h);
   return 0;
 }
 
@@ -264,8 +272,8 @@ static int pipe_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   return syscall_copyout(arg, &n, sizeof(n)) == 0 ? 0 : -EFAULT;
 }
 
-const struct vfs_file_ops pipe_read_ops = { .read = pipe_read, .poll = pipe_poll, .release = pipe_release, .ioctl = pipe_ioctl };
-const struct vfs_file_ops pipe_write_ops = { .write = pipe_write, .poll = pipe_poll, .release = pipe_release, .ioctl = pipe_ioctl };
+const struct vfs_file_ops pipe_read_ops = { .read = pipe_read, .poll = pipe_poll, .poll_gen = pipe_poll_gen, .release = pipe_release, .ioctl = pipe_ioctl };
+const struct vfs_file_ops pipe_write_ops = { .write = pipe_write, .poll = pipe_poll, .poll_gen = pipe_poll_gen, .release = pipe_release, .ioctl = pipe_ioctl };
 
 void vfs_pipe_init_handle(struct vfs_handle *h, struct vfs_pipe *pipe, int is_write) {
   h->private_data = pipe;
@@ -406,13 +414,16 @@ static void fifo_release(struct vfs_handle *h) {
 }
 
 static const struct vfs_file_ops fifo_read_ops = {
-    .read = pipe_read, .poll = pipe_poll, .release = fifo_release, .ioctl = pipe_ioctl};
+    .read = pipe_read, .poll = pipe_poll, .poll_gen = pipe_poll_gen,
+    .release = fifo_release, .ioctl = pipe_ioctl};
 static const struct vfs_file_ops fifo_write_ops = {
-    .write = pipe_write, .poll = pipe_poll, .release = fifo_release};
+    .write = pipe_write, .poll = pipe_poll, .poll_gen = pipe_poll_gen,
+    .release = fifo_release};
 /* O_RDWR on a FIFO is legal on Linux and never blocks — the opener is its own
  * peer, so both directions are wired up on one handle. */
 static const struct vfs_file_ops fifo_rdwr_ops = {
     .read = pipe_read, .write = pipe_write, .poll = pipe_poll,
+    .poll_gen = pipe_poll_gen,
     .release = fifo_release};
 
 int vfs_fifo_open(struct vfs_node *node, int flags) {

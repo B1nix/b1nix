@@ -32,9 +32,10 @@ typedef int (*lkpi_bridge_emit_fn)(void *arg, const char *name, int len,
                                    unsigned long long ino, unsigned int type);
 
 /* Mount `source` with the imported filesystem `fstype`; NULL on failure. The
- * handle returned is the root. */
+ * handle returned is the root. `opts` is the filesystem's own options,
+ * comma-separated, as mount(2)'s data string (NULL or "" for none). */
 void *lkpi_bridge_mount(const char *fstype, const char *source,
-                        unsigned long flags);
+                        unsigned long flags, const char *opts);
 void lkpi_bridge_unmount(void *root);
 
 void *lkpi_bridge_lookup(void *dir, const char *name);
@@ -45,7 +46,8 @@ int lkpi_bridge_set_flags(void *node, unsigned int flags);
 /* Push mode, owner and timestamps; fields equal to the inode's are left out. */
 int lkpi_bridge_setattr(void *node, unsigned int mode, unsigned int uid,
                         unsigned int gid, unsigned long long atime,
-                        unsigned long long mtime);
+                        unsigned int atime_nsec, unsigned long long mtime,
+                        unsigned int mtime_nsec);
 
 struct lkpi_bridge_statfs {
 	unsigned long long type, bsize, blocks, bfree, bavail, files, ffree;

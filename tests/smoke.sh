@@ -2316,7 +2316,9 @@ check_output "$LOG" "M110-9P: ok write-guest-file" "VirtIO-9P write file from gu
 # The guest's own read-back can be served from its page cache; the host's copy
 # is the one that says the data crossed the transport.
 _gout="$PROJECT_DIR/smoke_run/hostshare/guest_output.txt"
-if [ "$_gout" -nt "$SMOKE_RUN_STAMP" ] &&
+if ! grep -aq "M110-9P: ok write-guest-file" "$LOG" 2>/dev/null; then
+	blocked "VirtIO-9P guest write reached the host's file" "the guest never wrote it: M110-9P: ok write-guest-file is not in the log"
+elif [ "$_gout" -nt "$SMOKE_RUN_STAMP" ] &&
 	[ "$(cat "$_gout" 2>/dev/null)" = "Written by b1nix via VirtIO-9P!" ]; then
 	pass "VirtIO-9P guest write reached the host's file"
 else
@@ -3202,6 +3204,8 @@ check_output "$LOG" "M42-W5PRE: ok dup" "dup() returns lowest available descript
 check_output "$LOG" "M42-W5PRE: ok access" "access() checks exist/perm modes"
 check_output "$LOG" "M42-W5PRE: ok ftruncate" "ftruncate() resizes and zeroes memory buffers"
 check_output "$LOG" "M42-W5PRE: ok fchdir" "fchdir() changes current working directory"
+check_output "$LOG" "M42-W5PRE: ok getcwd-erange" "getcwd(2) returns the length with its NUL and refuses a short buffer with ERANGE instead of truncating"
+check_output "$LOG" "M42-W5PRE: ok utimensat-nofollow" "utimensat(AT_SYMLINK_NOFOLLOW) sets a dangling symlink's own times to the nanosecond"
 check_output "$LOG" "M42-W5PRE: ok fnmatch" "POSIX fnmatch matches brackets and PERIOD/PATHNAME flags"
 check_output "$LOG" "M42-W5PRE: ok regex" "POSIX regex matches intervals and named classes"
 check_output "$LOG" "M42-W5PRE: ok sigsuspend-alarm" "atomic sigsuspend waits for alarm and restores mask"
@@ -4057,6 +4061,9 @@ check_output "$LOG" "M107-SMOKE: ok syslog-klogctl" "syslog(2)/klogctl reports a
 check_output "$LOG" "M107-SMOKE: ok inotify-move" "a rename produces IN_MOVED_FROM and IN_MOVED_TO sharing one cookie"
 check_output "$LOG" "M107-SMOKE: ok inotify-attrib" "chmod on a watched file produces IN_ATTRIB"
 check_output "$LOG" "M107-SMOKE: ok inotify-selfdel" "unlinking a watched file produces IN_DELETE_SELF"
+check_output "$LOG" "M107-SMOKE: ok inotify-many-watches" "one inotify instance holds a hundred watches, and /proc/sys/fs/inotify/max_user_watches reports the per-user limit"
+check_output "$LOG" "M107-SMOKE: ok epoll-et-rearm" "an EPOLLET watch on a socket that is still readable reports again when more data arrives, as Linux queues an edge per wakeup"
+check_output "$LOG" "M107-SMOKE: ok clone-vfork-pidfd" "clone(CLONE_VM|CLONE_VFORK|CLONE_PIDFD) on the caller's stack hands back a pidfd that polls readable and waits for the child -- how Qt's QProcess starts every child"
 check_output "$LOG" "M107-SMOKE: ok rtc-read" "RTC_RD_TIME reads the CMOS clock and agrees with the system time"
 check_output "$LOG" "M107-SMOKE: ok rtc-alarm" "RTC_WKALM_SET/RTC_WKALM_RD round-trip an alarm time"
 check_output "$LOG" "M107-SMOKE: ok watchdog-timeout" "/dev/watchdog honours WDIOC_SETTIMEOUT/GETTIMEOUT/GETTIMELEFT and the magic close"
@@ -4137,7 +4144,7 @@ check_output "$LOG" "M109-SMOKE: ok veth-carries-frame" "a frame sent on one end
 check_output "$LOG" "M109-SMOKE: ok net-namespace" "unshare(CLONE_NEWNET) leaves a task with no interfaces at all - not the NIC, not a veth pair created before the unshare"
 check_output "$LOG" "M109-SMOKE: ok veth-crosses-namespace" "one veth end moved into another network namespace vanishes from this one, and a frame sent here is received there"
 check_output "$LOG" "M109-SMOKE: ok unlink-enoent" "unlink of a name that exists on neither the filesystem nor the VFS still fails ENOENT, while an in-memory device node on an on-disk directory really is removed"
-check_output "$LOG" "M109-UEVENT: ok sysfs-dev-tree" "/sys/dev/block/<maj:min>/{dev,uevent} agree with each other and with the block node in /dev"
+check_output "$LOG" "M109-UEVENT: ok sysfs-dev-tree" "/sys/dev/block/<maj:min> is a link named for the device (what lsblk resolves), and its dev and uevent agree with the block node in /dev"
 check_output "$LOG" "M109-UEVENT: ok sysfs-subsystem-link" "each device directory carries a subsystem symlink whose basename names the subsystem udev matches on"
 check_output "$LOG" "M109-UEVENT: ok uevent-trigger" "writing add to a device's sysfs uevent file re-announces it on the netlink group, DEVTYPE included (device coldplug: what udevadm trigger and mdev -s do)"
 check_output "$LOG" "M109-UEVENT: ok uevent-trigger-tty" "the same coldplug write works on a device that is not a disk: /sys/class/tty/tty1/uevent takes an add and re-announces the terminal (it was read-only, so udevadm trigger reached no tty at all)"

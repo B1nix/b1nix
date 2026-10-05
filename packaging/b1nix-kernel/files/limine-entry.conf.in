@@ -6,10 +6,14 @@
 # b1nix.entry= is not decoration: the initramfs hook reads it to know which
 # entry actually booted, which is the only way to tell a hand-picked menu
 # choice from the default one.
+#
+# nbd.nbds_max=0: the kernel's nbd driver is built in, and built in it
+# publishes empty /dev/nbdN devices from boot; Debian's is a module nothing
+# loads, so a Debian system has none, and neither does this one.
 
 /b1nix @RELEASE@@SUFFIX@
     protocol: multiboot2
     path: boot():/b1nix-@RELEASE@
-    cmdline: @CMDLINE@ b1nix.entry=@RELEASE@
+    cmdline: @CMDLINE@ nbd.nbds_max=0 b1nix.entry=@RELEASE@
     module_path: boot():/initrd-@RELEASE@
     module_string: initrd

@@ -617,6 +617,19 @@ void folio_get(struct folio *folio)
 	get_page(folio_page(folio, 0));
 }
 
+/*
+ * The last reference frees the folio. This was declared with the filesystem
+ * import and never defined: the DRM shim's empty inline stood in for it, so
+ * no file folio was ever freed -- a folio the reclaimer dropped left the
+ * cache and kept its frame, and a large copy to btrfs ran the machine out of
+ * memory however much of it had been written back.
+ */
+void folio_put(struct folio *folio)
+{
+	if (folio)
+		lkpi_put_page_free(folio_page(folio, 0));
+}
+
 /* virt_to_page is implemented in kernel/lkpi/page.c, next to the registry that
  * answers it. */
 
@@ -834,21 +847,58 @@ void tag_pages_for_writeback(struct address_space *mapping, pgoff_t start,
 	 * folio dirtied during it — extra work, never lost data. */
 }
 
+/* kernel/lkpi/fs_super.c: the writeback pass over every mounted superblock. */
+void lkpi_kick_writeback(void);
+void lkpi_wait_writeback(void);
+unsigned long lkpi_fs_reclaim(unsigned long want);
+/* b1nix's frame allocator, in frames and bytes. */
+extern unsigned long pmm_free_frame_count(void);
+extern unsigned long long pmm_total_usable_memory(void);
+
+/*
+ * The throttle that makes a writer wait when too much is dirty. Upstream
+ * counts dirty pages against a share of memory; this cache keeps no such
+ * count, and free memory is the signal instead: below an eighth of it free,
+ * the writer writes its own file back and starts a pass over the rest; below
+ * a sixteenth, it also waits for that pass and reclaims what it cleaned. Checked every sixteenth call --
+ * one call per page or per batch of pages, depending on the filesystem.
+ */
+static void balance_dirty(struct address_space *mapping, bool may_wait)
+{
+	static atomic_t calls;
+	unsigned long total, free;
+
+	if (atomic_inc_return(&calls) & 15)
+		return;
+	total = (unsigned long)(pmm_total_usable_memory() >> PAGE_SHIFT);
+	free = pmm_free_frame_count();
+	if (free >= total / 8)
+		return;
+	if (mapping)
+		filemap_fdatawrite(mapping);
+	lkpi_kick_writeback();
+	if (!may_wait || free >= total / 16)
+		return;
+	/* kswapd reclaims these folios too, but a writer this far ahead
+	 * outruns it; and the writer is at a point that holds none of the
+	 * locks reclaim takes, so it gives back what the pass made clean. */
+	lkpi_wait_writeback();
+	free = pmm_free_frame_count();
+	if (free < total / 8)
+		lkpi_fs_reclaim(total / 8 - free);
+}
+
 void balance_dirty_pages_ratelimited(struct address_space *mapping)
 {
-	(void)mapping;
-	/*
-	 * The throttle that makes a writer wait when too much is dirty. b1nix's
-	 * page cache has its own writeback pressure and this cache is not part of
-	 * it, so a writer here is not throttled — which is the reason the cache
-	 * can grow without bound, recorded in kernel/lkpi/fs_filemap.c.
-	 */
+	balance_dirty(mapping, true);
 }
 
 int balance_dirty_pages_ratelimited_flags(struct address_space *mapping,
                                           unsigned int flags)
 {
-	(void)mapping; (void)flags;
+	/* A BDP_ASYNC caller (io_uring) must not sleep here: it gets the
+	 * writeback started and no wait. */
+	balance_dirty(mapping, !(flags & BDP_ASYNC));
 	return 0;
 }
 
@@ -865,6 +915,7 @@ void __inode_attach_wb(struct inode *inode, struct folio *folio)
 void wakeup_flusher_threads(enum wb_reason reason)
 {
 	(void)reason;
+	lkpi_kick_writeback();
 }
 
 int sb_init_dio_done_wq(struct super_block *sb)

@@ -76,7 +76,9 @@ struct nlsa {
 #define HOT_NODE "/dev/loop8"
 #define HOT_SYS "/sys/block/loop8"
 
-#define BLK_MAJOR 8
+/* Linux's loop major, and loopN is minor N -- what lsblk and udev rely on
+ * to tell an unused loop device from a disk. */
+#define BLK_MAJOR 7
 
 static int g_fail;
 
@@ -641,6 +643,27 @@ static void test_sysfs_dev_tree(void) {
       return;
     }
 
+    /* A link to the device's directory, whose last component is the
+     * device's name: lsblk reads exactly that to name a device it was given
+     * by node, and a plain directory here made `lsblk /dev/vda` fail. */
+    char link[192];
+    snprintf(path, sizeof(path), "/sys/dev/block/%s", ent->d_name);
+    ssize_t ln = readlink(path, link, sizeof(link) - 1);
+    if (ln <= 0) {
+      closedir(d);
+      failm("sysfs-dev-tree", "/sys/dev/block entries are not links");
+      return;
+    }
+    link[ln] = '\0';
+    const char *base = strrchr(link, '/');
+    if (!base || strcmp(base + 1, strrchr(name, '/') ? strrchr(name, '/') + 1 : name) != 0) {
+      char why[256];
+      snprintf(why, sizeof(why), "%s links to %s, not to %s", ent->d_name, link, name);
+      closedir(d);
+      failm("sysfs-dev-tree", why);
+      return;
+    }
+
     char node[128];
     snprintf(node, sizeof(node), "/dev/%s", name);
     struct stat st;
@@ -676,7 +699,7 @@ static int hot_minor(void) {
   if (read_file(HOT_SYS "/dev", buf, sizeof(buf)) <= 0)
     return -1;
   int maj, min;
-  if (parse_devno(buf, &maj, &min) != 0 || maj != BLK_MAJOR)
+  if (parse_devno(buf, &maj, &min) != 0 || maj != BLK_MAJOR || min != HOT_LOOP)
     return -1;
   return min;
 }

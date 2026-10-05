@@ -221,22 +221,51 @@ int fs_parse(struct fs_context *fc, const struct fs_parameter_spec *desc,
 	result->has_value = param->type != fs_value_is_flag &&
 	                    param->type != fs_value_is_undefined;
 
-	for (spec = desc; spec->name; spec++) {
-		if (strcmp(spec->name, key) == 0)
-			break;
+	/*
+	 * Upstream's fs_lookup_key(): one name may be declared twice, as a flag
+	 * and as an option with a value -- btrfs has "compress" and
+	 * "compress=zstd:1", "space_cache" and "space_cache=v2" -- and the entry
+	 * whose kind matches the parameter is the one meant. Taking the first
+	 * entry of the name sent every "compress=..." to the flag, which refused
+	 * its value, and Calamares could not mount the root it had just made.
+	 */
+	{
+		const struct fs_parameter_spec *other = NULL;
+		bool want_flag = !result->has_value;
+
+		spec = NULL;
+		for (const struct fs_parameter_spec *p = desc; p->name; p++) {
+			if (strcmp(p->name, key) != 0)
+				continue;
+			if ((!p->type) == want_flag) {
+				spec = p;
+				break;
+			}
+			if (!other)
+				other = p;
+		}
+		if (!spec && other && (!want_flag ||
+		                       (other->flags & fs_param_can_be_empty)))
+			spec = other;
 		/*
 		 * "nofoo" for an option declared with fs_param_neg_with_no. The
 		 * negated form is the same option with the answer inverted, which is
 		 * why it is matched here rather than being a second table entry.
 		 */
-		if ((spec->flags & fs_param_neg_with_no) &&
-		    key[0] == 'n' && key[1] == 'o' &&
-		    strcmp(spec->name, key + 2) == 0) {
-			result->negated = true;
-			break;
+		if (!spec && key[0] == 'n' && key[1] == 'o') {
+			for (const struct fs_parameter_spec *p = desc; p->name; p++) {
+				if ((p->flags & fs_param_neg_with_no) &&
+				    strcmp(p->name, key + 2) == 0) {
+					result->negated = true;
+					spec = p;
+					break;
+				}
+			}
 		}
+		if (!spec && other)
+			spec = other; /* the wrong kind: refused below, as upstream */
 	}
-	if (!spec->name)
+	if (!spec)
 		return -ENOPARAM;
 
 	if (!spec->type) {

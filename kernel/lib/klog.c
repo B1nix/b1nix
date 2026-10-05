@@ -458,6 +458,11 @@ void panic_backtrace(void)
 	__asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
 	/* x86_64: walk frame pointer chain */
 	while (rbp && depth < 16) {
+		/* A frame pointer is read only where the fault dumper would read
+		 * one: walking a corrupt chain here faulted inside the panic. */
+		extern int arch_frame_pointer_safe(u64 fp);
+		if (!arch_frame_pointer_safe((u64)(usize)rbp))
+			break;
 		u64 rip = rbp[1];
 		u64 new_rbp = rbp[0];
 

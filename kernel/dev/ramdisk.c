@@ -111,3 +111,16 @@ void ramdisk_init(void) {
 
 	ramdisk_report();
 }
+
+/* Linux unpacks a cpio initramfs into the root filesystem and frees it; no
+ * block device is left behind. Kept as ram0 it was a "disk" to everything
+ * that lists disks -- the installer offered the initramfs as a place to
+ * install to. A module that was a filesystem image (an initrd proper, or the
+ * smoke suite's ext4 root) keeps its ram0: that is what it is for. */
+void ramdisk_release(void) {
+	if (!ramdisk_size)
+		return;
+	blk_unregister(&ramdisk_dev);
+	ramdisk_size = 0;
+	console_write("ramdisk: initramfs unpacked, ram0 released\n");
+}

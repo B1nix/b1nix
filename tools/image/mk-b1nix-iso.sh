@@ -151,6 +151,8 @@ fi  # REUSE_ROOT
 
 # ── 4. the medium ───────────────────────────────────────────────────────────
 log "writing the ISO"
+# nbd.nbds_max=0 as on an installed system (limine-entry.conf.in): no empty
+# /dev/nbdN for the installer to offer as disks.
 cat >"$ISO_TREE/boot/limine/limine.conf" <<EOF
 timeout: 3
 serial: yes
@@ -158,7 +160,7 @@ serial: yes
 /b1nix live
     protocol: multiboot2
     path: boot():/boot/b1nix
-    cmdline: boot=b1nix-live b1nix.live-label=$LABEL $CMDLINE_EXTRA
+    cmdline: boot=b1nix-live b1nix.live-label=$LABEL nbd.nbds_max=0 $CMDLINE_EXTRA
     module_path: boot():/boot/initrd
     module_string: initrd
 EOF

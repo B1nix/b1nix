@@ -272,9 +272,9 @@ static void sysfs_mk_ident(struct vfs_node *parent, int blk_index) {
  * The Linux-style block hierarchy, built from the block registry: a
  * /sys/block/<disk>/ directory with partition subdirectories, a
  * /sys/dev/block/<major:minor>/ mirror keyed by device number, and a flat
- * /sys/class/block. The major is BLK_SYSFS_MAJOR and the minor is the registry
- * index, which is exactly what /proc/partitions and /proc/self/mountinfo
- * print, so the three agree about which device is which.
+ * /sys/class/block. The numbers are blk_devno()'s -- Linux's majors -- which
+ * is exactly what /proc/partitions and /proc/self/mountinfo print, so the
+ * three agree about which device is which.
  *
  * Every device directory carries the two files a hot-plug helper reads:
  * `dev` ("major:minor") and `uevent` (MAJOR/MINOR/DEVNAME/DEVTYPE). `mdev -s`
@@ -307,6 +307,7 @@ static volatile int g_sysfs_blk_lock;
  * than under whatever name now occupies that slot. */
 static struct {
   char name[32];
+  u32 devno; /* the major:minor it was published under */
   u8 used;
 } g_sysfs_blkent[SYSFS_MAX_BLK];
 
@@ -358,16 +359,6 @@ static int sysfs_drop(struct vfs_node *parent, const char *name) {
   sysfs_free_subtree(n);
   vfs_node_put(n);
   return 1;
-}
-
-/* Registry index of a device, or -1. */
-static int sysfs_blk_index(struct block_device *dev) {
-  usize n = blk_count();
-  for (usize i = 0; i < n; i++) {
-    if (blk_at(i) == dev)
-      return (int)i;
-  }
-  return -1;
 }
 
 /* Writing to a `uevent` file re-announces the device.
@@ -425,10 +416,10 @@ static isize sysfs_uevent_write_cb(struct vfs_node *node, u64 offset,
  * reads for a device it did not learn about from a netlink message, and a
  * write that re-announces the device. */
 static void sysfs_mk_uevent_at(struct vfs_node *dir, const char *devpath,
-                               const char *subsystem, usize index,
+                               const char *subsystem, u32 devno,
                                const char *name, const char *devtype) {
   sysfs_mkstr(dir, "uevent", "MAJOR=%d\nMINOR=%lu\nDEVNAME=%s\nDEVTYPE=%s\n",
-              BLK_SYSFS_MAJOR, (unsigned long)index, name, devtype);
+              (int)(devno >> 8), (unsigned long)(devno & 0xFF), name, devtype);
   struct vfs_node *n = sysfs_child(dir, "uevent");
   if (!n)
     return;
@@ -443,8 +434,8 @@ static void sysfs_mk_uevent_at(struct vfs_node *dir, const char *devpath,
   if (devtype)
     strncpy(ue->devtype, devtype, sizeof(ue->devtype) - 1);
   strncpy(ue->devname, name, sizeof(ue->devname) - 1);
-  ue->major = BLK_SYSFS_MAJOR;
-  ue->minor = (int)index;
+  ue->major = (int)(devno >> 8);
+  ue->minor = (int)(devno & 0xFF);
   sn->ue = ue;
   n->inode->mode = 0644;
   n->inode->write_cb = sysfs_uevent_write_cb;
@@ -541,9 +532,10 @@ static void sysfs_block_publish(usize index, struct block_device *d) {
       partno = (int)(index + 1);
   }
 
+  u32 devno = blk_devno(d);
   char majmin[24];
-  snprintf(majmin, sizeof(majmin), "%d:%lu", BLK_SYSFS_MAJOR,
-           (unsigned long)index);
+  snprintf(majmin, sizeof(majmin), "%u:%u", (unsigned)(devno >> 8),
+           (unsigned)(devno & 0xFF));
 
   /* One canonical DEVPATH per device, the same one blk_announce() puts in the
    * hotplug message, so a re-announcement triggered through any of the three
@@ -573,59 +565,46 @@ static void sysfs_block_publish(usize index, struct block_device *d) {
         sysfs_mkstr(bd, "removable", "%d\n", blk_is_removable(d));
         sysfs_mkstr(bd, "ro", "0\n");
         sysfs_mk_queue_dir(bd, d);
+        /* An optical drive says so the way a SCSI device does: device/type
+         * 5 (TYPE_ROM). lsblk reads it for TYPE, and without it the CD drive
+         * was a "disk" to every partitioner that asks lsblk which disks
+         * there are. */
+        if (strncmp(d->name, "sr", 2) == 0) {
+          struct vfs_node *dv = sysfs_mkchild(bd, "device", VFS_DIRECTORY, 0);
+          if (dv)
+            sysfs_mkstr(dv, "type", "5\n");
+        }
       }
       sysfs_mk_ident(bd, (int)index);
-      sysfs_mk_uevent_at(bd, devpath, "block", index, d->name, devtype);
+      sysfs_mk_uevent_at(bd, devpath, "block", devno, d->name, devtype);
       sysfs_mk_subsystem_link(bd, part ? "../../../class/block"
                                        : "../../class/block");
     }
   }
 
-  /* /sys/dev/block/<major:minor>/ */
-  if (!sysfs_child(g_sysfs_devblock, majmin)) {
-    struct vfs_node *dbd =
-        sysfs_mkchild(g_sysfs_devblock, majmin, VFS_DIRECTORY, 0);
-    if (dbd) {
-      sysfs_mkstr(dbd, "dev", "%s\n", majmin);
-      sysfs_mk_live_size(dbd, (int)index);
-      if (part)
-        sysfs_mkstr(dbd, "partition", "%d\n", partno);
-      else
-        sysfs_mk_queue_dir(dbd, d);
-      sysfs_mk_uevent_at(dbd, devpath, "block", index, d->name, devtype);
-      sysfs_mk_subsystem_link(dbd, "../../../class/block");
-    }
-  }
-
-  /* An entry for the partition under its disk's /sys/dev/block directory, so
-   * that directory's getdents enumerates it (lsblk reads only the name). */
-  if (part && parent) {
-    int pidx = sysfs_blk_index(parent);
-    if (pidx >= 0) {
-      char pmajmin[24];
-      snprintf(pmajmin, sizeof(pmajmin), "%d:%d", BLK_SYSFS_MAJOR, pidx);
-      struct vfs_node *pdir = sysfs_child(g_sysfs_devblock, pmajmin);
-      if (pdir && !sysfs_child(pdir, d->name))
-        sysfs_mkchild(pdir, d->name, VFS_DIRECTORY, 0);
-    }
-  }
-
-  /* /sys/class/block/<name>/ — flat, disks and partitions alike. */
-  if (!sysfs_child(g_sysfs_classblock, d->name)) {
-    struct vfs_node *cb =
-        sysfs_mkchild(g_sysfs_classblock, d->name, VFS_DIRECTORY, 0);
-    if (cb) {
-      sysfs_mkstr(cb, "dev", "%s\n", majmin);
-      if (!part)
-        sysfs_mk_queue_dir(cb, d);
-      sysfs_mk_uevent_at(cb, devpath, "block", index, d->name, devtype);
-      sysfs_mk_subsystem_link(cb, "../../../class/block");
-    }
+  /* /sys/dev/block/<major:minor> and /sys/class/block/<name>: links to the
+   * device's own directory, as on Linux, not copies of it. lsblk names a
+   * device by reading the /sys/dev/block link and taking its last component;
+   * a directory there answered readlink with EINVAL, and `lsblk /dev/vda`
+   * failed with "failed to get sysfs name" -- which is how the installer's
+   * partitioning backend asks about each disk, and why it found none. */
+  {
+    char target[96];
+    if (part && parent && parent->name)
+      snprintf(target, sizeof(target), "../../block/%s/%s", parent->name,
+               d->name);
+    else
+      snprintf(target, sizeof(target), "../../block/%s", d->name);
+    if (!sysfs_child(g_sysfs_devblock, majmin))
+      sysfs_mk_link(g_sysfs_devblock, majmin, target);
+    if (!sysfs_child(g_sysfs_classblock, d->name))
+      sysfs_mk_link(g_sysfs_classblock, d->name, target);
   }
 
   strncpy(g_sysfs_blkent[index].name, d->name,
           sizeof(g_sysfs_blkent[index].name) - 1);
   g_sysfs_blkent[index].name[sizeof(g_sysfs_blkent[index].name) - 1] = '\0';
+  g_sysfs_blkent[index].devno = devno;
   g_sysfs_blkent[index].used = 1;
 }
 
@@ -636,8 +615,9 @@ static void sysfs_block_unpublish(usize index) {
   const char *name = g_sysfs_blkent[index].name;
 
   char majmin[24];
-  snprintf(majmin, sizeof(majmin), "%d:%lu", BLK_SYSFS_MAJOR,
-           (unsigned long)index);
+  snprintf(majmin, sizeof(majmin), "%u:%u",
+           (unsigned)(g_sysfs_blkent[index].devno >> 8),
+           (unsigned)(g_sysfs_blkent[index].devno & 0xFF));
   sysfs_drop(g_sysfs_devblock, majmin);
   sysfs_drop(g_sysfs_classblock, name);
 
@@ -650,13 +630,6 @@ static void sysfs_block_unpublish(usize index) {
         break;
     }
   }
-  /* And the enumeration stub inside its disk's /sys/dev/block directory. */
-  for (struct vfs_node *c = g_sysfs_devblock->first_child; c;
-       c = c->next_sibling) {
-    if (sysfs_drop(c, name))
-      break;
-  }
-
   g_sysfs_blkent[index].used = 0;
   g_sysfs_blkent[index].name[0] = '\0';
 }
@@ -778,7 +751,7 @@ static void sysfs_char_publish(struct vfs_node *devnode, const char *name) {
   u32 major = (u32)(rdev >> 8);
   u32 minor = (u32)(rdev & 0xff);
   /* Block devices have their own view; this one is for character devices. */
-  if (major == BLK_SYSFS_MAJOR)
+  if (devnode->inode->blk_dev)
     return;
   /* DRM (226) publishes its own entries here, and they are better than what
    * this walk could build: each is a LINK to the card's minor directory, which
