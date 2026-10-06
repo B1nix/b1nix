@@ -2056,6 +2056,18 @@ void sched_park_here_if_asked(void) {
   }
 }
 
+/* The task that asked for the sleep, and the CPU mask it had before it was
+ * moved to the boot CPU for it. */
+static struct task *g_park_mover;
+static u64 g_park_mover_affinity;
+
+static void sched_park_restore_mover(void) {
+  if (g_park_mover) {
+    g_task_affinity[task_index(g_park_mover)] = g_park_mover_affinity;
+    g_park_mover = 0;
+  }
+}
+
 int sched_park_secondary_cpus(u64 timeout_ms) {
   /* KVM (M131): VMXOFF on every CPU while each can still be asked to, the
    * way Linux takes a CPU's virtualization down before it goes offline. */
@@ -2065,6 +2077,29 @@ int sched_park_secondary_cpus(u64 timeout_ms) {
 
   if (want == 0)
     return 0; /* a machine with one CPU has nothing to park */
+  /* The sleep is entered from the boot CPU, as Linux enters it: a secondary
+   * cannot park itself, so a request made from one waited for its own CPU
+   * until the timeout and refused the sleep. Pin the asking task to CPU 0
+   * and let the scheduler move it there; sched_unpark_secondary_cpus gives
+   * its own mask back. */
+  {
+    struct percpu *pc = get_percpu();
+
+    if (pc && pc->cpu_id != 0 && current_task) {
+      usize ix = task_index(current_task);
+
+      g_park_mover = current_task;
+      g_park_mover_affinity = g_task_affinity[ix];
+      g_task_affinity[ix] = 1ULL;
+      while ((pc = get_percpu()) && pc->cpu_id != 0) {
+        if (ktime_monotonic_ns() >= deadline) {
+          sched_park_restore_mover();
+          return -1;
+        }
+        scheduler_yield();
+      }
+    }
+  }
   __atomic_store_n(&g_parked_cpus, 0, __ATOMIC_RELEASE);
   for (int c = 0; c < MAX_CPUS; c++)
     __atomic_store_n(&g_cpu_parked[c], 0, __ATOMIC_RELAXED);
@@ -2093,6 +2128,7 @@ int sched_park_secondary_cpus(u64 timeout_ms) {
         console_write(t && t->name ? t->name : "(none)");
         console_write(")\n");
       }
+      sched_park_restore_mover();
       return -1;
     }
     scheduler_sleep_ticks(1);
@@ -2111,6 +2147,8 @@ void sched_unpark_secondary_cpus(void) {
 
 static void sched_unpark_secondary_cpus_inner(void) {
   int want = (g_max_cpus > 1) ? g_max_cpus - 1 : 0;
+
+  sched_park_restore_mover();
 
   __atomic_store_n(&g_park_request, 0, __ATOMIC_RELEASE);
   if (!want)
@@ -10661,6 +10699,26 @@ static int stop_parked_task(struct task *t, int sig) {
     }
   }
   return 0;
+}
+
+/* Stay stopped until continued. A stopped task used to yield once and go
+ * back to user mode: with nothing else runnable that yield returned at once,
+ * still STOPPED, and the "stopped" program carried on running -- and a
+ * SIGCONT it then sent itself marked a running task READY. It is woken by the
+ * SIGCONT (or the SIGKILL) another task sends, which makes it READY; when this
+ * CPU has nothing else to run it halts until an interrupt instead of spinning. */
+void scheduler_stopped_wait(void) {
+  struct task *t = current_task;
+
+  while (t && __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == TASK_STOPPED) {
+    if (scheduler_yield())
+      continue;
+    if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != TASK_STOPPED)
+      break;
+    sched_acct_leave_kernel();
+    cpuidle_enter();
+    sched_acct_skip_idle();
+  }
 }
 
 void scheduler_self_stop(int sig) {

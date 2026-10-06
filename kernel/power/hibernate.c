@@ -524,13 +524,14 @@ int hibernate_enter(void) {
   (void)vfs_sync();
   page_cache_evict((usize)-1);
 
-  rc = sched_park_secondary_cpus(5000);
-  if (rc < 0)
-    return -EBUSY;
+  /* Userspace first, then the other CPUs: see suspend_enter_s3. */
   rc = sched_freeze_userspace(5000);
-  if (rc < 0) {
-    sched_unpark_secondary_cpus();
+  if (rc < 0)
     return rc;
+  rc = sched_park_secondary_cpus(5000);
+  if (rc < 0) {
+    sched_thaw_userspace();
+    return -EBUSY;
   }
   if (suspend_devices_suspend() != 0) {
     sched_thaw_userspace();

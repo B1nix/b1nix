@@ -917,6 +917,8 @@ usize scheduler_task_index(const struct task *task);
 /* Panics when the current task is about to return to user mode holding a
  * kernel lock or with preemption disabled. Called on every such return. */
 void sched_assert_user_return(void);
+/* A task that has just stopped itself waits here until it is continued. */
+void scheduler_stopped_wait(void);
 /* One-shot report when a secondary CPU comes to own the boot task. */
 /* The task whose kernel stack contains `sp`, or 0. See the definition. */
 struct task *scheduler_task_owning_stack(u64 sp);

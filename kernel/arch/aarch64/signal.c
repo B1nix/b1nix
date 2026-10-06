@@ -220,6 +220,12 @@ static void arch_check_and_deliver_signals_inner(struct interrupt_frame *frame) 
    * == 0 means the interrupted context was EL0t (userspace). */
   if ((frame->spsr & 0xFULL) != 0)
     return;
+  /* A stopped task does not go back to user mode until it is continued,
+   * whichever path stopped it. */
+  if (current_task->state == TASK_STOPPED) {
+    interrupts_enable();
+    scheduler_stopped_wait();
+  }
   sched_assert_user_return();
 
   interrupts_disable();
@@ -263,7 +269,10 @@ static void arch_check_and_deliver_signals_inner(struct interrupt_frame *frame) 
         __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)),
                            __ATOMIC_RELAXED);
         if (current_task->state == TASK_STOPPED) {
-          current_task->state = TASK_READY;
+          /* This task is the one running the delivery: it continues as
+           * RUNNING. READY is for a task waiting to be picked, and a
+           * running task marked READY went back to user mode that way. */
+          current_task->state = TASK_RUNNING;
           current_task->continued_report_pending = 1;
           scheduler_notify_wait_event(current_task->parent_id);
         }
@@ -277,7 +286,7 @@ static void arch_check_and_deliver_signals_inner(struct interrupt_frame *frame) 
         }
         scheduler_self_stop(i);
         interrupts_enable();
-        scheduler_yield();
+        scheduler_stopped_wait();
         return;
       } else if (scheduler_get_init_pid() &&
                  current_task->id == scheduler_get_init_pid()) {

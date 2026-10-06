@@ -384,24 +384,27 @@ static int suspend_enter_s3(const char *armed) {
     console_write(")\n");
     return -EINVAL;
   }
+  base_wakes = suspend_wake_count();
+  __atomic_store_n(&g_suspended, 1, __ATOMIC_RELEASE);
+  /* Userspace first, then the other CPUs, as Linux orders it. A CPU parks
+   * from its idle loop, and one running a busy user thread never reaches it:
+   * frozen first, that thread is off the CPU and the park goes through. */
+  rc = sched_freeze_userspace(SUSPEND_FREEZE_MS);
+  if (rc < 0) {
+    __atomic_store_n(&g_suspended, 0, __ATOMIC_RELEASE);
+    console_write("power: freeze aborted, userspace would not stop\n");
+    return rc;
+  }
   /* The other CPUs have to be off the processor: their state does not survive
    * S3, and one that is INIT'd while it holds a lock takes the machine with
    * it. They are parked from their idle loop, which is the one place an AP
    * holds nothing. */
   rc = sched_park_secondary_cpus(SUSPEND_PARK_MS);
   if (rc < 0) {
+    __atomic_store_n(&g_suspended, 0, __ATOMIC_RELEASE);
+    sched_thaw_userspace();
     console_write("power: refusing S3, a CPU would not park\n");
     return -EBUSY;
-  }
-
-  base_wakes = suspend_wake_count();
-  __atomic_store_n(&g_suspended, 1, __ATOMIC_RELEASE);
-  rc = sched_freeze_userspace(SUSPEND_FREEZE_MS);
-  if (rc < 0) {
-    __atomic_store_n(&g_suspended, 0, __ATOMIC_RELEASE);
-    sched_unpark_secondary_cpus();
-    console_write("power: freeze aborted, userspace would not stop\n");
-    return rc;
   }
 
   rc = suspend_suspend_devices();
