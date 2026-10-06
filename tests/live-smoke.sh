@@ -55,9 +55,23 @@ boot_iso() { # firmware serial-log
 	fi
 	accel=""
 	[ ! -w /dev/kvm ] || accel="-accel kvm -cpu host,+invtsc"
+	: >"$2"
 	# shellcheck disable=SC2086
 	timeout "$BOOT_TIMEOUT" qemu-system-x86_64 -machine q35 $accel $fwargs -m 2048 -smp 2 \
-		-cdrom "$ISO" -display none -serial file:"$2" -no-reboot >>"$LOG" 2>&1 || true
+		-cdrom "$ISO" -display none -serial file:"$2" -no-reboot >>"$LOG" 2>&1 &
+	_qemu=$!
+	# Done is done: once the guest has printed its result there is nothing left
+	# to learn from it, and the shutdown that follows was most of a UEFI boot's
+	# wall time. The checks below read the log, not the exit.
+	while kill -0 "$_qemu" 2>/dev/null; do
+		if grep -aq "LIVE-SMOKE: done" "$2" 2>/dev/null; then
+			sleep 1
+			kill "$_qemu" 2>/dev/null || true
+			break
+		fi
+		sleep 1
+	done
+	wait "$_qemu" 2>/dev/null || true
 }
 
 # ── stage 1: build ──────────────────────────────────────────────────────────
@@ -81,10 +95,19 @@ else
 fi
 
 # ── stage 2: boot it both ways ──────────────────────────────────────────────
+# Side by side: the two boots share nothing but the read-only medium, and one
+# after the other they were the lane's whole wall time twice over.
 for fw in bios uefi; do
 	blog="$OUT_DIR/live-smoke-$fw.log"
+	rm -f "$blog" "$blog.nofw"
 	info "booting the medium under $fw"
-	if ! boot_iso "$fw" "$blog"; then
+	{ boot_iso "$fw" "$blog" || : >"$blog.nofw"; } &
+done
+wait
+for fw in bios uefi; do
+	blog="$OUT_DIR/live-smoke-$fw.log"
+	if [ -f "$blog.nofw" ]; then
+		rm -f "$blog.nofw"
 		bad "$fw-boot" "no OVMF firmware on this host"
 		continue
 	fi

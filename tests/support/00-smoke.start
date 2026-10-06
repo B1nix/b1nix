@@ -15,6 +15,7 @@ SMOKE_SYSNET=0
 SMOKE_BLK=0
 SMOKE_GFX=0
 SMOKE_POSIX=0
+SMOKE_POWER=0
 if grep -q 'b1nix.smoke=sysnet' /proc/cmdline 2>/dev/null; then
     # The network half of what used to be one `sys` lane.
     #
@@ -35,6 +36,13 @@ elif grep -q 'b1nix.smoke=gfx' /proc/cmdline 2>/dev/null; then
     SMOKE_GFX=1
 elif grep -q 'b1nix.smoke=posix' /proc/cmdline 2>/dev/null; then
     SMOKE_POSIX=1
+elif grep -q 'b1nix.smoke=power' /proc/cmdline 2>/dev/null; then
+    # The posix lane's sequential group -- cgroups, swap, NUMA, huge pages,
+    # suspend, the AML interpreter and ACPI events -- on a machine of its own.
+    # Each measures the whole machine or takes it down for a while, so they run
+    # one after another, but nothing in them depends on the rest of posix, and
+    # inside posix they were most of the suite's longest lane.
+    SMOKE_POWER=1
 elif grep -q 'b1nix.smoke=blk' /proc/cmdline 2>/dev/null; then
     SMOKE_BLK=1
 elif grep -q 'b1nix.smoke=init' /proc/cmdline 2>/dev/null; then
@@ -107,6 +115,7 @@ else
     SMOKE_SYSNET=1
     SMOKE_GFX=1
     SMOKE_POSIX=1
+    SMOKE_POWER=1
     SMOKE_BLK=1
 fi
 
@@ -132,6 +141,7 @@ run_test() {
         sysnet) [ "$SMOKE_SYSNET" = "1" ] || return ;;
         blk) [ "$SMOKE_BLK" = "1" ] || return ;;
         posix) [ "$SMOKE_POSIX" = "1" ] || return ;;
+        power) [ "$SMOKE_POWER" = "1" ] || return ;;
         gfx) [ "$SMOKE_GFX" = "1" ] || return ;;
         *) return ;;
     esac
@@ -270,33 +280,33 @@ run_test /bin/m126_bpf_smoke posix
 # M127: cgroup v2 resource control. It moves processes between cgroups, kills
 # inside one, and loads every CPU on the machine for a few seconds -- so it runs
 # in the sequential group, where nothing else is measuring anything.
-run_test /bin/m127_smoke posix
+run_test /bin/m127_smoke power
 # M127: compressed swap. It takes the lane's swap disk off, puts swap on a zram
 # device, fills a cgroup past its memory.max and puts the disk back -- so it
 # runs in the sequential group, where nothing else is swapping at the time.
-run_test /bin/m127_swap_smoke posix
+run_test /bin/m127_swap_smoke power
 # M128: NUMA. The posix lane is the one QEMU starts with two nodes, so the
 # placement checks have somewhere to place things.
-run_test /bin/m128_smoke posix
+run_test /bin/m128_smoke power
 # M128: transparent huge pages. It turns the feature on for its own duration
 # through /sys and puts it back, and its last check watches the machine's free
 # memory across eight rounds -- so it runs in the sequential group, where
 # nothing else is allocating while it measures.
-run_test /bin/m128_thp_smoke posix
+run_test /bin/m128_thp_smoke power
 # M129: power management. It measures how often the timer interrupts an idle
 # machine, so it runs in the sequential group where nothing else is working.
-run_test /bin/m129_smoke posix
+run_test /bin/m129_smoke power
 # M129: suspend. It freezes every other userspace task for a few seconds and
 # is woken by the RTC alarm, so it runs in the sequential group -- nothing
 # else may be measuring, or running, while the machine is down.
-run_test /bin/m129_suspend_smoke posix
+run_test /bin/m129_suspend_smoke power
 # M134: the AML interpreter. It evaluates firmware methods that write to an
 # I/O port and read a status bit back, so it runs where nothing else is
 # poking at the same hardware.
-run_test /bin/m134_aml_smoke posix
+run_test /bin/m134_aml_smoke power
 # M135: ACPI events. The host presses the power button and changes the VM
 # generation when it asks, so it runs where nothing else is waiting on input.
-run_test /bin/m135_acpi_smoke posix
+run_test /bin/m135_acpi_smoke power
 run_test /bin/m131_kvm_smoke posix
 # M123: the same namespaces through Alpine's unshare, nsenter and bubblewrap.
 if [ "$SMOKE_POSIX" = "1" ] && [ -x /etc/m123-tools-smoke.sh ]; then
@@ -352,11 +362,11 @@ echo "B1NIX-TEST: done"
 # markers still on it.
 grep -q 'b1nix.keep-running' /proc/cmdline 2>/dev/null && exit 0
 
-# The posix lane ends on a thermal zone past its critical trip instead, where
+# The power lane ends on a thermal zone past its critical trip instead, where
 # the firmware declares one (M135): the kernel's orderly power-off is then the
 # only way the machine goes down, and the host checks that it did.
 TZ=/sys/class/thermal/thermal_zone0
-if grep -q 'b1nix.smoke=posix' /proc/cmdline 2>/dev/null &&
+if grep -q 'b1nix.smoke=power' /proc/cmdline 2>/dev/null &&
    [ "$(cat $TZ/trip_point_0_type 2>/dev/null)" = critical ] &&
    [ -w $TZ/emul_temp ]; then
     echo "SMOKE: past the critical trip"

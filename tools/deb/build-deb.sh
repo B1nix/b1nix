@@ -298,6 +298,27 @@ run_build() { # name staged-dir
 
 mkdir -p "$OUT/src"
 
+# ── nothing changed since the last build ────────────────────────────────────
+# Every distribution lane builds the packages first, and a full run of them
+# built the same tree four times over. A build is skipped when everything it
+# is made from is what the last successful build of these targets was made
+# from: the versions, the committed tree, every uncommitted change and every
+# untracked file under the directories a package is built out of, and b1cc's
+# tree the same way. DEB_NOCACHE=1 builds regardless -- the packages lane does,
+# since checking the build is its job.
+deb_inputs() {
+	printf '%s\n' "$DEB_VERSION $B1CC_DEB_VERSION $LIMINE_DEB_VERSION $DEB_ARCH $CHROOT_ARCH"
+	printf '%s\n' "$TARGETS" "$KERNEL_COMMON_REPLACES"
+	for _tree in "$ROOT_DIR" "$B1CC_DIR"; do
+		git -C "$_tree" rev-parse HEAD 2>/dev/null
+		git -C "$_tree" diff HEAD 2>/dev/null
+		git -C "$_tree" ls-files --others --exclude-standard -z 2>/dev/null |
+			xargs -0 -r sha256sum 2>/dev/null
+	done
+	sha256sum "$0"
+}
+_stamp="$OUT/.inputs-$DEB_ARCH-$(printf '%s' "$TARGETS" | sha256sum | cut -c1-12)"
+
 if [ $# -gt 0 ]; then
 	TARGETS="$*"
 elif [ "$DEB_ARCH" = "$CHROOT_ARCH" ]; then
@@ -307,6 +328,18 @@ else
 	# architecture adds its kernel.
 	TARGETS="b1nix-kernel"
 fi
+
+_fp=$(deb_inputs | sha256sum | cut -c1-64)
+if [ "${DEB_NOCACHE:-0}" != 1 ] && [ -f "$_stamp" ] &&
+	[ "$(head -1 "$_stamp")" = "$_fp" ] &&
+	tail -n +2 "$_stamp" | while read -r _deb; do
+		[ -f "$OUT/$_deb" ] || exit 1
+	done; then
+	log "inputs unchanged since the last build of $TARGETS for $DEB_ARCH -- reusing it"
+	tail -n +2 "$_stamp" | sed 's/^/  /' >&2
+	exit 0
+fi
+rm -f "$_stamp"
 
 for t in $TARGETS; do
 	case "$t" in
@@ -342,3 +375,14 @@ for d in "$OUT"/*.deb; do
 done
 log "packages in $OUT:"
 ls -1 "$OUT"/*.deb 2>/dev/null | sed 's|.*/|  |' >&2 || die "no .deb was produced"
+# What this build produced, for the next one to reuse: the input fingerprint,
+# then the packages of these targets at the versions just built.
+{
+	echo "$_fp"
+	for d in "$OUT"/*.deb; do
+		_v=$(basename "$d" | sed 's/^[^_]*_//; s/_[^_]*$//')
+		case "$_v" in
+		"$DEB_VERSION" | "$B1CC_DEB_VERSION" | "$LIMINE_DEB_VERSION") basename "$d" ;;
+		esac
+	done
+} >"$_stamp"

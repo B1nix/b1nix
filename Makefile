@@ -1595,7 +1595,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 print-%:
 	@echo '$($*)'
 
-.PHONY: all analyze objects FORCE iso iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-pku iso-hib iso-la57 iso-init iso-switchroot iso-live iso-test iso-full check-dynamic check-license iso-pass-chromium-disk iso-pass-chromium-disk-impl \
+.PHONY: all analyze objects FORCE iso iso-sys iso-sysnet iso-gfx iso-posix iso-power iso-blk iso-iommu iso-pku iso-hib iso-la57 iso-init iso-switchroot iso-live iso-test iso-full check-dynamic check-license iso-pass-chromium-disk iso-pass-chromium-disk-impl \
 	iso-chromium-min-disk iso-chromium-min-disk-impl \
 	check-ports \
 	userspace userspace-install busybox-package busybox-iso \
@@ -2412,6 +2412,11 @@ SMOKE_CMDLINE_sysnet=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1n
 # milliseconds is four cycles of 440 Hz.
 SMOKE_CMDLINE_gfx=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=gfx b1nix.hda-tone-ms=250
 SMOKE_CMDLINE_posix=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=posix
+# The posix lane's sequential group (see tests/support/00-smoke.start). Its
+# suspend without an alarm waits out the kernel's ceiling, since nobody presses
+# a key. Five seconds is still above the RTC alarm its next check arms three
+# seconds out -- below that the ceiling, not the alarm, ends that sleep.
+SMOKE_CMDLINE_power=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=power b1nix.suspend-max-ms=5000
 # b1nix.mtd: probe for the CFI NOR chip. Only this instance is given one
 # (tests/smoke.sh passes the pflash pair), and probing WRITES a query command
 # to a physical address, so it stays behind a flag rather than running on every
@@ -2566,7 +2571,7 @@ ROOT_MODULE_ROOM ?= 96
 ROOT_MODULE_COMPRESS ?= zstd
 ROOT_MODULE = $(BUILD_DIR)/root-module.img
 
-iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-pku iso-hib iso-la57 iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
+iso-sys iso-sysnet iso-gfx iso-posix iso-power iso-blk iso-iommu iso-pku iso-hib iso-la57 iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
 	@# The stage directory is reused between builds, so a module staged by an
 	@# earlier one is still sitting in it and lands in the image whether this
 	@# build asked for it or not. That is how images meant to be forty

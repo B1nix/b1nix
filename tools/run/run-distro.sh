@@ -116,6 +116,13 @@ while kill -0 "$QEMU" 2>/dev/null; do
 		log "guest finished its checks"
 		break
 	fi
+	# Nor after init has exited: nothing on the machine can make progress
+	# again, and waiting for the silence watchdog cost every failing boot of
+	# the fallback stage its full SILENCE.
+	if grep -aq "INIT-EXIT: init exited" "$LOG" 2>/dev/null; then
+		log "init exited -- the boot is over"
+		break
+	fi
 	if [ $((now - last_change)) -ge "$SILENCE" ]; then
 		log "console stuck for ${SILENCE}s (same line repeating, or nothing at all) -- killing the guest"
 		break

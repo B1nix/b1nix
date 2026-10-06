@@ -9,6 +9,7 @@
  * meet. See <lkpi/env.h> for why that matters.
  */
 
+#include <b1nix/kprintf.h>
 #include <b1nix/ktime.h>
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
@@ -1263,6 +1264,10 @@ void lkpi_might_sleep(const char *where)
 
     if (traced < 3) {
       traced++;
+      /* About to panic over this: what follows is the evidence, and a console
+       * userspace has quietened would swallow all but the panic line. */
+      if (current_task)
+        console_loglevel_set(CONSOLE_LOGLEVEL_DEFAULT);
       console_write("lkpi: cannot block (");
       console_write(current_task ? "" : "no task, ");
       console_write(interrupts_enabled() ? "irqs on" : "irqs off");
@@ -1271,6 +1276,10 @@ void lkpi_might_sleep(const char *where)
       console_write(", task=");
       console_write(current_task && current_task->name ? current_task->name
                                                        : "?");
+      if (current_task) {
+        console_write(", state=");
+        console_write_dec((u64)current_task->state);
+      }
       console_write(", last irq-off at 0x");
       console_write_hex64(lkpi_irq_off_site());
       ksym_print(lkpi_irq_off_site());

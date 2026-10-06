@@ -6834,6 +6834,22 @@ void sched_assert_user_return(void) {
     return;
   KASSERT(t->spin_held == 0,
           "return to user mode with %d native spinlock(s) held", t->spin_held);
+  /* A wait armed and never committed or cancelled: the task runs on as if
+   * blocked, and a later wake marks a running task READY and queues it. */
+  if (__builtin_expect(t->state != TASK_RUNNING, 0)) {
+    console_loglevel_set(CONSOLE_LOGLEVEL_DEFAULT);
+    console_write("return to user mode with a wait armed on chan 0x");
+    console_write_hex64((u64)(usize)t->wait_chan);
+    ksym_print((u64)(usize)t->wait_chan);
+    console_write(", last parked at ");
+    ksym_print((u64)(usize)((usize)t->id < SCHED_MAX_TASKS ? g_park_site[t->id] : 0));
+    console_write(", lease cleared in ");
+    console_write(g_task_lease_site[task_index(t)] ? g_task_lease_site[task_index(t)]
+                                                  : "?");
+    console_write("\n");
+  }
+  KASSERT(t->state == TASK_RUNNING,
+          "return to user mode in state %d (a wait was left armed)", (int)t->state);
   KASSERT(g_task_preempt_depth[task_index(t)] == 0,
           "return to user mode with preemption disabled (depth %d)",
           (int)g_task_preempt_depth[task_index(t)]);
@@ -7017,6 +7033,9 @@ void scheduler_wait_cancel(void) {
  * (or the controller never raises one). timeout_ticks == 0 means no deadline. */
 void scheduler_wait_prepare_timeout(void *chan, u64 timeout_ticks) {
   int irq_was_on = interrupts_enabled();
+
+  if (current_task && (usize)current_task->id < SCHED_MAX_TASKS)
+    g_park_site[current_task->id] = __builtin_return_address(0);
 
   interrupts_disable();
   if (current_task == 0)
@@ -8888,12 +8907,15 @@ void scheduler_exit_current(int exit_code) {
    * remaining tests, so the log simply stops. A default-action signal death is
    * otherwise silent (arch signal delivery logs only fault signals), which made
    * this look like a hang rather than a kill. Always announce it. */
+  /* A warning, so it is printed even once the console belongs to userspace:
+   * a machine whose init has gone has nothing left to say, and this line is
+   * the only thing that tells it from a slow one. */
   if (g_init_pid && current_task->id == g_init_pid) {
-    console_write("INIT-EXIT: init exited, pid=");
-    console_write_dec(current_task->id);
-    console_write(" code=0x");
-    console_write_hex64((u64)(unsigned)exit_code);
-    console_write("\n");
+    char line[96];
+
+    snprintf(line, sizeof(line), "INIT-EXIT: init exited, pid=%lu code=0x%x",
+             (unsigned long)current_task->id, (unsigned)exit_code);
+    klog_warn(line);
   }
 
   /* Who left, when, and with what.
@@ -12739,6 +12761,20 @@ int scheduler_is_pgrp_in_session(usize pgrp, usize session_id) {
 }
 
 /* Called before returning to userspace — delivers pending signals */
+/* A fatal signal can be acted on while the task has a wait armed -- it is
+ * delivered from the yield that commits the wait. The teardown that follows is
+ * the task's own work and may need to sleep: clearing the thread's
+ * clear-child-tid word faults its page in if it is gone, and that page can be
+ * a file's. Doing that while still published as blocked panicked in the
+ * filesystem's journal (might_sleep in a context that cannot block). So the
+ * wait is cancelled first, as scheduler_wait_cancel would. */
+static void sched_death_takes_cpu(void) {
+  enum task_state st = __atomic_load_n(&current_task->state, __ATOMIC_ACQUIRE);
+
+  if (st == TASK_BLOCKED || st == TASK_SLEEPING || st == TASK_READY)
+    scheduler_wait_cancel_keep_irqs();
+}
+
 void scheduler_deliver_pending_signals(void) {
   if (!current_task)
     return;
@@ -12791,6 +12827,7 @@ void scheduler_deliver_pending_signals(void) {
        * The signal stays pending and is acted on once the section is left. */
       if (task_in_kcrit(current_task))
         return;
+      sched_death_takes_cpu();
       current_task->exit_code = TASK_EXIT_SIGNALED | SIGKILL;
       terminate_group_siblings(current_task);
       /* Before reparenting: a dying PID-namespace init must no longer be
@@ -12858,6 +12895,7 @@ void scheduler_deliver_pending_signals(void) {
       case SIGXFSZ:
       case SIGVTALRM:
       case SIGPROF:
+        sched_death_takes_cpu();
         current_task->exit_code = TASK_EXIT_SIGNALED | sig;
         terminate_group_siblings(current_task);
         namespace_task_exit(current_task);

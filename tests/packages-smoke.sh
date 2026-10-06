@@ -54,7 +54,7 @@ in_test_chroot() { # command...
 
 # ── stage 1: build ──────────────────────────────────────────────────────────
 info "building the overlay packages"
-sh "$ROOT_DIR/tools/deb/build-deb.sh" >>"$LOG" 2>&1 || stage_die build
+DEB_NOCACHE=1 sh "$ROOT_DIR/tools/deb/build-deb.sh" >>"$LOG" 2>&1 || stage_die build
 for p in b1nix-kernel b1nix-base-files b1nix-desktop b1nix-tools b1cc; do
 	ls "$ROOT_DIR"/build/packages/out/"$p"_*.deb >/dev/null 2>&1 ||
 		bad "built-$p" "no .deb for $p in build/packages/out"
@@ -66,7 +66,7 @@ done
 [ -f "$ARM64_KERNEL_ELF" ] || stage_die no-arm64-kernel
 info "building the arm64 kernel package"
 ARCH=aarch64 DEB_ARCH=arm64 KERNEL_ELF="$ARM64_KERNEL_ELF" \
-	sh "$ROOT_DIR/tools/deb/build-deb.sh" b1nix-kernel >>"$LOG" 2>&1 || stage_die build-arm64
+	DEB_NOCACHE=1 sh "$ROOT_DIR/tools/deb/build-deb.sh" b1nix-kernel >>"$LOG" 2>&1 || stage_die build-arm64
 if ls "$ROOT_DIR"/build/packages/out/b1nix-kernel_*_arm64.deb >/dev/null 2>&1; then
 	ok "built-arm64-kernel"
 else

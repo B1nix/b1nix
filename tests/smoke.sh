@@ -200,7 +200,7 @@ log_wedged() {
 # The concatenated $LOG mixes several instances, so a marker missing from it is
 # unattributable: treat it as blocked if ANY contributing instance wedged.
 any_instance_wedged() {
-	for _l in "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG"; do
+	for _l in "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$POWER_LOG" "$GFX_LOG"; do
 		# A MISSING contributing log counts too: that instance did not run this
 		# time, so a marker absent from the concatenation is unattributable
 		# rather than a regression. Skipping it here made a restricted
@@ -228,7 +228,7 @@ missing_marker() {
 # Prints where each wedged instance stopped — the actual thing to debug.
 report_wedged_instances() {
 	_any=0
-	for _l in "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$SMP_LOG"; do
+	for _l in "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$POWER_LOG" "$GFX_LOG" "$SMP_LOG"; do
 		[ -f "$_l" ] || continue
 		grep -qa "B1NIX-TEST: done" "$_l" 2>/dev/null && continue
 		# The SMP instance stops at its own done-pattern by design.
@@ -415,6 +415,8 @@ run_qemu() {
 			# replies, which read as six "rx-arp (no reply)" failures.
 			local lane_cmdline="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.e1000-subnet=3 b1nix.smoke=$lane ${SMOKE_EXTRA_CMDLINE:-}"
 			[ "$lane" = "init" ] && lane_cmdline="b1nix.test=1 b1nix.e1000-subnet=3 b1nix.smoke=init"
+			# SMOKE_CMDLINE_power in the Makefile: the suspend ceiling.
+			[ "$lane" = "power" ] && lane_cmdline="$lane_cmdline b1nix.suspend-max-ms=5000"
 			# SMOKE_CMDLINE_switchroot in the Makefile, which the other arches
 			# bake into iso-switchroot. Without it this lane booted like any
 			# other -- ordinary root on the disk, PID 1 the usual init -- and
@@ -879,10 +881,10 @@ grade_index_build() {
 	command -v python3 >/dev/null 2>&1 || return 0
 	python3 "$PROJECT_DIR/tests/support/grade-index.py" "$PROJECT_DIR/tests/smoke.sh" "$_gi_dir" \
 		LOG="$LOG" SMP_LOG="$SMP_LOG" SYS_LOG="$SYS_LOG" SYSNET_LOG="$SYSNET_LOG" \
-		BLK_LOG="$BLK_LOG" POSIX_LOG="$POSIX_LOG" GFX_LOG="$GFX_LOG" INIT_LOG="$INIT_LOG" \
+		BLK_LOG="$BLK_LOG" POSIX_LOG="$POSIX_LOG" POWER_LOG="$POWER_LOG" GFX_LOG="$GFX_LOG" INIT_LOG="$INIT_LOG" \
 		SWITCHROOT_LOG="$SWITCHROOT_LOG" IOMMU_LOG="$IOMMU_LOG" AMDVI_LOG="$AMDVI_LOG" \
 		RASPI_LOG="$RASPI_LOG" 2>/dev/null || return 0
-	for _gi_var in LOG SMP_LOG SYS_LOG SYSNET_LOG BLK_LOG POSIX_LOG GFX_LOG INIT_LOG \
+	for _gi_var in LOG SMP_LOG SYS_LOG SYSNET_LOG BLK_LOG POSIX_LOG POWER_LOG GFX_LOG INIT_LOG \
 	               SWITCHROOT_LOG IOMMU_LOG AMDVI_LOG RASPI_LOG; do
 		[ -f "$_gi_dir/$_gi_var.hits" ] || continue
 		eval "GRADE_HITS_$_gi_var=\"\$GRADE_NL\$(cat \"\$_gi_dir/\$_gi_var.hits\")\$GRADE_NL\""
@@ -899,6 +901,7 @@ grade_index_has() {
 	"$SYSNET_LOG") _gi_hits=$GRADE_HITS_SYSNET_LOG ;;
 	"$BLK_LOG") _gi_hits=$GRADE_HITS_BLK_LOG ;;
 	"$POSIX_LOG") _gi_hits=$GRADE_HITS_POSIX_LOG ;;
+	"$POWER_LOG") _gi_hits=$GRADE_HITS_POWER_LOG ;;
 	"$GFX_LOG") _gi_hits=$GRADE_HITS_GFX_LOG ;;
 	"$INIT_LOG") _gi_hits=$GRADE_HITS_INIT_LOG ;;
 	"$SWITCHROOT_LOG") _gi_hits=$GRADE_HITS_SWITCHROOT_LOG ;;
@@ -1015,7 +1018,7 @@ else
 		# root disk; no command line opens an ISO. Building the lane ISOs there
 		# repacked seven images (two of them 268 MB), ~10 s, on every kernel
 		# change. What the lanes do use is the kernel and the checked root.
-		LANE_TARGETS="iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-iommu iso-pku iso-hib iso-init iso-switchroot"
+		LANE_TARGETS="iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-power iso-gfx iso-iommu iso-pku iso-hib iso-init iso-switchroot"
 		[ "${SMOKE_LA57:-0}" = "1" ] && LANE_TARGETS="$LANE_TARGETS iso-la57"
 		[ "$ARCH" = "aarch64" ] && LANE_TARGETS="check-dynamic build/$ARCH/kernel.elf"
 		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
@@ -1108,7 +1111,7 @@ _mkimg() {  # mkimg <instance-suffix>
 }
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
-    _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg pku; _mkimg hib; _mkimg smp; _mkimg switchroot; _mkimg kvm
+    _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg power; _mkimg gfx; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg pku; _mkimg hib; _mkimg smp; _mkimg switchroot; _mkimg kvm
     [ "${SMOKE_BIGMEM:-0}" = "1" ] && _mkimg bigmem
     [ "${SMOKE_LA57:-0}" = "1" ] && _mkimg la57
 }
@@ -1121,6 +1124,7 @@ SYS_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-sys-$ARCH.log"
 SYSNET_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-sysnet-$ARCH.log"
 BLK_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-blk-$ARCH.log"
 POSIX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-posix-$ARCH.log"
+POWER_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-power-$ARCH.log"
 GFX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-gfx-$ARCH.log"
 INIT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-init-$ARCH.log"
 SWITCHROOT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-switchroot-$ARCH.log"
@@ -1158,7 +1162,7 @@ fi
 # and three consecutive "runs" reported the same numbers off the same stale
 # files. An empty log makes the checks report missing markers, which is the
 # truth.
-for _l in "$LOG" "$SMP_LOG" "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" \
+for _l in "$LOG" "$SMP_LOG" "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" "$POWER_LOG" \
           "$GFX_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" \
           "$AMDVI_LOG" "$RASPI_LOG"; do
 	: > "$_l" 2>/dev/null || true
@@ -1431,11 +1435,40 @@ launch_posix() {
 		NVME_IMG=$(disk_img nvme posix)
 		SWAP_IMG=$(disk_img swap posix)
 		B1NIX_ISO_NAME=b1nix-posix.iso
+		# Two NUMA nodes, one CPU each, as the power lane has (M128): the
+		# per-node allocator is then exercised by everything this lane does,
+		# not only by the placement checks. The memory is the lane's usual
+		# 1 GiB, split in half.
+		EXTRA_QEMU_ARGS="${EXTRA_QEMU_ARGS:-} \
+			-object memory-backend-ram,id=numa0,size=512M \
+			-object memory-backend-ram,id=numa1,size=512M \
+			-numa node,nodeid=0,memdev=numa0,cpus=0 \
+			-numa node,nodeid=1,memdev=numa1,cpus=1 \
+			-numa dist,src=0,dst=1,val=21"
+		export EXTRA_QEMU_ARGS
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[posix] "
+		run_qemu "$POSIX_LOG"
+	) &
+	pid_posix=$!
+}
+
+# The posix lane's sequential group on a machine of its own: cgroups and swap
+# (M127), NUMA and huge pages (M128), idle, suspend and S3 (M129), the AML
+# interpreter (M134) and ACPI events (M135). Each measures the whole machine or
+# takes it down for a while, so inside the lane they ran one after another and
+# were most of the suite's longest instance; here they run beside it.
+launch_power() {
+	(
+		SATA_IMG=$(disk_img sata power)
+		AHCI_IMG=$(disk_img ahci power)
+		NVME_IMG=$(disk_img nvme power)
+		SWAP_IMG=$(disk_img swap power)
+		B1NIX_ISO_NAME=b1nix-power.iso
+		SMOKE_LANE=power
 		# Two NUMA nodes, one CPU each, and a distance between them the
-		# firmware states rather than one the kernel assumes (M128). This is
-		# the lane m128_smoke runs in, and it is also the only place the
-		# per-node allocator is exercised by everything else the lane does.
-		# The memory is the lane's usual 1 GiB, split in half.
+		# firmware states rather than one the kernel assumes (M128). The
+		# memory is the lane's usual 1 GiB, split in half.
 		# The firmware fixture: P-states, a battery, an adapter and a
 		# thermal zone this machine would otherwise not have (M129/M134).
 		if [ -n "$ACPI_FIXTURE" ] && [ "$ARCH" = "x86_64" ]; then
@@ -1454,20 +1487,20 @@ launch_posix() {
 		# kernel's own "entering S3" line and then does what a power button
 		# would (see tests/support/acpi/s3-waker.py).
 		if [ "$ARCH" = "x86_64" ] && command -v python3 >/dev/null 2>&1; then
-			SMOKE_QMP_SOCK="$PROJECT_DIR/smoke_run/qmp-posix-$$.sock"
+			SMOKE_QMP_SOCK="$PROJECT_DIR/smoke_run/qmp-power-$$.sock"
 			export SMOKE_QMP_SOCK
 			rm -f "$SMOKE_QMP_SOCK"
 			python3 "$PROJECT_DIR/tests/support/acpi/s3-waker.py" \
-				"$SMOKE_QMP_SOCK" "$POSIX_LOG" 3 300 \
-				>>"$POSIX_LOG" 2>&1 &
+				"$SMOKE_QMP_SOCK" "$POWER_LOG" 3 300 \
+				>>"$POWER_LOG" 2>&1 &
 			# M135: the power button and a hotplugged card, when
 			# m135_acpi_smoke asks.
 			python3 "$PROJECT_DIR/tests/support/acpi/acpi-actor.py" \
-				"$SMOKE_QMP_SOCK" "$POSIX_LOG" 600 \
-				>"$PROJECT_DIR/smoke_run/acpi-actor-posix.log" 2>&1 &
+				"$SMOKE_QMP_SOCK" "$POWER_LOG" 600 \
+				>"$PROJECT_DIR/smoke_run/acpi-actor-power.log" 2>&1 &
 		fi
 		SMOKE_PROGRESS_MODE=full
-		PROGRESS_PREFIX="[posix] "
+		PROGRESS_PREFIX="[power] "
 		# The guest powers itself off a second after it is done. Waiting for
 		# that is how the lane proves \_S5 (M135): QEMU leaves on its own only
 		# if the firmware's sleep type reached PM1 control.
@@ -1475,9 +1508,9 @@ launch_posix() {
 			SMOKE_DONE_SETTLE=15
 			export SMOKE_DONE_SETTLE
 		fi
-		run_qemu "$POSIX_LOG"
+		run_qemu "$POWER_LOG"
 	) &
-	pid_posix=$!
+	pid_power=$!
 }
 
 launch_gfx() {
@@ -1931,7 +1964,7 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	# in the bootloader, before the guest clock starts: switchroot does 4 s of
 	# work and takes 37 s. Ordered by guest time they started last and the whole
 	# suite ended when they did.
-	_inst_list="pku hib switchroot blk sysnet posix sys gfx iommu init amdvi"
+	_inst_list="pku hib switchroot blk sysnet posix power sys gfx iommu init amdvi"
 	[ "$ARCH" = "aarch64" ] && _inst_list="kvm $_inst_list"
 	# The Raspberry Pi lane is off by default, and not because it is broken.
 	#
@@ -1964,14 +1997,14 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	if [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMOKE_INSTANCES " | grep -q " smp "; then
 		_ran_list="$_ran_list smp"
 	fi
-	for _known in sys sysnet blk posix gfx init switchroot iommu amdvi pku hib bigmem la57 raspi smp kvm; do
+	for _known in sys sysnet blk posix power gfx init switchroot iommu amdvi pku hib bigmem la57 raspi smp kvm; do
 		case " $_ran_list " in
 		*" $_known "*) continue ;;
 		esac
 		rm -f "$PROJECT_DIR/smoke_run/b1nix-smoke-$_known-$ARCH.log"
 	done
 	run_slot_pool $SMOKE_MAX_CONCURRENT $_inst_list
-	cat "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$PKU_LOG" "$HIB_LOG" "$RASPI_LOG" "$KVM_LOG" 2>/dev/null >"$LOG" || true
+	cat "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" "$POWER_LOG" "$GFX_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$PKU_LOG" "$HIB_LOG" "$RASPI_LOG" "$KVM_LOG" 2>/dev/null >"$LOG" || true
 else
 	launch_sys
 	launch_smp_solo
@@ -1996,7 +2029,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "=== Results ==="
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
-	for _i in sys sysnet blk posix gfx init switchroot iommu amdvi pku smp kvm; do
+	for _i in sys sysnet blk posix power gfx init switchroot iommu amdvi pku smp kvm; do
 	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" "$(disk_img vblk "$_i")"
 	done
 	[ "$FAILED" -eq 0 ]
@@ -3374,28 +3407,28 @@ check_output "$POSIX_LOG" "M125-SMOKE: ok async-completion" "a request left arme
 # The posix lane is started with two nodes (see launch_posix), so the placement
 # checks have somewhere to place things; the topology checks hold on one node
 # too, which is what every other lane is.
-check_output "$POSIX_LOG" "M128-SMOKE: start" "the NUMA smoke starts"
-check_output "$POSIX_LOG" "M128-SMOKE: ok node-online" "/sys/devices/system/node/online lists the nodes the machine has"
-check_output "$POSIX_LOG" "M128-SMOKE: ok node-meminfo" "each node reports its own MemTotal and MemFree, and never more free than it has"
-check_output "$POSIX_LOG" "M128-SMOKE: ok node-distance" "each node's distance row has one entry per node and starts at 10 for itself (SLIT, as numactl prints it)"
-check_output "$POSIX_LOG" "M128-SMOKE: ok node-cpulist" "a node names the CPUs that sit on it"
-check_output "$POSIX_LOG" "M128-SMOKE: ok mems-allowed" "MPOL_F_MEMS_ALLOWED names exactly the nodes /sys lists"
+check_output "$POWER_LOG" "M128-SMOKE: start" "the NUMA smoke starts"
+check_output "$POWER_LOG" "M128-SMOKE: ok node-online" "/sys/devices/system/node/online lists the nodes the machine has"
+check_output "$POWER_LOG" "M128-SMOKE: ok node-meminfo" "each node reports its own MemTotal and MemFree, and never more free than it has"
+check_output "$POWER_LOG" "M128-SMOKE: ok node-distance" "each node's distance row has one entry per node and starts at 10 for itself (SLIT, as numactl prints it)"
+check_output "$POWER_LOG" "M128-SMOKE: ok node-cpulist" "a node names the CPUs that sit on it"
+check_output "$POWER_LOG" "M128-SMOKE: ok mems-allowed" "MPOL_F_MEMS_ALLOWED names exactly the nodes /sys lists"
 # The placement checks need a machine with more than one node. The x86_64
 # posix lane is started with two; the aarch64 port has no ACPI, so it has no
 # SRAT to read a topology out of and every machine it runs on is one node.
 if [ "$ARCH" = "aarch64" ]; then
-	check_output "$POSIX_LOG" "M128-SMOKE: one node" "the NUMA smoke says so rather than passing its placement checks for free on a single-node machine"
+	check_output "$POWER_LOG" "M128-SMOKE: one node" "the NUMA smoke says so rather than passing its placement checks for free on a single-node machine"
 	skipped "M128-SMOKE: ok bind-allocates-there" "this port reads no memory topology: SRAT and SLIT are ACPI, and the boards here describe themselves in a device tree (one node)"
 	skipped "M128-SMOKE: ok mbind-range" "same: one node, so there is nowhere to bind a range away to"
 	skipped "M128-SMOKE: ok interleave-spreads" "same: one node, so there is nothing to interleave across"
 else
-	check_output "$POSIX_LOG" "M128-SMOKE: ok bind-allocates-there" "a mapping bound to a node is served from that node — measured by the kernel's own answer per page AND by that node's free memory falling while the other node's does not"
-	check_output "$POSIX_LOG" "M128-SMOKE: ok mbind-range" "mbind binds the part of a mapping it names and leaves the rest, and MPOL_MF_MOVE migrates pages that are already on the wrong node with their contents intact"
-	check_output "$POSIX_LOG" "M128-SMOKE: ok interleave-spreads" "MPOL_INTERLEAVE reaches every node in its mask"
+	check_output "$POWER_LOG" "M128-SMOKE: ok bind-allocates-there" "a mapping bound to a node is served from that node — measured by the kernel's own answer per page AND by that node's free memory falling while the other node's does not"
+	check_output "$POWER_LOG" "M128-SMOKE: ok mbind-range" "mbind binds the part of a mapping it names and leaves the rest, and MPOL_MF_MOVE migrates pages that are already on the wrong node with their contents intact"
+	check_output "$POWER_LOG" "M128-SMOKE: ok interleave-spreads" "MPOL_INTERLEAVE reaches every node in its mask"
 fi
-check_output "$POSIX_LOG" "M128-SMOKE: ok policy-inherited" "a child reads back the memory policy its parent set"
-check_output "$POSIX_LOG" "M128-SMOKE: ok bad-node-refused" "a policy naming a node the machine does not have, an empty MPOL_BIND mask and an unknown mode are each EINVAL"
-check_output "$POSIX_LOG" "M128-SMOKE: done" "the NUMA smoke completes"
+check_output "$POWER_LOG" "M128-SMOKE: ok policy-inherited" "a child reads back the memory policy its parent set"
+check_output "$POWER_LOG" "M128-SMOKE: ok bad-node-refused" "a policy naming a node the machine does not have, an empty MPOL_BIND mask and an unknown mode are each EINVAL"
+check_output "$POWER_LOG" "M128-SMOKE: done" "the NUMA smoke completes"
 
 # ── M128: transparent huge pages for anonymous memory ──
 # The feature is off unless the boot line asks for it (b1nix.thp), so the test
@@ -3403,9 +3436,9 @@ check_output "$POSIX_LOG" "M128-SMOKE: done" "the NUMA smoke completes"
 # and puts the knob back. Both ports install blocks — a 2 MiB directory entry
 # on x86_64, a level-2 block descriptor on aarch64 — so the same checks run on
 # both; a machine that reports "mode never" records them as skipped instead.
-check_output "$POSIX_LOG" "M128-THP: start" "the transparent-hugepage smoke starts"
-check_output "$POSIX_LOG" "M128-THP: ok sysfs" "/sys/kernel/mm/transparent_hugepage publishes the state and a 2 MiB hpage_pmd_size"
-if grep -qa "M128-THP: mode never" "$POSIX_LOG"; then
+check_output "$POWER_LOG" "M128-THP: start" "the transparent-hugepage smoke starts"
+check_output "$POWER_LOG" "M128-THP: ok sysfs" "/sys/kernel/mm/transparent_hugepage publishes the state and a 2 MiB hpage_pmd_size"
+if grep -qa "M128-THP: mode never" "$POWER_LOG"; then
 	skipped "M128-THP: ok hugepage-backed" "this machine reports the feature off and installs no huge pages"
 	skipped "M128-THP: ok data-intact" "same: nothing is 2 MiB-backed here"
 	skipped "M128-THP: ok fork-cow" "same"
@@ -3418,32 +3451,32 @@ if grep -qa "M128-THP: mode never" "$POSIX_LOG"; then
 	skipped "M128-THP: ok recycled-range" "same"
 	skipped "M128-THP: ok no-leak" "same"
 else
-	check_output "$POSIX_LOG" "M128-THP: ok hugepage-backed" "a MADV_HUGEPAGE anonymous mapping reports AnonHugePages in /proc/self/smaps — read out of the page-directory entries themselves, not out of madvise's return value"
-	check_output "$POSIX_LOG" "M128-THP: ok data-intact" "every page of the 2 MiB-backed mapping reads back what was written to it, and the mapping's Rss counts all of it"
-	check_output "$POSIX_LOG" "M128-THP: ok fork-cow" "the data survives a fork, and a copy-on-write write in the child and in the parent leaves each of them with its own bytes"
-	check_output "$POSIX_LOG" "M128-THP: ok mprotect-half" "mprotect over part of a huge-backed range reads back the right bytes, and the rest of the mapping is untouched"
-	check_output "$POSIX_LOG" "M128-THP: ok munmap-half" "munmap of half a 2 MiB block frees only that half and leaves the other half's bytes in place"
-	check_output "$POSIX_LOG" "M128-THP: ok nohugepage-splits" "MADV_NOHUGEPAGE takes a block back apart — AnonHugePages falls to zero and not a byte of the mapping changes"
-	check_output "$POSIX_LOG" "M128-THP: ok mprotect-keeps-block" "mprotect over a range that covers a block whole writes the protection into the 2 MiB entry instead of breaking it into 512 leaves — ld.so mprotects every segment it maps, and that must not cost a mapping its blocks"
-	check_output "$POSIX_LOG" "M128-THP: ok fork-shares-block" "a fork SHARES the block copy-on-write instead of breaking the parent's apart: the parent is still 2 MiB-backed after the fork and before either side writes, and the first write on either side is resolved per page"
-	check_output "$POSIX_LOG" "M128-THP: ok khugepaged-collapse" "khugepaged collapses a range that was already faulted at 4 KiB into one block — the case the fault path cannot reach at all — proved by the kernel's own collapse counter moving and by every byte of the 8 MiB reading back after the copy"
-	check_output "$POSIX_LOG" "M128-THP: ok recycled-range" "an address range already faulted at 4 KiB is block-backed the second time round: the empty page table the first mapping left behind is taken out of the tree and kept until the process exits, so a program that recycles addresses — every long-lived allocator does — keeps getting blocks"
-	check_output "$POSIX_LOG" "M128-THP: ok no-leak" "eight rounds of mapping, filling and releasing 8 MiB leave the machine's free memory where it started, so no 512-frame block was leaked"
+	check_output "$POWER_LOG" "M128-THP: ok hugepage-backed" "a MADV_HUGEPAGE anonymous mapping reports AnonHugePages in /proc/self/smaps — read out of the page-directory entries themselves, not out of madvise's return value"
+	check_output "$POWER_LOG" "M128-THP: ok data-intact" "every page of the 2 MiB-backed mapping reads back what was written to it, and the mapping's Rss counts all of it"
+	check_output "$POWER_LOG" "M128-THP: ok fork-cow" "the data survives a fork, and a copy-on-write write in the child and in the parent leaves each of them with its own bytes"
+	check_output "$POWER_LOG" "M128-THP: ok mprotect-half" "mprotect over part of a huge-backed range reads back the right bytes, and the rest of the mapping is untouched"
+	check_output "$POWER_LOG" "M128-THP: ok munmap-half" "munmap of half a 2 MiB block frees only that half and leaves the other half's bytes in place"
+	check_output "$POWER_LOG" "M128-THP: ok nohugepage-splits" "MADV_NOHUGEPAGE takes a block back apart — AnonHugePages falls to zero and not a byte of the mapping changes"
+	check_output "$POWER_LOG" "M128-THP: ok mprotect-keeps-block" "mprotect over a range that covers a block whole writes the protection into the 2 MiB entry instead of breaking it into 512 leaves — ld.so mprotects every segment it maps, and that must not cost a mapping its blocks"
+	check_output "$POWER_LOG" "M128-THP: ok fork-shares-block" "a fork SHARES the block copy-on-write instead of breaking the parent's apart: the parent is still 2 MiB-backed after the fork and before either side writes, and the first write on either side is resolved per page"
+	check_output "$POWER_LOG" "M128-THP: ok khugepaged-collapse" "khugepaged collapses a range that was already faulted at 4 KiB into one block — the case the fault path cannot reach at all — proved by the kernel's own collapse counter moving and by every byte of the 8 MiB reading back after the copy"
+	check_output "$POWER_LOG" "M128-THP: ok recycled-range" "an address range already faulted at 4 KiB is block-backed the second time round: the empty page table the first mapping left behind is taken out of the tree and kept until the process exits, so a program that recycles addresses — every long-lived allocator does — keeps getting blocks"
+	check_output "$POWER_LOG" "M128-THP: ok no-leak" "eight rounds of mapping, filling and releasing 8 MiB leave the machine's free memory where it started, so no 512-frame block was leaked"
 fi
-check_output "$POSIX_LOG" "M128-THP: done" "the transparent-hugepage smoke completes"
+check_output "$POWER_LOG" "M128-THP: done" "the transparent-hugepage smoke completes"
 
 # ── M129: power management ──
-check_output "$POSIX_LOG" "M129-SMOKE: start" "the power-management smoke starts"
-check_output "$POSIX_LOG" "M129-SMOKE: ok loc-counter" "/proc/interrupts reports local timer interrupts (LOC), so how often the machine wakes can be measured at all"
+check_output "$POWER_LOG" "M129-SMOKE: start" "the power-management smoke starts"
+check_output "$POWER_LOG" "M129-SMOKE: ok loc-counter" "/proc/interrupts reports local timer interrupts (LOC), so how often the machine wakes can be measured at all"
 if [ "$ARCH" = "aarch64" ]; then
-	check_output "$POSIX_LOG" "M129-SMOKE: ok idle-not-worse" "the capped idle timer costs no more than the fixed beat it replaced (this port ticks at 100 Hz, where nearly every wakeup already asks for about a tick, so there is little for the cap to save)"
+	check_output "$POWER_LOG" "M129-SMOKE: ok idle-not-worse" "the capped idle timer costs no more than the fixed beat it replaced (this port ticks at 100 Hz, where nearly every wakeup already asks for about a tick, so there is little for the cap to save)"
 else
-	check_output "$POSIX_LOG" "M129-SMOKE: ok idle-is-quiet" "an idle second costs well under what the fixed beat would: the timer really is programmed for the next deadline"
+	check_output "$POWER_LOG" "M129-SMOKE: ok idle-is-quiet" "an idle second costs well under what the fixed beat would: the timer really is programmed for the next deadline"
 fi
-check_output "$POSIX_LOG" "M129-SMOKE: ok idle-measured" "an idle second's timer interrupts are counted (the number itself depends on b1nix.dynticks, and the log prints it)"
-check_output "$POSIX_LOG" "M129-SMOKE: ok busy-still-ticks" "a CPU with work to do still takes its timer interrupts, so nothing goes unpreempted"
-check_output "$POSIX_LOG" "M129-SMOKE: ok cpufreq-honest" "cpufreq names the driver the machine really has, offers only governors that driver can honour, and reports a frequency (a guest whose hypervisor hides the power-management leaves says \"none\" rather than offering a governor that moves nothing)"
-check_output "$POSIX_LOG" "M129-SMOKE: ok cpuidle-sysfs" "/sys/devices/system/cpu/cpu0/cpuidle/state0 names the idle state this machine really uses and its counters move"
+check_output "$POWER_LOG" "M129-SMOKE: ok idle-measured" "an idle second's timer interrupts are counted (the number itself depends on b1nix.dynticks, and the log prints it)"
+check_output "$POWER_LOG" "M129-SMOKE: ok busy-still-ticks" "a CPU with work to do still takes its timer interrupts, so nothing goes unpreempted"
+check_output "$POWER_LOG" "M129-SMOKE: ok cpufreq-honest" "cpufreq names the driver the machine really has, offers only governors that driver can honour, and reports a frequency (a guest whose hypervisor hides the power-management leaves says \"none\" rather than offering a governor that moves nothing)"
+check_output "$POWER_LOG" "M129-SMOKE: ok cpuidle-sysfs" "/sys/devices/system/cpu/cpu0/cpuidle/state0 names the idle state this machine really uses and its counters move"
 # ── M129: the P-states ACPI declared ──
 #
 # QEMU's own firmware declares none, so the lane boots a supplementary table
@@ -3451,55 +3484,55 @@ check_output "$POSIX_LOG" "M129-SMOKE: ok cpuidle-sysfs" "/sys/devices/system/cp
 # below is compared against what that table declares rather than against a range
 # of plausible numbers: the kernel has to have read the firmware, not guessed.
 if [ -n "$ACPI_FIXTURE" ] && [ "$ARCH" = "x86_64" ]; then
-	check_output "$POSIX_LOG" "M129-PSTATE: khz $ACPI_FIXTURE_PSS_KHZ" "the frequencies the kernel read out of _PSS are exactly the ones the firmware declared, in the order it declared them"
-	check_output "$POSIX_LOG" "M129-PSTATE: control $ACPI_FIXTURE_PSS_CONTROL" "so are the control values — the number written to the register _PCT names to ask for each state, which is the only part of a P-state the kernel cannot invent"
-	check_output "$POSIX_LOG" "M129-SMOKE: ok pstates-declared" "/sys/.../scaling_available_frequencies lists those states and cpuinfo_max_freq/cpuinfo_min_freq are their two ends"
-	check_output "$POSIX_LOG" "M129-SMOKE: ok pstates-selected" "writing scaling_setspeed picks the state the firmware declared for that frequency, the kernel writes its control value to the declared register, and /proc/b1nix-cpufreq reports that the write was accepted"
+	check_output "$POWER_LOG" "M129-PSTATE: khz $ACPI_FIXTURE_PSS_KHZ" "the frequencies the kernel read out of _PSS are exactly the ones the firmware declared, in the order it declared them"
+	check_output "$POWER_LOG" "M129-PSTATE: control $ACPI_FIXTURE_PSS_CONTROL" "so are the control values — the number written to the register _PCT names to ask for each state, which is the only part of a P-state the kernel cannot invent"
+	check_output "$POWER_LOG" "M129-SMOKE: ok pstates-declared" "/sys/.../scaling_available_frequencies lists those states and cpuinfo_max_freq/cpuinfo_min_freq are their two ends"
+	check_output "$POWER_LOG" "M129-SMOKE: ok pstates-selected" "writing scaling_setspeed picks the state the firmware declared for that frequency, the kernel writes its control value to the declared register, and /proc/b1nix-cpufreq reports that the write was accepted"
 else
 	skipped "M129-PSTATE: khz" "no ACPI fixture: this port has no ACPI at all (aarch64), or the host has no python3 to generate the table"
 	skipped "M129-SMOKE: ok pstates-declared" "same"
 	skipped "M129-SMOKE: ok pstates-selected" "same"
 fi
-check_output "$POSIX_LOG" "M129-SMOKE: done" "the power-management smoke completes"
+check_output "$POWER_LOG" "M129-SMOKE: done" "the power-management smoke completes"
 
 # ── M129: suspend (s2idle behind /sys/power/state) ──
-check_output "$POSIX_LOG" "M129-SUSPEND: start" "the suspend smoke starts"
-check_output "$POSIX_LOG" "M129-SUSPEND: ok state-lists-freeze" "/sys/power/state names the states this machine really has, and freeze is one of them"
-check_output "$POSIX_LOG" "M129-SUSPEND: ok unknown-state-refused" "a state the machine does not have is refused with EINVAL rather than accepted and ignored"
-check_output "$POSIX_LOG" "M129-SUSPEND: ok freeze-without-alarm" "a suspend with no alarm armed still returns and leaves the machine working — a keypress is a wake source, and refusing to suspend a laptop because nobody set an alarm would be the wrong behaviour to lock in"
-check_output "$POSIX_LOG" "M129-SUSPEND: ok alarm-armed" "RTC_WKALM_SET arms the alarm a few seconds ahead of the hardware clock"
-check_output "$POSIX_LOG" "M129-SUSPEND: ok slept-the-interval" "the write to /sys/power/state blocked for about the interval the alarm was armed for -- the machine waited for the wake instead of returning at once"
-check_output "$POSIX_LOG" "M129-SUSPEND: ok child-frozen" "a child that does nothing but spin has a hole of that length in its OWN CLOCK_MONOTONIC timeline: userspace really stopped running"
-check_output "$POSIX_LOG" "M129-SUSPEND: ok child-runs-again" "the thaw puts it back: the same child is counting again after the resume"
-check_output "$POSIX_LOG" "M129-SUSPEND: ok rtc-irq-counted" "/proc/interrupts RTC row moved, so the alarm interrupt was really routed, taken and acknowledged (IRQ 8 on x86_64 interrupted nothing at all before M129)"
-check_output "$POSIX_LOG" "M129-SUSPEND: ok machine-alive" "after the resume a file round-trip, a fork that is waited for and a syscall all still work"
+check_output "$POWER_LOG" "M129-SUSPEND: start" "the suspend smoke starts"
+check_output "$POWER_LOG" "M129-SUSPEND: ok state-lists-freeze" "/sys/power/state names the states this machine really has, and freeze is one of them"
+check_output "$POWER_LOG" "M129-SUSPEND: ok unknown-state-refused" "a state the machine does not have is refused with EINVAL rather than accepted and ignored"
+check_output "$POWER_LOG" "M129-SUSPEND: ok freeze-without-alarm" "a suspend with no alarm armed still returns and leaves the machine working — a keypress is a wake source, and refusing to suspend a laptop because nobody set an alarm would be the wrong behaviour to lock in"
+check_output "$POWER_LOG" "M129-SUSPEND: ok alarm-armed" "RTC_WKALM_SET arms the alarm a few seconds ahead of the hardware clock"
+check_output "$POWER_LOG" "M129-SUSPEND: ok slept-the-interval" "the write to /sys/power/state blocked for about the interval the alarm was armed for -- the machine waited for the wake instead of returning at once"
+check_output "$POWER_LOG" "M129-SUSPEND: ok child-frozen" "a child that does nothing but spin has a hole of that length in its OWN CLOCK_MONOTONIC timeline: userspace really stopped running"
+check_output "$POWER_LOG" "M129-SUSPEND: ok child-runs-again" "the thaw puts it back: the same child is counting again after the resume"
+check_output "$POWER_LOG" "M129-SUSPEND: ok rtc-irq-counted" "/proc/interrupts RTC row moved, so the alarm interrupt was really routed, taken and acknowledged (IRQ 8 on x86_64 interrupted nothing at all before M129)"
+check_output "$POWER_LOG" "M129-SUSPEND: ok machine-alive" "after the resume a file round-trip, a fork that is waited for and a syscall all still work"
 # ── M129: ACPI S3, where the firmware declares it ──
 #
 # A different state from the freeze above and proved differently: the processor's
 # state is gone across S3, so the witness is the kernel's own S3 counter — which
 # an s2idle suspend never moves — plus a machine that still works afterwards.
-if grep -qa "M129-SUSPEND: no-s3" "$POSIX_LOG"; then
+if grep -qa "M129-SUSPEND: no-s3" "$POWER_LOG"; then
 	skipped "M129-SUSPEND: ok s3-slept" "this machine has no S3: the log line says which part of it is missing (no \\_S3 in the firmware, or no FADT register to enter it through)"
 	skipped "M129-SUSPEND: ok s3-alive" "same"
 	skipped "M129-SUSPEND: ok s3-devices" "same"
 else
-	check_output "$POSIX_LOG" "ps2: keyboard back after the resume: self-test passed, translation on, irq1 armed" "the i8042 keyboard, reset by the S3, passed its self-test again and the controller kept scancode translation on: without it the set-1 map would read set-2 codes (M135)"
-	check_output "$POSIX_LOG" "ps2: mouse back after the resume: reporting enabled" "the PS/2 mouse, reset by the S3 with reporting off, answered its reset and has reporting on again (M135)"
-	check_output "$POSIX_LOG" "M129-SUSPEND: ok s3-tablet" "the virtio tablet, reset by the S3, reports the host's input afterwards: its driver rebuilt the queue (M135)"
-	check_output "${POSIX_LOG%.log}-hvc.out" "HVC-AFTER-S3: ok" "text written to /dev/hvc0 after the S3 still reaches the host (QEMU keeps this device's state across the sleep, so this shows the console works afterwards, not that its resume rebuilt it)"
-	check_output "$POSIX_LOG" "M129-SUSPEND: ok s3-msi-restored" "every PCI function that had MSI or MSI-X enabled before the S3 has it after: the table is saved just before the sleep and written back behind the restored header (M135)"
-	check_output "$POSIX_LOG" "M129-SUSPEND: ok s3-slept" "writing mem to /sys/power/state really entered ACPI S3: the kernel's S3 counter moved (it counts only the path that writes SLP_TYP into PM1_CNT and returns through the real-mode wake-up trampoline), and the machine was down for about the interval the RTC alarm was armed for"
-	check_output "$POSIX_LOG" "M129-SUSPEND: ok s3-alive" "and the processor was rebuilt from what the kernel saved: a file round-trip, a fork that is waited for and a syscall all work after the resume"
-	check_output "$POSIX_LOG" "M129-SUSPEND: ok s3-devices" "and the devices came back with it: an evdev node answers, the display takes a whole modeset (create a dumb buffer, add it as a framebuffer, set the CRTC — the last of those sends a scanout command to the device, so a virtio-gpu whose queues did not come back fails it), and the audio device takes a buffer"
+	check_output "$POWER_LOG" "ps2: keyboard back after the resume: self-test passed, translation on, irq1 armed" "the i8042 keyboard, reset by the S3, passed its self-test again and the controller kept scancode translation on: without it the set-1 map would read set-2 codes (M135)"
+	check_output "$POWER_LOG" "ps2: mouse back after the resume: reporting enabled" "the PS/2 mouse, reset by the S3 with reporting off, answered its reset and has reporting on again (M135)"
+	check_output "$POWER_LOG" "M129-SUSPEND: ok s3-tablet" "the virtio tablet, reset by the S3, reports the host's input afterwards: its driver rebuilt the queue (M135)"
+	check_output "${POWER_LOG%.log}-hvc.out" "HVC-AFTER-S3: ok" "text written to /dev/hvc0 after the S3 still reaches the host (QEMU keeps this device's state across the sleep, so this shows the console works afterwards, not that its resume rebuilt it)"
+	check_output "$POWER_LOG" "M129-SUSPEND: ok s3-msi-restored" "every PCI function that had MSI or MSI-X enabled before the S3 has it after: the table is saved just before the sleep and written back behind the restored header (M135)"
+	check_output "$POWER_LOG" "M129-SUSPEND: ok s3-slept" "writing mem to /sys/power/state really entered ACPI S3: the kernel's S3 counter moved (it counts only the path that writes SLP_TYP into PM1_CNT and returns through the real-mode wake-up trampoline), and the machine was down for about the interval the RTC alarm was armed for"
+	check_output "$POWER_LOG" "M129-SUSPEND: ok s3-alive" "and the processor was rebuilt from what the kernel saved: a file round-trip, a fork that is waited for and a syscall all work after the resume"
+	check_output "$POWER_LOG" "M129-SUSPEND: ok s3-devices" "and the devices came back with it: an evdev node answers, the display takes a whole modeset (create a dumb buffer, add it as a framebuffer, set the CRTC — the last of those sends a scanout command to the device, so a virtio-gpu whose queues did not come back fails it), and the audio device takes a buffer"
 	# USB, specifically: the host controller comes back halted and reset, and
 	# the keyboard's slot and address were the controller's — so a resume that
 	# only re-programmed the rings leaves a keyboard that is plugged in and
 	# reports nothing. The driver prints its enumeration markers whenever it
 	# addresses a device and configures an interrupt endpoint, so finding them
 	# AFTER the sleep is the proof that it happened again on the far side.
-	_s3_at="$(grep -an "s3: back from the sleep" "$POSIX_LOG" 2>/dev/null | head -1 | cut -d: -f1)"
+	_s3_at="$(grep -an "s3: back from the sleep" "$POWER_LOG" 2>/dev/null | head -1 | cut -d: -f1)"
 	if [ -n "$_s3_at" ]; then
-		_usb_after="$(awk -v n="$_s3_at" 'NR > n && /M37-USB: ok hid-config/ { c++ } END { print c + 0 }' "$POSIX_LOG")"
+		_usb_after="$(awk -v n="$_s3_at" 'NR > n && /M37-USB: ok hid-config/ { c++ } END { print c + 0 }' "$POWER_LOG")"
 		if [ "${_usb_after:-0}" -gt 0 ]; then
 			pass "the USB keyboard was addressed and its interrupt endpoint configured again after the resume — the controller and the device both came back, not just the driver's memory"
 		else
@@ -3512,7 +3545,7 @@ else
 	# either (the audio test's own is 440) — so finding each in the capture
 	# proves samples reached that card on the far side of the sleep rather
 	# than that a write returned a byte count.
-	_s3_wav="${POSIX_LOG%.log}-audio.wav"
+	_s3_wav="${POWER_LOG%.log}-audio.wav"
 	for _s3_card in "ac97 880" "hda 660"; do
 		_s3_name="${_s3_card% *}"
 		_s3_hz="${_s3_card#* }"
@@ -3531,8 +3564,8 @@ else
 		fi
 	done
 fi
-check_output "$POSIX_LOG" "M129-SUSPEND: done" "the suspend smoke completes"
-check_output "$POSIX_LOG" "power: freeze," "the kernel reports the freeze, how many tasks it is holding and which wake source is armed"
+check_output "$POWER_LOG" "M129-SUSPEND: done" "the suspend smoke completes"
+check_output "$POWER_LOG" "power: freeze," "the kernel reports the freeze, how many tasks it is holding and which wake source is armed"
 
 # ── M134: the AML interpreter, on the firmware's own bytecode ──
 #
@@ -3540,53 +3573,53 @@ check_output "$POSIX_LOG" "power: freeze," "the kernel reports the freeze, how m
 # battery and thermal rows are deliberately two-sided: this machine's firmware
 # declares neither, so "no-battery" and "no-thermal-zone" are the expected
 # outcomes HERE, while a machine that has them must publish working files.
-check_output "$POSIX_LOG" "M134-AML: start" "the AML smoke starts"
-check_output "$POSIX_LOG" "M134-AML: ok namespace-roots" "the namespace has the predefined roots the ACPI specification requires an OS to create (\\_SB_, \\_GPE, \\_SI_)"
+check_output "$POWER_LOG" "M134-AML: start" "the AML smoke starts"
+check_output "$POWER_LOG" "M134-AML: ok namespace-roots" "the namespace has the predefined roots the ACPI specification requires an OS to create (\\_SB_, \\_GPE, \\_SI_)"
 if [ "$ARCH" = "x86_64" ]; then
-	check_output "$POSIX_LOG" "M134-AML: ok dsdt-loaded" "the DSDT was found through the FADT and decoded; /proc/b1nix-acpi names it"
-	check_output "$POSIX_LOG" "M134-AML: ok namespace-size" "the loader built hundreds of objects out of the byte stream, not the handful this kernel predefines -- a parser that gave up early cannot pass this"
-	check_output "$POSIX_LOG" "M134-AML: ok devices-found" "the firmware's Device() declarations became devices in the namespace"
-	check_output "$POSIX_LOG" "M134-AML: ok s5-sleep-type" "\\_S5_ evaluates to a sleep package whose first element is the three-bit SLP_TYP this machine wants for soft-off -- the value a kernel powers the machine off with, and one only an evaluator can produce"
-	check_output "$POSIX_LOG" "M134-AML: ok pci0-hid" "\\_SB_.PCI0._HID reads back as the compressed EISA id of a PCI host bridge (PNP0A03 or PNP0A08) and nothing else"
-	check_output "$POSIX_LOG" "M134-AML: ok pci0-crs" "\\_SB_.PCI0._CRS is a resource template: a Buffer object that ends in the small end tag"
-	check_output "$POSIX_LOG" "M134-AML: ok method-with-args\|M134-AML: ok method-args-absent" "a firmware method called WITH AN ARGUMENT runs: CSTA(n) writes the CPU selector to its SystemIO operation region and reads the enabled bit back, answering 0x0F for a processor that exists and 0 for one that does not (or the marker saying this firmware has no such method)"
-	check_output "$POSIX_LOG" "M134-AML: ok pci-config-refused\|M134-AML: ok pci-config-absent" "an operation region in an address space this interpreter does not implement (PCI config, here the PIIX link devices' routing registers) is REFUSED: the evaluation fails with region-refused rather than answering a plausible number"
-	check_output "$POSIX_LOG" "M134-AML: ok refusal-recorded\|M134-AML: ok pci-config-absent" "the refusal is recorded in /proc/b1nix-acpi, so a machine whose firmware needs an address space this kernel lacks says which one"
-	check_output "$POSIX_LOG" "M134-AML: ok no-battery\|M134-AML: ok battery-sysfs" "the battery sysfs agrees with the firmware: a machine whose firmware declares no ACPI battery has an empty /sys/class/power_supply rather than an invented one"
-	check_output "$POSIX_LOG" "M134-AML: ok no-thermal-zone\|M134-AML: ok thermal-sysfs" "the thermal sysfs agrees with the firmware: no thermal zone with a _TMP means no /sys/class/thermal/thermal_zone0"
+	check_output "$POWER_LOG" "M134-AML: ok dsdt-loaded" "the DSDT was found through the FADT and decoded; /proc/b1nix-acpi names it"
+	check_output "$POWER_LOG" "M134-AML: ok namespace-size" "the loader built hundreds of objects out of the byte stream, not the handful this kernel predefines -- a parser that gave up early cannot pass this"
+	check_output "$POWER_LOG" "M134-AML: ok devices-found" "the firmware's Device() declarations became devices in the namespace"
+	check_output "$POWER_LOG" "M134-AML: ok s5-sleep-type" "\\_S5_ evaluates to a sleep package whose first element is the three-bit SLP_TYP this machine wants for soft-off -- the value a kernel powers the machine off with, and one only an evaluator can produce"
+	check_output "$POWER_LOG" "M134-AML: ok pci0-hid" "\\_SB_.PCI0._HID reads back as the compressed EISA id of a PCI host bridge (PNP0A03 or PNP0A08) and nothing else"
+	check_output "$POWER_LOG" "M134-AML: ok pci0-crs" "\\_SB_.PCI0._CRS is a resource template: a Buffer object that ends in the small end tag"
+	check_output "$POWER_LOG" "M134-AML: ok method-with-args\|M134-AML: ok method-args-absent" "a firmware method called WITH AN ARGUMENT runs: CSTA(n) writes the CPU selector to its SystemIO operation region and reads the enabled bit back, answering 0x0F for a processor that exists and 0 for one that does not (or the marker saying this firmware has no such method)"
+	check_output "$POWER_LOG" "M134-AML: ok pci-config-refused\|M134-AML: ok pci-config-absent" "an operation region in an address space this interpreter does not implement (PCI config, here the PIIX link devices' routing registers) is REFUSED: the evaluation fails with region-refused rather than answering a plausible number"
+	check_output "$POWER_LOG" "M134-AML: ok refusal-recorded\|M134-AML: ok pci-config-absent" "the refusal is recorded in /proc/b1nix-acpi, so a machine whose firmware needs an address space this kernel lacks says which one"
+	check_output "$POWER_LOG" "M134-AML: ok no-battery\|M134-AML: ok battery-sysfs" "the battery sysfs agrees with the firmware: a machine whose firmware declares no ACPI battery has an empty /sys/class/power_supply rather than an invented one"
+	check_output "$POWER_LOG" "M134-AML: ok no-thermal-zone\|M134-AML: ok thermal-sysfs" "the thermal sysfs agrees with the firmware: no thermal zone with a _TMP means no /sys/class/thermal/thermal_zone0"
 	if [ -n "$ACPI_FIXTURE" ]; then
 		# The other side of those two: with a battery and a zone DECLARED, the
 		# files must carry the firmware's own numbers. This is what the M129
 		# roadmap called unexercised — the code was written and no machine here
 		# declared anything for it to read.
-		check_output "$POSIX_LOG" "M134-AML: battery cap $ACPI_FIXTURE_BAT_CAPACITY_PCT full $ACPI_FIXTURE_BAT_FULL_UWH now $ACPI_FIXTURE_BAT_NOW_UWH volt $ACPI_FIXTURE_BAT_VOLTAGE_UV status Discharging" "/sys/class/power_supply/BAT0 reports the firmware's own _BIF and _BST numbers — capacity as the percentage of last-full, energy and voltage in the micro- units sysfs uses, and the state _BST's status word names"
-		check_output "$POSIX_LOG" "M134-AML: thermal_zone0 $ACPI_FIXTURE_TZ_TEMP_MC mC" "/sys/class/thermal/thermal_zone0/temp is the _TMP the firmware declared, converted from tenths of a kelvin to millidegrees Celsius"
+		check_output "$POWER_LOG" "M134-AML: battery cap $ACPI_FIXTURE_BAT_CAPACITY_PCT full $ACPI_FIXTURE_BAT_FULL_UWH now $ACPI_FIXTURE_BAT_NOW_UWH volt $ACPI_FIXTURE_BAT_VOLTAGE_UV status Discharging" "/sys/class/power_supply/BAT0 reports the firmware's own _BIF and _BST numbers — capacity as the percentage of last-full, energy and voltage in the micro- units sysfs uses, and the state _BST's status word names"
+		check_output "$POWER_LOG" "M134-AML: thermal_zone0 $ACPI_FIXTURE_TZ_TEMP_MC mC" "/sys/class/thermal/thermal_zone0/temp is the _TMP the firmware declared, converted from tenths of a kelvin to millidegrees Celsius"
 	fi
 else
-	check_output "$POSIX_LOG" "M134-AML: ok no-acpi-firmware" "a machine with no ACPI at all -- every board on this architecture -- reports exactly that: the interpreter is there, it built only the predefined roots, and it publishes no battery and no thermal zone rather than inventing either"
+	check_output "$POWER_LOG" "M134-AML: ok no-acpi-firmware" "a machine with no ACPI at all -- every board on this architecture -- reports exactly that: the interpreter is there, it built only the predefined roots, and it publishes no battery and no thermal zone rather than inventing either"
 fi
-check_output "$POSIX_LOG" "M134-AML: done" "the AML smoke completes"
+check_output "$POWER_LOG" "M134-AML: done" "the AML smoke completes"
 # M135: ACPI events, pressed from outside by tests/support/acpi/acpi-actor.py.
 if [ "$ARCH" = "x86_64" ]; then
-	check_output "$POSIX_LOG" "M135-ACPI: ok interrupts-sysfs" "/sys/firmware/acpi/interrupts counts the SCI, the GPEs and the fixed events"
-	check_output "$POSIX_LOG" "M135-ACPI: ok power-button-device" "the fixed power button is an input device named \"Power Button\""
-	check_output "$POSIX_LOG" "M135-ACPI: ok power-button" "QEMU's power button arrives through the SCI as KEY_POWER down and up, counted in ff_pwr_btn"
-	check_output "$POSIX_LOG" "M135-ACPI: ok pci-hotplug" "a card hotplugged into the pc machine raises a GPE whose method notifies its slot; the new function appears in /sys/bus/pci with an add uevent"
-	check_output "$POSIX_LOG" "M135-ACPI: ok wakeup-count" "the power button press is a wakeup event: /sys/power/wakeup_count moves, /sys/class/wakeup counts it, and writing back a count it has overtaken is refused (the handshake systemd suspends with)"
-	check_output "$POSIX_LOG" "M135-ACPI: ok wakeup-count-aborts" "with the count written back, an RTC alarm firing before the suspend makes the suspend refuse with EBUSY"
-	check_output "$POSIX_LOG" "M135-ACPI: done" "the ACPI events smoke completes"
+	check_output "$POWER_LOG" "M135-ACPI: ok interrupts-sysfs" "/sys/firmware/acpi/interrupts counts the SCI, the GPEs and the fixed events"
+	check_output "$POWER_LOG" "M135-ACPI: ok power-button-device" "the fixed power button is an input device named \"Power Button\""
+	check_output "$POWER_LOG" "M135-ACPI: ok power-button" "QEMU's power button arrives through the SCI as KEY_POWER down and up, counted in ff_pwr_btn"
+	check_output "$POWER_LOG" "M135-ACPI: ok pci-hotplug" "a card hotplugged into the pc machine raises a GPE whose method notifies its slot; the new function appears in /sys/bus/pci with an add uevent"
+	check_output "$POWER_LOG" "M135-ACPI: ok wakeup-count" "the power button press is a wakeup event: /sys/power/wakeup_count moves, /sys/class/wakeup counts it, and writing back a count it has overtaken is refused (the handshake systemd suspends with)"
+	check_output "$POWER_LOG" "M135-ACPI: ok wakeup-count-aborts" "with the count written back, an RTC alarm firing before the suspend makes the suspend refuse with EBUSY"
+	check_output "$POWER_LOG" "M135-ACPI: done" "the ACPI events smoke completes"
 fi
 # M135: the frequency policy over the fixture's P-states.
 if [ -n "$ACPI_FIXTURE" ] && [ "$ARCH" = "x86_64" ]; then
-	check_output "$POSIX_LOG" "M135-ACPI: ok cpufreq-policy-layout" "cpufreq lives in /sys/devices/system/cpu/cpufreq/policy0, and every CPU's cpufreq is a link to it"
-	check_output "$POSIX_LOG" "M135-CPUFREQ: ppc $ACPI_FIXTURE_PPC bios_limit $ACPI_FIXTURE_PPC_KHZ" "the kernel read the firmware's _PPC and publishes its frequency as bios_limit"
-	check_output "$POSIX_LOG" "M135-ACPI: ok cpufreq-ppc-ceiling" "_PPC caps scaling_max_freq, and the performance governor runs at the platform's ceiling rather than above it"
-	check_output "$POSIX_LOG" "M135-ACPI: ok cpufreq-setspeed-refused" "scaling_setspeed is refused unless the userspace governor is in force"
-	check_output "$POSIX_LOG" "M135-ACPI: ok cpufreq-policy-limit" "writing scaling_max_freq narrows the policy and the clock follows; writing it back returns to the platform's ceiling"
-	check_output "$POSIX_LOG" "M135-ACPI: ok cpufreq-ondemand" "the ondemand governor drops to the slowest state when idle and raises the clock to the ceiling while a CPU spins"
-	check_output "$POSIX_LOG" "M135-BAT: $ACPI_FIXTURE_BAT_INFO" "the battery publishes what _BIX declares: cycle count, design capacity and voltage, chemistry, model, serial and maker"
-	check_output "$POSIX_LOG" "M135-ACPI: ok battery-alarm" "writing alarm hands the trip to the firmware's _BTP, and capacity_level reads Low below it"
-	check_output "$POSIX_LOG" "M135-ACPI: ok charge-behaviour" "charge_behaviour offers what _BMD says the battery can do, hands a choice to _BMC, and reads back what _BMD then reports; a mode that does not exist is refused"
+	check_output "$POWER_LOG" "M135-ACPI: ok cpufreq-policy-layout" "cpufreq lives in /sys/devices/system/cpu/cpufreq/policy0, and every CPU's cpufreq is a link to it"
+	check_output "$POWER_LOG" "M135-CPUFREQ: ppc $ACPI_FIXTURE_PPC bios_limit $ACPI_FIXTURE_PPC_KHZ" "the kernel read the firmware's _PPC and publishes its frequency as bios_limit"
+	check_output "$POWER_LOG" "M135-ACPI: ok cpufreq-ppc-ceiling" "_PPC caps scaling_max_freq, and the performance governor runs at the platform's ceiling rather than above it"
+	check_output "$POWER_LOG" "M135-ACPI: ok cpufreq-setspeed-refused" "scaling_setspeed is refused unless the userspace governor is in force"
+	check_output "$POWER_LOG" "M135-ACPI: ok cpufreq-policy-limit" "writing scaling_max_freq narrows the policy and the clock follows; writing it back returns to the platform's ceiling"
+	check_output "$POWER_LOG" "M135-ACPI: ok cpufreq-ondemand" "the ondemand governor drops to the slowest state when idle and raises the clock to the ceiling while a CPU spins"
+	check_output "$POWER_LOG" "M135-BAT: $ACPI_FIXTURE_BAT_INFO" "the battery publishes what _BIX declares: cycle count, design capacity and voltage, chemistry, model, serial and maker"
+	check_output "$POWER_LOG" "M135-ACPI: ok battery-alarm" "writing alarm hands the trip to the firmware's _BTP, and capacity_level reads Low below it"
+	check_output "$POWER_LOG" "M135-ACPI: ok charge-behaviour" "charge_behaviour offers what _BMD says the battery can do, hands a choice to _BMC, and reads back what _BMD then reports; a mode that does not exist is refused"
 	# M131: a VM through /dev/kvm, Linux's KVM imported through linuxkpi. The
 	# lanes run under the host's KVM with -cpu host, so the guest CPU has VMX.
 	check_output "$POSIX_LOG" "kvm: Intel VMX" "on the host's Intel CPU, KVM's VMX module takes the machine"
@@ -3596,23 +3629,23 @@ if [ -n "$ACPI_FIXTURE" ] && [ "$ARCH" = "x86_64" ]; then
 	check_output "$POSIX_LOG" "M131-KVM: ok vcpu" "KVM_CREATE_VCPU, and the vCPU's run area maps from its descriptor"
 	check_output "$POSIX_LOG" "M131-KVM: ok guest-io" "the guest executed real-mode code in VMX non-root mode: KVM_RUN reported its port writes, and they carry 2+2 as it computed it"
 	check_output "$POSIX_LOG" "M131-KVM: ok guest-hlt" "the guest's HLT comes back to userspace as KVM_EXIT_HLT"
-	check_output "$POSIX_LOG" "M135-THERMAL: trips $ACPI_FIXTURE_TZ_TRIPS" "the zone's trip points are the firmware's _CRT, _HOT, _PSV and _ACx, in Linux's order"
-	check_output "$POSIX_LOG" "M135-THERMAL: cdevs $ACPI_FIXTURE_TZ_CDEVS" "the cooling devices are the processor and the fans the zone's _ALx lists name"
-	check_output "$POSIX_LOG" "M135-ACPI: ok thermal-passive" "past _PSV the processor is slowed step by step through its P-states (ACPI's _TC1/_TC2 formula every _TSP)"
-	check_output "$POSIX_LOG" "M135-ACPI: ok thermal-active" "past each _ACx the fans its _ALx names come on, switched through their _PR0 power resources and read back from _STA"
-	check_output "$POSIX_LOG" "M135-ACPI: ok thermal-release" "below the trips the fans go off and the processor gets its clock back"
-	check_output "$POSIX_LOG" "critical temperature reached" "the lane ends past the critical trip, and the kernel says so"
-	check_absent "$POSIX_LOG" "the orderly power-off did not finish" "the orderly power-off went through /sbin/poweroff and init, not the kernel's forced fallback"
-	check_absent "$POSIX_LOG" "no /sbin/poweroff: powering off now" "userspace had a /sbin/poweroff to run"
-	check_output "$POSIX_LOG" "M135-IDLE: driver acpi_idle governor menu states $ACPI_FIXTURE_CST" "the idle states are the firmware's _CST, with its latencies, under the menu governor"
-	check_output "$POSIX_LOG" "M135-ACPI: ok runtime-pm" "with power/control=auto an idle NVMe controller autosuspends to D3hot (its PM capability says so) and a read brings it back to D0 and works; control=on keeps it up"
-	check_output "$POSIX_LOG" "M135-ACPI: ok idle-cst" "each _CST state publishes its residency, twice its exit latency as Linux's acpi_idle sets it"
-	check_output "$POSIX_LOG" "M135-ACPI: ok idle-deep-when-quiet" "a quiet machine sleeps in its deepest state"
-	check_output "$POSIX_LOG" "M135-ACPI: ok idle-disable" "stateN/disable takes a state from the governor, which picks the next deepest instead"
-	if grep -aq "M135-IDLE: skip idle-follows-prediction" "$POSIX_LOG"; then
+	check_output "$POWER_LOG" "M135-THERMAL: trips $ACPI_FIXTURE_TZ_TRIPS" "the zone's trip points are the firmware's _CRT, _HOT, _PSV and _ACx, in Linux's order"
+	check_output "$POWER_LOG" "M135-THERMAL: cdevs $ACPI_FIXTURE_TZ_CDEVS" "the cooling devices are the processor and the fans the zone's _ALx lists name"
+	check_output "$POWER_LOG" "M135-ACPI: ok thermal-passive" "past _PSV the processor is slowed step by step through its P-states (ACPI's _TC1/_TC2 formula every _TSP)"
+	check_output "$POWER_LOG" "M135-ACPI: ok thermal-active" "past each _ACx the fans its _ALx names come on, switched through their _PR0 power resources and read back from _STA"
+	check_output "$POWER_LOG" "M135-ACPI: ok thermal-release" "below the trips the fans go off and the processor gets its clock back"
+	check_output "$POWER_LOG" "critical temperature reached" "the lane ends past the critical trip, and the kernel says so"
+	check_absent "$POWER_LOG" "the orderly power-off did not finish" "the orderly power-off went through /sbin/poweroff and init, not the kernel's forced fallback"
+	check_absent "$POWER_LOG" "no /sbin/poweroff: powering off now" "userspace had a /sbin/poweroff to run"
+	check_output "$POWER_LOG" "M135-IDLE: driver acpi_idle governor menu states $ACPI_FIXTURE_CST" "the idle states are the firmware's _CST, with its latencies, under the menu governor"
+	check_output "$POWER_LOG" "M135-ACPI: ok runtime-pm" "with power/control=auto an idle NVMe controller autosuspends to D3hot (its PM capability says so) and a read brings it back to D0 and works; control=on keeps it up"
+	check_output "$POWER_LOG" "M135-ACPI: ok idle-cst" "each _CST state publishes its residency, twice its exit latency as Linux's acpi_idle sets it"
+	check_output "$POWER_LOG" "M135-ACPI: ok idle-deep-when-quiet" "a quiet machine sleeps in its deepest state"
+	check_output "$POWER_LOG" "M135-ACPI: ok idle-disable" "stateN/disable takes a state from the governor, which picks the next deepest instead"
+	if grep -aq "M135-IDLE: skip idle-follows-prediction" "$POWER_LOG"; then
 		skipped "M135-ACPI: ok idle-follows-prediction" "the host was too loaded for the paced ping-pong to make short idles (the log gives the mean)"
 	else
-		check_output "$POSIX_LOG" "M135-ACPI: ok idle-follows-prediction" "a CPU woken over and over by a paced pipe ping-pong stops taking its deepest state: the governor predicts short idles from the recent ones"
+		check_output "$POWER_LOG" "M135-ACPI: ok idle-follows-prediction" "a CPU woken over and over by a paced pipe ping-pong stops taking its deepest state: the governor predicts short idles from the recent ones"
 	fi
 fi
 # ── M135: hibernation (the hib instance) ──
@@ -3643,9 +3676,9 @@ fi
 # The posix lane waits for its guest's poweroff -f: QEMU exiting by itself is
 # the firmware's \_S5 reached through PM1 control (M135).
 if [ "$ARCH" = "x86_64" ]; then
-	check_output "$POSIX_LOG" "SMOKE-WATCHDOG: qemu-exited-after-done" "the machine turns itself off through \\_S5 -- here from the critical thermal trip, by way of /sbin/poweroff and init: QEMU exits on its own"
+	check_output "$POWER_LOG" "SMOKE-WATCHDOG: qemu-exited-after-done" "the machine turns itself off through \\_S5 -- here from the critical thermal trip, by way of /sbin/poweroff and init: QEMU exits on its own"
 fi
-check_absent "$POSIX_LOG" "M134-AML: fail" "no AML check failed"
+check_absent "$POWER_LOG" "M134-AML: fail" "no AML check failed"
 
 # M128: the >64 GiB claim, when the bigmem lane ran (SMOKE_BIGMEM=1). The
 # numbers are read from the kernel's own report, and the lane has to reach the
@@ -5013,7 +5046,7 @@ if [ "$BLOCKED" -gt 0 ]; then
 	report_wedged_instances
 fi
 
-for _i in sys sysnet blk posix gfx init switchroot iommu amdvi pku smp kvm; do
+for _i in sys sysnet blk posix power gfx init switchroot iommu amdvi pku smp kvm; do
     rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" \
           "$(disk_img vblk "$_i")" "$(disk_img ahci "$_i")" "$(disk_img btrfs "$_i")" "$(disk_img btrfsz "$_i")" \
           "$(disk_img bcache "$_i")"

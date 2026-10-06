@@ -28,6 +28,7 @@
  * anyway and says that is what happened.
  */
 
+#include <b1nix/bootinfo.h>
 #include <b1nix/suspend.h>
 
 #include <b1nix/arch.h>
@@ -547,7 +548,10 @@ int suspend_enter(const char *state) {
   console_write("\n");
 
   start = ktime_monotonic_ns();
-  target = start + (u64)SUSPEND_MAX_MS * 1000000ull;
+  /* b1nix.suspend-max-ms= lowers it where every second of it is a wait for
+   * a wake that cannot come: a test lane with nobody at the keyboard. */
+  target = start + (u64)bootinfo_get_u32("b1nix.suspend-max-ms", SUSPEND_MAX_MS) *
+                       1000000ull;
 
   for (;;) {
     if (suspend_wake_count() != base_wakes)

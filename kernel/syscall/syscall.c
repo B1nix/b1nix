@@ -282,8 +282,24 @@ static int is_user_range_valid(const void *src, usize size, int write);
  * as a hang that depends on whether the page happened to be present
  * (FreeBSD's vm_fault WITNESS check). */
 static inline void user_copy_assert_may_fault(void) {
-  KASSERT(!current_task || current_task->spin_held == 0,
-          "user copy with %d native spinlock(s) held", current_task->spin_held);
+  struct task *t = current_task;
+
+  if (!t)
+    return;
+  KASSERT(t->spin_held == 0, "user copy with %d native spinlock(s) held",
+          t->spin_held);
+  /* Nor between arming a wait and committing it: the task is already
+   * published as blocked, and a fault taken now cannot sleep for the page it
+   * needs -- a write fault on a shared file mapping went on into the
+   * filesystem's journal and panicked there, far from the copy that did it. */
+  if (__builtin_expect(t->state != TASK_RUNNING, 0)) {
+    /* The copy is usually reached through a poll or wait handler several
+     * frames down; name them before the assertion stops the machine. */
+    console_loglevel_set(CONSOLE_LOGLEVEL_DEFAULT);
+    dump_raw_stack_with_symbols((u64)(usize)__builtin_frame_address(0), 160);
+  }
+  KASSERT(t->state == TASK_RUNNING,
+          "user copy by a task in state %d (a wait is armed)", (int)t->state);
 }
 
 /* Read one aligned user word without letting a fault be serviced: 0, or
