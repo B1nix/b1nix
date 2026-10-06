@@ -8,6 +8,7 @@
  * completed TX buffers and delivers received frames (minus the virtio_net_hdr)
  * to ethernet_receive(); irq_ack() reads the virtio ISR.
  */
+#include <b1nix/kmutex.h>
 #include <b1nix/console.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
@@ -55,8 +56,8 @@ static volatile int vnet_ready;
 static u32 vnet_features;             /* what the host and driver agreed on */
 static usize vnet_hdr_size = sizeof(struct virtio_net_hdr);
 
-static volatile int net_tx_lock = 0;
-static volatile int net_rx_lock = 0;
+static kmutex_t net_tx_lock = KMUTEX_INIT;
+static kmutex_t net_rx_lock = KMUTEX_INIT;
 
 static void **tx_buffers;       /* Pre-allocated TX buffer pool */
 static u8 *tx_inflight;
@@ -173,15 +174,15 @@ static int vnet_transmit(struct netdev *nd, const u8 hdr[14],
 	u8 *buffer = 0;
 	u16 pool_idx = 0;
 	for (int tries = 0; tries < 2; tries++) {
-		while (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+		kmutex_lock(&net_tx_lock);
 		if (tx_pool_count > 0) {
 			tx_pool_count--;
 			pool_idx = tx_pool_free[tx_pool_count];
 			buffer = tx_buffers[pool_idx];
-			__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
+			kmutex_unlock(&net_tx_lock);
 			break;
 		}
-		__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
+		kmutex_unlock(&net_tx_lock);
 		vnet_netdev.poll(&vnet_netdev);
 	}
 	if (!buffer) return -1;
@@ -201,7 +202,7 @@ static int vnet_transmit(struct netdev *nd, const u8 hdr[14],
 	vnet_tx_offload(vhdr, eth_hdr, 14 + payload_len, tx_flags);
 
 	for (int tries = 0; tries < 2; tries++) {
-		while (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+		kmutex_lock(&net_tx_lock);
 
 		u16 d0 = 0xFFFF;
 		for (u16 i = 0; i < net_tx_vq.queue_size; i++) {
@@ -211,7 +212,7 @@ static int vnet_transmit(struct netdev *nd, const u8 hdr[14],
 			}
 		}
 		if (d0 == 0xFFFF) {
-			__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
+			kmutex_unlock(&net_tx_lock);
 			vnet_netdev.poll(&vnet_netdev);
 			continue;
 		}
@@ -229,15 +230,15 @@ static int vnet_transmit(struct netdev *nd, const u8 hdr[14],
 		net_tx_vq.avail->idx++;
 		__asm__ volatile("" ::: "memory");
 		virtq_kick(&net_dev, &net_tx_vq);
-		__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
+		kmutex_unlock(&net_tx_lock);
 		return 0;
 	}
 
 	/* Return buffer to pool on send failure. */
-	while (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+	kmutex_lock(&net_tx_lock);
 	tx_pool_free[tx_pool_count] = pool_idx;
 	tx_pool_count++;
-	__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
+	kmutex_unlock(&net_tx_lock);
 	return -1;
 }
 
@@ -249,7 +250,7 @@ static void vnet_poll(struct netdev *nd)
 	}
 
 	/* Reap completed TX descriptors and return their buffers to the pool. */
-	if (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) {
+	if (!kmutex_trylock(&net_tx_lock)) {
 		return;
 	}
 	/* Bound each drain to queue_size iterations: a malicious/buggy device that
@@ -272,10 +273,10 @@ static void vnet_poll(struct netdev *nd)
 		}
 		net_tx_vq.last_used_idx++;
 	}
-	__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
+	kmutex_unlock(&net_tx_lock);
 
 	/* Don't block if someone else is already polling RX. */
-	if (__atomic_test_and_set(&net_rx_lock, __ATOMIC_ACQUIRE)) return;
+	if (!kmutex_trylock(&net_rx_lock)) return;
 
 	u32 rx_drained = 0;
 	while (net_rx_vq.used->idx != net_rx_vq.last_used_idx &&
@@ -316,7 +317,7 @@ static void vnet_poll(struct netdev *nd)
 		net_rx_vq.last_used_idx++;
 	}
 
-	__atomic_clear(&net_rx_lock, __ATOMIC_RELEASE);
+	kmutex_unlock(&net_rx_lock);
 }
 
 static int vnet_irq_ack(struct netdev *nd)

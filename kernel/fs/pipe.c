@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/kmutex.h>
 #include <b1nix/klog.h>
 #include <b1nix/syscall.h>
 #include <b1nix/vfs.h>
@@ -49,16 +50,16 @@ static isize pipe_read(struct vfs_handle *h, char *buf, usize size) {
   if (!pipe || !pipe->used) return -EIO;
   
   while (1) {
-    while (__atomic_test_and_set(&pipe->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+    kmutex_lock(&pipe->lock);
     if (pipe->size == 0) {
-      if (pipe->writers == 0) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return 0; }
-      if (h->flags & B1NIX_O_NONBLOCK) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EAGAIN; }
-      if (scheduler_signal_pending()) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -ERESTARTSYS; }
+      if (pipe->writers == 0) { kmutex_unlock(&pipe->lock); return 0; }
+      if (h->flags & B1NIX_O_NONBLOCK) { kmutex_unlock(&pipe->lock); return -EAGAIN; }
+      if (scheduler_signal_pending()) { kmutex_unlock(&pipe->lock); return -ERESTARTSYS; }
       interrupts_disable();
       current_task->wait_chan = pipe;
       scheduler_lease_clear_here(__func__);
       current_task->state = TASK_BLOCKED;
-      __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
+      kmutex_unlock(&pipe->lock);
       scheduler_yield();
       interrupts_enable();
       continue;
@@ -72,7 +73,7 @@ static isize pipe_read(struct vfs_handle *h, char *buf, usize size) {
     pipe->read_pos = (pipe->read_pos + 1) % PIPE_BUFFER_SIZE;
   }
   pipe->size -= to_r;
-  __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&pipe->lock);
   
   /* Wake up writers */
   scheduler_wake_all(pipe);
@@ -86,21 +87,21 @@ static isize pipe_write(struct vfs_handle *h, const char *buf, usize size) {
   if (!pipe || !pipe->used) return -EIO;
 
   while (1) {
-    while (__atomic_test_and_set(&pipe->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+    kmutex_lock(&pipe->lock);
     if (pipe->readers == 0) {
-      __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
+      kmutex_unlock(&pipe->lock);
       scheduler_kill(scheduler_get_pid(), SIGPIPE);
       return -EPIPE;
     }
     usize free_space = PIPE_BUFFER_SIZE - pipe->size;
     if (free_space == 0) {
-      if (h->flags & B1NIX_O_NONBLOCK) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EAGAIN; }
-      if (scheduler_signal_pending()) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -ERESTARTSYS; }
+      if (h->flags & B1NIX_O_NONBLOCK) { kmutex_unlock(&pipe->lock); return -EAGAIN; }
+      if (scheduler_signal_pending()) { kmutex_unlock(&pipe->lock); return -ERESTARTSYS; }
       interrupts_disable();
       current_task->wait_chan = pipe;
       scheduler_lease_clear_here(__func__);
       current_task->state = TASK_BLOCKED;
-      __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
+      kmutex_unlock(&pipe->lock);
       scheduler_yield();
       interrupts_enable();
       continue;
@@ -117,7 +118,7 @@ static isize pipe_write(struct vfs_handle *h, const char *buf, usize size) {
   if (to_w)
     pipe->event_gen++;
   pipe->size += to_w;
-  __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&pipe->lock);
   
   /* Wake up readers */
   scheduler_wake_all(pipe);
@@ -150,10 +151,8 @@ isize vfs_pipe_tee(struct vfs_handle *in, struct vfs_handle *out, usize len) {
 
   struct vfs_pipe *first = src < dst ? src : dst;
   struct vfs_pipe *second = src < dst ? dst : src;
-  while (__atomic_test_and_set(&first->lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
-  while (__atomic_test_and_set(&second->lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&first->lock);
+  kmutex_lock(&second->lock);
 
   isize res;
   if (dst->readers == 0) {
@@ -187,8 +186,8 @@ isize vfs_pipe_tee(struct vfs_handle *in, struct vfs_handle *out, usize len) {
   res = (isize)n;
 
 out_unlock:
-  __atomic_clear(&second->lock, __ATOMIC_RELEASE);
-  __atomic_clear(&first->lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&second->lock);
+  kmutex_unlock(&first->lock);
   if (res > 0) {
     scheduler_wake_all(dst);
     scheduler_wake_all(vfs_poll_chan);
@@ -220,7 +219,7 @@ static int pipe_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
 static void pipe_release(struct vfs_handle *h) {
   struct vfs_pipe *pipe = (struct vfs_pipe *)h->private_data;
   if (!pipe) return;
-  while (__atomic_test_and_set(&pipe->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+  kmutex_lock(&pipe->lock);
   /* One end closed twice, or closed by a handle that never counted itself. */
   if (h->kind == VFS_HANDLE_PIPE_READ) {
     KASSERT(pipe->readers > 0, "pipe %p reader closed with no readers",
@@ -251,7 +250,7 @@ static void pipe_release(struct vfs_handle *h) {
     }
     pipe->used = 0;
   }
-  __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&pipe->lock);
   if (doomed) {
     __atomic_sub_fetch(&g_pipe_buffers_held, 1, __ATOMIC_ACQ_REL);
     kfree(doomed); /* outside the pipe lock: kfree can grow the heap */

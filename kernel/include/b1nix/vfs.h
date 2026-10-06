@@ -5,6 +5,7 @@
 #include <b1nix/dirent.h>
 #include <b1nix/posix.h>
 #include <b1nix/types.h>
+#include <b1nix/kmutex.h>
 #include <b1nix/uidgid.h>
 
 #define VFS_MAX_PATH 256
@@ -1145,7 +1146,7 @@ struct vfs_pipe {
    * one that fills an empty pipe: Linux wakes a pipe's pollers on each write,
    * and liburing's poll-mshot-update reads one byte per completion. */
   u32 event_gen;
-  volatile int lock;
+  kmutex_t lock;
 };
 
 /* Datagram queue geometry for UDP, raw and netlink sockets. Linux bounds a

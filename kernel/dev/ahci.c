@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/kmutex.h>
 #include <b1nix/arch.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/ahci.h>
@@ -38,7 +39,7 @@ struct ahci_port_state {
   u64 phys_fis;
   int present;
   int atapi;         // the port answered with the packet-device signature
-  volatile int busy; // yield-safe per-port I/O mutex (see ahci_port_lock)
+  kmutex_t busy; /* per-port I/O mutex (see ahci_port_lock) */
 };
 
 static struct ahci_port_state ports[AHCI_MAX_PORTS];
@@ -52,22 +53,16 @@ static struct ahci_port_state ports[AHCI_MAX_PORTS];
  * re-enter ahci_port_write()/read() and rewrite the in-flight command table,
  * corrupting the command QEMU is still reading (mismatched FIS sector count vs
  * PRDT byte count → ide_dma_cb assert) and silently dropping the swap I/O. This
- * mirrors virtio_blk's busy-flag mutex: spin with scheduler_yield() so we never
- * hold a real spinlock across the blocking DMA wait (CLAUDE.md: never sleep/
- * yield holding a spinlock). __sync_lock_test_and_set gives the SMP-safe
- * atomic claim. */
+ * is a sleeping mutex, as virtio_blk's is, so no spinlock is held across the
+ * blocking DMA wait. */
 static void ahci_port_lock(struct ahci_port_state *port) {
-  while (__sync_lock_test_and_set(&port->busy, 1)) {
-    scheduler_yield();
-  }
   /* Held: a critical section no fatal signal or freezer cuts short while a
-   * command is in flight (see virtio_blk_lock). */
-  scheduler_kcrit_enter();
+   * command is in flight -- kmutex_lock makes it one. */
+  kmutex_lock(&port->busy);
 }
 
 static void ahci_port_unlock(struct ahci_port_state *port) {
-  __sync_lock_release(&port->busy);
-  scheduler_kcrit_leave();
+  kmutex_unlock(&port->busy);
 }
 
 static u64 ahci_pci_bar5 = 0;

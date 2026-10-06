@@ -10,6 +10,8 @@
  */
 
 #include <b1nix/ktime.h>
+#include <b1nix/kmutex.h>
+#include <b1nix/spinlock.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/blk.h>
 #include <b1nix/bootinfo.h>
@@ -219,3 +221,18 @@ EXPORT_SYMBOL(try_module_get);
 EXPORT_SYMBOL(module_put);
 EXPORT_SYMBOL(module_find);
 EXPORT_SYMBOL(module_symbol_lookup);
+
+/* Locks, for modules that take them: the kmutex and the out-of-line half of
+ * the native spinlock (owner tokens, held-lock accounting and witness). */
+EXPORT_SYMBOL(kmutex_lock);
+EXPORT_SYMBOL(kmutex_trylock);
+EXPORT_SYMBOL(kmutex_unlock);
+EXPORT_SYMBOL(kmutex_assert_held);
+EXPORT_SYMBOL(spin_owner_self);
+EXPORT_SYMBOL(spin_note);
+EXPORT_SYMBOL(spin_note_at);
+EXPORT_SYMBOL(spin_lock_stuck);
+EXPORT_SYMBOL(spin_unlock_unheld);
+EXPORT_SYMBOL(spin_unlock_foreign);
+EXPORT_SYMBOL(spin_lock_recursive);
+EXPORT_SYMBOL(spin_assert_held_failed);

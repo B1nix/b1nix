@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/spinlock.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -419,14 +420,11 @@ static void irq_restore(u64 flags) {
 void tlb_shootdown_poll(void);
 
 static void tcp_lock(void) {
-  while (__atomic_test_and_set(&tcp_queue_lock, __ATOMIC_ACQUIRE)) {
-    cpu_relax();
-    tlb_shootdown_poll();
-  }
+  spin_lock(&tcp_queue_lock);
 }
 
 static void tcp_unlock(void) {
-  __atomic_clear(&tcp_queue_lock, __ATOMIC_RELEASE);
+  spin_unlock(&tcp_queue_lock);
 }
 
 static void tcp_free_retransmit_list(struct tcp_retransmit_pkt *head) {

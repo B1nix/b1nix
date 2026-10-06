@@ -20,6 +20,7 @@
  * instead of re-spinning, so a slow (TCG, large-readahead) request costs a
  * context switch instead of an arbitrary polling budget.
  */
+#include <b1nix/kmutex.h>
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
 #include <b1nix/irq.h>
@@ -134,7 +135,7 @@ struct vblk_mmio_instance {
   volatile struct virtio_mmio_regs *regs;
   struct virtqueue vq;
   struct block_device blk;
-  volatile int busy;
+  kmutex_t busy;
   /* Descriptors are handed out from a rolling cursor, never from 0 again:
    * restarting at 0 after a timeout handed the device descriptors it was
    * still reading, and its late completion then landed on the next request's
@@ -164,12 +165,11 @@ static int vblk_mmio_irq(void *ctx) {
 }
 
 static void vblk_lock(struct vblk_mmio_instance *inst) {
-  while (__sync_lock_test_and_set(&inst->busy, 1))
-    scheduler_yield();
+  kmutex_lock(&inst->busy);
 }
 
 static void vblk_unlock(struct vblk_mmio_instance *inst) {
-  __sync_lock_release(&inst->busy);
+  kmutex_unlock(&inst->busy);
 }
 
 /* Same page-boundary-splitting descriptor builder as virtio_blk.c: a region

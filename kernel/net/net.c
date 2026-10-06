@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <stdio.h>
+#include <b1nix/spinlock.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -1496,10 +1497,10 @@ void net_loopback_enqueue(const void *ip_pkt, usize len, int is_v6)
 	if (!copy)
 		return; /* drop on OOM — TCP retransmit recovers */
 	memcpy(copy, ip_pkt, len);
-	while (__atomic_test_and_set(&net_lb_lock, __ATOMIC_ACQUIRE)) { }
+	spin_lock(&net_lb_lock);
 	u32 next = (net_lb_tail + 1) % NET_LOOPBACK_Q;
 	if (next == net_lb_head) { /* full — drop, retransmit recovers */
-		__atomic_clear(&net_lb_lock, __ATOMIC_RELEASE);
+		spin_unlock(&net_lb_lock);
 		kfree(copy);
 		return;
 	}
@@ -1511,7 +1512,7 @@ void net_loopback_enqueue(const void *ip_pkt, usize len, int is_v6)
 	__atomic_fetch_add(&net_lb_enq_seq, 1, __ATOMIC_RELEASE);
 	if (!__atomic_load_n(&net_lb_draining, __ATOMIC_ACQUIRE))
 		kick_net_task = 1;
-	__atomic_clear(&net_lb_lock, __ATOMIC_RELEASE);
+	spin_unlock(&net_lb_lock);
 
 	if (kick_net_task && net_task_id >= 0) {
 		scheduler_wake_task((usize)net_task_id);
@@ -1526,11 +1527,11 @@ void net_loopback_drain(void)
 	}
 	net_lb_owner = current_task;
 	while (1) {
-		while (__atomic_test_and_set(&net_lb_lock, __ATOMIC_ACQUIRE)) { }
+		spin_lock(&net_lb_lock);
 		if (net_lb_head == net_lb_tail) {
 			net_lb_owner = 0;
 			__atomic_clear(&net_lb_draining, __ATOMIC_RELEASE);
-			__atomic_clear(&net_lb_lock, __ATOMIC_RELEASE);
+			spin_unlock(&net_lb_lock);
 			break;
 		}
 		u8 *data = net_loopback_q[net_lb_head].data;
@@ -1538,7 +1539,7 @@ void net_loopback_drain(void)
 		int is_v6 = net_loopback_q[net_lb_head].is_v6;
 		u32 ns = net_loopback_q[net_lb_head].ns;
 		net_lb_head = (net_lb_head + 1) % NET_LOOPBACK_Q;
-		__atomic_clear(&net_lb_lock, __ATOMIC_RELEASE);
+		spin_unlock(&net_lb_lock);
 
 		u32 saved_ns = namespace_net_push_context(ns);
 		if (is_v6)

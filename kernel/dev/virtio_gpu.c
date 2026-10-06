@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/kmutex.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
@@ -1474,18 +1475,17 @@ static int vgpu_sched_ready;
  * than slow: with interrupts off the completion interrupt cannot be delivered
  * and the timer cannot tick, so the wait can only poll and nothing else on the
  * machine runs -- the guest stops dead after the first command the host
- * actually executes. Yielding while waiting keeps the mutual exclusion and lets the
+ * actually executes. A sleeping mutex keeps the mutual exclusion and lets the
  * rest of the system live. */
-static volatile int vgpu_submit_busy;
+static kmutex_t vgpu_submit_busy = KMUTEX_INIT;
 
 static int vgpu_sched_run_job(struct drm_sched_job *job)
 {
     struct vgpu_submit_job *sj = (struct vgpu_submit_job *)job;
 
-    while (__atomic_exchange_n(&vgpu_submit_busy, 1, __ATOMIC_ACQUIRE))
-        scheduler_yield();
+    kmutex_lock(&vgpu_submit_busy);
     sj->result = vgpu_submit_stream_locked(sj->ctx_id, sj->cmd, sj->cmd_bytes);
-    __atomic_store_n(&vgpu_submit_busy, 0, __ATOMIC_RELEASE);
+    kmutex_unlock(&vgpu_submit_busy);
     /* The device round trip completed inside vgpu_submit_stream_locked, so the
      * job is done by the time run_job returns; the scheduler signals the fence
      * with this result. */

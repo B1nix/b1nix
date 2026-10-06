@@ -16,6 +16,7 @@
  * only set a pending flag. All hardware wait loops are bounded so a wedged or
  * absent device can never hang the boot.
  */
+#include <b1nix/kmutex.h>
 #include <b1nix/console.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
@@ -141,8 +142,8 @@ static u64 rx_buf_phys, tx_buf_phys;
 static u8 *rx_buf_virt, *tx_buf_virt;
 static u16 rx_cur, tx_cur;
 
-static volatile int e1000_tx_lock;
-static volatile int e1000_rx_lock;
+static kmutex_t e1000_tx_lock = KMUTEX_INIT;
+static kmutex_t e1000_rx_lock = KMUTEX_INIT;
 
 static struct netdev e1000_netdev;
 static struct mac_addr e1000_mac;
@@ -372,8 +373,7 @@ static int e1000_xmit(const u8 hdr[14], const void *payload, usize plen)
 	if (total > E1000_BUF_SZ)
 		return -1;
 
-	while (__atomic_test_and_set(&e1000_tx_lock, __ATOMIC_ACQUIRE))
-		scheduler_yield();
+	kmutex_lock(&e1000_tx_lock);
 
 	u16 i = tx_cur;
 	/* Wait for this descriptor to drain (bounded). Past the bound the NIC
@@ -387,7 +387,7 @@ static int e1000_xmit(const u8 hdr[14], const void *payload, usize plen)
 		}
 	}
 	if (!drained) {
-		__atomic_clear(&e1000_tx_lock, __ATOMIC_RELEASE);
+		kmutex_unlock(&e1000_tx_lock);
 		return -1;
 	}
 
@@ -407,7 +407,7 @@ static int e1000_xmit(const u8 hdr[14], const void *payload, usize plen)
 	tx_cur = (u16)((i + 1) % E1000_NUM_TX);
 	e1000_write(E1000_TDT, tx_cur);
 
-	__atomic_clear(&e1000_tx_lock, __ATOMIC_RELEASE);
+	kmutex_unlock(&e1000_tx_lock);
 	return 0;
 }
 
@@ -427,7 +427,7 @@ static void e1000_poll(struct netdev *nd)
 	(void)nd;
 	if (!e1000_inited)
 		return;
-	if (__atomic_test_and_set(&e1000_rx_lock, __ATOMIC_ACQUIRE))
+	if (!kmutex_trylock(&e1000_rx_lock))
 		return;
 
 	while (rx_ring[rx_cur].status & RXD_STAT_DD) {
@@ -444,7 +444,7 @@ static void e1000_poll(struct netdev *nd)
 		e1000_write(E1000_RDT, old);
 	}
 
-	__atomic_clear(&e1000_rx_lock, __ATOMIC_RELEASE);
+	kmutex_unlock(&e1000_rx_lock);
 }
 
 /* Interrupts this device has actually raised. Proves at runtime that RX is
@@ -699,8 +699,7 @@ void e1000_selftest(void)
 		return;
 	}
 	/* Prevent the concurrent background net_task poll from stealing packets during the selftest */
-	while (__atomic_test_and_set(&e1000_rx_lock, __ATOMIC_ACQUIRE))
-		scheduler_yield();
+	kmutex_lock(&e1000_rx_lock);
 
 	console_write("M37-E1000: ok init\n");
 
@@ -802,5 +801,5 @@ void e1000_selftest(void)
 		console_write("M37-E1000: FAIL rx-irq (no interrupt serviced)\n");
 	}
 
-	__atomic_clear(&e1000_rx_lock, __ATOMIC_RELEASE);
+	kmutex_unlock(&e1000_rx_lock);
 }

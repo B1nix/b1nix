@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/kmutex.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/ktime.h>
 #include <b1nix/lapic.h>
@@ -63,13 +64,12 @@ struct eventfd_state {
 static u64 efd_lock(struct eventfd_state *e) {
   u64 flags = interrupts_save();
 
-  while (__atomic_test_and_set(&e->lock, __ATOMIC_ACQUIRE))
-    cpu_relax();
+  spin_lock(&e->lock);
   return flags;
 }
 
 static void efd_unlock(struct eventfd_state *e, u64 flags) {
-  __atomic_clear(&e->lock, __ATOMIC_RELEASE);
+  spin_unlock(&e->lock);
   interrupts_restore(flags);
 }
 
@@ -304,7 +304,7 @@ int vfs_eventfd(unsigned int initval, int flags) {
 /* Ids are handed out in sequence and never reused within a boot, which is
  * exactly the promise the id is for. */
 static u64 g_pidfd_next_id = 1;
-static volatile int g_pidfd_id_lock = 0;
+static kmutex_t g_pidfd_id_lock = KMUTEX_INIT;
 
 struct pidfd_state {
   usize pid;
@@ -312,10 +312,9 @@ struct pidfd_state {
 };
 
 static u64 pidfd_alloc_id(void) {
-  while (__atomic_test_and_set(&g_pidfd_id_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&g_pidfd_id_lock);
   u64 id = g_pidfd_next_id++;
-  __atomic_clear(&g_pidfd_id_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&g_pidfd_id_lock);
   return id;
 }
 
@@ -443,7 +442,7 @@ static volatile int g_armed_timerfds = 0;
 
 struct timerfd_state {
   struct timerfd_state *all_next, *all_prev; /* g_timerfds, under g_timerfd_list_lock */
-  volatile int lock;
+  kmutex_t lock;
   int armed;
   int clockid;       /* which clock an ABSTIME deadline is measured against */
   u64 next_tick;     /* absolute tick of the next expiration; 0 = disarmed */
@@ -486,13 +485,12 @@ static volatile u64 g_timerfd_due = ~0ull;
 static u64 timerfd_list_acquire(void) {
   u64 flags = interrupts_save();
   interrupts_disable();
-  while (__atomic_test_and_set(&g_timerfd_list_lock, __ATOMIC_ACQUIRE))
-    ;
+  spin_lock(&g_timerfd_list_lock);
   return flags;
 }
 
 static void timerfd_list_release(u64 flags) {
-  __atomic_clear(&g_timerfd_list_lock, __ATOMIC_RELEASE);
+  spin_unlock(&g_timerfd_list_lock);
   interrupts_restore(flags);
 }
 
@@ -613,12 +611,11 @@ static isize timerfd_read(struct vfs_handle *h, char *buf, usize len) {
   if (!t || len < sizeof(u64))
     return -EINVAL;
   while (1) {
-    while (__atomic_test_and_set(&t->lock, __ATOMIC_ACQUIRE))
-      scheduler_yield();
+    kmutex_lock(&t->lock);
     timerfd_advance(t);
     if (t->expirations != 0)
       break;
-    __atomic_clear(&t->lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&t->lock);
     if (h->flags & B1NIX_O_NONBLOCK)
       return -EAGAIN;
     if (scheduler_signal_pending())
@@ -630,7 +627,7 @@ static isize timerfd_read(struct vfs_handle *h, char *buf, usize len) {
   }
   u64 out = t->expirations;
   t->expirations = 0;
-  __atomic_clear(&t->lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&t->lock);
   timerfd_trace("read", t->clockid, out, t->next_tick, t->interval_ticks);
   memcpy(buf, &out, sizeof(u64));
   return (isize)sizeof(u64);
@@ -810,10 +807,9 @@ int vfs_timerfd_gettime(int fd, struct b1nix_itimerspec *cur) {
   struct timerfd_state *t = (struct timerfd_state *)h->private_data;
   if (!t)
     return -EINVAL;
-  while (__atomic_test_and_set(&t->lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&t->lock);
   timerfd_current_locked(t, cur);
-  __atomic_clear(&t->lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&t->lock);
   return 0;
 }
 
@@ -943,8 +939,7 @@ int vfs_timerfd_settime(int fd, int flags,
     }
   }
 
-  while (__atomic_test_and_set(&t->lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&t->lock);
 
   if (old_value)
     timerfd_current_locked(t, old_value);
@@ -978,7 +973,7 @@ int vfs_timerfd_settime(int fd, int flags,
       __atomic_add_fetch(&g_armed_timerfds, 1, __ATOMIC_RELAXED);
     timerfd_note_deadline(t->next_tick);
   }
-  __atomic_clear(&t->lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&t->lock);
   timerfd_trace(disarm ? "disarm" : (flags & B1NIX_TFD_TIMER_ABSTIME) ? "arm-abs"
                                                                      : "arm-rel",
                 t->clockid, value, t->next_tick, interval);
@@ -1177,7 +1172,7 @@ struct epoll_old_table {
 };
 
 struct epoll_state {
-  volatile int lock;
+  kmutex_t lock;
   struct epoll_watch *watch;
   int capacity;
   struct epoll_old_table *retired;
@@ -1388,8 +1383,7 @@ int vfs_epoll_ctl(int epfd, int op, int fd, struct b1nix_epoll_event *event) {
     return -EBADF;
 
   int rc = 0;
-  while (__atomic_test_and_set(&ep->lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&ep->lock);
 
   /* Find an existing registration for fd.
    *
@@ -1485,7 +1479,7 @@ int vfs_epoll_ctl(int epfd, int op, int fd, struct b1nix_epoll_event *event) {
     break;
   }
 
-  __atomic_clear(&ep->lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&ep->lock);
   return rc;
 }
 

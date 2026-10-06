@@ -18,6 +18,7 @@
  *
  * Polling driver: net_task pumps poll() ~100 Hz (RX interrupts are masked).
  */
+#include <b1nix/spinlock.h>
 #include <b1nix/console.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
@@ -241,8 +242,7 @@ static int r8169_xmit(const u8 hdr[14], const void *payload, usize plen)
 	if (total > R8169_BUF_SZ)
 		return -1;
 
-	while (__atomic_test_and_set(&r8169_tx_lock, __ATOMIC_ACQUIRE))
-		r8169_relax();
+	spin_lock(&r8169_tx_lock);
 
 	/* Wait (bounded) for the current descriptor to be free (OWN clear).
 	 * The bound is a real time budget (~10 ms), not an arbitrary iteration
@@ -255,7 +255,7 @@ static int r8169_xmit(const u8 hdr[14], const void *payload, usize plen)
 		r_udelay(1);
 	}
 	if (!ok) {
-		__atomic_clear(&r8169_tx_lock, __ATOMIC_RELEASE);
+		spin_unlock(&r8169_tx_lock);
 		return -1;
 	}
 
@@ -274,7 +274,7 @@ static int r8169_xmit(const u8 hdr[14], const void *payload, usize plen)
 	r_w8(R_TXPOLL, TXPOLL_NPQ);          /* kick the normal-priority queue */
 
 	tx_cur = (u16)((tx_cur + 1) % R8169_NUM_TX);
-	__atomic_clear(&r8169_tx_lock, __ATOMIC_RELEASE);
+	spin_unlock(&r8169_tx_lock);
 	return 0;
 }
 
@@ -293,7 +293,7 @@ static void r8169_poll(struct netdev *nd)
 	(void)nd;
 	if (!r8169_inited)
 		return;
-	if (__atomic_test_and_set(&r8169_rx_lock, __ATOMIC_ACQUIRE))
+	if (!spin_trylock(&r8169_rx_lock))
 		return;
 
 	int budget = R8169_NUM_RX * 2;       /* bound the drain per poll */
@@ -318,7 +318,7 @@ static void r8169_poll(struct netdev *nd)
 	}
 
 	r_w16(R_ISR, 0xFFFF);                 /* ack any pending RX/TX causes */
-	__atomic_clear(&r8169_rx_lock, __ATOMIC_RELEASE);
+	spin_unlock(&r8169_rx_lock);
 }
 
 static int r8169_irq_ack(struct netdev *nd)

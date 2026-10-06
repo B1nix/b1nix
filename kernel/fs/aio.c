@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/kmutex.h>
 #include <b1nix/klog.h>
 #include <b1nix/aio.h>
 #include <b1nix/errno.h>
@@ -27,7 +28,7 @@ struct aio_context {
   u32 cq_head;
   u32 cq_tail;
   struct aio_request **completed;
-  volatile int lock;
+  kmutex_t lock;
   /* R3-11: the worker thread looks a ctx up by task and uses it after dropping
    * the list lock, while the owner's aio_task_cleanup may free it concurrently.
    * `refcount` counts transient holders (only the worker takes one); `dying` is
@@ -40,20 +41,19 @@ struct aio_context {
 
 static struct aio_request *aio_pending_head = 0;
 static struct aio_request *aio_pending_tail = 0;
-static volatile int aio_pending_lock = 0;
+static kmutex_t aio_pending_lock = KMUTEX_INIT;
 static char aio_worker_chan;
 static int aio_worker_created = 0;
 static int aio_worker_started = 0;
 static struct aio_context *aio_ctx_list = 0;
-static volatile int aio_ctx_list_lock = 0;
+static kmutex_t aio_ctx_list_lock = KMUTEX_INIT;
 
 static void aio_ctx_list_acquire(void) {
-  while (__atomic_test_and_set(&aio_ctx_list_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&aio_ctx_list_lock);
 }
 
 static void aio_ctx_list_release(void) {
-  __atomic_clear(&aio_ctx_list_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&aio_ctx_list_lock);
 }
 
 static struct aio_context *aio_ctx_find_by_task(struct task *owner) {
@@ -122,21 +122,19 @@ static void aio_ctx_list_remove(struct aio_context *ctx) {
 }
 
 static void aio_ctx_acquire(struct aio_context *ctx) {
-  while (__atomic_test_and_set(&ctx->lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&ctx->lock);
 }
 
 static void aio_ctx_release(struct aio_context *ctx) {
-  __atomic_clear(&ctx->lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&ctx->lock);
 }
 
 static void aio_pending_acquire(void) {
-  while (__atomic_test_and_set(&aio_pending_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&aio_pending_lock);
 }
 
 static void aio_pending_release(void) {
-  __atomic_clear(&aio_pending_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&aio_pending_lock);
 }
 
 static u32 aio_cq_count_locked(const struct aio_context *ctx) {

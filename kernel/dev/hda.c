@@ -17,6 +17,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <b1nix/kmutex.h>
 #include <b1nix/console.h>
 #include <b1nix/ktime.h>
 #include <b1nix/sound.h>
@@ -225,7 +226,7 @@ static u64 hda_rirb_phys;
 static u16 hda_corb_wp;
 
 /* Output stream state */
-static volatile int hda_play_lock;
+static kmutex_t hda_play_lock = KMUTEX_INIT;
 
 /* VFS /dev/dsp node */
 static struct sound_device hda_sound_dev;
@@ -889,8 +890,7 @@ static int hda_resume(void *ctx) {
 	(void)ctx;
 	if (!hda_inited)
 		return 0;
-	while (__sync_lock_test_and_set(&hda_play_lock, 1))
-		scheduler_yield();
+	kmutex_lock(&hda_play_lock);
 	hda_controller_reset();
 	/* The codec announces itself in STATESTS when it is ready for verbs. The
 	 * fixed millisecond after reset is the earliest that can happen, not a
@@ -909,13 +909,13 @@ static int hda_resume(void *ctx) {
 			console_write("hda: codec did not come back after the resume\n");
 	}
 	if (hda_program_corb_rirb() < 0) {
-		__sync_lock_release(&hda_play_lock);
+		kmutex_unlock(&hda_play_lock);
 		return -EIO;
 	}
 	if (hda_output_nid)
 		hda_configure_output();
 	hda_program_stream();
-	__sync_lock_release(&hda_play_lock);
+	kmutex_unlock(&hda_play_lock);
 	return 0;
 }
 
@@ -926,13 +926,12 @@ static isize hda_dsp_write(struct vfs_node *node, u64 offset, const char *buffer
 	if (!hda_inited) return -1;
 
 	/* Serialize writes via a spin flag */
-	while (__sync_lock_test_and_set(&hda_play_lock, 1))
-		scheduler_yield();
+	kmutex_lock(&hda_play_lock);
 
 	/* If no codec is present, just accept the data (playback won't produce
 	 * audible output but the syscall succeeds so userspace doesn't hang). */
 	if (!hda_output_nid) {
-		__sync_lock_release(&hda_play_lock);
+		kmutex_unlock(&hda_play_lock);
 		return (isize)size;
 	}
 
@@ -1009,7 +1008,7 @@ static isize hda_dsp_write(struct vfs_node *node, u64 offset, const char *buffer
 		 * and saying they were is the lie that made a silent card look like
 		 * a working one. */
 		if (!played) {
-			__sync_lock_release(&hda_play_lock);
+			kmutex_unlock(&hda_play_lock);
 			return written ? (isize)written : -EIO;
 		}
 
@@ -1017,7 +1016,7 @@ static isize hda_dsp_write(struct vfs_node *node, u64 offset, const char *buffer
 		avail   -= chunk;
 	}
 
-	__sync_lock_release(&hda_play_lock);
+	kmutex_unlock(&hda_play_lock);
 	return (isize)written;
 }
 
@@ -1047,11 +1046,10 @@ static isize hda_sound_write(struct sound_device *dev, const void *buf, usize le
 	(void)dev;
 	if (!hda_inited) return -1;
 
-	while (__sync_lock_test_and_set(&hda_play_lock, 1))
-		scheduler_yield();
+	kmutex_lock(&hda_play_lock);
 
 	if (!hda_output_nid) {
-		__sync_lock_release(&hda_play_lock);
+		kmutex_unlock(&hda_play_lock);
 		return (isize)len;
 	}
 
@@ -1080,7 +1078,7 @@ static isize hda_sound_write(struct sound_device *dev, const void *buf, usize le
 		written += chunk;
 	}
 
-	__sync_lock_release(&hda_play_lock);
+	kmutex_unlock(&hda_play_lock);
 	return (isize)written;
 }
 

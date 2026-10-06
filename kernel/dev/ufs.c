@@ -40,6 +40,7 @@
  * an ext filesystem labelled `b1nix-root` — i.e. one b1nix itself put there.
  */
 
+#include <b1nix/kmutex.h>
 #include <b1nix/blk.h>
 #include <b1nix/bootmark.h>
 #include <b1nix/bootinfo.h>
@@ -164,7 +165,7 @@ struct ufs_host {
 	u32 cap;
 	u64 utrl_phys, utmrl_phys, ucd_phys, bounce_phys;
 	u8 *utrl, *ucd, *bounce;
-	volatile int io_busy;
+	kmutex_t io_busy;
 	u32 index;              /* ufs<N>, for messages */
 	int quiet;              /* probing LUNs that may not exist */
 	u32 bounce_bytes;       /* DMA bounce buffer size */
@@ -480,13 +481,12 @@ static int scsi_exec(struct ufs_host *h, u8 lun, const u8 *cdb, u32 cdb_len,
 
 static void ufs_io_lock(struct ufs_host *h)
 {
-	while (__sync_lock_test_and_set(&h->io_busy, 1))
-		scheduler_yield();
+	kmutex_lock(&h->io_busy);
 }
 
 static void ufs_io_unlock(struct ufs_host *h)
 {
-	__sync_lock_release(&h->io_busy);
+	kmutex_unlock(&h->io_busy);
 }
 
 /* ── Block device ────────────────────────────────────────────────────────── */
@@ -1203,7 +1203,7 @@ void ufs_log_panic_flush(void)
 	struct block_device *disk = blk_partition_parent(g_log_part);
 	struct ufs_lu *lu = disk ? (struct ufs_lu *)disk->priv : 0;
 
-	if (!lu || __atomic_load_n(&lu->host->io_busy, __ATOMIC_ACQUIRE))
+	if (!lu || __atomic_load_n(&lu->host->io_busy.owner, __ATOMIC_ACQUIRE))
 		return;
 	memcpy(buf, zone, size);
 	g_log_part->write_blocks(g_log_part, g_log_sector, size / 512, buf);
@@ -1231,7 +1231,9 @@ void ufs_log_reboot_flush(void)
 		arch_udelay(100);
 	if (rd(lu->host, REG_UTRLDBR) & 1u)
 		return;
-	__sync_lock_release(&lu->host->io_busy);
+	/* Taken over, not unlocked: the holder is a parked CPU's task that will
+	 * never run again, so the owner check an unlock makes cannot hold. */
+	__atomic_store_n(&lu->host->io_busy.owner, 0, __ATOMIC_RELEASE);
 	memcpy(buf, zone, size);
 	g_log_part->write_blocks(g_log_part, g_log_sector, size / 512, buf);
 }

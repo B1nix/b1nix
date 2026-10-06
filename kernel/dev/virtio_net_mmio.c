@@ -14,6 +14,7 @@
  * extra num_buffers field), so its length is decided per device rather than by
  * sizeof(struct virtio_net_hdr).
  */
+#include <b1nix/kmutex.h>
 #include <b1nix/console.h>
 #include <b1nix/irq.h>
 #include <b1nix/mm.h>
@@ -90,8 +91,8 @@ static struct virtqueue g_rx_vq;
 static struct virtqueue g_tx_vq;
 static usize g_hdr_len = VNET_HDR_MODERN;
 static volatile int g_ready;
-static volatile int g_tx_lock;
-static volatile int g_rx_lock;
+static kmutex_t g_tx_lock = KMUTEX_INIT;
+static kmutex_t g_rx_lock = KMUTEX_INIT;
 
 static void **tx_buffers;  /* one page each, pre-allocated */
 static u8 *tx_inflight;
@@ -190,16 +191,15 @@ static int vnet_transmit(struct netdev *nd, const u8 hdr[14],
   u8 *buffer = 0;
   u16 pool_idx = 0;
   for (int tries = 0; tries < 2; tries++) {
-    while (__atomic_test_and_set(&g_tx_lock, __ATOMIC_ACQUIRE))
-      scheduler_yield();
+    kmutex_lock(&g_tx_lock);
     if (tx_pool_count > 0) {
       tx_pool_count--;
       pool_idx = tx_pool_free[tx_pool_count];
       buffer = tx_buffers[pool_idx];
-      __atomic_clear(&g_tx_lock, __ATOMIC_RELEASE);
+      kmutex_unlock(&g_tx_lock);
       break;
     }
-    __atomic_clear(&g_tx_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&g_tx_lock);
     g_netdev.poll(&g_netdev); /* reap completions and retry once */
   }
   if (!buffer)
@@ -210,8 +210,7 @@ static int vnet_transmit(struct netdev *nd, const u8 hdr[14],
   memcpy(buffer + g_hdr_len + 14, payload, payload_len);
 
   for (int tries = 0; tries < 2; tries++) {
-    while (__atomic_test_and_set(&g_tx_lock, __ATOMIC_ACQUIRE))
-      scheduler_yield();
+    kmutex_lock(&g_tx_lock);
 
     u16 d0 = 0xFFFF;
     for (u16 i = 0; i < g_tx_vq.queue_size; i++) {
@@ -221,7 +220,7 @@ static int vnet_transmit(struct netdev *nd, const u8 hdr[14],
       }
     }
     if (d0 == 0xFFFF) {
-      __atomic_clear(&g_tx_lock, __ATOMIC_RELEASE);
+      kmutex_unlock(&g_tx_lock);
       g_netdev.poll(&g_netdev);
       continue;
     }
@@ -239,14 +238,13 @@ static int vnet_transmit(struct netdev *nd, const u8 hdr[14],
     g_tx_vq.avail->idx++;
     __sync_synchronize();
     vnet_kick(1);
-    __atomic_clear(&g_tx_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&g_tx_lock);
     return 0;
   }
 
-  while (__atomic_test_and_set(&g_tx_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&g_tx_lock);
   tx_pool_free[tx_pool_count++] = pool_idx;
-  __atomic_clear(&g_tx_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&g_tx_lock);
   return -1;
 }
 
@@ -257,7 +255,7 @@ static void vnet_poll(struct netdev *nd) {
 
   /* Reap finished transmits. Bounded by queue_size so a device that keeps
    * used->idx ahead of us can never spin here holding the lock. */
-  if (!__atomic_test_and_set(&g_tx_lock, __ATOMIC_ACQUIRE)) {
+  if (kmutex_trylock(&g_tx_lock)) {
     u32 drained = 0;
     while (g_tx_vq.used && g_tx_vq.used->idx != g_tx_vq.last_used_idx &&
            drained < g_tx_vq.queue_size) {
@@ -272,10 +270,10 @@ static void vnet_poll(struct netdev *nd) {
       }
       g_tx_vq.last_used_idx++;
     }
-    __atomic_clear(&g_tx_lock, __ATOMIC_RELEASE);
+    kmutex_unlock(&g_tx_lock);
   }
 
-  if (__atomic_test_and_set(&g_rx_lock, __ATOMIC_ACQUIRE))
+  if (!kmutex_trylock(&g_rx_lock))
     return;
   u32 rx_drained = 0;
   while (g_rx_vq.used->idx != g_rx_vq.last_used_idx &&
@@ -298,7 +296,7 @@ static void vnet_poll(struct netdev *nd) {
     }
     g_rx_vq.last_used_idx++;
   }
-  __atomic_clear(&g_rx_lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&g_rx_lock);
 }
 
 static int vnet_irq_ack(struct netdev *nd) {

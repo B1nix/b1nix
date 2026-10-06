@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/kmutex.h>
 #include <b1nix/klog.h>
 #include <b1nix/console.h>
 #include <stdio.h>
@@ -168,7 +169,7 @@ struct unix_socket_data {
    * already answered. */
   int peer_wr_shut;
 
-  volatile int lock;
+  kmutex_t lock;
   /* Lifetime: a unix_socket_data outlives its own socket as long as a PEER (or
    * a listener backlog slot) still points at it. Each such pointer is a counted
    * reference; the struct is freed when the count hits 0. This is what makes
@@ -178,11 +179,11 @@ struct unix_socket_data {
 };
 
 static void unix_lock(struct unix_socket_data *u) {
-  while (__atomic_test_and_set(&u->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+  kmutex_lock(&u->lock);
 }
 
 static void unix_unlock(struct unix_socket_data *u) {
-  __atomic_clear(&u->lock, __ATOMIC_RELEASE);
+  kmutex_unlock(&u->lock);
 }
 
 /* Connections waiting on a listening socket to be accepted. */

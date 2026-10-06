@@ -3,6 +3,7 @@
 #define B1NIX_VIRTIO_9P_H
 
 #include <b1nix/types.h>
+#include <b1nix/kmutex.h>
 #include <b1nix/virtio.h>
 
 #define VIRTIO_9P_DEVICE_ID_LEGACY 0x1009
@@ -173,7 +174,7 @@ struct virtio_9p_dev {
     u8 *resp_buf;
     u64 req_buf_phys;
     u64 resp_buf_phys;
-    volatile int busy;
+    kmutex_t busy;
 };
 
 /* Serialization / Deserialization buffer helper */

@@ -12,6 +12,7 @@
  * hw/audio/ac97.c). AC'97 mixer volume fields are attenuation: 0 = full
  * volume; bit 15 of each volume register is the mute flag.
  */
+#include <b1nix/kmutex.h>
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
@@ -89,7 +90,7 @@ static u8  *ac97_dma_buf;
 static u32 ac97_dma_buf_sz;
 static u64 ac97_bdl_phys;
 
-static volatile int ac97_play_lock;
+static kmutex_t ac97_play_lock = KMUTEX_INIT;
 
 static int ac97_vol_left = 100;
 static int ac97_vol_right = 100;
@@ -269,8 +270,7 @@ static isize ac97_sound_write(struct sound_device *dev, const void *buf,
 	if (!ac97_inited)
 		return -1;
 
-	while (__sync_lock_test_and_set(&ac97_play_lock, 1))
-		scheduler_yield();
+	kmutex_lock(&ac97_play_lock);
 
 	usize written = 0;
 	while (written < len) {
@@ -286,7 +286,7 @@ static isize ac97_sound_write(struct sound_device *dev, const void *buf,
 		written += chunk;
 	}
 
-	__sync_lock_release(&ac97_play_lock);
+	kmutex_unlock(&ac97_play_lock);
 	return (isize)written;
 }
 

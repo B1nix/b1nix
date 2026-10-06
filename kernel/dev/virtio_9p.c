@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/kmutex.h>
 #include <b1nix/virtio_9p.h>
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
@@ -19,15 +20,11 @@ static struct virtio_9p_dev g_p9_devs[MAX_VIRTIO_9P_DEVS];
 static int g_p9_dev_count = 0;
 
 void virtio_9p_lock(struct virtio_9p_dev *p9dev) {
-  while (__sync_lock_test_and_set(&p9dev->busy, 1)) {
-    scheduler_yield();
-  }
-  scheduler_kcrit_enter();
+  kmutex_lock(&p9dev->busy); /* the holder is a kernel critical section */
 }
 
 void virtio_9p_unlock(struct virtio_9p_dev *p9dev) {
-  __sync_lock_release(&p9dev->busy);
-  scheduler_kcrit_leave();
+  kmutex_unlock(&p9dev->busy);
 }
 
 struct virtio_9p_dev *virtio_9p_find_by_tag(const char *tag) {

@@ -7,6 +7,7 @@
  * as procfs (see kernel/fs/proc/procfs.c for the rationale on node type).
  */
 
+#include <b1nix/spinlock.h>
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -657,8 +658,7 @@ static void sysfs_block_refresh(void) {
   if (gen == __atomic_load_n(&g_sysfs_blk_gen, __ATOMIC_ACQUIRE))
     return;
 
-  while (__sync_lock_test_and_set(&g_sysfs_blk_lock, 1))
-    ;
+  spin_lock(&g_sysfs_blk_lock);
   if (gen != g_sysfs_blk_gen) {
     __atomic_store_n(&g_sysfs_blk_gen, gen, __ATOMIC_RELEASE);
     usize n = blk_count();
@@ -673,7 +673,7 @@ static void sysfs_block_refresh(void) {
         sysfs_block_publish(i, d);
     }
   }
-  __sync_lock_release(&g_sysfs_blk_lock);
+  spin_unlock(&g_sysfs_blk_lock);
 }
 
 /* The block layer telling sysfs that the registry moved.

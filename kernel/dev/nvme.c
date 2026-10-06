@@ -1,4 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/kmutex.h>
+#include <b1nix/klog.h>
 #include <b1nix/ktime.h>
 #include <b1nix/arch.h>
 #include <b1nix/kprintf.h>
@@ -100,7 +102,7 @@ struct nvme_device {
     struct block_device blk_dev;
     char blk_name[16];
     u16 cid_counter;
-    volatile int io_busy; // yield-safe I/O-path mutex (see nvme_io_lock)
+    kmutex_t io_busy; /* I/O-path mutex (see nvme_io_lock) */
     volatile u64 io_owner; // pid holding io_busy, for the stall report
 
     /* M98: message-signalled completions. use_msix is set once the controller's
@@ -133,51 +135,15 @@ static usize nvme_controller_count;
 extern u64 g_nvme_io_submits, g_nvme_io_completions;
 
 static void nvme_io_lock(struct nvme_device *dev) {
-    u64 start_ns = ktime_monotonic_ns();
-    int reported = 0;
-
-    while (__sync_lock_test_and_set(&dev->io_busy, 1)) {
-        /* A yield-spin on a flag nothing ever releases is indistinguishable
-         * from a wedged machine: the waiter stays READY, prints nothing, and
-         * the lane dies on the harness timeout with no evidence at all. Name
-         * the task that took it and never gave it back.
-         *
-         * On WALL CLOCK, not on a spin count -- the same correction the
-         * completion wait below already carries, and for the same reason. Every
-         * iteration here ends in scheduler_yield(), which costs a whole tick
-         * once the scheduler is up, so the old count of 200,000 meant something
-         * like 2000 seconds: twenty times the harness's patience, so the report
-         * could never fire and every wedge involving this mutex arrived with no
-         * evidence. Five seconds is far beyond any honest NVMe command. */
-        if (!reported && ktime_monotonic_ns() - start_ns > 5000000000ull) {
-            reported = 1;
-            console_write("nvme: io mutex held by pid ");
-            console_write_dec(dev->io_owner);
-            console_write(" for over 5s; waiter pid ");
-            console_write_dec(current_task ? (u64)current_task->id : 0);
-            console_write(" submits=");
-            console_write_dec(g_nvme_io_submits);
-            console_write(" completions=");
-            console_write_dec(g_nvme_io_completions);
-            console_write("\n");
-        }
-        scheduler_yield();
-    }
+    /* A kmutex: the holder is a kernel critical section (neither a fatal
+     * signal nor the freezer takes it mid-command) and the waiters sleep. */
+    kmutex_lock(&dev->io_busy);
     dev->io_owner = current_task ? (u64)current_task->id : 0;
-    /* Held, so a critical section: neither a fatal signal nor the freezer
-     * takes the task until the command it is about to issue has completed
-     * (the guard goes up after the wait, as in virtio_blk_lock). */
-    scheduler_kcrit_enter();
-}
-
-static void nvme_io_release(struct nvme_device *dev) {
-    dev->io_owner = 0;
-    __sync_lock_release(&dev->io_busy);
 }
 
 static void nvme_io_unlock(struct nvme_device *dev) {
-    nvme_io_release(dev);
-    scheduler_kcrit_leave();
+    dev->io_owner = 0;
+    kmutex_unlock(&dev->io_busy);
 }
 
 /* Called from the exit path with the dying task's id.
@@ -203,16 +169,14 @@ void nvme_release_io_lock_of(u64 pid)
 {
     struct nvme_device *dev = &nvme;
 
-    if (!pid || !dev->io_busy || dev->io_owner != pid)
-        return;
-    console_write("nvme: task ");
-    console_write_dec(pid);
-    console_write(" exited holding the io mutex (submits=");
-    console_write_dec(g_nvme_io_submits);
-    console_write(" completions=");
-    console_write_dec(g_nvme_io_completions);
-    console_write("); releasing it\n");
-    nvme_io_release(dev); /* the owner's guard went with it */
+    /* The holder is in a kernel critical section and cannot be killed while
+     * it holds the mutex, so a task that exits holding it is a kernel bug,
+     * not a leak to tidy up. */
+    KASSERT(!pid || !dev->io_busy.owner || dev->io_owner != pid,
+            "nvme: task %lu exited holding the io mutex (submits=%lu "
+            "completions=%lu)", (unsigned long)pid,
+            (unsigned long)g_nvme_io_submits,
+            (unsigned long)g_nvme_io_completions);
 }
 
 /* M70: I/O completion interrupt handler. Runs in IRQ context. The controller's
@@ -414,7 +378,7 @@ void nvme_debug_dump(void)
 	console_write(" msix=");
 	console_write_dec((u64)dev->use_msix);
 	console_write(" busy=");
-	console_write_dec((u64)dev->io_busy);
+	console_write_dec(dev->io_busy.owner != 0);
 	console_write(" owner=");
 	console_write_dec(dev->io_owner);
 	console_write(" wait_since_ms=");

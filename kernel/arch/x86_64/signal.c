@@ -227,8 +227,25 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
  * chance — and only when nothing was delivered, which is the case Linux calls
  * restore_saved_sigmask(). */
 static void arch_deliver_signals_body(struct interrupt_frame *frame);
+static void arch_check_and_deliver_signals_inner(struct interrupt_frame *frame);
 
 void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
+  /* On the way back to user mode the interrupt, if this is the end of one,
+   * has been handled: delivering a signal -- an exit included -- is the
+   * task's own work, not an interrupt handler's. */
+  int user = frame && (frame->cs == 0x1B || frame->cs == 0x23);
+  int irq_nest = 0;
+
+  if (user && current_task) {
+    irq_nest = current_task->irq_nest;
+    current_task->irq_nest = 0;
+  }
+  arch_check_and_deliver_signals_inner(frame);
+  if (user && current_task)
+    current_task->irq_nest = irq_nest;
+}
+
+static void arch_check_and_deliver_signals_inner(struct interrupt_frame *frame) {
   arch_deliver_signals_body(frame);
   /* Every return to user mode passes here: put back key rights a kernel copy
    * had to clear (arch_pkru_kernel_fault). */

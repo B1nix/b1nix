@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/spinlock.h>
 #include <b1nix/ktime.h>
 #include <b1nix/rtc.h>
 #include <b1nix/console.h>
@@ -4064,8 +4065,7 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
 static volatile int procfs_refresh_lock;
 
 static void procfs_refresh(struct vfs_node *root) {
-  while (__sync_lock_test_and_set(&procfs_refresh_lock, 1))
-    ;
+  spin_lock(&procfs_refresh_lock);
   u32 pidns = procfs_pidns_of(root);
   usize slots = scheduler_task_slots();
   for (usize i = 0; i < slots; i++) {
@@ -4081,7 +4081,7 @@ static void procfs_refresh(struct vfs_node *root) {
       continue;
     procfs_make_piddir(root, name, 0 /* derive from name */);
   }
-  __sync_lock_release(&procfs_refresh_lock);
+  spin_unlock(&procfs_refresh_lock);
 }
 
 /* A numbered directory is listed only while the instance's namespace still

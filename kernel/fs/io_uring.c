@@ -66,6 +66,7 @@
  * IORING_OFF_CQ_RING / IORING_OFF_SQES arrive at that callback unchanged.
  */
 
+#include <b1nix/kmutex.h>
 #include <b1nix/io_uring.h>
 #include <b1nix/tracepoint.h>
 #include <b1nix/net.h>
@@ -237,9 +238,9 @@ struct iou_zcrx {
   u64 rq_addr;      /* the refill ring, in the program's address space */
   u32 rq_entries;
   u32 rq_head;      /* the next refill entry this side takes */
-  /* Held across reads of the program's memory, which may fault: a flag
-   * waited on by yielding, not a spinlock (see iou_zcrx_lock). */
-  volatile int busy;
+  /* Held across reads of the program's memory, which may fault: a sleeping
+   * mutex, not a spinlock (see iou_zcrx_lock). */
+  kmutex_t busy;
 };
 
 #define IOU_ZCRX_RQ_HEAD 0u   /* offsetof(struct io_uring, head) */
@@ -407,7 +408,7 @@ struct iou_req {
 struct io_ring_ctx {
   struct io_ring_ctx *next; /* g_ctx_list */
   volatile int refs;        /* the handle holds one, the inode holds one */
-  volatile int lock;
+  kmutex_t lock;
 
   usize owner_tgid;
 
@@ -466,7 +467,7 @@ struct io_ring_ctx {
    * the two CPUs happened to run. The order requests are served in is part of
    * the interface, so the serving is serialised even though the picking is
    * already safe. */
-  volatile int sweeping;
+  kmutex_t sweeping;
   volatile usize sweeper;
   u32 nr_live;
   u32 nr_deferred; /* requests in IOU_ST_DEFERRED */
@@ -611,40 +612,33 @@ static struct io_ring_ctx *g_ctx_list;
 /* Rings alive: the gate on the syscall-exit work below, so a machine with no
  * rings pays one load per system call for it. */
 static int g_iou_nr_rings;
-static volatile int g_ctx_list_lock;
+static kmutex_t g_ctx_list_lock = KMUTEX_INIT;
 
-/* These locks spin with a yield, so their holder can be preempted -- and a
- * SIGKILL is acted on at the preemption point unless the task is inside a
- * kernel critical section (scheduler_kcrit_enter). A thread killed while
- * holding one left it held by a task that no longer existed, and every later
- * system call of every io_uring user spun on it: an exit_group of a threaded
- * test took the whole machine with it. The kill waits for the unlock. */
+/* Sleeping mutexes. A SIGKILL is acted on at a preemption point unless the
+ * task is inside a kernel critical section, and a thread killed while holding
+ * one of these once left it held by a task that no longer existed: an
+ * exit_group of a threaded test took the whole machine with it. A kmutex's
+ * holder is in such a section for as long as it holds it. */
 static void iou_list_lock(void) {
-  scheduler_kcrit_enter();
-  while (__atomic_test_and_set(&g_ctx_list_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&g_ctx_list_lock);
 }
 
 static void iou_list_unlock(void) {
-  __atomic_clear(&g_ctx_list_lock, __ATOMIC_RELEASE);
-  scheduler_kcrit_leave();
+  kmutex_unlock(&g_ctx_list_lock);
 }
 
-/* The per-ring lock is a plain spin-with-yield, like the rest of this file's
- * neighbours (aio.c, eventpoll.c). No interrupt handler ever takes it: a ring
+/* The per-ring lock, a kmutex like the rest of this file's neighbours (aio.c,
+ * eventpoll.c). No interrupt handler ever takes it: a ring
  * is only ever touched by the task that owns it and by a teardown, so there is
  * nothing for spin_lock_irqsave to protect against here. Nothing sleeps while
  * it is held — the issue paths take it, drop it, do the I/O, and take it again
  * to post. */
 static void iou_lock(struct io_ring_ctx *ctx) {
-  scheduler_kcrit_enter(); /* see iou_list_lock */
-  while (__atomic_test_and_set(&ctx->lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&ctx->lock);
 }
 
 static void iou_unlock(struct io_ring_ctx *ctx) {
-  __atomic_clear(&ctx->lock, __ATOMIC_RELEASE);
-  scheduler_kcrit_leave();
+  kmutex_unlock(&ctx->lock);
 }
 
 extern volatile u64 g_vfs_poll_seq;
@@ -1998,17 +1992,13 @@ static struct iou_zcrx *iou_zcrx_of(struct io_ring_ctx *ctx, u32 id) {
 
 /* The queue's own lock. Taking a page out of the refill ring reads the
  * program's memory and may fault, which must not happen under the ring's
- * spinlock; this is a flag waited on by yielding, held inside a kcrit section
- * so a SIGKILL cannot leave it held (the lesson of iou_list_lock). */
+ * spinlock; this is a sleeping mutex instead (see iou_list_lock). */
 static void iou_zcrx_lock(struct iou_zcrx *z) {
-  scheduler_kcrit_enter();
-  while (__atomic_exchange_n(&z->busy, 1, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&z->busy);
 }
 
 static void iou_zcrx_unlock(struct iou_zcrx *z) {
-  __atomic_store_n(&z->busy, 0, __ATOMIC_RELEASE);
-  scheduler_kcrit_leave();
+  kmutex_unlock(&z->busy);
 }
 
 /* Take back what the program returned through the refill ring. An entry that
@@ -4278,13 +4268,11 @@ static int iou_progress(struct io_ring_ctx *ctx) {
 
   /* Already sweeping this ring, one frame down: nothing to do here, and
    * certainly not a second pass over the same list. */
-  if (__atomic_load_n(&ctx->sweeping, __ATOMIC_ACQUIRE) &&
+  if (__atomic_load_n(&ctx->sweeping.owner, __ATOMIC_ACQUIRE) &&
       __atomic_load_n(&ctx->sweeper, __ATOMIC_ACQUIRE) == me)
     return 0;
   /* The sweep is a lock too: see iou_list_lock. */
-  scheduler_kcrit_enter();
-  while (__atomic_test_and_set(&ctx->sweeping, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+  kmutex_lock(&ctx->sweeping);
   __atomic_store_n(&ctx->sweeper, me, __ATOMIC_RELEASE);
   now = ktime_monotonic_ns();
 
@@ -4548,8 +4536,7 @@ static int iou_progress(struct io_ring_ctx *ctx) {
   }
 
   __atomic_store_n(&ctx->sweeper, 0, __ATOMIC_RELEASE);
-  __atomic_clear(&ctx->sweeping, __ATOMIC_RELEASE);
-  scheduler_kcrit_leave();
+  kmutex_unlock(&ctx->sweeping);
   if (did)
     scheduler_wake_all(ctx);
   /* The owner has just done the work the flag was asking for, and the next
@@ -5783,7 +5770,12 @@ static void iou_crossring_kick(struct io_ring_ctx *ctx) {
 void io_uring_dump_state(void) {
   int nctx = 0;
 
-  iou_list_lock();
+  /* Called from the hang watchdog, which runs in the timer interrupt: it may
+   * not sleep for the list, and a list somebody holds is itself the answer. */
+  if (!kmutex_trylock(&g_ctx_list_lock)) {
+    console_write("io_uring: ring list busy\n");
+    return;
+  }
   for (struct io_ring_ctx *c = g_ctx_list; c; c = c->next) {
     int armed = 0;
 
@@ -5867,7 +5859,7 @@ void io_uring_dump_state(void) {
       console_write("\n");
     }
   }
-  iou_list_unlock();
+  kmutex_unlock(&g_ctx_list_lock);
   if (!nctx)
     console_write("io_uring: no rings\n");
 }

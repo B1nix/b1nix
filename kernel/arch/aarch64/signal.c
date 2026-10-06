@@ -194,7 +194,26 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
   frame->x2 = uc_addr;
 }
 
+static void arch_check_and_deliver_signals_inner(struct interrupt_frame *frame);
+
+/* On the way back to EL0 the interrupt, if this is the end of one, has been
+ * handled: delivering a signal -- an exit included -- is the task's own work,
+ * not an interrupt handler's. */
 void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
+  struct task *t = current_task;
+  int irq_nest;
+
+  if (!t || !frame || (frame->spsr & 0xFULL) != 0) {
+    arch_check_and_deliver_signals_inner(frame);
+    return;
+  }
+  irq_nest = t->irq_nest;
+  t->irq_nest = 0;
+  arch_check_and_deliver_signals_inner(frame);
+  t->irq_nest = irq_nest;
+}
+
+static void arch_check_and_deliver_signals_inner(struct interrupt_frame *frame) {
   if (!current_task || !frame)
     return;
   /* Only a frame returning to EL0 can carry a signal handler. SPSR_EL1.M[3:0]

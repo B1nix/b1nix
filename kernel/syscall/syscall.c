@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/kmutex.h>
 #include <b1nix/ktime.h>
 #include <b1nix/arch.h>
 #include <b1nix/acpi_event.h>
@@ -5681,7 +5682,7 @@ static u64 sys_mremap(void *old_addr, usize old_len, usize new_len, int flags,
  * indexed by hashing that frame, so unrelated spaces almost never collide, and
  * when they do the cost is the old behaviour for those two alone. */
 #define VMA_LOCK_SLOTS 16
-static volatile int g_vma_mutex[VMA_LOCK_SLOTS];
+static kmutex_t g_vma_mutex[VMA_LOCK_SLOTS];
 
 /* Who holds each slot.
  *
@@ -5708,68 +5709,28 @@ static unsigned vma_lock_slot(void) {
  * address space mid-call, and recomputing would then unlock a different one. */
 static unsigned vma_mutator_lock(void) {
   unsigned slot = vma_lock_slot();
-  unsigned long spins = 0;
 
-  while (__sync_lock_test_and_set(&g_vma_mutex[slot], 1)) {
-    scheduler_yield();
-    /* Say who is being waited for, once, before the wait becomes a hang that
-     * has to be diagnosed from the outside. The count is generous: a mutator
-     * can legitimately block on frame reclaim or writeback while holding this,
-     * and yields are cheap. */
-    if (++spins == 2000000ul) {
-      struct task *owner = g_vma_mutex_owner[slot];
-
-      console_write("vma: mutator lock slot ");
-      console_write_dec(slot);
-      console_write(" held for a very long time by ");
-      if (owner) {
-        console_write(owner->name ? owner->name : "?");
-        console_write(" pid ");
-        console_write_dec(owner->id);
-        console_write(" state ");
-        console_write_dec((u64)owner->state);
-      } else {
-        console_write("nobody on record");
-      }
-      console_write("; waiter pid ");
-      console_write_dec(current_task ? current_task->id : 0);
-      console_write("\n");
-      /* The owner's pid and state say that it is stuck, and nothing about
-       * where. The task dump names the syscall every task is in and the
-       * channel it is waiting on, so the one line that reports the stall also
-       * carries the answer — the alternative is a guest that has gone silent
-       * and a second run with an instrument added. Printed once, with the
-       * warning, for the same reason the warning is printed once. */
-      scheduler_dump_tasks();
-    }
-  }
+  /* A kmutex: waiters sleep, and the holder is a kernel critical section, so
+   * neither exit_group nor a fatal signal ends it with the slot held. */
+  kmutex_lock(&g_vma_mutex[slot]);
   __atomic_store_n(&g_vma_mutex_owner[slot], current_task, __ATOMIC_RELEASE);
   return slot;
 }
 static void vma_mutator_unlock(unsigned slot) {
   __atomic_store_n(&g_vma_mutex_owner[slot], 0, __ATOMIC_RELEASE);
-  __sync_lock_release(&g_vma_mutex[slot]);
+  kmutex_unlock(&g_vma_mutex[slot]);
 }
 
-/* Give back any address-space mutex this task still holds.
- *
- * Called from the exit path. A task that dies inside mmap — killed by the
- * group leader's exit_group, or by a fault — would otherwise leave the slot
- * set forever. */
+/* Called from the exit path. The holder cannot die holding a slot (see
+ * vma_mutator_lock), so a slot still recorded as this task's is a kernel bug,
+ * not a leak to tidy up. */
 void syscall_release_vma_locks(struct task *t) {
   if (!t)
     return;
-  for (unsigned i = 0; i < VMA_LOCK_SLOTS; i++) {
-    struct task *owner =
-        __atomic_load_n(&g_vma_mutex_owner[i], __ATOMIC_ACQUIRE);
-    if (owner != t)
-      continue;
-    __atomic_store_n(&g_vma_mutex_owner[i], 0, __ATOMIC_RELEASE);
-    __sync_lock_release(&g_vma_mutex[i]);
-    console_write("vma: released a mutator lock left held by a dying task, pid ");
-    console_write_dec(t->id);
-    console_write("\n");
-  }
+  for (unsigned i = 0; i < VMA_LOCK_SLOTS; i++)
+    KASSERT(__atomic_load_n(&g_vma_mutex_owner[i], __ATOMIC_ACQUIRE) != t,
+            "vma: pid %lu exited holding mutator lock slot %u",
+            (unsigned long)t->id, i);
 }
 
 /* The key a mapping ends up with after mprotect (Linux's

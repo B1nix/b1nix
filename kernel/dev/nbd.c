@@ -18,6 +18,7 @@
  * would buy nothing until there is an asynchronous path to feed it.
  */
 
+#include <b1nix/kmutex.h>
 #include <b1nix/blk.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/errno.h>
@@ -59,7 +60,7 @@ struct nbd_device {
 	struct vfs_handle *io_sock;
 	/* One request on the stream at a time. Two interleaved their requests
 	 * and their replies, and a READ's payload landed in the other's buffer. */
-	volatile int req_busy;
+	kmutex_t req_busy;
 	u64 handle_seq;
 	spinlock_t lock;
 	int used;
@@ -165,8 +166,7 @@ static int nbd_request(struct nbd_device *nd, u32 type, u64 offset, u32 len,
 	u64 flags;
 	int rc;
 
-	while (__atomic_test_and_set(&nd->req_busy, __ATOMIC_ACQUIRE))
-		scheduler_yield();
+	kmutex_lock(&nd->req_busy);
 	spin_lock_irqsave(&nd->lock, &flags);
 	u64 handle = ++nd->handle_seq;
 	nd->io_sock = nd->sock;
@@ -174,14 +174,14 @@ static int nbd_request(struct nbd_device *nd, u32 type, u64 offset, u32 len,
 		vfs_handle_retain(nd->io_sock);
 	spin_unlock_irqrestore(&nd->lock, flags);
 	if (!nd->io_sock && !nd->conn) {
-		__atomic_clear(&nd->req_busy, __ATOMIC_RELEASE);
+		kmutex_unlock(&nd->req_busy);
 		return -1;
 	}
 	rc = nbd_exchange(nd, type, handle, offset, len, rbuf, wbuf);
 	if (nd->io_sock)
 		vfs_handle_release(nd->io_sock);
 	nd->io_sock = 0;
-	__atomic_clear(&nd->req_busy, __ATOMIC_RELEASE);
+	kmutex_unlock(&nd->req_busy);
 	return rc;
 }
 

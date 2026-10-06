@@ -108,7 +108,7 @@ static void m26_diag_task(void) {
  * second, and holds the bucket only across the chain edit itself — never
  * across writeback, which drops pc_lock and blocks on I/O.
  */
-static volatile int *pc_bucket;
+static spinlock_t *pc_bucket;
 
 /* Interrupts off while a bucket is held, for the same reason the cache-wide
  * lock masks them.
@@ -120,8 +120,6 @@ static volatile int *pc_bucket;
  * The section is a few pointer reads; masking costs nothing and removes the
  * only way it can be interrupted. */
 static u64 lock_bucket(u32 h) {
-  extern void tlb_shootdown_poll(void);
-
   /* Preemption off, interrupts on.
    *
    * The holder must not be descheduled — a CPU inside the cache-wide lock can
@@ -129,18 +127,13 @@ static u64 lock_bucket(u32 h) {
    * Masking interrupts would do it too, but this section sits on the lookup
    * path of every read in the system, and the machine still needs its timer. */
   scheduler_preempt_disable();
-  while (__sync_lock_test_and_set(&pc_bucket[h], 1)) {
-    while (pc_bucket[h]) {
-      cpu_relax();
-      tlb_shootdown_poll();
-    }
-  }
+  spin_lock(&pc_bucket[h]);
   return 0;
 }
 
 static void unlock_bucket(u32 h, u64 flags) {
   (void)flags;
-  __sync_lock_release(&pc_bucket[h]);
+  spin_unlock(&pc_bucket[h]);
   scheduler_preempt_enable();
 }
 

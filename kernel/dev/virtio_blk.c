@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <b1nix/kmutex.h>
 #include <b1nix/arch.h>
 #include <b1nix/blk.h>
 #include <b1nix/arch.h>
@@ -66,7 +67,7 @@ struct virtio_blk_instance {
   struct virtio_device dev;
   struct virtqueue vq;
   struct block_device blk;
-  volatile int busy;
+  kmutex_t busy;
   /* What the device and the driver both agreed to, not what either wished for. */
   u32 features;
   /* Largest number of 512-byte blocks one request may carry. Derived from the
@@ -125,29 +126,20 @@ void virtio_blk_lock_stats(u64 *free_now, u64 *waited, u64 *yields) {
 }
 
 static void virtio_blk_lock(struct virtio_blk_instance *inst) {
-  /* The guard goes up AFTER the lock is held, not before.
-   *
-   * Waiting for the lock is not a critical section — nothing is held yet, and
-   * a task killed here leaves nothing behind. Raising the guard around the wait
-   * instead made a task that merely wanted the disk unkillable for as long as
-   * somebody else had it: the fatal signal stayed pending, the loop kept
-   * yielding, and `timeout` could not end the process it was watching. */
-  if (!__sync_lock_test_and_set(&inst->busy, 1)) {
+  /* A kmutex: the waiters sleep, and the holder is a kernel critical section
+   * only once it holds the lock -- a task merely waiting for the disk stays
+   * killable. */
+  if (kmutex_trylock(&inst->busy)) {
     vblk_lock_uncontended++;
-    scheduler_kcrit_enter();
     return;
   }
   vblk_lock_waited++;
-  do {
-    vblk_lock_yields++;
-    scheduler_yield();
-  } while (__sync_lock_test_and_set(&inst->busy, 1));
-  scheduler_kcrit_enter();
+  vblk_lock_yields++;
+  kmutex_lock(&inst->busy);
 }
 
 static void virtio_blk_unlock(struct virtio_blk_instance *inst) {
-  __sync_lock_release(&inst->busy);
-  scheduler_kcrit_leave();
+  kmutex_unlock(&inst->busy);
 }
 
 /* M70: completion interrupt handler. Runs in IRQ context — read the device ISR
