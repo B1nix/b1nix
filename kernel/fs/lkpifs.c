@@ -35,7 +35,20 @@
 struct lkpifs_node {
 	void *handle;             /* the imported filesystem's dentry */
 	const char *linux_name;   /* which type, for diagnostics */
+	struct lkpifs_node *prev, *next; /* g_lkpifs_nodes */
 };
+
+/*
+ * Every node's handle, wherever the node is. An unmount has to release them
+ * all before the imported filesystem goes, and the tree under the mount does
+ * not reach them all: a file unlinked while open, or still held by the page
+ * cache, has left the tree and keeps its handle until its last holder goes.
+ * Its dentry, negative by then, still holds its parent, and the parent the
+ * grandparent: the unmount freed a superblock under a chain of dentries --
+ * apt's scratch files in /tmp and /var did it on every install.
+ */
+static struct lkpifs_node *g_lkpifs_nodes;
+static spinlock_t g_lkpifs_nodes_lock = SPINLOCK_INIT;
 
 static void lkpifs_release(struct vfs_node *node);
 
@@ -239,8 +252,16 @@ static void install_ops(struct vfs_node *node, void *handle,
 	struct lkpifs_node *info = kzalloc(sizeof(*info));
 
 	if (info) {
+		u64 flags;
+
 		info->handle = handle;
 		info->linux_name = linux_name;
+		spin_lock_irqsave(&g_lkpifs_nodes_lock, &flags);
+		info->next = g_lkpifs_nodes;
+		if (g_lkpifs_nodes)
+			g_lkpifs_nodes->prev = info;
+		g_lkpifs_nodes = info;
+		spin_unlock_irqrestore(&g_lkpifs_nodes_lock, flags);
 		node->inode->data = info;
 		/* Not VFS_NODE_OWNS_DATA: the handle has to be released to the
 		 * imported filesystem before the memory goes, which is what
@@ -398,17 +419,8 @@ static struct vfs_node *lkpifs_mount_type(const char *linux_name,
 	return root;
 }
 
-/*
- * Release the imported filesystem's handles held by this subtree.
- *
- * Every node materialised under the mount keeps a dentry of the imported
- * filesystem alive, and those nodes outlive the unmount: b1nix frees them with
- * the rest of its tree afterwards. The imported side must not be unmounted
- * while its dentries are still referenced — an inode whose last reference has
- * not gone never reaches evict_inode, so a file unlinked during the session
- * stayed on ext4's orphan list with its bitmap bit set and no deletion time,
- * which the host's e2fsck reports as a deleted inode with zero dtime.
- */
+/* The handles of the nodes under `node`, for an unmount that leaves the
+ * superblock to other mounts. */
 static void lkpifs_release_subtree(struct vfs_node *node)
 {
 	struct vfs_node *child;
@@ -424,6 +436,46 @@ static void lkpifs_release_subtree(struct vfs_node *node)
 			lkpi_bridge_put(info->handle);
 			info->handle = 0;
 		}
+	}
+}
+
+/*
+ * Release every handle on the superblock `root` belongs to, but the root's
+ * own, which belongs to the mount. Only for its last mount: other mounts of
+ * the same superblock -- btrfs subvolumes -- hold handles on it too.
+ *
+ * Every node materialised under the mount keeps a dentry of the imported
+ * filesystem alive, and those nodes outlive the unmount: b1nix frees them with
+ * the rest of its tree afterwards. The imported side must not be unmounted
+ * while its dentries are still referenced -- an inode whose last reference has
+ * not gone never reaches evict_inode, so a file unlinked during the session
+ * stayed on ext4's orphan list with its bitmap bit set and no deletion time,
+ * which the host's e2fsck reports as a deleted inode with zero dtime.
+ */
+static void lkpifs_release_handles(struct lkpifs_node *root)
+{
+	void *sb = lkpi_bridge_sb(root->handle);
+
+	if (!sb)
+		return;
+	for (;;) {
+		struct lkpifs_node *n;
+		void *h = 0;
+		u64 flags;
+
+		/* One at a time: the put may evict, which sleeps. */
+		spin_lock_irqsave(&g_lkpifs_nodes_lock, &flags);
+		for (n = g_lkpifs_nodes; n; n = n->next) {
+			if (n != root && n->handle && lkpi_bridge_sb(n->handle) == sb) {
+				h = n->handle;
+				n->handle = 0;
+				break;
+			}
+		}
+		spin_unlock_irqrestore(&g_lkpifs_nodes_lock, flags);
+		if (!h)
+			return;
+		lkpi_bridge_put(h);
 	}
 }
 
@@ -452,8 +504,12 @@ static int lkpifs_umount(struct vfs_node *root)
 	if (!info)
 		return 0;
 	lkpifs_flush_subtree(root);
-	for (child = root->first_child; child; child = child->next_sibling)
-		lkpifs_release_subtree(child);
+	if (lkpi_bridge_last_mount(info->handle)) {
+		lkpifs_release_handles(info);
+	} else {
+		for (child = root->first_child; child; child = child->next_sibling)
+			lkpifs_release_subtree(child);
+	}
 	handle = info->handle;
 	info->handle = 0;
 	if (handle) {
@@ -1034,6 +1090,18 @@ static void lkpifs_release(struct vfs_node *node)
 	if (!info)
 		return;
 	node->inode->data = 0;
+	{
+		u64 flags;
+
+		spin_lock_irqsave(&g_lkpifs_nodes_lock, &flags);
+		if (info->prev)
+			info->prev->next = info->next;
+		else
+			g_lkpifs_nodes = info->next;
+		if (info->next)
+			info->next->prev = info->prev;
+		spin_unlock_irqrestore(&g_lkpifs_nodes_lock, flags);
+	}
 	if (info->handle)
 		lkpi_bridge_put(info->handle);
 	kfree(info);

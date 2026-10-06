@@ -376,6 +376,14 @@ void generic_shutdown_super(struct super_block *sb)
 		/* Cached inodes kept past their last reference: write, then evict,
 		 * as upstream's sync_filesystem + evict_inodes do here. */
 		sync_inodes_sb(sb);
+		/*
+		 * No longer active from here on, before evict_inodes and put_super,
+		 * as upstream orders it: iput keeps an unreferenced inode cached
+		 * only on an active superblock. Cleared after put_super, the inodes
+		 * put_super itself releases -- ext4's journal and quota inodes,
+		 * vfat's FAT inode -- stayed cached on a superblock about to be freed.
+		 */
+		sb->s_flags &= ~SB_ACTIVE;
 		evict_inodes(sb);
 		/*
 		 * put_super belongs inside this branch, exactly as upstream has it.
@@ -386,6 +394,34 @@ void generic_shutdown_super(struct super_block *sb)
 		 */
 		if (sb->s_op && sb->s_op->put_super)
 			sb->s_op->put_super(sb);
+		/*
+		 * Upstream's "Busy inodes after unmount". The superblock is freed
+		 * next, and an inode still on its list will reach it again on its
+		 * last iput -- unlinking itself from a list head that by then belongs
+		 * to whatever reused the memory. The next mount found its own inode
+		 * list rewritten under it.
+		 */
+		if (!list_empty(&sb->s_inodes)) {
+			struct inode *inode;
+
+			list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+				struct dentry *alias;
+
+				printk(KERN_ERR "VFS: busy inode %lu count %d state 0x%lx nlink %u on %s (%s)\n",
+				       inode->i_ino, atomic_read(&inode->i_count),
+				       (unsigned long)inode->i_state, inode->i_nlink,
+				       sb->s_id, sb->s_type ? sb->s_type->name : "?");
+				/* Who holds it: a dentry still naming the inode, and
+				 * that dentry's own count and place in the tree. */
+				hlist_for_each_entry(alias, &inode->i_dentry, d_u)
+					printk(KERN_ERR "VFS:   alias '%s' count %d parent '%s'\n",
+					       alias->d_name.name ? (const char *)alias->d_name.name : "",
+					       (int)alias->d_lockref.count,
+					       alias->d_parent && alias->d_parent->d_name.name ?
+					       (const char *)alias->d_parent->d_name.name : "");
+			}
+			panic("VFS: busy inodes after unmount");
+		}
 	}
 	sb->s_flags &= ~SB_ACTIVE;
 	mutex_lock(&sb_instances_lock);
@@ -1232,9 +1268,11 @@ struct dentry *mount_subtree(struct vfsmount *mnt, const char *path)
 		return d;
 	}
 
-	/* The dentry outlives the vfsmount, so it takes its own reference before
-	 * the mount is dropped. */
-	dget(root);
+	/* The mount's reference on its root passes to the caller with the
+	 * dentry, as its hold on the superblock does. Taking another here and
+	 * freeing the mount without dropping its own leaked one per mount of a
+	 * whole btrfs filesystem: the root inode was still referenced when the
+	 * superblock was freed, and the unmount found it busy. */
 	kfree(mnt);
 	return root;
 }

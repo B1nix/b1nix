@@ -98,6 +98,10 @@ void remove_inode_hash(struct inode *inode)
 	if (!hlist_unhashed(&inode->i_hash))
 		hlist_del_init(&inode->i_hash);
 	spin_unlock_irqrestore(&inode_hash_lock, flags);
+	/* A lookup that found it going waits for exactly this (see
+	 * inode_get_or_wait_locked). It re-searches and never touches the inode. */
+	if (inode->i_state & (I_FREEING | I_WILL_FREE))
+		lkpi_wake_all(inode);
 }
 
 /* ── allocation ─────────────────────────────────────────────────── */
@@ -169,6 +173,38 @@ void inode_init_once(struct inode *inode)
  * would leave every field around it uninitialised — which the first
  * BTRFS_I(inode) dereference then reads.
  */
+/*
+ * The filesystem's teardown of an inode, then its memory, as upstream's
+ * destroy_inode: destroy_inode first when there is one, and free_inode after
+ * it when there is that too. A filesystem with both -- ext4 and btrfs -- had
+ * only the first called, so no inode of theirs was ever freed.
+ */
+static void i_callback(struct rcu_head *head)
+{
+	struct inode *inode = container_of(head, struct inode, i_rcu);
+
+	if (inode->free_inode)
+		inode->free_inode(inode);
+	else
+		kfree(inode);
+}
+
+static void destroy_inode(struct inode *inode)
+{
+	const struct super_operations *ops = inode->i_sb ? inode->i_sb->s_op : NULL;
+
+	if (ops && ops->destroy_inode) {
+		ops->destroy_inode(inode);
+		if (!ops->free_inode)
+			return;
+	}
+	/* After a grace period, as upstream: a path walk or an alias search
+	 * under rcu_read_lock may still be looking at it. The function is kept
+	 * in the inode because the superblock may be gone by then. */
+	inode->free_inode = ops ? ops->free_inode : NULL;
+	call_rcu(&inode->i_rcu, i_callback);
+}
+
 static struct inode *alloc_inode(struct super_block *sb)
 {
 	struct inode *inode;
@@ -183,17 +219,44 @@ static struct inode *alloc_inode(struct super_block *sb)
 	return inode;
 }
 
+/*
+ * The superblock's inode list has one lock, the superblock's own, as upstream.
+ * Adds used to happen under inode_hash_lock on the iget paths and under this
+ * one in new_inode, so two inserts on one superblock could interleave: the
+ * list head ended up naming an inode whose own links said it was alone, and
+ * the next list_del of it was list corruption.
+ */
+static void inode_sb_list_add(struct inode *inode)
+{
+	struct super_block *sb = inode->i_sb;
+	unsigned long flags;
+
+	if (!sb)
+		return;
+	spin_lock_irqsave(&sb->s_inode_list_lock, flags);
+	list_add(&inode->i_sb_list, &sb->s_inodes);
+	spin_unlock_irqrestore(&sb->s_inode_list_lock, flags);
+}
+
+static void inode_sb_list_del(struct inode *inode)
+{
+	struct super_block *sb = inode->i_sb;
+	unsigned long flags;
+
+	if (!sb)
+		return;
+	spin_lock_irqsave(&sb->s_inode_list_lock, flags);
+	if (!list_empty(&inode->i_sb_list))
+		list_del_init(&inode->i_sb_list);
+	spin_unlock_irqrestore(&sb->s_inode_list_lock, flags);
+}
+
 struct inode *new_inode(struct super_block *sb)
 {
 	struct inode *inode = alloc_inode(sb);
 
-	if (inode && sb) {
-		unsigned long flags;
-
-		spin_lock_irqsave(&sb->s_inode_list_lock, flags);
-		list_add(&inode->i_sb_list, &sb->s_inodes);
-		spin_unlock_irqrestore(&sb->s_inode_list_lock, flags);
-	}
+	if (inode)
+		inode_sb_list_add(inode);
 	return inode;
 }
 
@@ -230,6 +293,37 @@ static struct inode *find_inode_locked(struct super_block *sb,
 		return inode;
 	}
 	return NULL;
+}
+
+/*
+ * Take a reference on an inode a lookup found, unless it is on its way out.
+ * Then the lookup must not touch it -- evict is already freeing it -- and
+ * waits until evict has taken it out of the hash, then searches again, as
+ * upstream's __wait_on_freeing_inode does. Called with inode_hash_lock held;
+ * returns 0 with the reference taken and the lock still held, or 1 with the
+ * lock released after the wait.
+ *
+ * The test and the increment are one step under i_lock, the lock iput holds
+ * while the count reaches zero and the inode is marked going. Handing out a
+ * going inode was a use-after-free: btrfs found an inode the unmount was
+ * evicting, took a reference, and its iput evicted the inode a second time
+ * through a delayed node already freed.
+ */
+static int inode_get_or_wait_locked(struct inode *inode, unsigned long flags)
+{
+	spin_lock(&inode->i_lock);
+	if (!(inode->i_state & (I_FREEING | I_WILL_FREE))) {
+		atomic_inc(&inode->i_count);
+		spin_unlock(&inode->i_lock);
+		return 0;
+	}
+	spin_unlock(&inode->i_lock);
+	/* Armed under the hash lock, so the wake after the unhash cannot fall
+	 * between the test and the sleep. */
+	lkpi_wait_prepare(inode);
+	spin_unlock_irqrestore(&inode_hash_lock, flags);
+	lkpi_wait_commit();
+	return 1;
 }
 
 /*
@@ -279,7 +373,8 @@ again:
 	spin_lock_irqsave(&inode_hash_lock, flags);
 	inode = find_inode_locked(sb, ino, NULL, NULL, ino);
 	if (inode) {
-		atomic_inc(&inode->i_count);
+		if (inode_get_or_wait_locked(inode, flags))
+			goto again;
 		spin_unlock_irqrestore(&inode_hash_lock, flags);
 		wait_on_inode_new(inode);
 		return inode;
@@ -302,17 +397,12 @@ again:
 		/* Somebody inserted the same inode while we allocated. Theirs wins —
 		 * it may already be locked by its creator. */
 		spin_unlock_irqrestore(&inode_hash_lock, flags);
-		if (sb && sb->s_op && sb->s_op->destroy_inode)
-			sb->s_op->destroy_inode(inode);
-		else
-			kfree(inode);
+		destroy_inode(inode);
 		goto again;
 	}
 	hlist_add_head(&inode->i_hash, &inode_hashtable[inode_hash(sb, ino)]);
-	if (sb) {
-		list_add(&inode->i_sb_list, &sb->s_inodes);
-	}
 	spin_unlock_irqrestore(&inode_hash_lock, flags);
+	inode_sb_list_add(inode);
 	return inode;
 }
 
@@ -328,7 +418,8 @@ again:
 	spin_lock_irqsave(&inode_hash_lock, flags);
 	inode = find_inode_locked(sb, hashval, test, data, 0);
 	if (inode) {
-		atomic_inc(&inode->i_count);
+		if (inode_get_or_wait_locked(inode, flags))
+			goto again;
 		spin_unlock_irqrestore(&inode_hash_lock, flags);
 		wait_on_inode_new(inode);
 		return inode;
@@ -343,26 +434,19 @@ again:
 	 * btrfs's location, for instance — and must run before it is published,
 	 * or `test` will not recognise it. */
 	if (set && set(inode, data)) {
-		if (sb && sb->s_op && sb->s_op->destroy_inode)
-			sb->s_op->destroy_inode(inode);
-		else
-			kfree(inode);
+		destroy_inode(inode);
 		return NULL;
 	}
 
 	spin_lock_irqsave(&inode_hash_lock, flags);
 	if (find_inode_locked(sb, hashval, test, data, 0)) {
 		spin_unlock_irqrestore(&inode_hash_lock, flags);
-		if (sb && sb->s_op && sb->s_op->destroy_inode)
-			sb->s_op->destroy_inode(inode);
-		else
-			kfree(inode);
+		destroy_inode(inode);
 		goto again;
 	}
 	hlist_add_head(&inode->i_hash, &inode_hashtable[inode_hash(sb, hashval)]);
-	if (sb)
-		list_add(&inode->i_sb_list, &sb->s_inodes);
 	spin_unlock_irqrestore(&inode_hash_lock, flags);
+	inode_sb_list_add(inode);
 	return inode;
 }
 
@@ -372,10 +456,13 @@ struct inode *ilookup(struct super_block *sb, unsigned long ino)
 	unsigned long flags;
 
 	inode_hash_init();
+again:
 	spin_lock_irqsave(&inode_hash_lock, flags);
 	inode = find_inode_locked(sb, ino, NULL, NULL, ino);
-	if (inode)
-		atomic_inc(&inode->i_count);
+	if (inode) {
+		if (inode_get_or_wait_locked(inode, flags))
+			goto again;
+	}
 	spin_unlock_irqrestore(&inode_hash_lock, flags);
 	if (inode)
 		wait_on_inode_new(inode);
@@ -389,10 +476,13 @@ struct inode *ilookup5(struct super_block *sb, unsigned long hashval,
 	unsigned long flags;
 
 	inode_hash_init();
+again:
 	spin_lock_irqsave(&inode_hash_lock, flags);
 	inode = find_inode_locked(sb, hashval, test, data, 0);
-	if (inode)
-		atomic_inc(&inode->i_count);
+	if (inode) {
+		if (inode_get_or_wait_locked(inode, flags))
+			goto again;
+	}
 	spin_unlock_irqrestore(&inode_hash_lock, flags);
 	if (inode)
 		wait_on_inode_new(inode);
@@ -479,7 +569,7 @@ void ihold(struct inode *inode)
 {
 	int old = __atomic_fetch_add(&inode->i_count.counter, 1, __ATOMIC_RELAXED);
 
-	if (__builtin_expect(old <= 0, 0))
+	if (__builtin_expect(old <= 0 || (inode->i_state & I_CLEAR), 0))
 		lkpi_refcount_bug("ihold", inode, old);
 }
 
@@ -512,8 +602,12 @@ void clear_inode(struct inode *inode)
  * lock is what guarantees it is not. */
 void __iget(struct inode *inode)
 {
-	if (inode)
+	if (inode) {
+		if (inode->i_state & I_CLEAR)
+			lkpi_refcount_bug("__iget of an evicted inode", inode,
+			                  atomic_read(&inode->i_count));
 		atomic_inc(&inode->i_count);
+	}
 }
 
 static void evict(struct inode *inode)
@@ -522,6 +616,18 @@ static void evict(struct inode *inode)
 	unsigned long flags;
 
 	spin_lock_irqsave(&inode->i_lock, flags);
+	/* Upstream's BUG_ON(inode->i_state & I_CLEAR): an inode is evicted once.
+	 * A second eviction runs the filesystem's teardown again -- btrfs puts
+	 * its root a second time and frees it under every other inode of it. */
+	if (inode->i_state & I_CLEAR) {
+		char line[96];
+
+		snprintf(line, sizeof(line), "lkpi: inode %lu evicted twice", inode->i_ino);
+		spin_unlock_irqrestore(&inode->i_lock, flags);
+		printk(KERN_ERR "%s\n", line);
+		dump_stack();
+		panic("lkpi: an inode evicted twice");
+	}
 	inode->i_state |= I_FREEING;
 	spin_unlock_irqrestore(&inode->i_lock, flags);
 
@@ -534,39 +640,53 @@ static void evict(struct inode *inode)
 	truncate_inode_pages_final(&inode->i_data);
 	remove_inode_hash(inode);
 
-	spin_lock_irqsave(&inode_hash_lock, flags);
-	if (!list_empty(&inode->i_sb_list))
-		list_del_init(&inode->i_sb_list);
-	spin_unlock_irqrestore(&inode_hash_lock, flags);
+	inode_sb_list_del(inode);
 
 	if (sb && sb->s_op && sb->s_op->evict_inode)
 		sb->s_op->evict_inode(inode);
 	else
 		clear_inode(inode);
 
-	if (sb && sb->s_op && sb->s_op->destroy_inode)
-		sb->s_op->destroy_inode(inode);
-	else if (sb && sb->s_op && sb->s_op->free_inode)
-		sb->s_op->free_inode(inode);
-	else
-		kfree(inode);
+	destroy_inode(inode);
 }
 
 void iput(struct inode *inode)
 {
 	struct super_block *sb;
-	int drop;
+	unsigned long flags;
+	int drop, cnt;
 
 	if (!inode)
 		return;
-	{
-		int left = __atomic_sub_fetch(&inode->i_count.counter, 1,
-		                              __ATOMIC_ACQ_REL);
-
-		if (__builtin_expect(left < 0, 0))
-			lkpi_refcount_bug("iput", inode, left + 1);
-		if (left != 0)
+	/* Not the last reference: no lock. */
+	cnt = atomic_read(&inode->i_count);
+	while (cnt > 1) {
+		if (__atomic_compare_exchange_n(&inode->i_count.counter, &cnt, cnt - 1,
+		                                0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
 			return;
+	}
+
+	/*
+	 * The last one, maybe: dropped under i_lock, and a superblock that will
+	 * not keep the inode marks it going in the same hold. igrab and every
+	 * lookup test that mark under the same lock. Dropping the count with no
+	 * lock left a window -- zero, and not yet going -- in which btrfs took a
+	 * reference to an inode this put then evicted; its own later put evicted
+	 * the inode a second time.
+	 */
+	spin_lock_irqsave(&inode->i_lock, flags);
+	cnt = __atomic_sub_fetch(&inode->i_count.counter, 1, __ATOMIC_ACQ_REL);
+	if (__builtin_expect(cnt < 0, 0)) {
+		spin_unlock_irqrestore(&inode->i_lock, flags);
+		lkpi_refcount_bug("iput", inode, cnt + 1);
+	}
+	if (__builtin_expect(inode->i_state & I_CLEAR, 0)) {
+		spin_unlock_irqrestore(&inode->i_lock, flags);
+		lkpi_refcount_bug("iput of an evicted inode", inode, cnt + 1);
+	}
+	if (cnt != 0) {
+		spin_unlock_irqrestore(&inode->i_lock, flags);
+		return;
 	}
 
 	sb = inode->i_sb;
@@ -580,10 +700,20 @@ void iput(struct inode *inode)
 	 * when the rename dropped b's dentry. The superblock evicts what is left
 	 * at unmount (evict_inodes).
 	 */
-	if (!drop && sb && (sb->s_flags & SB_ACTIVE))
+	if (!drop && sb && (sb->s_flags & SB_ACTIVE)) {
+		spin_unlock_irqrestore(&inode->i_lock, flags);
 		return;
-	if (!drop)
+	}
+	if (!drop) {
+		/* Written out first, and nobody may take it meanwhile. */
+		inode->i_state |= I_WILL_FREE;
+		spin_unlock_irqrestore(&inode->i_lock, flags);
 		filemap_write_and_wait(inode->i_mapping);
+		spin_lock_irqsave(&inode->i_lock, flags);
+		inode->i_state &= ~I_WILL_FREE;
+	}
+	inode->i_state |= I_FREEING;
+	spin_unlock_irqrestore(&inode->i_lock, flags);
 	evict(inode);
 }
 
@@ -592,12 +722,34 @@ void iput(struct inode *inode)
 void evict_inodes(struct super_block *sb)
 {
 	struct inode *inode, *next;
+	unsigned long flags;
+	LIST_HEAD(dispose);
 
-	list_for_each_entry_safe(inode, next, &sb->s_inodes, i_sb_list) {
-		if (atomic_read(&inode->i_count) != 0)
+	/*
+	 * Choose first, evict after, as upstream does. Evicting one inode can
+	 * put another -- btrfs drops what a subvolume root holds -- and on a
+	 * superblock no longer active that put evicts and frees at once, so a
+	 * walk that evicted as it went stepped onto freed memory through the
+	 * `next` it had saved. Every victim is marked I_FREEING and taken off
+	 * the walk under the list lock; a put that reaches one of them later
+	 * finds it already going.
+	 */
+	spin_lock_irqsave(&sb->s_inode_list_lock, flags);
+	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+		spin_lock(&inode->i_lock);
+		if (atomic_read(&inode->i_count) != 0 ||
+		    (inode->i_state & (I_NEW | I_FREEING))) {
+			spin_unlock(&inode->i_lock);
 			continue;
-		if (inode->i_state & (I_NEW | I_FREEING))
-			continue;
+		}
+		inode->i_state |= I_FREEING;
+		spin_unlock(&inode->i_lock);
+		list_add(&inode->i_lru, &dispose);
+	}
+	spin_unlock_irqrestore(&sb->s_inode_list_lock, flags);
+
+	list_for_each_entry_safe(inode, next, &dispose, i_lru) {
+		list_del_init(&inode->i_lru);
 		evict(inode);
 	}
 }

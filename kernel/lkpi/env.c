@@ -1311,6 +1311,15 @@ void lkpi_refcount_bug(const char *what, const void *obj, int count)
 
   lkpi_snprintf(line, sizeof(line), "lkpi: %s on %p at refcount %d", what, obj,
                 count);
+  /* Whose put it was: the panic's own unwind starts inside panic and has
+   * lost this frame chain by the time it prints. */
+  {
+    extern void arch_backtrace(u64 fp, u64 pc);
+
+    klog_warn(line);
+    arch_backtrace((u64)(usize)__builtin_frame_address(0),
+                   (u64)(usize)__builtin_return_address(0));
+  }
   panic(line);
 }
 

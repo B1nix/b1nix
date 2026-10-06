@@ -326,6 +326,20 @@ int lkpi_bridge_gone(void *nodep)
 	return d && !d->d_inode;
 }
 
+void *lkpi_bridge_sb(void *nodep)
+{
+	struct dentry *d = nodep;
+
+	return d ? d->d_sb : NULL;
+}
+
+int lkpi_bridge_last_mount(void *rootp)
+{
+	struct dentry *root = rootp;
+
+	return root && root->d_sb && atomic_read(&root->d_sb->s_active) == 1;
+}
+
 void lkpi_bridge_put(void *nodep)
 {
 	if (nodep)
