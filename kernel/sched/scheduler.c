@@ -777,6 +777,12 @@ static u64   g_task_pass[TASK_SLOTS];
  * side tables, because find_unused_task must clear it when it recycles a
  * slot. 0 means "any CPU". */
 static u64 g_task_affinity[TASK_SLOTS];
+/* A new task between find_unused_task and the READY that publishes it: not to
+ * be woken, picked or claimed. It waits BLOCKED with no channel, and a wake
+ * that reached it -- one meant for the channel or deadline a fork child copied
+ * from its parent, or a wake of channel NULL -- ran it half-built on another
+ * CPU, and its creator's own READY store then landed on a running task. */
+static volatile u8 g_task_constructing[TASK_SLOTS];
 /* The CPU each task was last switched in on: /proc/<pid>/stat's processor. */
 static u16 g_task_cpu[TASK_SLOTS];
 static u64   g_min_pass = 0;
@@ -1564,6 +1570,7 @@ static struct task *find_unused_task(int user) {
       /* M77: default core-dump soft cap of 1 MiB (the kernel's coredump path
        * further clamps to the global /proc/sys/kernel/coredump-max). */
       g_task_rlimits[i][RLIMIT_CORE].rlim_cur = 1024 * 1024;
+      __atomic_store_n(&g_task_constructing[i], 1, __ATOMIC_RELEASE);
       T(i)->state = TASK_BLOCKED;
       T(i)->id = claim_task_id(user);
       tasks_unlock(flags);
@@ -1697,6 +1704,7 @@ static struct task *find_unused_task(int user) {
   g_task_rlimits[i][RLIMIT_NOFILE].rlim_max = 1024;
   /* M77: default core-dump soft cap of 1 MiB. */
   g_task_rlimits[i][RLIMIT_CORE].rlim_cur = 1024 * 1024;
+  __atomic_store_n(&g_task_constructing[i], 1, __ATOMIC_RELEASE);
   T(i)->state = TASK_BLOCKED;
   T(i)->id = claim_task_id(user);
   tasks_unlock(flags);
@@ -1707,6 +1715,8 @@ static struct task *find_unused_task(int user) {
  * find_unused_task). The store also publishes any prior writes (e.g. the
  * kfree of the task's resources) before the slot becomes claimable again. */
 static void free_task_slot(struct task *t) {
+  /* A fork that failed half-way frees its child here with the flag still up. */
+  __atomic_store_n(&g_task_constructing[task_index(t)], 0, __ATOMIC_RELEASE);
   /* The mapping lookup cache and free-area hint are per slot and hold raw
    * pointers into this task's list: the next owner of the slot must not find
    * them, whatever its address space's generation happens to read. */
@@ -1816,6 +1826,9 @@ static int sched_ap_idle_cpu_of(const struct task *t) {
 int task_claim(struct task *t) {
   int one = 1;
   enum task_state expected = TASK_READY;
+
+  if (__atomic_load_n(&g_task_constructing[task_index(t)], __ATOMIC_ACQUIRE))
+    return 0;
 
   if (task_running_somewhere(t))
     return 0;
@@ -2406,6 +2419,11 @@ static struct task *pick_next_task(void) {
       continue;
     if (t->stealable)
       continue;
+    /* Not a candidate at all, rather than one task_claim refuses: chosen as
+     * the best and then refused, it took every pick this CPU made until fork
+     * published it, and the task fork was waiting on never ran. */
+    if (__atomic_load_n(&g_task_constructing[index], __ATOMIC_ACQUIRE))
+      continue;
     if (on_ap && !t->ap_runnable)
       continue; /* APs run only userspace ELF processes */
     if (pcpu && !sched_task_allowed_on_cpu(t, pcpu->cpu_id))
@@ -2831,9 +2849,15 @@ void sched_wakelat_dump(void) {
   console_write("\n");
 }
 
+/* Who last made each task READY, for the report a task that went back to user
+ * mode still READY gives (sched_assert_user_return). */
+static void *g_task_readied_by[TASK_SLOTS];
+
 static void sched_wake_enqueue(struct task *t) {
   if (t) {
     usize i = task_index(t);
+
+    g_task_readied_by[i] = __builtin_return_address(0);
 
     sched_waitprof_wake(t);
     if (wakelat_enabled())
@@ -3481,6 +3505,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
    * publish that here so the first pick doesn't spin forever. */
   task->stack_released = 1;
   task->state = TASK_READY;
+  __atomic_store_n(&g_task_constructing[task_index(task)], 0, __ATOMIC_RELEASE);
   sched_rq_enqueue_current(task);
   interrupts_restore(irqflags);
 
@@ -3650,6 +3675,12 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
   child->irq_nest = 0;
   child->w_held_n = 0;
   child->w_untracked = 0;
+  /* Nor the parent's wait. The child sits BLOCKED while it is built so that
+   * no CPU picks it, and a wake for the channel or deadline the copy carried
+   * over turned it READY half-built: another CPU ran it before fork had
+   * finished, and fork's own READY store then landed on a running task. */
+  child->wait_chan = 0;
+  child->wake_tick = 0;
   child->next_run = claimed_next_run;
   /* The memcpy copied the parent's fpu_state SAVE-AREA, which is only refreshed
    * on a context switch-out and may lag the parent's live FPU. Capture the
@@ -4003,6 +4034,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
    * never calls arch_context_switch from this path). */
   child->stack_released = 1;
   child->state = TASK_READY;
+  __atomic_store_n(&g_task_constructing[task_index(child)], 0, __ATOMIC_RELEASE);
   sched_rq_enqueue_current(child);
   interrupts_enable();
   /* Kick the other CPUs out of `sti; hlt` so an idle AP (or the BSP, once the
@@ -5563,6 +5595,7 @@ clone_nomem:
    * stack_released=1 explicitly before the first pick sees it. */
   child->stack_released = 1;
   child->state = TASK_READY;
+  __atomic_store_n(&g_task_constructing[task_index(child)], 0, __ATOMIC_RELEASE);
   sched_rq_enqueue_current(child);
   interrupts_enable();
 
@@ -6884,6 +6917,8 @@ void sched_assert_user_return(void) {
     console_write(", lease cleared in ");
     console_write(g_task_lease_site[task_index(t)] ? g_task_lease_site[task_index(t)]
                                                   : "?");
+    console_write(", made READY by ");
+    ksym_print((u64)(usize)g_task_readied_by[task_index(t)]);
     console_write("\n");
   }
   KASSERT(t->state == TASK_RUNNING,
@@ -7159,9 +7194,15 @@ void scheduler_wake_all(void *chan) {
     kprof_wake_site(__builtin_return_address(0));
   }
   int woken = 0;
+  /* Nothing waits on channel NULL; every task being built does, as far as
+   * the loop below could tell, and so does every other task parked with no
+   * channel. A file-lock release woke it on every close. */
+  KASSERT(chan != 0, "scheduler_wake_all: wake of channel NULL");
   for (usize i = 0; i < g_task_hwm; i++) {
     struct task *t = T(i);
     if (!t || t->wait_chan != chan) continue;
+    if (__atomic_load_n(&g_task_constructing[i], __ATOMIC_ACQUIRE))
+      continue;
     enum task_state expected = TASK_BLOCKED;
     if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY,
                                     0, __ATOMIC_ACQUIRE,
@@ -10625,24 +10666,7 @@ void scheduler_fd_close_on_exec(void) {
  * next return to userspace. Caller must already hold IRQs disabled. SIGCHLD is
  * excluded from waitpid interruption, so this never spuriously aborts a parent
  * blocked reaping another child. */
-static void post_sigchld_to_parent(usize parent_id, int job_control_event) {
-  /* A child changing state is also a readiness change on every pidfd that
-   * names it, and a poller has no other way to hear about it.
-   *
-   * A pidfd is readable exactly when the process it holds has exited, and
-   * b1nix's poll implementation re-examines its descriptors only when
-   * something wakes vfs_poll_chan. Nothing did on this path, so an epoll_wait
-   * on a pidfd slept through the death it was waiting for -- which is how
-   * systemd waits for the child it runs its generators in, and it sat in that
-   * epoll_wait for the rest of the boot.
-   *
-   * Announced before the SIGCHLD, and unconditionally: a pidfd holder need not
-   * be the parent, and there is no cheap way to ask which of them there are.
-   * Deaths are rare next to the wake this costs. */
-  {
-    extern void *vfs_poll_chan;
-    scheduler_wake_all(vfs_poll_chan);
-  }
+static void post_sigchld_bit(usize parent_id, int job_control_event) {
   if (parent_id == 0)
     return;
   for (usize p = 0; p < g_task_hwm; p++) {
@@ -10652,9 +10676,32 @@ static void post_sigchld_to_parent(usize parent_id, int job_control_event) {
         return;
       __atomic_fetch_or(&T(p)->pending_signals, (1ULL << (SIGCHLD - 1)),
                         __ATOMIC_RELEASE);
-sched_sigwait_notify(T(p), SIGCHLD);
+      sched_sigwait_notify(T(p), SIGCHLD);
       return;
     }
+  }
+}
+
+static void post_sigchld_to_parent(usize parent_id, int job_control_event) {
+  post_sigchld_bit(parent_id, job_control_event);
+  /* A child changing state is also a readiness change on every pidfd that
+   * names it, and on a signalfd that takes SIGCHLD, and a poller has no other
+   * way to hear about either.
+   *
+   * A pidfd is readable exactly when the process it holds has exited, and
+   * b1nix's poll implementation re-examines its descriptors only when
+   * something wakes vfs_poll_chan. Nothing did on this path, so an epoll_wait
+   * on a pidfd slept through the death it was waiting for -- which is how
+   * systemd waits for the child it runs its generators in, and it sat in that
+   * epoll_wait for the rest of the boot.
+   *
+   * Announced AFTER the bit is posted, and unconditionally: a pidfd holder
+   * need not be the parent, and there is no cheap way to ask which of them
+   * there are. Woken first, a poller could rescan before the bit landed, find
+   * its signalfd empty and sleep through the SIGCHLD. */
+  {
+    extern void *vfs_poll_chan;
+    scheduler_wake_all(vfs_poll_chan);
   }
 }
 

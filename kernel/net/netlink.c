@@ -1079,8 +1079,17 @@ void netlink_uevent_unregister(struct vfs_socket_state *s) {
     }
 }
 
+/* Who a queued message is from, as its receiver reads it back: the kernel or
+ * a task's own write, the multicast group it went to, and the sending socket's
+ * port id. NULL is the common case, a reply the kernel builds. */
+struct nl_src {
+  int from_task;
+  u32 groups;
+  u32 portid;
+};
+
 static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
-                            usize len);
+                            usize len, const struct nl_src *src);
 
 /* Copy one announcement to every listener that joined one of `groups`, except
  * the sender (a socket never receives its own multicast). */
@@ -1095,33 +1104,30 @@ static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
  * from the kernel is not a reply -- so iproute2 discarded the answer to every
  * request it made and waited for one that never came.
  *
- * Only a task's own write(2) to a uevent socket clears the flag, for the
- * length of the delivery. */
-static int nl_enqueue_from_kernel = 1;
-static u32 nl_enqueue_groups;
-/* The port id of the socket a task's write(2) came from, for the length of the
- * delivery. Zero while the kernel is the sender. */
-static u32 nl_enqueue_portid;
+ * It travels with the message as an argument. It used to be three globals set
+ * around the delivery, and a kernel uevent broadcast on one CPU reset them
+ * under udevd's unicast to a worker on another: the worker saw a message from
+ * the kernel where it trusts only its manager, ignored it, and the event it
+ * carried never finished -- `udevadm settle` waited for it for ever. */
 
 static void netlink_uevent_deliver(u32 groups, const void *payload, usize len,
                                    const struct vfs_socket_state *from) {
   if (!groups)
     return;
   int listeners = 0, delivered = 0;
-  nl_enqueue_groups = groups;
+  struct nl_src src = {from != 0, groups, from ? from->local.nl.nl_pid : 0};
   for (int i = 0; i < MAX_UEVENT_SOCKS; i++) {
     struct vfs_socket_state *t = uevent_socks[i];
     if (!t || t == from)
       continue;
     listeners++;
     if (nl_sock_groups(t) & groups) {
-      netlink_enqueue(t, (const u8 *)payload, len);
+      netlink_enqueue(t, (const u8 *)payload, len, &src);
       delivered++;
     }
   }
   /* Who was listening and who got it. A uevent that reaches nobody looks
    * exactly like one that was never sent, from userspace. `b1nix.trace-uevent`. */
-  nl_enqueue_groups = 0;
   if (bootinfo_has_flag("b1nix.trace-uevent")) {
     char ul[256];
     snprintf(ul, sizeof(ul), "uevent: groups=0x%x len=%lu listeners=%d sent=%d '%s'",
@@ -1156,8 +1162,8 @@ static int netlink_uevent_unicast(u32 dest_pid, const void *payload, usize len,
       continue;
     if (t->local.nl.nl_pid != dest_pid)
       continue;
-    nl_enqueue_groups = 0;
-    netlink_enqueue(t, (const u8 *)payload, len);
+    struct nl_src src = {1, 0, from->local.nl.nl_pid};
+    netlink_enqueue(t, (const u8 *)payload, len, &src);
     if (bootinfo_has_flag("b1nix.trace-uevent")) {
       char ul[192];
       snprintf(ul, sizeof(ul),
@@ -1184,19 +1190,11 @@ static isize netlink_uevent_send(struct vfs_socket_state *s, const void *buf,
   if (len > NL_SLOT_MAX)
     return -EMSGSIZE;
   if (groups) {
-    nl_enqueue_from_kernel = 0;
-    nl_enqueue_portid = s->local.nl.nl_pid;
     netlink_uevent_deliver(groups, buf, len, s);
-    nl_enqueue_portid = 0;
-    nl_enqueue_from_kernel = 1;
     return (isize)len;
   }
   if (dest_pid) {
-    nl_enqueue_from_kernel = 0;
-    nl_enqueue_portid = s->local.nl.nl_pid;
     int r = netlink_uevent_unicast(dest_pid, buf, len, s);
-    nl_enqueue_portid = 0;
-    nl_enqueue_from_kernel = 1;
     return r < 0 ? (isize)r : (isize)len;
   }
   /* nl_pid 0 with no group is the kernel, which has nothing to do with a
@@ -1248,7 +1246,7 @@ static u32 nl_backlog_limit(const struct vfs_socket_state *s) {
 }
 
 static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
-                            usize len) {
+                            usize len, const struct nl_src *src) {
   /* A socket filter runs before the datagram is queued and decides how much of
    * it the socket accepts; zero means the message is not for this listener.
    * systemd's device monitor relies on this to see only tagged devices. */
@@ -1267,13 +1265,14 @@ static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
    * what a udev monitor requires before it will look at the message. */
   u32 cred[3];
   {
-    struct cred *c = nl_enqueue_from_kernel ? 0 : scheduler_get_current_cred();
-    cred[0] = nl_enqueue_from_kernel ? 0u : (u32)scheduler_get_pid();
+    int from_task = src && src->from_task;
+    struct cred *c = from_task ? scheduler_get_current_cred() : 0;
+    cred[0] = from_task ? (u32)scheduler_get_pid() : 0u;
     cred[1] = c ? (u32)c->euid : 0u;
     cred[2] = c ? (u32)c->egid : 0u;
   }
-  u32 groups = nl_enqueue_groups;
-  u32 portid = nl_enqueue_from_kernel ? 0u : nl_enqueue_portid;
+  u32 groups = src ? src->groups : 0;
+  u32 portid = src && src->from_task ? src->portid : 0u;
 
   /* The backlog node is allocated before the lock is taken: kmalloc may
    * reclaim, and reclaim must never run under a spinlock. */
@@ -1381,7 +1380,7 @@ int netlink_kernel_unicast(struct vfs_handle *h, const void *payload,
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   if (s->domain != B1NIX_AF_NETLINK)
     return -EBADF;
-  netlink_enqueue(s, (const u8 *)payload, len);
+  netlink_enqueue(s, (const u8 *)payload, len, 0);
   return 0;
 }
 
@@ -1407,7 +1406,7 @@ static void netlink_deliver(struct vfs_socket_state *s, const u8 *buf,
     if (chunk == 0) /* a single message larger than a slot: cannot happen with
                      * the encoders above, but never loop forever. */
       break;
-    netlink_enqueue(s, buf + pos, chunk);
+    netlink_enqueue(s, buf + pos, chunk, 0);
     pos += chunk;
   }
 }

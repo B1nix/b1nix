@@ -382,13 +382,24 @@ void filelock_release_all_by_ofd(void *ofd) {
   if (!filelock_initialized || !ofd)
     return;
   spin_lock_irqsave(&filelock_lock, &flags);
+  void *woken = 0;
   for (int i = 0; i < MAX_FILE_LOCKS; i++) {
-    if (file_locks[i].active && file_locks[i].ofd == ofd)
+    if (file_locks[i].active && file_locks[i].ofd == ofd) {
+      void *inode = file_locks[i].inode;
+
       free_lock(&file_locks[i]);
+      /* Someone may be blocked on exactly what was just dropped, and an
+       * F_SETLKW waiter sleeps on the inode. This woke channel 0 instead --
+       * on every close -- which reached no lock waiter at all and promoted
+       * every task parked with no channel, a task still being built among
+       * them. The wake does not sleep, so it is safe under the lock. */
+      if (inode && inode != woken) {
+        scheduler_wake_all(inode);
+        woken = inode;
+      }
+    }
   }
   spin_unlock_irqrestore(&filelock_lock, flags);
-  /* Someone may be blocked on exactly what was just dropped. */
-  scheduler_wake_all(0);
 }
 
 int filelock_unlock(int fd) {
