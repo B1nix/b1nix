@@ -9938,6 +9938,17 @@ static void scheduler_dump_sysring(usize idx) {
 
 static int g_dump_dead;
 
+void dump_tasks_at_thread(void *arg) {
+  u64 at = (u64)bootinfo_get_u32("b1nix.dump-tasks-at", 0) * 1000000000ull;
+
+  (void)arg;
+  while (ktime_monotonic_ns() < at)
+    scheduler_sleep_ticks(sched_tick_hz());
+  console_loglevel_set(CONSOLE_LOGLEVEL_DEFAULT);
+  console_write("dump-tasks-at: the tasks, as asked on the command line\n");
+  scheduler_dump_tasks();
+}
+
 void scheduler_dump_tasks(void) {
   /* Every other task's mapping list is read below, while those tasks run and
    * exit on other CPUs: counted as a walker, so no mapping is freed under it. */

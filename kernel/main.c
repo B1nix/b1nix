@@ -2057,6 +2057,14 @@ void kernel_main(usize arg0, usize arg1)
 	int init_pid = user_spawn(init_path, 0, 0);
 	if (init_pid > 0)
 		scheduler_set_init_pid((usize)init_pid);
+	/* b1nix.dump-tasks-at=<seconds>: every task, and where it is waiting,
+	 * that long after boot. For a userspace that stops making progress while
+	 * still printing -- the case the console-silence watchdog cannot see. */
+	if (bootinfo_get_u32("b1nix.dump-tasks-at", 0)) {
+		extern void dump_tasks_at_thread(void *arg);
+
+		kthread_create("dump-tasks-at", dump_tasks_at_thread, 0);
+	}
 	/* The cmdline is echoed again here, next to the spawn it decided. It is
 	 * printed once near the top of the boot too, but that has long scrolled
 	 * away by now — and on a board where the only console is a panel, "which

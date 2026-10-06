@@ -225,7 +225,7 @@ qemu-img create -q -f qcow2 -b "$BROKEN_IMG" -F raw "$_fb_disk" || stage_die fal
 _fell_back=0
 for _try in 1 2 3 4; do
 	_bl="$OUT_DIR/distro-smoke-fallback-$_try.log"
-	IMG_FORMAT=qcow2 SNAPSHOT=off qemu_boot "$_fb_disk" "$_bl"
+	IMG_FORMAT=qcow2 SNAPSHOT=off DISK_CACHE=unsafe qemu_boot "$_fb_disk" "$_bl"
 	if clean_log "$_bl" | grep -aq "DISTRO-SMOKE: done"; then
 		# The in-guest checks ran, so this boot reached userspace: the only
 		# kernel that can do that here is the good one.

@@ -43,6 +43,10 @@ CPUS="${CPUS:-4}"
 # own writable copy (usually a qcow2 overlay) with SNAPSHOT=off.
 IMG_FORMAT="${IMG_FORMAT:-raw}"
 SNAPSHOT="${SNAPSHOT:-on}"
+# DISK_CACHE=unsafe for a throwaway writable copy: a guest flush then costs no
+# host fsync. Under host I/O pressure that fsync held one boot-count write for
+# eighteen seconds, and the lane read the stall as a hung boot.
+DISK_CACHE="${DISK_CACHE:-}"
 # FIRMWARE=uefi boots through OVMF and Limine's EFI loader instead of SeaBIOS
 # and Limine's BIOS stages. The image carries both, and an installed machine
 # boots whichever its firmware is.
@@ -90,7 +94,7 @@ VIRTFS=""
 log "booting $(basename "$IMG") under $FIRMWARE (deadline ${DEADLINE}s, silence ${SILENCE}s)"
 # shellcheck disable=SC2086
 qemu-system-x86_64 -machine pc $ACCEL $FW -m "$MEM" -smp "$CPUS" \
-	-drive file="$IMG",format="$IMG_FORMAT",if=virtio,snapshot="$SNAPSHOT" \
+	-drive file="$IMG",format="$IMG_FORMAT",if=virtio,snapshot="$SNAPSHOT"${DISK_CACHE:+,cache=$DISK_CACHE} \
 	$VIRTFS -display none -serial file:"$LOG" -no-reboot "$@" &
 QEMU=$!
 trap 'kill "$QEMU" 2>/dev/null || true' EXIT INT TERM
